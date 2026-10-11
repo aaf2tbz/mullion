@@ -1188,10 +1188,8 @@ public:
     BlitObject Dst(device, pDstResource);
 
     if (Dst.Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
-      D3D11_BUFFER_DESC desc;
-      ((ID3D11Buffer *)pDstResource)->GetDesc(&desc);
       uint32_t copy_offset = 0;
-      uint32_t copy_len = desc.ByteWidth;
+      uint32_t copy_len = Dst.BufferDesc.ByteWidth;
       if (pDstBox) {
         if (pDstBox->right <= pDstBox->left) {
           return;
@@ -1207,14 +1205,12 @@ public:
           MapResource(pDstResource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
-          Unmap(pDstResource, 0);
           return;
         }
         if (CopyFlags & D3D11_COPY_NO_OVERWRITE) {
           MapResource(pDstResource, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped);
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
-          Unmap(pDstResource, 0);
           return;
         }
       }

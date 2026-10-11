@@ -84,23 +84,21 @@ public:
       TResourceBase<tag_buffer>(*pDesc, device) {
     buffer_ = new Buffer(pDesc->ByteWidth, device->GetMTLDevice());
     Flags<BufferAllocationFlag> flags;
-    if (!m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC)
-      flags.set(BufferAllocationFlag::CpuWriteCombined);
     // if (pDesc->Usage != D3D11_USAGE_DEFAULT)
     if (pDesc->Usage == D3D11_USAGE_IMMUTABLE)
       flags.set(BufferAllocationFlag::GpuReadonly);
-    if (pDesc->Usage != D3D11_USAGE_DYNAMIC) {
-      if (pInitialData)
-        flags.set(BufferAllocationFlag::GpuManaged);
-      else if (pDesc->BindFlags & kD3D11OutputBindFlags)
-        flags.set(BufferAllocationFlag::GpuPrivate);
-      else
-        flags.set(BufferAllocationFlag::GpuManaged);
-    } else {
+    if (pDesc->Usage == D3D11_USAGE_DYNAMIC ||
+        (pDesc->Usage == D3D11_USAGE_DEFAULT && !(pDesc->BindFlags & kD3D11OutputBindFlags))) {
+      if (!m_parent->IsTraced())
+        flags.set(BufferAllocationFlag::CpuWriteCombined);
       flags.set(BufferAllocationFlag::SuballocateFromOnePage);
 #ifdef __i386__
       flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
+    } else if (pInitialData || !(pDesc->BindFlags & kD3D11OutputBindFlags)) {
+      flags.set(BufferAllocationFlag::GpuManaged);
+    } else {
+      flags.set(BufferAllocationFlag::GpuPrivate);
     }
     auto allocation = buffer_->allocate(flags);
     auto &initializer = device->GetDXMTDevice().queue().initializer;
