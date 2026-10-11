@@ -278,8 +278,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID iid,
                                             void **adapter) override {
-    ERR("DXGIFactory::EnumWrapAdapter: not implemented");
-    return DXGI_ERROR_NOT_FOUND;
+    // no software rasterizer here: the GPU's adapter is the one that makes a device, as in Wine and DXVK
+    return EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, iid, adapter);
   };
 
   HRESULT STDMETHODCALLTYPE

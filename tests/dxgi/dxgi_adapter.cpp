@@ -4,6 +4,8 @@
 //   its three descriptions are of one adapter.
 // - EnumAdapterByLuid "outputs the IDXGIAdapter for the specified LUID", "designed to be paired with
 //   ID3D12Device::GetAdapterLuid": the device's LUID finds its adapter, and a LUID of no adapter finds none.
+// - EnumWarpAdapter "provides an adapter which can be provided to D3D12CreateDevice" (IDXGIFactory4::EnumWarpAdapter,
+//   https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgifactory4-enumwarpadapter).
 // - CheckInterfaceSupport: "S_OK indicates that the interface is supported, otherwise DXGI_ERROR_UNSUPPORTED".
 // - QueryVideoMemoryInfo: a budget for the local group, the application's usage in it, which grows by a texture's
 //   size when one is made, and no more to reserve than the budget. "When the adapter is UMA, D3D12_MEMORY_POOL_L0 and
@@ -70,6 +72,12 @@ main(int argc, char **argv) {
   expect(SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&found))) && found && same(luid, desc.AdapterLuid),
          "the device's LUID does not find its adapter");
   expect(FAILED(factory->EnumAdapterByLuid(other, IID_PPV_ARGS(&missing))) && !missing, "a LUID of no adapter finds one");
+
+  ComPtr<IDXGIAdapter> warp;
+  ComPtr<ID3D12Device> software;
+  expect(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)) == S_OK && warp &&
+             SUCCEEDED(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&software))) && software,
+         "the WARP adapter makes no device");
 
   LARGE_INTEGER version;
   expect(adapter->CheckInterfaceSupport(__uuidof(ID3D10Device), &version) == S_OK, "no Direct3D 10 on the adapter");
