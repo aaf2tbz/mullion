@@ -484,14 +484,15 @@ public:
     // 0 and DXGI_FORMAT_UNKNOWN keep what there is (the window's size for a size of 0), and the flags are the swap
     // chain's from now on, except that tearing is allowed for a swap chain's whole life (IDXGISwapChain::ResizeBuffers).
     // a resize that is refused leaves the swap chain as it was
-    if ((Format != DXGI_FORMAT_UNKNOWN && ConvertSwapChainFormat(Format) == WMTPixelFormatInvalid) ||
-        BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
+    UINT support;
+    if (FAILED(device_->CheckFormatSupport(Format == DXGI_FORMAT_UNKNOWN ? desc_.Format : Format, &support)) ||
+        !(support & D3D11_FORMAT_SUPPORT_DISPLAY) || BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
       return E_INVALIDARG;
     if ((flags ^ desc_.Flags) & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
       return DXGI_ERROR_INVALID_CALL;
     if (BufferCount == 1 && desc_.SwapEffect >= DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
       return DXGI_ERROR_INVALID_CALL;
-    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
     for (const auto &buffer : backbuffers_)
       if (buffer->GetPrivateRefCount() > 1)
         return DXGI_ERROR_INVALID_CALL;
