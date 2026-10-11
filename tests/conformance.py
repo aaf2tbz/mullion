@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -90,16 +89,10 @@ def wine_suite(dll, source, objects, out):
     return names, lambda name: ([exe, dll], {"MULLION_TEST": name, "WINETEST_PLATFORM": "windows"})
 
 
-def compiler(builds):
-    """the C compiler the build's own programs for Windows are made with"""
-    return next(json.loads(path.read_text()) for b in builds for path in [b / "meson-info" / "intro-compilers.json"]
-                if path.exists())["host"]["c"]["exelist"]
-
-
 def vkd3d_suite(checkout, builds, binary, env, out):
     """vkd3d-proton's Direct3D 12 tests: the program, its tests, and how one of them is run"""
     # the build's compiler, and the IDL compiler of its toolchain
-    cc = compiler(builds)
+    cc = run.compiler(builds)
     widl = cc[0].rsplit("-", 1)[0] + "-widl"
     meson = lambda path, name: re.findall(r"'(\w+\.\w+)'", re.search(rf"{name} = \[(.*?)\]", path.read_text(), re.S)[1])
     (out / "include").mkdir(parents=True, exist_ok=True)
@@ -139,7 +132,7 @@ def verdict(status, text):
     return "skipped" if not executed else "partly" if skipped else "passed"
 
 
-def site(text, files, symbolizer):
+def site(text, files):
     """where a log with the libraries' load addresses says its run ended: the assertion that failed, or the fault's
     module, function and line, the function being the one the source has there, not what the compiler put into
     it. `files` are the modules' files by name"""
@@ -152,9 +145,7 @@ def site(text, files, symbolizer):
     base, module = max(((b, m) for b, m in loaded if b <= address), default=(0, "?"))
     if module not in files:
         return f"{module}+{address - base:#x}"
-    named = subprocess.run([symbolizer, f"--obj={files[module]}", "--relative-address", "-f", "-C", "-p", "-s", hex(address - base)],
-                           capture_output=True, text=True).stdout.strip()
-    return f"{module}: {named.splitlines()[-1].replace(' (inlined by) ', '') if named else hex(address - base)}"
+    return f"{module}: {run.named(files[module], address - base)}"
 
 
 def arguments(parser):
@@ -172,8 +163,6 @@ def conformance(args, builds, binary, base):
     """runs the suites the arguments name; the number of verdicts that differ from the recorded ones"""
     out = builds[0] / "conformance"
     pe = {path.name: path for path in run.libraries(builds)[1].values()}
-    # the toolchain's symbolizer, beside its compiler
-    symbolizer = Path(shutil.which(compiler(builds)[0])).parent / "llvm-symbolizer"
     suites = {}
     if args.wine_source and args.wine_build:
         for dll in WINE_TESTS:
@@ -191,12 +180,16 @@ def conformance(args, builds, binary, base):
         def one(name):
             argv, env = command(name)
             status = run.finish([binary, *argv], dict(base, **env), args.seconds, logs / f"{name}.txt")
-            word = verdict(status, (logs / f"{name}.txt").read_text(errors="replace"))
+            text = (logs / f"{name}.txt").read_text(errors="replace")
+            word = verdict(status, text)
             files = dict(pe, **{Path(argv[0]).name.lower(): argv[0]})
+            if word == "timeout":
+                # what went wrong under it, and where its threads are (run.where)
+                return word, "; ".join(run.faults(text.splitlines())[:1] + re.findall(r"^stuck: (.*)$", text, re.M)[-1:])
             if word != "crashed":
                 return word, ""
             run.finish([binary, *argv], dict(base, **env, WINEDEBUG="+loaddll"), args.seconds, logs / f"{name}.crash.txt")
-            return word, site((logs / f"{name}.crash.txt").read_text(errors="replace"), files, symbolizer)
+            return word, site((logs / f"{name}.crash.txt").read_text(errors="replace"), files)
 
         with ThreadPoolExecutor(args.jobs) as pool:
             ran = dict(zip(names, pool.map(one, names)))

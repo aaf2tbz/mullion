@@ -12,6 +12,8 @@ foreach name : ['bridge_errors', 'feature_queries', 'shared_resource', 'device_i
                   dependencies : d3d11_test_deps + d3d11_test_links.get(name, [])),
        env : ['DXMT_SHADER_CACHE=0'], timeout : 600)
 endforeach
+# no test: the runner's way to see where the threads of a test that outlived its time are
+executable('where', ['where.cpp'], dependencies : [cpp.find_library('dbghelp')])
 # 'window' tests present to a real window
 test('d3d11_swapchain_formats', executable('d3d11_swapchain_formats', ['d3d11_swapchain_formats.cpp'], dependencies : d3d11_test_deps),
      env : ['DXMT_SHADER_CACHE=0'], suite : 'window', timeout : 300)

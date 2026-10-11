@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -28,6 +29,12 @@ PATIENCE = 1800
 TURNS, TURN = 6, 6
 # how long a test may say nothing after a fault of the GPU's before it counts as hung
 QUIET = 30
+# what says where a hung test's threads are, set by environment(): the Wine's binary and the build's program for it
+# (tests/d3d11/where.cpp), the build's modules by name, and the symbolizer of the build's toolchain
+WHERE = {}
+# the Objective-C runtime keeps freed objects as zombies under the tests and says when one is messaged (Foundation,
+# NSDebug.h: NSZombieEnabled): an object released once too often names itself there, whatever its memory holds by then
+ZOMBIES = {"NSZombieEnabled": "YES"}
 
 
 def libraries(builds):
@@ -70,7 +77,8 @@ def install(wine, prefix, unix, pe):
 
 # what the library and Metal say when the GPU's work went wrong under a test: a command buffer that failed
 # (src/d3d12/d3d12_command_queue.cpp, src/dxmt/dxmt_command_queue.cpp), a rule of Metal's validation broken
-FAULTS = ("Device error", "failed assertion")
+# (Metal's debug layer), a message to an Objective-C object that was freed (ZOMBIES)
+FAULTS = ("Device error", "failed assertion", "message sent to deallocated instance")
 
 
 @contextlib.contextmanager
@@ -132,6 +140,7 @@ def finish(command, env, seconds, log):
                                 if time.time() - log.stat().st_mtime > QUIET and (
                                         faults(lines) or any(line.startswith("wrong: ") for line in lines)):
                                     break
+                        where(command, env, process, log)
                         return None
                     finally:
                         if process.poll() is None:
@@ -139,6 +148,59 @@ def finish(command, env, seconds, log):
                             process.wait()
         time.sleep(10)
     sys.exit(f"memory pressure level {level} for {PATIENCE} s: no test started")
+
+
+def compiler(builds):
+    """the C compiler the build's own programs for Windows are made with"""
+    return next(json.loads(path.read_text()) for b in builds for path in [b / "meson-info" / "intro-compilers.json"]
+                if path.exists())["host"]["c"]["exelist"]
+
+
+def named(file, offset):
+    """the function and line the build's symbols give an offset in a module: the function the source has there, not
+    what the compiler put into it"""
+    said = subprocess.run([WHERE["symbolizer"], f"--obj={file}", "--relative-address", "-f", "-C", "-p", "-s", hex(offset)],
+                          capture_output=True, text=True).stdout.strip()
+    return said.splitlines()[-1].replace(" (inlined by) ", "") if said else hex(offset)
+
+
+def where(command, env, process, log):
+    """what a test in the Wine that outlived its time leaves behind. in its log: where every thread of its program is
+    in Windows, a line a thread (tests/d3d11/where.cpp, which has until it has said nothing for as long as a hung test
+    may), and under `stuck:` the innermost frame each thread has in the build's own modules with the number of
+    threads there, and the threads that never gave their stack. beside its log: where the threads of its processes
+    are in macOS, in the libraries' unix halves and the system's (sample, for as long as it samples when it is not
+    told)"""
+    if command[:1] != WHERE.get("tool", [])[:1] or len(WHERE["tool"]) < 2:
+        return
+    pids = subprocess.run(["pgrep", "-g", str(process.pid)], capture_output=True, text=True).stdout.split()
+    samples = [subprocess.Popen(["sample", pid, "-file", f"{log}.{pid}.sample"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for pid in pids]
+    with open(log, "ab") as out:
+        asked = time.time()
+        reader = subprocess.Popen(WHERE["tool"] + [Path(command[1]).name], env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                  stderr=subprocess.STDOUT, start_new_session=True)
+        while reader.poll() is None and time.time() - max(asked, log.stat().st_mtime) < QUIET:
+            time.sleep(1)
+        if reader.poll() is None:
+            os.killpg(reader.pid, signal.SIGKILL)
+        reader.wait()
+    for sample in samples:
+        sample.wait()
+    files = dict(WHERE["files"], **{Path(command[1]).name.lower(): command[1]})
+    places, text = {}, log.read_text(errors="replace")
+    silent = set(" ".join(re.findall(r"^threads: \w+:(.*)$", text, re.M)).split()) - set(re.findall(r"^(?:where|refused): \w+ (\w+):", text, re.M))
+    if silent:
+        places["gave no stack (" + " ".join(sorted(silent)) + ")"] = len(silent)
+    for refusal in re.findall(r"^refused: \w+ \w+: (.*)$", text, re.M):
+        places[f"refused by {refusal}"] = places.get(f"refused by {refusal}", 0) + 1
+    for frames in re.findall(r"^where: \w+ \w+:(.*)$", text, re.M):
+        own = [(module, offset) for module, offset in (frame.rsplit("+", 1) for frame in frames.split()) if module.lower() in files]
+        # a thread with no frame in what was built is where its innermost frame is
+        place = f"in {own[0][0]}: {named(files[own[0][0].lower()], int(own[0][1], 16))}" if own else "in " + (frames.split() or ["no frame"])[0]
+        places[place] = places.get(place, 0) + 1
+    with open(log, "a") as out:
+        out.write("stuck: " + "; ".join(f"{count} {place}" for place, count in places.items()) + "\n")
 
 
 def faults(lines):
@@ -180,7 +242,7 @@ def environment(args):
     wine = args.wine.resolve()
     prefix = (args.prefix or builds[0] / "tests-prefix").resolve()
     unix, pe = libraries(builds)
-    base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), DXMT_SHADER_CACHE="0")
+    base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), DXMT_SHADER_CACHE="0", **ZOMBIES)
     base.pop("DXMT_GPU_FAMILY", None)
     # the build's libraries in place of the Wine's own, the shader compiler the prefix has, and no installer or
     # debugger that asks in a dialog
@@ -197,6 +259,9 @@ def environment(args):
                        env=base, stdin=subprocess.DEVNULL, check=True)
     if not args.no_install:
         install(wine, prefix, unix, pe)
+    WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
+                 files={path.name.lower(): path for path in pe.values()},
+                 symbolizer=Path(shutil.which(compiler(builds)[0])).parent / "llvm-symbolizer")
     return builds, binary, base
 
 
