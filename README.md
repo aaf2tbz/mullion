@@ -12,7 +12,7 @@ This is a pre-release. Things will break. Tell us when they do, and tell us what
 - It talks to Metal directly. Nothing sits between Direct3D and the GPU's own API.
 - One install covers Direct3D 10, 11 and 12.
 - It works with the Wine you already have. It needs no patched Wine and no DLL overrides, and it installs the way DXMT does.
-- It is held to the Direct3D specification. 114 test programs draw, read the result back and compare it with what the specification says.
+- It is held to the Direct3D specification. 151 test programs draw, read the result back and compare it with what the specification says.
 - It is open source under the LGPL. You can read it, build it, and ship it with your own tools.
 
 ## How it runs today
@@ -22,6 +22,10 @@ The Black Myth: Wukong benchmark runs from start to finish on Mullion. On an M5 
 | Mullion | D3DMetal |
 |---|---|
 | ![Black Myth: Wukong benchmark result on Mullion: 23 FPS average](docs/wukong-mullion.jpg) | ![The same benchmark on D3DMetal: 34 FPS average](docs/wukong-d3dmetal.jpg) |
+
+3DMark Fire Strike, a Direct3D 11 benchmark, scores 7003 on the same machine at its default settings: 6792 for graphics, 22802 for physics and 3878 combined. Time Spy's two graphics tests render correctly, but 3DMark does not show a score for them yet, and Steel Nomad does not start yet. We are working on both.
+
+![3DMark Fire Strike result on Mullion: 7003](docs/firestrike-mullion.jpg)
 
 ## Requirements
 
@@ -79,7 +83,7 @@ Open an issue for a game that breaks, with your Mac model and macOS version, how
 
 ## Credits
 
-We did not start from nothing. Mullion is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and CodeWeavers, from commit `7c8dee1` (16 September 2026). DXMT gave us the Direct3D 10 and 11 foundation, the DXBC shader converter and the Metal bridge. On top of it we wrote the DXIL front end and most of the Direct3D 12: about 20,000 lines of source and 34,000 lines of tests.
+We did not start from nothing. Mullion is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and CodeWeavers, from commit `7c8dee1` (16 September 2026). DXMT gave us the Direct3D 10 and 11 foundation, the DXBC shader converter and the Metal bridge. On top of it we wrote the DXIL front end and most of the Direct3D 12: about 23,000 lines of source and 50,000 lines of tests.
 
 Mullion is a separate project. Please do not report its problems to DXMT.
 
