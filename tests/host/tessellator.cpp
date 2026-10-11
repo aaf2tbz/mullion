@@ -8,6 +8,12 @@
 // (metal/metal_stdlib stands in for Metal's library): the hull stage's workloads, what the mesh stage makes of each,
 // and what a geometry shader's threadgroup looks up for each primitive (dxmt.get_domain_primitive_location). the
 // d3d11 and d3d12 tessellator tests check the same source as the GPU runs it, by its points and what it covers.
+// listing work is the zip's attempted slots, including ones that make no triangle. D3D11.3 11.7.5 defines an epoch
+// as "a power of 2 number of vertices on one half of the domain (excluding corners)"; 11.7.6.2 omits "one segment
+// on each end of the inside". for H points on the larger half-edge, the smallest containing epoch E has E < 2H:
+// trying both edges at both ends and two middle slots costs at most 4E + 2 <= 8H - 2. the frame has P >= 2H + 1
+// edge points (the inner edge omits two end segments, the outer has at least one), so fewer than 4P slots suffice.
+// each triangle advances one edge segment: a complete frame has the sum of its edges' segments in triangles.
 #include "../tessellator.hpp"
 #include "tessellation_limits.hpp"
 #include <set>
@@ -63,7 +69,7 @@ int
 main() {
   using namespace dxmt::dxbc;
   unsigned failures = 0, patches_checked = 0;
-  size_t primitives = 0;
+  size_t primitives = 0, frames_checked = 0, zip_slots = 0;
   // the largest factors a hull shader may declare: the tessellator's, and lower ones whole and not, odd and even
   for (float declared : {64.0f, 17.5f, 8.0f, 3.0f, 1.0f})
   for (Domain domain : {reference::isoline, reference::triangle, reference::quad})
@@ -89,6 +95,17 @@ main() {
       for (uint32_t seed = 1; seed <= 48; seed++)
         for (auto &patch : draw_patches(domain, seed))
           all.push_back(patch);
+      if (domain != reference::isoline)
+        for (uint32_t factor = 1; factor <= most_segments; factor++) {
+          Factors uniform{};
+          uniform.fill(factor);
+          all.push_back(uniform);
+          // both sides of every epoch boundary, with unequal edges and inside axes and both orders of parity
+          for (float inside : {1.0f, float(factor) + 0.5f, float(most_segments)}) {
+            Factors mixed = {float(factor), 1, float(most_segments), float(factor) + 0.5f, inside, float(factor)};
+            all.push_back(mixed);
+          }
+        }
       for (auto f : all) {
         // the hull stage's cap, which a NaN passes
         for (auto &factor : f)
@@ -104,6 +121,22 @@ main() {
         if ((size_t)count > workloads.size())
           fail("workloads", f, count, workloads.size());
         count = std::min<size_t>(count, workloads.size());
+        if (domain != reference::isoline)
+          for (int w = 0; w < count; w++)
+            for (int frame = 0; frame < 4 && workloads[w].edge[frame].segments >= 0; frame += 2) {
+              tess_zip zip = {workloads[w].edge[frame], workloads[w].edge[frame + 1], 0, 0, 0};
+              size_t triangles = 0, segments = zip.inner.segments + zip.outer.segments;
+              short3 indices(0, 0, 0);
+              while (zip.next(indices, 0, zip.inner.segments + 1))
+                triangles++;
+              if (triangles != segments)
+                fail("triangles in a frame", f, triangles, segments);
+              size_t bound = 4 * (segments + 2);
+              if ((size_t)zip.slot >= bound)
+                fail("zip slots in a frame", f, zip.slot, bound - 1);
+              frames_checked++;
+              zip_slots += zip.slot;
+            }
         // by corners: the points, an isoline patch's lines, the other patches' triangles
         for (int vertices : {1, domain == reference::isoline ? 2 : 3}) {
           std::multiset<Primitive> made, looked;
@@ -131,6 +164,9 @@ main() {
                 from_mesh.push_back(at(recorded.indices[vertices * n + c]));
                 auto location = get_domain_primitive_location(w, n, c, vertices, 0, data);
                 from_lookup.push_back(corner(location.uv.x, location.uv.y));
+                if (from_lookup.back() != from_mesh.back())
+                  fail("primitive numbering", f, primitive_vertex(workloads[w], n, c, vertices),
+                       recorded.indices[vertices * n + c]);
               }
               made.insert(primitive(from_mesh));
               looked.insert(primitive(from_lookup));
@@ -153,6 +189,7 @@ main() {
     printf("failed: %u wrong\n", failures);
     return 1;
   }
-  printf("passed: %zu primitives of %u patches as the reference's\n", primitives, patches_checked);
+  printf("passed: %zu primitives of %u patches as the reference's; %zu frames in %zu zip slots\n",
+         primitives, patches_checked, frames_checked, zip_slots);
   return 0;
 }

@@ -492,31 +492,17 @@ cull(Mesh mesh, threadgroup uint *behind, short primitive, short a, short b, sho
     mesh.set_primitive(primitive, culled_primitive{(behind[a] & behind[b] & behind[c]) != 0});
 }
 
-// half an edge has at most 1 << ruler_levels points: the largest factor's
-constexpr constant int ruler_levels = 5;
-
-// when a place on half an edge, counted from the edge's end, gets its point as the factor grows: the ruler
-// function's order (D3D11.3 11.7.5), in which the place beside the end is the last
-int
-ruler(int place) {
-  if (place < 2)
-    return place << ruler_levels;
-  int zeros = ctz(place - 1);
-  return (1 << (ruler_levels - 1 - zeros)) + ((place - 1) >> (zeros + 1));
-}
-
 // a frame's triangles zip its edges together, as the reference's StitchTransition and StitchRegular do (11.7.6):
 // each steps along one edge, an outer step taking the outer edge's next segment and the inner edge's point, an inner
 // step the inner edge's next segment and the outer edge's point. all are clockwise
 struct tess_zip {
   tess_edge inner, outer;
   short slot, i, o;
+  // the edges' containing ruler epoch (D3D11.3 11.7.5); the inner edge omits two end segments (11.7.6.2)
+  int places = inner.kind & stitch_transition
+                   ? 1 << (clz(0u) - clz(uint(max((inner.segments + 2) / 2, outer.segments / 2) - 1)))
+                   : 0;
 
-  // the points half the edge has apart from its middle
-  static int half_points(tess_edge edge) {
-    bool odd = edge.kind & edge_odd;
-    return partition_of(edge.factor, odd).half_points - odd;
-  }
   int slots() const {
     return inner.kind & stitch_transition ? 4 * places + 2 : 2 * inner.segments + (inner.kind & stitch_strip ? 0 : 2);
   }
@@ -531,8 +517,9 @@ struct tess_zip {
         return in_odd && out_odd ? 1 + middle : middle ? 0 : in_odd ? 1 : out_odd ? 2 : 0;
       }
       int mirrored = middle < 0 ? at : 4 * places + 1 - at, place = mirrored / 2;
-      return mirrored & 1 ? (ruler(place) < half_points(outer) ? 2 : 0)
-                          : (place && ruler(place) < half_points(inner) ? 1 : 0);
+      int introduced = place ? (places + place) >> (ctz(place) + 1) : 0;
+      return mirrored & 1 ? (introduced < outer.segments / 2 ? 2 : 0)
+                          : (place && introduced < (inner.segments + 2) / 2 ? 1 : 0);
     }
     int segments = inner.segments;
     // a row of quads, each cut from the inner edge's point to the outer edge's next
@@ -560,9 +547,6 @@ struct tess_zip {
     }
     return false;
   }
-
-  // the places half an edge has at most, its end among them
-  enum { places = (1 << ruler_levels) + 1 };
 };
 
 // the workload's triangle `n`, numbered as its frames' zips make them; false past the last
