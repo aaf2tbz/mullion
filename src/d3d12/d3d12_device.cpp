@@ -1630,13 +1630,6 @@ public:
     return E_NOTIMPL;
   }
 
-  /* ID3D12Device8: D3D12_RESOURCE_DESC1 adds only a sampler feedback mip region */
-  static D3D12_RESOURCE_DESC
-  WithoutMipRegion(const D3D12_RESOURCE_DESC1 &desc1) {
-    return {desc1.Dimension, desc1.Alignment, desc1.Width,      desc1.Height, desc1.DepthOrArraySize,
-            desc1.MipLevels, desc1.Format,    desc1.SampleDesc, desc1.Layout, desc1.Flags};
-  }
-
   /* the resource to create: a sampler feedback map is one R32_UINT texel per mip region of its paired texture's first
      mip. a region is a power of two from 4 texels to half the texture (Sampler Feedback spec, "Mip region
      constraints") */
@@ -1673,7 +1666,7 @@ public:
     HRESULT hr = create(&desc, IID_PPV_ARGS(&map));
     if (FAILED(hr))
       return hr;
-    auto asked = WithoutMipRegion(*pDesc);
+    auto asked = *pDesc;
     // no mip count is the full chain, as of the texture the map is paired with
     if (!asked.MipLevels)
       asked.MipLevels = std::bit_width(std::max<UINT64>(asked.Width, asked.Height));

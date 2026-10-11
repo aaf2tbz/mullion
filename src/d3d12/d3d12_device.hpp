@@ -99,7 +99,13 @@ struct AccelerationStructure;
 struct AccelerationStructureInputs;
 struct CompactedSize;
 
-class MTLD3D12Resource : public ID3D12Resource {
+inline D3D12_RESOURCE_DESC
+WithoutMipRegion(const D3D12_RESOURCE_DESC1 &desc1) {
+  return {desc1.Dimension, desc1.Alignment, desc1.Width,      desc1.Height, desc1.DepthOrArraySize,
+          desc1.MipLevels, desc1.Format,    desc1.SampleDesc, desc1.Layout, desc1.Flags};
+}
+
+class MTLD3D12Resource : public ID3D12Resource2 {
 public:
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
@@ -107,7 +113,25 @@ public:
   Rc<Buffer> buffer;
   // a sampler feedback map's description as its application gave it: `texture` has one R32_UINT texel per mip region
   // (TranscodeFeedback in dxmt_command_feedback.hpp)
-  std::optional<D3D12_RESOURCE_DESC> feedback;
+  std::optional<D3D12_RESOURCE_DESC1> feedback;
+
+  HRESULT STDMETHODCALLTYPE
+  GetProtectedResourceSession(REFIID riid, void **ppProtectedSession) override {
+    if (ppProtectedSession)
+      *ppProtectedSession = nullptr;
+    return E_NOINTERFACE;
+  }
+
+  D3D12_RESOURCE_DESC1 *STDMETHODCALLTYPE
+  GetDesc1(D3D12_RESOURCE_DESC1 *__ret) override {
+    D3D12_RESOURCE_DESC desc;
+    GetDesc(&desc);
+    *__ret = feedback.value_or(D3D12_RESOURCE_DESC1{
+        desc.Dimension, desc.Alignment, desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels,
+        desc.Format, desc.SampleDesc, desc.Layout, desc.Flags, {}
+    });
+    return __ret;
+  }
 
   virtual HRESULT STDMETHODCALLTYPE
   CreateShaderResourceView(const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) = 0;

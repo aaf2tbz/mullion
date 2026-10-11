@@ -262,7 +262,8 @@ public:
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource)) {
+        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) || riid == __uuidof(ID3D12Resource1) ||
+        riid == __uuidof(ID3D12Resource2)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -292,7 +293,7 @@ public:
 
   virtual D3D12_RESOURCE_DESC *STDMETHODCALLTYPE
   GetDesc(D3D12_RESOURCE_DESC *__ret) {
-    *__ret = feedback.value_or(desc_);
+    *__ret = feedback ? WithoutMipRegion(*feedback) : desc_;
     return __ret;
   };
 
