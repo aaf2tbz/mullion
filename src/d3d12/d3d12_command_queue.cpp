@@ -1138,7 +1138,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   Signal(ID3D12Fence *pFence, UINT64 Value) {
     // from the CPU, once the work before has completed and what it left for the CPU is done
-    auto work = [this, fence = Com(static_cast<MTLD3D12Fence *>(pFence)), Value] {
+    auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
       StartCommitting().inflight->completed = [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
         fence->Reach(Value);

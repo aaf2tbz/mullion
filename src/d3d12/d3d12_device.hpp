@@ -218,6 +218,9 @@ public:
 
 class MTLD3D12Fence : public ID3D12Fence1 {
 public:
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
+
   std::atomic<uint64_t> value;
 
   // a signal runs those that wait for its value or less, each once and before it returns. what waited is not asked

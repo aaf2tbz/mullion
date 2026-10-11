@@ -1,0 +1,14 @@
+# a release wakes events but leaves the queue wait flags unset
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -219,8 +219,8 @@
+   std::shared_ptr<std::atomic<bool>>
+   Expect(uint64_t expected) {
+     auto reached = std::make_shared<std::atomic<bool>>();
+-    Expect(expected, [reached] {
+-      *reached = true;
++    Expect(expected, [this, reached] {
++      *reached = value != UINT64_MAX;
+       reached->notify_all();
+     });
+     return reached;

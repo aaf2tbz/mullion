@@ -37,6 +37,17 @@ public:
     return S_OK;
   }
 
+  ULONG STDMETHODCALLTYPE
+  Release() {
+    uint32_t refCount = --m_refCount;
+    if (!refCount) {
+      // pending signals keep the object alive after the last public release has unblocked its waiters
+      Reach(UINT64_MAX);
+      ReleasePrivate();
+    }
+    return refCount;
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
