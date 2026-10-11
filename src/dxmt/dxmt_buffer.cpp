@@ -17,6 +17,7 @@
  */
 
 #include "dxmt_buffer.hpp"
+#include "dxmt_diag.hpp"
 #include "dxmt_format.hpp"
 #include "thread.hpp"
 #include "util_likely.hpp"
@@ -46,6 +47,8 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     info_.memory.set(placed_buffer);
   }
   obj_ = device.newBuffer(info_);
+  if (diag::profile && obj_)
+    diag::Write(diag::Line("buffer", diag::Now(), obj_.handle, info_.length));
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
 };
@@ -66,6 +69,8 @@ BufferAllocation::BufferAllocation(
     assert(0 && "heap doesn't support placed buffer");
   }
   obj_ = heap.newBuffer(info_, heap_offset);
+  if (diag::profile && obj_)
+    diag::Write(diag::Line("buffer", diag::Now(), obj_.handle, info_.length));
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
 }
@@ -80,6 +85,8 @@ BufferAllocation::BufferAllocation(
   suballocation_size_ = info_.length;
   fenceTrackers.resize(suballocation_count_);
   obj_ = device.newPlacementSparseBuffer(info_.length, info_.options, page_size, gpuAddress_);
+  if (diag::profile && obj_)
+    diag::Write(diag::Line("buffer", diag::Now(), obj_.handle, info_.length));
   mappedMemory_ = nullptr;
 }
 

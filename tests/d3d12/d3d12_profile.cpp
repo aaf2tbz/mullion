@@ -508,6 +508,8 @@ main(int argc, char **argv) {
           expect(number(row[3]) && number(row[5]) && began <= number(row[4]) &&
                      number(row[4]) + number(row[5]) <= ended,
                  "execute span outside run");
+        } else if (row[0] == "buffer" && expect(row.size() == 4, "malformed buffer creation")) {
+          expect(number(row[1]) && number(row[2]) && number(row[3]), "empty buffer creation");
         } else {
           expect(false, "unexpected record kind %s (stale record was not truncated)", row[0].c_str());
         }

@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
     using Key = std::pair<std::string, UINT64>;
     std::map<Key, std::vector<std::string>> buffers;
     std::vector<std::vector<std::string>> passes, targets, presented;
-    UINT files = 0, presents = 0, submits = 0, present_spans = 0, encodes = 0;
+    UINT files = 0, presents = 0, submits = 0, present_spans = 0, encodes = 0, resource_buffers = 0;
     UINT64 last_frame = 0;
     for (auto &entry : std::filesystem::directory_iterator(directory)) {
       if (entry.path().extension() != ".diag")
@@ -354,6 +354,9 @@ int main(int argc, char **argv) {
           encodes += row[1] == "encode";
           expect(row[1] == "execute" || row[1] == "present" || row[1] == "encode", "unknown CPU span");
           expect(number(row[3]) && number(row[4]) && number(row[5]), "empty CPU span");
+        } else if (row[0] == "buffer" && expect(row.size() == 4, "bad buffer row")) {
+          resource_buffers++;
+          expect(number(row[1]) && number(row[2]) && number(row[3]), "empty buffer creation");
         } else if (row[0] != "clock")
           expect(false, "unexpected record %s", row[0].c_str());
       }
@@ -361,6 +364,7 @@ int main(int argc, char **argv) {
     const bool profiling = setting && !strcmp(setting, "profile");
     expect(files == UINT(profiling), "got %u profile files", files);
     if (profiling) {
+      expect(resource_buffers > 0, "resource buffer creations missing");
       expect(presents == frames && present_spans == frames && submits == buffers.size() && encodes == buffers.size(),
              "missing or extra frames/submissions");
       for (auto &present : presented) {

@@ -65,11 +65,15 @@ def profile(directory):
         "span\texecute\t\t2\t200\t30\t1:1", "span\tpresent\t\t2\t199\t10",
         f"span\tpipeline\t{c} \t3\t250\t7", "span\tpresent\t\t3\t350\t5",
         "span\texecute\t\t3\t401\t6\t1:3", f"span\tpipeline\t{b} \t3\t401\t8\t4:2",
+        "buffer\t401\t11\t32", "buffer\t100\t12\t4096", "buffer\t99\t11\t16",
+        "buffer\t101\t13\t256", "buffer\t200\t14\t4096", "buffer\t400\t15\t256",
+        "buffer\t101\t16\t16",
     ]
     path = directory / "mullion-1.diag"
     path.write_text("\n".join(lines) + "\n")
     record = tool.Record(path)
     assert record.frames == [100, 200, 400]
+    assert [row["resource_buffers"] for row in tool.frame_rows(record)] == [2, 3, 1, 1]
     assert [record.frame_of(p) for p in record.passes] == [0] * 7 + [1] * 2 + [2] * 2 + [3]
     assert record.passes[0].stages == [(10, 30), (25, 40)]
     gpu = [35, 10, 10, 10, 0, 0, 0, 30, 10, 0, 10, 15]
@@ -217,6 +221,7 @@ def profile(directory):
         assert work == expected_work[index]
         assert [(time, text.split(",")[0]) for time, text in made] == expected_made[index]
         assert bridge == expected_bridge[index]
+        assert "resource_buffers" in output.getvalue()
 
 
 def empty_and_short(directory):
@@ -231,6 +236,7 @@ def empty_and_short(directory):
         assert tool.cpu_totals(record) == ({}, {}, {})
         assert tool.by_pipeline([]) == tool.pipeline_runs([]) == tool.by_kind([]) == {}
         assert all(row["waits"] is None for row in tool.frame_rows(record))
+        assert all(row["resource_buffers"] == 0 for row in tool.frame_rows(record))
         if len(times) < 2:
             assert all(stats[key] is None for key in ("mean", "median", "longest", "fps"))
         elif times == [100, 100]:
