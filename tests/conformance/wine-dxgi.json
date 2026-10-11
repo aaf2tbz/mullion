@@ -27,13 +27,11 @@
   "verdict": "passed"
  },
  "test_create_swapchain": {
-  "verdict": "timeout",
-  "why": "semantics: by its first failing check only",
-  "first": "dxgi.c:1830: Test failed: d3d10: Got unexpected refcount 3.",
-  "failures": 10
+  "verdict": "crashed",
+  "at": "winemenubuilder.exe+0x18917"
  },
  "test_cursor_clipping": {
-  "verdict": "passed"
+  "verdict": "failed"
  },
  "test_default_fullscreen_target_output": {
   "verdict": "failed",
@@ -75,10 +73,7 @@
   "verdict": "passed"
  },
  "test_mode_change": {
-  "verdict": "failed",
-  "why": "bug: fullscreen and display modes: SetFullscreenState and ResizeTarget do not give the window and the output the size and style asked for, and window messages, styles and the associated window differ",
-  "first": "dxgi.c:7881: Test failed: d3d10: Got a different mode.",
-  "failures": 2
+  "verdict": "partly"
  },
  "test_multi_adapter": {
   "verdict": "partly"
@@ -111,10 +106,8 @@
   "failures": 18
  },
  "test_resize_target": {
-  "verdict": "failed",
-  "why": "bug: fullscreen and display modes: SetFullscreenState and ResizeTarget do not give the window and the output the size and style asked for, and window messages, styles and the associated window differ",
-  "first": "dxgi.c:3672: Test failed: d3d10: Adapter 0: output 0: test 2: Got window rect (0,0)-(1512,982), expected (0,0)-(800,600).",
-  "failures": 344
+  "verdict": "timeout",
+  "at": "6 gave no stack (01f8 0238 023c 0240 0244 0248)"
  },
  "test_resize_target_wndproc": {
   "verdict": "passed"
@@ -138,20 +131,16 @@
   "failures": 2
  },
  "test_swapchain_formats": {
-  "verdict": "timeout",
-  "why": "unclassified: by its first failing check only",
-  "failures": 0
+  "verdict": "failed"
  },
  "test_swapchain_parameters": {
-  "verdict": "failed",
-  "why": "missing: a Direct3D 10 or 11 flip swap chain has only its buffer 0 ('Non zero-index buffer is not supported')",
-  "first": "dxgi.c:4887: Test failed: Got usage 20, expected 60, test 0.",
-  "failures": 280
+  "verdict": "passed"
  },
  "test_swapchain_present": {
-  "verdict": "timeout",
-  "why": "unclassified: by its first failing check only",
-  "failures": 0
+  "verdict": "failed",
+  "why": "bug: fullscreen and occlusion: a fullscreen swap chain stays fullscreen when another window is shown over it, and Present does not answer DXGI_STATUS_OCCLUDED for a window that is covered or minimized",
+  "first": "dxgi.c:5185: Test failed: d3d10: Got unexpected state 0x1, expected 0.",
+  "failures": 19
  },
  "test_swapchain_present_count": {
   "verdict": "failed",

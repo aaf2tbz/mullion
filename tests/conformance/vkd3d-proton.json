@@ -1,9 +1,6 @@
 {
  "test_advanced_cbv_layout": {
-  "verdict": "failed",
-  "why": "missing: the shader converter refuses a shader: 'DXIL operation 58 (dx.op.cbufferLoad.i64) is not lowered yet', 'stream output of a primitive that only a geometry shader can take'",
-  "first": "test_advanced_cbv_layout:2263:Test 1: Test failed: Failed to create compute pipeline state, hr 0x80004005.",
-  "failures": 6
+  "verdict": "passed"
  },
  "test_ags_float8_conversion": {
   "verdict": "failed",
@@ -141,10 +138,7 @@
   "verdict": "passed"
  },
  "test_check_feature_support": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "test_check_feature_support:266:format 0x42: Test failed: Got unexpected hr 0x80004005.",
-  "failures": 37
+  "verdict": "passed"
  },
  "test_clear_depth_stencil_view": {
   "verdict": "passed"
@@ -324,7 +318,8 @@
   "verdict": "timeout",
   "why": "timeout: Metal refuses a texture ('Texture Creation' assertion), then the test does not end",
   "first": "test_copy_texture_mismatch_format:1376: Test failed: Expected 0x0a0a0a0a or 0x38003800, got #0",
-  "failures": 1
+  "failures": 1,
+  "at": "_mtlValidateArgumentsForTextureViewOnDevice:1877: failed assertion `Texture Creation; 1 gave no stack (00f0)"
  },
  "test_copy_tiles": {
   "verdict": "passed"
@@ -387,10 +382,7 @@
   "verdict": "passed"
  },
  "test_create_pipeline_state": {
-  "verdict": "failed",
-  "why": "missing: the shader converter refuses a shader: 'DXIL operation 58 (dx.op.cbufferLoad.i64) is not lowered yet', 'stream output of a primitive that only a geometry shader can take'",
-  "first": "test_create_pipeline_state:641:Test 2: Test failed: Got unexpected return value 0x80004005.",
-  "failures": 1
+  "verdict": "passed"
  },
  "test_create_pipeline_with_null_root_signature": {
   "verdict": "passed"
@@ -740,15 +732,14 @@
   "failures": 4
  },
  "test_fence_wait_robustness": {
-  "verdict": "timeout",
-  "why": "timeout: a command buffer timed out on the GPU (recorded before the queue's rework)",
-  "failures": 0
+  "verdict": "passed"
  },
  "test_fence_wait_robustness_shared": {
   "verdict": "timeout",
   "why": "missing: OpenSharedHandle of a fence (E_NOTIMPL), then the test does not end",
   "first": "test_fence_wait_robustness_shared:1261: Test failed: Failed to create shared handle, hr #80004001.",
-  "failures": 9
+  "failures": 9,
+  "at": "2 in d3d12core.dll: dxmt::MTLD3D12CommandQueueImpl::Watch() at ??:0:0; 1 in d3d12core.dll: dxmt::MTLD3D12Fence::Reach(unsigned long long) at ??:0:0; 1 in d3d12core.dll: void std::__1::__contention_wait<8ull, std::__1::NoTimeout>(std::__1::__cxx_atomic_impl<long long, std::__1::__cxx_atomic_base_impl<long long>>*, void const*, void const*, std::__1::NoTimeout) at ??:0:0; 1 in d3d12core.dll: dxmt::MTLD3D12Fence::Expect(unsigned long long, std::__1::function<void ()>&&) at ??:0:0"
  },
  "test_format_support": {
   "verdict": "failed",
@@ -880,10 +871,7 @@
   "verdict": "passed"
  },
  "test_integer_blending_pipeline_state": {
-  "verdict": "failed",
-  "why": "bug: a pipeline with blending enabled on an integer target the pixel shader does not write is refused ('pixel format 53 is not blendable')",
-  "first": "test_integer_blending_pipeline_state:147:Test 0: Test failed: Unexpected hr 0x80070057.",
-  "failures": 1
+  "verdict": "passed"
  },
  "test_large_buffer_descriptors": {
   "verdict": "passed"
@@ -898,7 +886,8 @@
   "verdict": "timeout",
   "why": "timeout: Metal refuses a texture descriptor (a buffer view too large for a texture), then the test does not end",
   "first": "test_large_texel_buffer_view:5000:Test 5: Test failed: Got data 0, expected 0xaaaa at 0.",
-  "failures": 9
+  "failures": 9,
+  "at": "-[MTLTextureDescriptorInternal validateWithDevice:]:1421: failed assertion `Texture Descriptor Validation; 1 gave no stack (00f4)"
  },
  "test_layered_rendering_dxbc": {
   "verdict": "passed"
@@ -955,10 +944,7 @@
   "verdict": "partly"
  },
  "test_misc_agility_sdk_feature_checks": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "test_misc_agility_sdk_feature_checks:2742: Test failed: Expected D3D12_FEATURE_PREDICATION to return E_NOTIMPL.",
-  "failures": 453
+  "verdict": "passed"
  },
  "test_mismatching_pso_stages": {
   "verdict": "failed",
@@ -970,10 +956,7 @@
   "verdict": "passed"
  },
  "test_missing_bindings_root_signature": {
-  "verdict": "failed",
-  "why": "lenient: CreateGraphicsPipelineState, CreateComputePipelineState and CreatePipelineState accept what Windows refuses, or fail with E_FAIL where it says E_INVALIDARG: stages that do not match, a geometry shader's topology, dual source blending with several targets, a mesh with a vertex shader, bindings outside the root signature, a cached blob of another shader",
-  "first": "test_missing_bindings_root_signature:1809: Test failed: Unexpected hr #0.",
-  "failures": 1
+  "verdict": "passed"
  },
  "test_multiple_render_targets": {
   "verdict": "passed"
@@ -982,10 +965,7 @@
   "verdict": "passed"
  },
  "test_multisample_quality_levels": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "test_multisample_quality_levels:589:format 0: Test failed: Got unexpected quality levels 0.",
-  "failures": 37
+  "verdict": "passed"
  },
  "test_multisample_rendering": {
   "verdict": "passed"
@@ -1036,7 +1016,8 @@
   "verdict": "timeout",
   "why": "timeout: Metal's assertions 'A command encoder is already encoding to this command buffer' and 'commit command buffer with uncommitted encoder' with a null render target",
   "first": "test_null_rtv:2857: Test failed: Got 0x00000000, expected 0xffffffff at (0, 0, 0).",
-  "failures": 1
+  "failures": 1,
+  "at": "-[AGXG17XFamilyCommandBuffer blitCommandEncoderCommon:]:891: failed assertion `A command encoder is already encoding to this command buffer'; 3 gave no stack (0110 0114 0118)"
  },
  "test_null_srv": {
   "verdict": "passed"
@@ -1058,7 +1039,7 @@
  },
  "test_open_heap_from_address": {
   "verdict": "crashed",
-  "at": "d3d12.exe: test_open_heap_from_address at d3d12_win32_exclusive.c:112:25",
+  "at": "winemenubuilder.exe+0x1f788",
   "why": "missing: not implemented: root signatures from a library's subobject and of version 1.2, heaps with ALLOW_WRITE_WATCH, ID3D12DeviceConfiguration1, ID3DDestructionNotifier, OpenExistingHeapFromAddress, shared handles",
   "first": "test_open_heap_from_address:106: Test failed: Failed to open heap from address: hr #80004001.",
   "failures": 1
@@ -1086,10 +1067,7 @@
   "verdict": "passed"
  },
  "test_planar_video_formats": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "test_planar_video_formats:4163:Format 0x67: Test failed: Got invalid hr 0x80070057.",
-  "failures": 3
+  "verdict": "partly"
  },
  "test_primitive_id_read_tess_geom": {
   "verdict": "failed",
@@ -1114,7 +1092,7 @@
  },
  "test_quad_tessellation_dxbc": {
   "verdict": "crashed",
-  "at": "d3d12.exe: test_quad_tessellation at d3d12_tessellation.c:382:5",
+  "at": "winemenubuilder.exe+0x42b26",
   "why": "missing: a tessellation pipeline with stream output is refused ('stream output of a tessellated draw is not implemented yet'); the tests go on without a pipeline",
   "first": "test_quad_tessellation_dxbc:347: Test failed: Failed to create state, hr 0x80004001.",
   "failures": 2
@@ -1149,7 +1127,7 @@
  },
  "test_quad_tessellation_wrong_pso_topology_dxil": {
   "verdict": "crashed",
-  "at": "d3d12.exe: test_quad_tessellation at d3d12_tessellation.c:382:5",
+  "at": "winemenubuilder.exe+0x42b26",
   "why": "missing: a tessellation pipeline with stream output is refused ('stream output of a tessellated draw is not implemented yet'); the tests go on without a pipeline",
   "first": "test_quad_tessellation_wrong_pso_topology_dxil:347: Test failed: Failed to create state, hr 0x80004001.",
   "failures": 2
@@ -1174,7 +1152,7 @@
  },
  "test_query_pipeline_statistics": {
   "verdict": "crashed",
-  "at": "d3d12.exe: test_query_pipeline_statistics at d3d12_query.c:303:5",
+  "at": "winemenubuilder.exe+0x142a17",
   "why": "missing: pipeline statistics queries: CreateQueryHeap returns E_NOTIMPL, BeginQuery logs 'query type 3 is not implemented', and ResolveQueryData then ends the process in unix call 36 (MTLBlitCommandEncoder_encodeCommands)",
   "first": "test_query_pipeline_statistics:233: Test failed: Failed to create query heap, type 2, hr 0x80004001.",
   "failures": 7
@@ -1246,15 +1224,13 @@
   "failures": 1
  },
  "test_raytracing_embedded_subobjects": {
-  "verdict": "failed",
-  "why": "lenient: CreateStateObject accepts ray tracing pipelines and libraries Windows refuses (duplicate or missing subobjects, a missing root signature)",
-  "first": "test_raytracing_embedded_subobjects:3120: Test failed: Unexpected compilation success.",
-  "failures": 1
+  "verdict": "passed"
  },
  "test_raytracing_huge_dispatch": {
   "verdict": "timeout",
   "why": "timeout: a DispatchRays of the largest size does not end",
-  "failures": 0
+  "failures": 0,
+  "at": "1 in winemetal.dll: MTLCommandBuffer_waitUntilCompleted at ??:0:0; 1 in d3d12core.dll: dxmt::MTLD3D12CommandQueueImpl::Watch() at ??:0:0; 1 in d3d12.exe: wait_queue_idle_ at d3d12_crosstest.h:352:10"
  },
  "test_raytracing_local_rs_static_sampler": {
   "verdict": "passed"
@@ -1270,10 +1246,7 @@
   "failures": 1
  },
  "test_raytracing_missing_required_objects": {
-  "verdict": "failed",
-  "why": "lenient: CreateStateObject accepts ray tracing pipelines and libraries Windows refuses (duplicate or missing subobjects, a missing root signature)",
-  "first": "test_raytracing_missing_required_objects:2881: Test failed: Successfully created RTPSO object which is not expected.",
-  "failures": 4
+  "verdict": "passed"
  },
  "test_raytracing_multi_global_rs": {
   "verdict": "passed"
@@ -1285,10 +1258,7 @@
   "verdict": "passed"
  },
  "test_raytracing_object_assignment_ignore_default": {
-  "verdict": "failed",
-  "why": "lenient: CreateStateObject accepts ray tracing pipelines and libraries Windows refuses (duplicate or missing subobjects, a missing root signature)",
-  "first": "test_raytracing_object_assignment_ignore_default:3327: Test failed: Unexpected success in compiling PSO.",
-  "failures": 1
+  "verdict": "passed"
  },
  "test_raytracing_opacity_micro_map": {
   "verdict": "partly"
@@ -1297,10 +1267,7 @@
   "verdict": "partly"
  },
  "test_raytracing_reject_duplicate_objects": {
-  "verdict": "failed",
-  "why": "lenient: CreateStateObject accepts ray tracing pipelines and libraries Windows refuses (duplicate or missing subobjects, a missing root signature)",
-  "first": "test_raytracing_reject_duplicate_objects:2974: Test failed: Successfully created RTPSO object which is not expected.",
-  "failures": 2
+  "verdict": "passed"
  },
  "test_raytracing_root_signature_from_subobject": {
   "verdict": "failed",
@@ -1342,7 +1309,8 @@
   "verdict": "timeout",
   "why": "timeout: Metal refuses a render pipeline descriptor (a format it cannot render to), then the test does not end",
   "first": "test_render_target_support_validation:5381: Test failed: Failed to create pipeline state, hr #80004005",
-  "failures": 2
+  "failures": 2,
+  "at": "validateWithDevice:5101: failed assertion `Render Pipeline Descriptor Validation; 1 gave no stack (00e0)"
  },
  "test_rendering_no_attachments_layers": {
   "verdict": "passed"
@@ -1426,10 +1394,7 @@
   "failures": 1
  },
  "test_root_signature_embedded": {
-  "verdict": "failed",
-  "why": "bug: the shader compiler faults ('the shader compiler faulted') on shaders with an embedded root signature",
-  "first": "test_root_signature_embedded:1909:Test 0: Test failed: Expected hr #80070057, got hr #80004005",
-  "failures": 9
+  "verdict": "passed"
  },
  "test_root_signature_empty_blob": {
   "verdict": "passed"
@@ -1486,10 +1451,7 @@
   "verdict": "passed"
  },
  "test_sampler_feedback_format_features": {
-  "verdict": "failed",
-  "why": "bug: sampler feedback values differ from the suite's (tier 1.0 is reported)",
-  "first": "test_sampler_feedback_format_features:164: Test failed: Failed to query for format features, hr #80070057.",
-  "failures": 6
+  "verdict": "passed"
  },
  "test_sampler_feedback_grad": {
   "verdict": "failed",

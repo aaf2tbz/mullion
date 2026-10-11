@@ -24,10 +24,7 @@
   "verdict": "passed"
  },
  "test_check_multisample_quality_levels": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "d3d11.c:15812: Test failed: Got unexpected hr 0x80070057.",
-  "failures": 5
+  "verdict": "passed"
  },
  "test_clear_buffer_unordered_access_view": {
   "verdict": "passed"
@@ -81,28 +78,16 @@
   "failures": 18
  },
  "test_copy_subresource_region": {
-  "verdict": "failed",
-  "why": "bug: CopySubresourceRegion of 1D and 3D textures, and of some 2D regions, leaves or takes the wrong texels",
-  "first": "d3d11.c:14971: Test failed: Got 0xff0000ff, expected 0x00000000 at (0, 0, 0), sub-resource 0.",
-  "failures": 3
+  "verdict": "passed"
  },
  "test_copy_subresource_region_1d": {
-  "verdict": "failed",
-  "why": "bug: CopySubresourceRegion of 1D and 3D textures, and of some 2D regions, leaves or takes the wrong texels",
-  "first": "d3d11.c:15084: Test failed: Got colour 0x00000000 at (0, 0), expected 0xff0000ff.",
-  "failures": 16
+  "verdict": "passed"
  },
  "test_copy_subresource_region_3d": {
-  "verdict": "failed",
-  "why": "bug: CopySubresourceRegion of 1D and 3D textures, and of some 2D regions, leaves or takes the wrong texels",
-  "first": "d3d11.c:15243: Test failed: Got 0x00000000, expected 0xff0000ff at (0, 0, 0), sub-resource 0.",
-  "failures": 38
+  "verdict": "passed"
  },
  "test_create_blend_state": {
-  "verdict": "failed",
-  "why": "semantics: Direct3D 10 and 11 state objects: descriptions are not normalized as Windows normalizes them (a sampler's anisotropy and comparison function, a depth stencil state's masks), equal states are not one object, and states keep or lose references the tests count",
-  "first": "d3d11.c:5692: Test failed: Got unexpected src blend 0 for render target 1.",
-  "failures": 49
+  "verdict": "passed"
  },
  "test_create_buffer": {
   "verdict": "failed",
@@ -117,21 +102,18 @@
   "failures": 2
  },
  "test_create_depthstencil_state": {
-  "verdict": "failed",
-  "why": "semantics: Direct3D 10 and 11 state objects: descriptions are not normalized as Windows normalizes them (a sampler's anisotropy and comparison function, a depth stencil state's masks), equal states are not one object, and states keep or lose references the tests count",
-  "first": "d3d11.c:5852: Test failed: Got unexpected depth write mask 0.",
-  "failures": 12
+  "verdict": "passed"
  },
  "test_create_depthstencil_view": {
   "verdict": "crashed",
-  "at": "d3d11_test.exe: check_interface_ at d3d11.c:276:10",
+  "at": "winemenubuilder.exe+0xa7d07",
   "why": "bug: view creation fails with E_FAIL for descriptions Windows accepts: render target views of buffers and of 3D texture slices ('Unhandled rtv creation', 'tex3d rtv creation not properly handled'), depth stencil view test 20, shader resource view test 16, unordered access view test 24",
   "first": "d3d11.c:4059: Test failed: Got unexpected refcount 1, expected >= 2.",
   "failures": 3
  },
  "test_create_device": {
-  "verdict": "timeout",
-  "why": "lenient: by its first failing check only",
+  "verdict": "failed",
+  "why": "bug: D3D11CreateDevice without an adapter and with D3D_DRIVER_TYPE_UNKNOWN makes a device; Windows returns E_INVALIDARG and clears the device, the feature level and the context",
   "first": "d3d11.c:2183: Test failed: Got unexpected hr 0.",
   "failures": 4
  },
@@ -139,10 +121,7 @@
   "verdict": "passed"
  },
  "test_create_query": {
-  "verdict": "failed",
-  "why": "bug: Direct3D 10 and 11 queries: GetData succeeds where the tests expect S_FALSE or an error, writes data it should leave, and counts differ; queries of deferred contexts fail (E_FAIL)",
-  "first": "d3d11.c:6090: Test failed: Got hr 0, expected 0x80004002.",
-  "failures": 21
+  "verdict": "passed"
  },
  "test_create_rasterizer_state": {
   "verdict": "passed"
@@ -155,16 +134,10 @@
   "failures": 4
  },
  "test_create_sampler_state": {
-  "verdict": "failed",
-  "why": "semantics: Direct3D 10 and 11 state objects: descriptions are not normalized as Windows normalizes them (a sampler's anisotropy and comparison function, a depth stencil state's masks), equal states are not one object, and states keep or lose references the tests count",
-  "first": "d3d11.c:5453: Test failed: Got unexpected max anisotropy 16.",
-  "failures": 28
+  "verdict": "passed"
  },
  "test_create_shader": {
-  "verdict": "failed",
-  "why": "missing: feature levels 9_x: their shaders are refused ('Invalid DXBC bytecode') and their format support is not answered",
-  "first": "d3d11.c:5193: Test failed: Feature level 0xb100: Got unexpected hr err:   Failed to initialize shader: Invalid DXBC bytecode",
-  "failures": 110
+  "verdict": "passed"
  },
  "test_create_shader_resource_view": {
   "verdict": "crashed",
@@ -211,16 +184,10 @@
   "verdict": "passed"
  },
  "test_deferred_context_map": {
-  "verdict": "failed",
-  "why": "unclassified: by its first failing check only",
-  "first": "d3d11.c:33891: Test failed: Unexpected pointer 00000000DEADBEEF.",
-  "failures": 3
+  "verdict": "passed"
  },
  "test_deferred_context_queries": {
-  "verdict": "failed",
-  "why": "bug: Direct3D 10 and 11 queries: GetData succeeds where the tests expect S_FALSE or an error, writes data it should leave, and counts differ; queries of deferred contexts fail (E_FAIL)",
-  "first": "d3d11.c:33800: Test failed: Got unexpected hr 0x80004005.",
-  "failures": 9
+  "verdict": "passed"
  },
  "test_deferred_context_rendering": {
   "verdict": "passed"
@@ -391,10 +358,7 @@
   "verdict": "passed"
  },
  "test_keyed_mutex": {
-  "verdict": "failed",
-  "why": "missing: shared resources and keyed mutexes ('DeviceTexture: Failed to create shared handle', E_FAIL)",
-  "first": "d3d11.c:35392: Test failed: got 0x80004005.",
-  "failures": 9
+  "verdict": "passed"
  },
  "test_layered_rendering": {
   "verdict": "passed"
@@ -430,10 +394,7 @@
   "verdict": "passed"
  },
  "test_nv12": {
-  "verdict": "failed",
-  "why": "unclassified: by its first failing check only",
-  "first": "d3d11.c:36456: Test failed: Got hr 0x80070057.",
-  "failures": 1
+  "verdict": "partly"
  },
  "test_occlusion_query": {
   "verdict": "failed",
@@ -481,7 +442,8 @@
   "verdict": "timeout",
   "why": "lenient: by its first failing check only",
   "first": "d3d11.c:15647: Test failed: Feature level 0xa100: Got hr 0 for WRITE_DISCARD.",
-  "failures": 2246
+  "failures": 2246,
+  "at": "d3d11.c:_mtlValidateStrideTextureParameters:1938: failed assertion `Texture Descriptor Validation; 20 gave no stack (02c8 02e4 02e8 02f0 02fc 0300 0304 030c 0314 0318 0320 0330 0338 034c 0370 0374 0384 0388 0398 03a0)"
  },
  "test_resource_map": {
   "verdict": "passed"
@@ -520,10 +482,7 @@
   "verdict": "passed"
  },
  "test_shared_resource": {
-  "verdict": "failed",
-  "why": "missing: shared resources and keyed mutexes ('DeviceTexture: Failed to create shared handle', E_FAIL)",
-  "first": "d3d11.c:35225: Test failed: Feature level 0x9100: MiscFlags 0x2, nthandle 0: got err:   DeviceTexture: Failed to create shared handle",
-  "failures": 33
+  "verdict": "passed"
  },
  "test_sm4_breakc_instruction": {
   "verdict": "passed"
@@ -547,10 +506,7 @@
   "verdict": "passed"
  },
  "test_so_statistics_query": {
-  "verdict": "failed",
-  "why": "bug: Direct3D 10 and 11 queries: GetData succeeds where the tests expect S_FALSE or an error, writes data it should leave, and counts differ; queries of deferred contexts fail (E_FAIL)",
-  "first": "d3d11.c:6708: Test failed: Got unexpected hr 0x1.",
-  "failures": 21
+  "verdict": "passed"
  },
  "test_staging_buffers": {
   "verdict": "failed",
@@ -583,16 +539,13 @@
   "verdict": "passed"
  },
  "test_swapchain_flip": {
-  "verdict": "crashed",
-  "at": "d3d11_test.exe: test_swapchain_flip at d3d11.c:16134:5",
-  "why": "missing: a Direct3D 10 or 11 flip swap chain has only its buffer 0 ('Non zero-index buffer is not supported')",
-  "first": "d3d11.c:16117: Test failed: Got unexpected hr 0x887a0004.",
-  "failures": 3
+  "verdict": "passed"
  },
  "test_swapchain_formats": {
-  "verdict": "timeout",
-  "why": "unclassified: by its first failing check only",
-  "failures": 0
+  "verdict": "failed",
+  "why": "bug: a swap chain of DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM is refused with E_INVALIDARG; Windows makes it at feature levels 11_0 and 11_1",
+  "first": "d3d11.c:15946: Test failed: Feature level 0xb100: Got hr 0x80070057, expected 0 (format 0x59).",
+  "failures": 2
  },
  "test_swapchain_views": {
   "verdict": "failed",
@@ -634,10 +587,7 @@
   "verdict": "passed"
  },
  "test_timestamp_query": {
-  "verdict": "failed",
-  "why": "bug: Direct3D 10 and 11 queries: GetData succeeds where the tests expect S_FALSE or an error, writes data it should leave, and counts differ; queries of deferred contexts fail (E_FAIL)",
-  "first": "d3d11.c:6516: Test failed: Got unexpected hr 0.",
-  "failures": 5
+  "verdict": "passed"
  },
  "test_uav_counters": {
   "verdict": "passed"

@@ -15,10 +15,7 @@
   "verdict": "passed"
  },
  "test_check_multisample_quality_levels": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "d3d10core.c:10636: Test failed: Got unexpected hr 0x80070057.",
-  "failures": 5
+  "verdict": "passed"
  },
  "test_clear_after_draw": {
   "verdict": "passed"
@@ -54,22 +51,13 @@
   "failures": 1590
  },
  "test_copy_subresource_region": {
-  "verdict": "failed",
-  "why": "bug: CopySubresourceRegion of 1D and 3D textures, and of some 2D regions, leaves or takes the wrong texels",
-  "first": "d3d10core.c:10156: Test failed: Got 0xff0000ff, expected 0x00000000 at (0, 0), sub-resource 0.",
-  "failures": 3
+  "verdict": "passed"
  },
  "test_copy_subresource_region_1d": {
-  "verdict": "failed",
-  "why": "bug: CopySubresourceRegion of 1D and 3D textures, and of some 2D regions, leaves or takes the wrong texels",
-  "first": "d3d10core.c:10266: Test failed: Got color 0x00000000 at (0, 0), expected 0xff0000ff.",
-  "failures": 16
+  "verdict": "passed"
  },
  "test_create_blend_state": {
-  "verdict": "failed",
-  "why": "semantics: Direct3D 10 and 11 state objects: descriptions are not normalized as Windows normalizes them (a sampler's anisotropy and comparison function, a depth stencil state's masks), equal states are not one object, and states keep or lose references the tests count",
-  "first": "d3d10core.c:4303: Test failed: Got unexpected src blend 0.",
-  "failures": 7
+  "verdict": "passed"
  },
  "test_create_buffer": {
   "verdict": "failed",
@@ -78,10 +66,7 @@
   "failures": 31
  },
  "test_create_depthstencil_state": {
-  "verdict": "failed",
-  "why": "semantics: Direct3D 10 and 11 state objects: descriptions are not normalized as Windows normalizes them (a sampler's anisotropy and comparison function, a depth stencil state's masks), equal states are not one object, and states keep or lose references the tests count",
-  "first": "d3d10core.c:4538: Test failed: Got unexpected stencil read mask 0.",
-  "failures": 10
+  "verdict": "passed"
  },
  "test_create_depthstencil_view": {
   "verdict": "crashed",
@@ -107,10 +92,7 @@
   "failures": 4
  },
  "test_create_sampler_state": {
-  "verdict": "failed",
-  "why": "semantics: Direct3D 10 and 11 state objects: descriptions are not normalized as Windows normalizes them (a sampler's anisotropy and comparison function, a depth stencil state's masks), equal states are not one object, and states keep or lose references the tests count",
-  "first": "d3d10core.c:4143: Test failed: Got unexpected comparison func 8.",
-  "failures": 27
+  "verdict": "passed"
  },
  "test_create_shader": {
   "verdict": "passed"
@@ -204,10 +186,7 @@
   "failures": 279
  },
  "test_format_support": {
-  "verdict": "failed",
-  "why": "bug: CheckFeatureSupport fails or answers nothing where Windows answers: FORMAT_SUPPORT returns E_INVALIDARG for formats it does not have, MULTISAMPLE_QUALITY_LEVELS and FORMAT_INFO return E_FAIL, and sizes and features of newer SDKs get other answers",
-  "first": "d3d10core.c:13824: Test failed: Got unexpected hr 0x80070057.",
-  "failures": 117
+  "verdict": "passed"
  },
  "test_fp_specials": {
   "verdict": "passed"
@@ -262,7 +241,7 @@
  },
  "test_layered_rtv_mismatch": {
   "verdict": "failed",
-  "why": "bug: a pipeline whose pixel shader writes float4 to an RGBA32_UINT target is not created (Metal: 'output of type float4 is not compatible with a MTLPixelFormatRGBA32Uint color attachment'), and the draw is lost",
+  "why": "bug: a pixel shader whose output type is not the render target view's (a float4 into an R32G32B32A32_UINT view of a float texture): Metal refuses the pipeline ('output of type float4 is not compatible with a MTLPixelFormatRGBA32Uint color attachment') and nothing is drawn; Windows writes the output's bits",
   "first": "d3d10core.c:19672: Test failed: Got colour {0.00000000e+000, 0.00000000e+000, 0.00000000e+000, 0.00000000e+000}.",
   "failures": 1
  },
@@ -360,10 +339,7 @@
   "verdict": "passed"
  },
  "test_so_statistics_query": {
-  "verdict": "failed",
-  "why": "bug: Direct3D 10 and 11 queries: GetData succeeds where the tests expect S_FALSE or an error, writes data it should leave, and counts differ; queries of deferred contexts fail (E_FAIL)",
-  "first": "d3d10core.c:5114: Test failed: Got unexpected hr 0x1.",
-  "failures": 4
+  "verdict": "passed"
  },
  "test_staging_buffers": {
   "verdict": "failed",
@@ -396,16 +372,10 @@
   "verdict": "passed"
  },
  "test_swapchain_flip": {
-  "verdict": "crashed",
-  "at": "d3d10core_test.exe: test_swapchain_flip at d3d10core.c:11180:5",
-  "why": "missing: a Direct3D 10 or 11 flip swap chain has only its buffer 0 ('Non zero-index buffer is not supported')",
-  "first": "d3d10core.c:11163: Test failed: Failed to get buffer, hr 0x887a0004.",
-  "failures": 3
+  "verdict": "passed"
  },
  "test_swapchain_formats": {
-  "verdict": "timeout",
-  "why": "unclassified: by its first failing check only",
-  "failures": 0
+  "verdict": "passed"
  },
  "test_swapchain_views": {
   "verdict": "failed",
@@ -435,10 +405,7 @@
   "verdict": "passed"
  },
  "test_timestamp_query": {
-  "verdict": "failed",
-  "why": "bug: Direct3D 10 and 11 queries: GetData succeeds where the tests expect S_FALSE or an error, writes data it should leave, and counts differ; queries of deferred contexts fail (E_FAIL)",
-  "first": "d3d10core.c:5035: Test failed: Got unexpected hr 0.",
-  "failures": 3
+  "verdict": "passed"
  },
  "test_uint_shader_instructions": {
   "verdict": "passed"
