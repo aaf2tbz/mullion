@@ -367,7 +367,7 @@ CompileFunction(
   auto key = h.final();
   auto &cache = ShaderCache::getInstance(WMTMetalVersion(device->GetMetalVersion()));
   bool enabled = false;
-  WMT::Error error;
+  WMT::Reference<WMT::Error> error;
   auto cached = [&]() -> WMT::Reference<WMT::Function> {
     WMT::Reference<WMT::DispatchData> data;
     if (auto reader = cache.getReader()) {
@@ -421,7 +421,6 @@ CompileFunction(
   SM50_COMPILED_BITCODE compiled;
   SM50GetCompiledBitcode(bitcode, &compiled);
   auto data = WMT::MakeDispatchData(compiled.Data, compiled.Size);
-  error = {};
   auto library = device->GetMTLDevice().newLibrary(data, error);
   auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{};
   if (!function) {
