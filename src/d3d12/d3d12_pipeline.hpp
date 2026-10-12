@@ -31,7 +31,7 @@ namespace dxmt {
 class MTLD3D12Device;
 
 // library references must survive the last public reference without retaining the device (test_pipeline_library)
-template <typename Base> class MTLD3D12PipelineObject : public MTLD3D12Object<ComObject<Base>> {
+template <typename Base> class MTLD3D12PipelineObject : public MTLD3D12Object<ComObject<Base, ID3DDestructionNotifier>> {
 protected:
   MTLD3D12Device *device_;
 
@@ -40,7 +40,7 @@ public:
 
   ULONG STDMETHODCALLTYPE
   AddRef() override {
-    auto count = ComObject<Base>::AddRef();
+    auto count = ComObject<Base, ID3DDestructionNotifier>::AddRef();
     if (count == 1)
       device_->AddRef();
     return count;
@@ -49,7 +49,7 @@ public:
   ULONG STDMETHODCALLTYPE
   Release() override {
     auto device = device_;
-    auto count = ComObject<Base>::Release();
+    auto count = ComObject<Base, ID3DDestructionNotifier>::Release();
     if (!count)
       device->Release();
     return count;

@@ -456,7 +456,7 @@ CompileFunction(
       stored = found->second;
   }
   if (stored) {
-    WMT::Error error;
+    WMT::Reference<WMT::Error> error;
     auto library = device->GetMTLDevice().newLibrary(stored, error);
     auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{};
     if (!function)
@@ -1276,7 +1276,7 @@ public:
       WARN("D3D12GraphicsPipelineState: Unknown interface query ", str::format(riid));
     }
 
-    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
+    return MTLD3D12PipelineObject::QueryInterface(riid, ppvObject);
   }
 
   virtual HRESULT STDMETHODCALLTYPE

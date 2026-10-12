@@ -116,7 +116,7 @@ public:
       WARN("D3D12ComputePipelineState: Unknown interface query ", str::format(riid));
     }
 
-    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
+    return MTLD3D12PipelineObject::QueryInterface(riid, ppvObject);
   }
 
   virtual HRESULT STDMETHODCALLTYPE
@@ -156,7 +156,7 @@ CreateComputePipelineState(
   return pso->QueryInterface(riid, ppPipelineState);
 };
 
-class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary1, ID3DDestructionNotifier> {
+class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary1> {
   static constexpr char kMagic[] = "Mullion library 2";
   static constexpr SIZE_T kHeaderSize = sizeof(kMagic) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(Sha1Digest);
   struct Entry {
@@ -166,8 +166,6 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
   };
   dxmt::mutex mutex_;
   std::map<std::wstring, Entry, std::less<>> entries_;
-  std::map<UINT, std::pair<PFN_DESTRUCTION_CALLBACK, void *>> callbacks_;
-  UINT next_callback_ = 0;
   PipelineShaderCache shaders_;
 
   SIZE_T
@@ -213,12 +211,7 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
 
 public:
   MTLD3D12PipelineLibrary(MTLD3D12Device *device) :
-      MTLD3D12DeviceChild<ID3D12PipelineLibrary1, ID3DDestructionNotifier>(device) {}
-
-  ~MTLD3D12PipelineLibrary() {
-    for (auto &[id, callback] : callbacks_)
-      callback.first(callback.second);
-  }
+      MTLD3D12DeviceChild<ID3D12PipelineLibrary1>(device) {}
 
   HRESULT
   Initialize(const void *blob, SIZE_T size) {
@@ -293,9 +286,7 @@ public:
     if (iid == __uuidof(IUnknown) || iid == __uuidof(ID3D12Object) || iid == __uuidof(ID3D12DeviceChild) ||
         iid == __uuidof(ID3D12PipelineLibrary) || iid == __uuidof(ID3D12PipelineLibrary1))
       *object = static_cast<ID3D12PipelineLibrary1 *>(ref(this));
-    else if (iid == __uuidof(ID3DDestructionNotifier))
-      *object = static_cast<ID3DDestructionNotifier *>(ref(this));
-    return *object ? S_OK : E_NOINTERFACE;
+    return *object ? S_OK : MTLD3D12DeviceChild::QueryInterface(iid, object);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -399,30 +390,6 @@ public:
     auto checksum = hash.final();
     memcpy(data_ptr + kHeaderSize - sizeof(checksum), &checksum, sizeof(checksum));
     return S_OK;
-  }
-
-  HRESULT STDMETHODCALLTYPE
-  RegisterDestructionCallback(PFN_DESTRUCTION_CALLBACK callback, void *data, UINT *id) override {
-    if (!callback)
-      return DXGI_ERROR_INVALID_CALL;
-    std::lock_guard lock(mutex_);
-    if (next_callback_ == std::numeric_limits<UINT>::max())
-      return E_OUTOFMEMORY;
-    try {
-      callbacks_.emplace(next_callback_ + 1, std::pair{callback, data});
-    } catch (const std::bad_alloc &) {
-      return E_OUTOFMEMORY;
-    }
-    ++next_callback_;
-    if (id)
-      *id = next_callback_;
-    return S_OK;
-  }
-
-  HRESULT STDMETHODCALLTYPE
-  UnregisterDestructionCallback(UINT id) override {
-    std::lock_guard lock(mutex_);
-    return callbacks_.erase(id) ? S_OK : DXGI_ERROR_NOT_FOUND;
   }
 };
 
