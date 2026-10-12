@@ -2428,7 +2428,6 @@ Converter::operator()(const InstLoadRaw &load) {
     return;
 
   mask_t Mask = GetMask(load.dst);
-  bool Volatile = cast<llvm::PointerType>(Buf->Pointer->getType())->getAddressSpace() == 3;
 
   auto Index = ir.CreateLShr(LoadOperand(load.src_byte_offset, kMaskComponentX), 2);
 
@@ -2436,8 +2435,7 @@ Converter::operator()(const InstLoadRaw &load) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), Comp)));
     if (load.feedback)
       StoreFeedback(load.feedback, BufferResidency(Ptr));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = LoadBufferValue(Buf.value(), ir.getInt32Ty(), Ptr);
     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
   }
 
@@ -2447,8 +2445,7 @@ Converter::operator()(const InstLoadRaw &load) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), DstComp)));
     if (load.feedback)
       Residency = ir.CreateOr(Residency, BufferResidency(Ptr));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = LoadBufferValue(Buf.value(), ir.getInt32Ty(), Ptr);
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
@@ -2464,7 +2461,6 @@ Converter::operator()(const InstLoadStructured &load) {
     return;
 
   mask_t Mask = GetMask(load.dst);
-  bool Volatile = cast<llvm::PointerType>(Buf->Pointer->getType())->getAddressSpace() == 3;
 
   // in 64 bits: an element index scaled by the stride can wrap 32 and pass the bounds check
   auto IndexStruct = ir.CreateMul(
@@ -2478,8 +2474,7 @@ Converter::operator()(const InstLoadStructured &load) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), Comp)));
     if (load.feedback)
       StoreFeedback(load.feedback, BufferResidency(Ptr));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = LoadBufferValue(Buf.value(), ir.getInt32Ty(), Ptr);
     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
   }
 
@@ -2489,8 +2484,7 @@ Converter::operator()(const InstLoadStructured &load) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), DstComp)));
     if (load.feedback)
       Residency = ir.CreateOr(Residency, BufferResidency(Ptr));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = LoadBufferValue(Buf.value(), ir.getInt32Ty(), Ptr);
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
@@ -3069,6 +3063,33 @@ Converter::CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Valu
   auto ByteLength = DecodeRawBufferByteLength(Buffer.Metadata);
   auto Dwords = ir.CreateZExtOrTrunc(ir.CreateLShr(ByteLength, 2), Index->getType());
   return ir.CreateSelect(ir.CreateICmpULT(Index, Dwords), Addr, llvm::Constant::getNullValue(Addr->getType()));
+}
+
+llvm::Value *
+Converter::LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr) {
+  auto Load = [&]() -> llvm::Value * {
+    return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(Type, Ptr)
+                                 : ir.CreateLoad(Type, Ptr, Ptr->getType()->getPointerAddressSpace() == 3);
+  };
+  if (!Buffer.Metadata)
+    return Load();
+  // a null pointer is a bounds result, not a zero-valued load (D3D11.3 22.4.10 and 22.4.12)
+  auto Head = ir.GetInsertBlock();
+  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
+  if (auto Branch = Head->getTerminator())
+    Branch->eraseFromParent();
+  auto Read = llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent(), Tail);
+  ir.SetInsertPoint(Head);
+  ir.CreateCondBr(ir.CreateIsNotNull(Ptr), Read, Tail);
+  ir.SetInsertPoint(Read);
+  auto Value = Load();
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Tail, Tail->begin());
+  auto Result = ir.CreatePHI(Type, 2);
+  Result->addIncoming(llvm::Constant::getNullValue(Type), Head);
+  Result->addIncoming(Value, Read);
+  return Result;
 }
 
 llvm::Value *

@@ -1773,7 +1773,6 @@ convert_dxil(
     auto element = ir.CreateMul(wide(index), ir.getInt64(stride));
     return defined(offset) ? ir.CreateAdd(element, wide(offset)) : element;
   };
-  // a buffer's `index`th unit of `unit` type, or null past its end: Metal reads 0 there and drops the write
   auto unit_ptr = [&](BufferResourceHandle &b, Type *unit, Value *index) -> Value * {
     if (!b.StructureStride)
       index = ir.CreateAnd(index, ir.getInt64(UINT32_MAX / (unit->getPrimitiveSizeInBits() / 8)));
@@ -2715,7 +2714,7 @@ convert_dxil(
               ir.CreateStore(piece, ptr);
             continue;
           }
-          Value *piece = b.GlobalCoherent ? (Value *)air.CreateDeviceCoherentLoad(unit, ptr) : ir.CreateLoad(unit, ptr);
+          Value *piece = dxbc.LoadBufferValue(b, unit, ptr);
           loaded = ir.CreateOr(loaded, ir.CreateShl(ir.CreateZExt(piece, element), shift));
         }
         if (!store)
