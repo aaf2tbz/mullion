@@ -108,6 +108,11 @@ D3D12GetDebugInterface(REFIID iid, void **debug) {
 static std::atomic<bool> experimental_shader_models;
 
 bool
+ExperimentalShaderModelsEnabled() {
+  return experimental_shader_models;
+}
+
+bool
 ShaderContainerHolds(const void *container, size_t size) {
   if (FAILED(microsoft::CDXBCParser().ReadDXBC(container, size)))
     return false;

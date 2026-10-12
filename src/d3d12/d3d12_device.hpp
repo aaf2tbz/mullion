@@ -38,6 +38,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
 
 #define IMPLEMENT_ME                                                                                                   \
@@ -47,7 +48,36 @@
     __builtin_unreachable();                                                                                           \
   } while (0);
 
+// ID3D12DeviceConfiguration1 from DirectX-Headers, d3d12.h; the installed SDK declares only its base.
+#ifndef __ID3D12DeviceConfiguration1_INTERFACE_DEFINED__
+MIDL_INTERFACE("ed342442-6343-4e16-bb82-a3a577874e56")
+ID3D12DeviceConfiguration1 : public ID3D12DeviceConfiguration {
+  virtual HRESULT STDMETHODCALLTYPE CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(
+      const void *Library, SIZE_T Size, LPCWSTR Name, REFIID riid, void **Deserializer
+  ) = 0;
+};
+__CRT_UUID_DECL(ID3D12DeviceConfiguration1, 0xed342442, 0x6343, 0x4e16, 0xbb, 0x82, 0xa3, 0xa5, 0x77, 0x87, 0x4e, 0x56)
+#endif
+
 namespace dxmt {
+
+bool ExperimentalShaderModelsEnabled();
+HRESULT DeserializeLibraryRootSignature(const void *Library, SIZE_T Size, LPCWSTR Name, REFIID riid, void **Deserializer);
+
+// a subobject a DXIL library defines, of the kinds a state object takes from one: their numbers are D3D12's
+// subobject types
+struct LibrarySubobject {
+  D3D12_STATE_SUBOBJECT_TYPE type;
+  std::wstring name;
+  // a root signature, serialized
+  std::span<const uint8_t> bytes;
+  // an association's subobject, then its exports; a hit group's any hit, closest hit and intersection shaders
+  std::vector<std::wstring> names;
+  // a shader config's payload and attribute sizes, a pipeline config's depth and flags, or state object flags
+  uint32_t values[2]{};
+};
+std::vector<LibrarySubobject> ReadSubobjects(const D3D12_SHADER_BYTECODE &Library);
+
 
 // Metal's GPU timestamps count nanoseconds on Apple GPUs: sampleTimestamps advances them by 1e9 a second, as D3D11
 // reports for its timestamp queries
@@ -216,6 +246,7 @@ struct Tiling {
 class MTLD3D12Heap : public ID3D12Heap {
 public:
   WMT::Reference<WMT::Heap> heap;
+  std::shared_ptr<void> memory;
 };
 
 class MTLD3D12Fence : public ID3D12Fence1 {
@@ -564,6 +595,9 @@ CreatePlacedBuffer(
     MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC *pDesc,
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 );
+
+HRESULT
+OpenHeap(MTLD3D12Device *pDevice, const void *Address, HANDLE Mapping, REFIID riid, void **ppHeap);
 
 HRESULT
 CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap);

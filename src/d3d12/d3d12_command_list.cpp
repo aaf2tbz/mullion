@@ -482,7 +482,7 @@ public:
       WARN("D3D12GraphicsCommandList: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12DeviceChild::QueryInterface(riid, ppvObject);
   }
 
   D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE

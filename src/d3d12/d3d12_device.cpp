@@ -103,7 +103,8 @@ NotSupportedOnNode(void *pFeatureData, UINT DataSize) {
   return S_OK;
 }
 
-class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
+class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DDestructionNotifier, ID3D12DeviceConfiguration1>> {
+  bool experimental_shader_models_ = ExperimentalShaderModelsEnabled();
   uint32_t simd_width_ = 0, total_lanes_ = 0;
   WMT::Reference<WMT::Buffer> atomic_locks_;
   uint64_t atomic_locks_address_ = 0;
@@ -290,6 +291,11 @@ public:
       return S_OK;
     }
 
+    if (riid == __uuidof(ID3D12DeviceConfiguration) || riid == __uuidof(ID3D12DeviceConfiguration1)) {
+      *ppvObject = ref(static_cast<ID3D12DeviceConfiguration1 *>(this));
+      return S_OK;
+    }
+
     if (riid == __uuidof(IDXGIDevice) || riid == __uuidof(IDXGIDevice1) || riid == __uuidof(IDXGIDevice2) ||
         riid == __uuidof(IDXGIDevice3) || riid == __uuidof(IDXGIDevice4))
       return E_NOINTERFACE;
@@ -308,7 +314,39 @@ public:
       WARN("D3D12Device: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Object::QueryInterface(riid, ppvObject);
+  }
+
+  D3D12_DEVICE_CONFIGURATION_DESC *STDMETHODCALLTYPE
+  GetDesc(D3D12_DEVICE_CONFIGURATION_DESC *desc) {
+    *desc = {D3D12_DEVICE_FLAG_NONE, 0, D3D12_SDK_VERSION, UINT(experimental_shader_models_)};
+    return desc;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  GetEnabledExperimentalFeatures(GUID *guids, UINT count) {
+    if (count < UINT(experimental_shader_models_) || (experimental_shader_models_ && !guids))
+      return E_INVALIDARG;
+    if (experimental_shader_models_)
+      guids[0] = D3D12ExperimentalShaderModels;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc, ID3DBlob **result, ID3DBlob **error) {
+    return D3D12SerializeVersionedRootSignature(desc, result, error);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateVersionedRootSignatureDeserializer(const void *blob, SIZE_T size, REFIID riid, void **deserializer) {
+    return D3D12CreateVersionedRootSignatureDeserializer(blob, size, riid, deserializer);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(
+      const void *library, SIZE_T size, LPCWSTR name, REFIID riid, void **deserializer
+  ) {
+    return DeserializeLibraryRootSignature(library, size, name, riid, deserializer);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -984,7 +1022,7 @@ public:
     auto d3d12heap = static_cast<MTLD3D12Heap *>(pHeap);
     auto heap_desc = d3d12heap->GetDesc();
     HRESULT hr = S_OK;
-    hr = ValidateHeapProperties(&heap_desc.Properties, heap_desc.Flags, advertise_numa_);
+    hr = d3d12heap->memory ? S_OK : ValidateHeapProperties(&heap_desc.Properties, heap_desc.Flags, advertise_numa_);
     if (FAILED(hr))
       return hr;
     hr = ValidateResourceDescs(pDesc, &heap_desc.Properties);
@@ -1271,12 +1309,12 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   OpenExistingHeapFromAddress(const void *pAddress, REFIID riid, void **ppHeap) {
-    return E_NOTIMPL;
+    return OpenHeap(this, pAddress, nullptr, riid, ppHeap);
   }
 
   HRESULT STDMETHODCALLTYPE
   OpenExistingHeapFromFileMapping(HANDLE hFileMapping, REFIID riid, void **ppHeap) {
-    return E_NOTIMPL;
+    return hFileMapping ? OpenHeap(this, nullptr, hFileMapping, riid, ppHeap) : E_INVALIDARG;
   }
 
   HRESULT STDMETHODCALLTYPE

@@ -531,7 +531,7 @@ public:
       WARN("D3D12CommandSignature: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
   }
 };
 

@@ -66,7 +66,7 @@ public:
       WARN("ID3D12Fence: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12DeviceChild::QueryInterface(riid, ppvObject);
   }
 
   UINT64 STDMETHODCALLTYPE

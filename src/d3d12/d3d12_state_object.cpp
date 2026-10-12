@@ -49,18 +49,7 @@ struct RayShader {
   const void *collection = nullptr;
 };
 
-// a subobject a DXIL library defines, of the kinds a state object takes from one: their numbers are D3D12's
-// subobject types
-struct LibrarySubobject {
-  D3D12_STATE_SUBOBJECT_TYPE type;
-  std::wstring name;
-  // a root signature, serialized
-  std::span<const uint8_t> bytes;
-  // an association's subobject, then its exports; a hit group's any hit, closest hit and intersection shaders
-  std::vector<std::wstring> names;
-  // a shader config's payload and attribute sizes, a pipeline config's depth and flags, or state object flags
-  uint32_t values[2]{};
-};
+} // namespace
 
 // the subobjects in a library's runtime data, the container's RDAT part: a version and a count of parts, the parts'
 // offsets, and each part its type, its size and its data (DXC's DxilRuntimeReflection.h). a record of the subobject
@@ -83,8 +72,13 @@ ReadSubobjects(const D3D12_SHADER_BYTECODE &library) {
   };
   enum { Strings = 1, Indices = 2, RawBytes = 5, Subobjects = 6, Parts };
   std::span<const uint8_t> parts[Parts];
+  if (data.size() < 8 || word(data, 4) > (data.size() - 8) / sizeof(uint32_t))
+    return {};
   for (uint32_t i = 0, count = word(data, 4); i < count; i++) {
-    uint64_t at = word(data, 8 + 4 * i), type = word(data, at), size = word(data, at + 4);
+    uint64_t at = word(data, 8 + (uint64_t)sizeof(uint32_t) * i);
+    if (at < 8 + (uint64_t)sizeof(uint32_t) * count || at > data.size() - 8)
+      return {};
+    uint64_t type = word(data, at), size = word(data, at + 4);
     if (type < Parts && at + 8 + size <= data.size())
       parts[type] = data.subspan(at + 8, size);
   }
@@ -96,6 +90,9 @@ ReadSubobjects(const D3D12_SHADER_BYTECODE &library) {
     return name;
   };
   uint32_t stride = word(parts[Subobjects], 4);
+  if (parts[Subobjects].size() < 8 || stride < 2 * sizeof(uint32_t) ||
+      word(parts[Subobjects], 0) > (parts[Subobjects].size() - 8) / stride)
+    return {};
   for (uint32_t i = 0, count = word(parts[Subobjects], 0); i < count; i++) {
     auto record = parts[Subobjects].subspan(std::min<size_t>(8 + (uint64_t)i * stride, parts[Subobjects].size()));
     auto field = [&](uint32_t index) { return index * 4 < stride ? word(record, index * 4) : 0; };
@@ -110,6 +107,10 @@ ReadSubobjects(const D3D12_SHADER_BYTECODE &library) {
     case D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION:
       subobject.names.push_back(string(field(2)));
       // the exports are a row of the index part: its length, then the strings
+      if ((uint64_t)field(3) * sizeof(uint32_t) + sizeof(uint32_t) > parts[Indices].size() ||
+          word(parts[Indices], (uint64_t)field(3) * sizeof(uint32_t)) >
+              (parts[Indices].size() / sizeof(uint32_t)) - field(3) - 1)
+        return {};
       for (uint32_t n = 0, row = field(3), length = word(parts[Indices], (uint64_t)row * 4); n < length; n++)
         subobject.names.push_back(string(word(parts[Indices], ((uint64_t)row + 1 + n) * 4)));
       break;
@@ -136,6 +137,8 @@ ReadSubobjects(const D3D12_SHADER_BYTECODE &library) {
   }
   return out;
 }
+
+namespace {
 
 // a hit group: its name, and the names of its closest hit, any hit and intersection shaders, empty for none
 struct HitGroup {
@@ -829,7 +832,7 @@ public:
     }
     if (logQueryInterfaceError(__uuidof(ID3D12StateObject), riid))
       WARN("D3D12StateObject: Unknown interface query ", str::format(riid));
-    return E_NOINTERFACE;
+    return MTLD3D12DeviceChild::QueryInterface(riid, ppvObject);
   }
 
   void *STDMETHODCALLTYPE

@@ -320,7 +320,7 @@ MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
     WARN("D3D12CommandAllocator: Unknown interface query ", str::format(riid));
   }
 
-  return E_NOINTERFACE;
+  return MTLD3D12DeviceChild::QueryInterface(riid, ppvObject);
 }
 
 HRESULT STDMETHODCALLTYPE

@@ -31,8 +31,10 @@ namespace dxmt {
 std::atomic_uint64_t global_buffer_seq = {0};
 
 BufferAllocation::BufferAllocation(
-    WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, uint32_t names
+    WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, uint32_t names,
+    std::shared_ptr<void> memory
 ) :
+    memory_(std::move(memory)),
     info_(info),
     flags_(flags) {
   // (sub)allocate a minimum of 256B buffer so that texture can be created
@@ -192,7 +194,7 @@ Buffer::createView(BufferViewDescriptor const &descriptor) {
 }
 
 Rc<BufferAllocation>
-Buffer::allocate(Flags<BufferAllocationFlag> flags, uint32_t names) {
+Buffer::allocate(Flags<BufferAllocationFlag> flags, uint32_t names, std::shared_ptr<void> memory) {
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
     options |= WMTResourceOptionCPUCacheModeWriteCombined;
@@ -204,10 +206,10 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, uint32_t names) {
     options |= WMTResourceStorageModeManaged;
   }
   WMTBufferInfo info;
-  info.memory.set(0);
+  info.memory.set(memory.get());
   info.length = length_;
   info.options = options;
-  return new BufferAllocation(device_, info, flags, names);
+  return new BufferAllocation(device_, info, flags, names, std::move(memory));
 };
 
 Rc<BufferAllocation>

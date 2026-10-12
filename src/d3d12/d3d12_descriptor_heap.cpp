@@ -147,7 +147,7 @@ public:
       WARN("D3D12DescriptorHeap: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
   }
 
   virtual D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE
@@ -430,7 +430,7 @@ public:
       WARN("D3D12DescriptorHeap: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
   }
 
   virtual D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE
@@ -571,7 +571,7 @@ public:
       WARN("D3D12DescriptorHeap: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
   }
 
   virtual D3D12_DESCRIPTOR_HEAP_DESC *STDMETHODCALLTYPE

@@ -42,6 +42,7 @@ SerializeVersionedRootSignatureImpl(
   using ROOT_PARAMETER = GetType<ROOT_SIGNATURE_DESC>::ROOT_PARAMETER;
   using ROOT_DESCRIPTOR = GetType<ROOT_SIGNATURE_DESC>::ROOT_DESCRIPTOR;
   using DESCRIPTOR_RANGE = GetType<ROOT_SIGNATURE_DESC>::DESCRIPTOR_RANGE;
+  using STATIC_SAMPLER = GetType<ROOT_SIGNATURE_DESC>::STATIC_SAMPLER;
 
   struct segment {
     size_t offset;
@@ -152,12 +153,12 @@ SerializeVersionedRootSignatureImpl(
 
   /* Static Samplers */
 
-  D3D12_STATIC_SAMPLER_DESC *StaticSamplers = nullptr;
+  STATIC_SAMPLER *StaticSamplers = nullptr;
   RootSig->StaticSamplersOffset = add_segment(pDesc->NumStaticSamplers, &StaticSamplers);
   if (pDesc->NumStaticSamplers) {
     if (!StaticSamplers)
       return E_OUTOFMEMORY;
-    memcpy(StaticSamplers, pDesc->pStaticSamplers, sizeof(D3D12_STATIC_SAMPLER_DESC) * pDesc->NumStaticSamplers);
+    memcpy(StaticSamplers, pDesc->pStaticSamplers, sizeof(STATIC_SAMPLER) * pDesc->NumStaticSamplers);
   }
 
   struct DXBC_ROOT_SIGNATURE_BLOB_HEADER {
@@ -217,6 +218,11 @@ D3D12SerializeVersionedRootSignature(
     return SerializeVersionedRootSignatureImpl<D3D12_ROOT_SIGNATURE_DESC1>(
         &pRootSignatureDesc->Desc_1_1, D3D_ROOT_SIGNATURE_VERSION_1_1, ppBlob, ppErrorBlob
     );
+  case RootSignatureVersion12:
+    return SerializeVersionedRootSignatureImpl<RootSignatureDesc2>(
+        &reinterpret_cast<const VersionedRootSignatureDesc2 *>(pRootSignatureDesc)->Desc_1_2,
+        RootSignatureVersion12, ppBlob, ppErrorBlob
+    );
   }
 
   return E_INVALIDARG;
@@ -273,6 +279,9 @@ public:
     case D3D_ROOT_SIGNATURE_VERSION_1_1:
       *ppDesc = &impl_.desc_1_1_;
       break;
+    case RootSignatureVersion12:
+      *ppDesc = reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *>(&impl_.desc_1_2_);
+      break;
     default:
       return E_INVALIDARG;
     }
@@ -284,6 +293,8 @@ public:
     switch (impl_.raw_root_sig_->Version) {
     case D3D_ROOT_SIGNATURE_VERSION_1_0:
       return &impl_.desc_1_0_;
+    case RootSignatureVersion12:
+      return reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *>(&impl_.desc_1_2_);
     default:
       return &impl_.desc_1_1_;
     }
@@ -293,8 +304,16 @@ public:
 
   HRESULT
   Deserialize(const void *pBytecode, SIZE_T DataSize) {
-
-    return impl_.Deserialize(pBytecode, DataSize);
+    HRESULT hr = impl_.Deserialize(pBytecode, DataSize);
+    if (FAILED(hr))
+      return hr;
+    if constexpr (std::is_same_v<Base, ID3D12VersionedRootSignatureDeserializer>) {
+      if (impl_.desc_1_2_.Version != RootSignatureVersion12) {
+        hr = impl_.ConvertVersionedRootSignature(impl_.desc_1_1_.Desc_1_1, impl_.desc_1_2_.Desc_1_2);
+        impl_.desc_1_2_.Version = RootSignatureVersion12;
+      }
+    }
+    return hr;
   }
 
 private:
@@ -305,12 +324,30 @@ private:
 // argument; a whole container with no root signature in it is E_FAIL on Windows (vkd3d-proton's
 // test_root_signature_empty_blob: "Has to be E_FAIL, not E_INVALIDARG, oddly enough")
 static HRESULT
-RootSignaturePart(const void *pBytecode, SIZE_T Length, const void **ppPart, UINT *pSize) {
+RootSignaturePart(
+    const void *pBytecode, SIZE_T Length, const void **ppPart, UINT *pSize, LPCWSTR Name = nullptr, bool *FromLibrary = nullptr
+) {
   if (!pBytecode || Length < sizeof(microsoft::DXBCHeader) ||
       microsoft::DXBCGetSizeAssumingValidPointer(pBytecode) > Length ||
       !ShaderContainerHolds(pBytecode, microsoft::DXBCGetSizeAssumingValidPointer(pBytecode)))
     return E_INVALIDARG;
-  return SUCCEEDED(microsoft::DXBCGetRootSignature(pBytecode, ppPart, pSize)) ? S_OK : E_FAIL;
+  if (!Name && SUCCEEDED(microsoft::DXBCGetRootSignature(pBytecode, ppPart, pSize)))
+    return S_OK;
+  bool found = false;
+  for (auto &subobject : ReadSubobjects({pBytecode, Length})) {
+    bool global = subobject.type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+    bool local = subobject.type == D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE;
+    if (!(Name ? (global || local) && subobject.name == Name : global))
+      continue;
+    if (found || subobject.bytes.empty())
+      return E_INVALIDARG;
+    found = true;
+    *ppPart = subobject.bytes.data();
+    *pSize = subobject.bytes.size();
+  }
+  if (FromLibrary)
+    *FromLibrary = found;
+  return found ? S_OK : E_FAIL;
 }
 
 extern "C" HRESULT WINAPI
@@ -330,6 +367,21 @@ D3D12CreateVersionedRootSignatureDeserializer(
   if (FAILED(hr))
     return hr;
   return deserializer->QueryInterface(iid, ppDeserializer);
+}
+
+HRESULT
+DeserializeLibraryRootSignature(const void *Library, SIZE_T Size, LPCWSTR Name, REFIID riid, void **Deserializer) {
+  InitReturnPtr(Deserializer);
+  if (!Name)
+    return E_INVALIDARG;
+  const void *part;
+  UINT length;
+  HRESULT hr = RootSignaturePart(Library, Size, &part, &length, Name);
+  if (FAILED(hr))
+    return hr;
+  auto deserializer = Com(new MTLD3D12RootSignatureDeserializer<ID3D12VersionedRootSignatureDeserializer>());
+  hr = deserializer->Deserialize(part, length);
+  return FAILED(hr) ? hr : deserializer->QueryInterface(riid, Deserializer);
 }
 
 extern "C" HRESULT WINAPI
@@ -409,9 +461,21 @@ public:
   Initialize() {
     const void *pRawRootSig;
     UINT RawRootSigSize;
-    HRESULT hr = RootSignaturePart(blob_.data(), blob_.size(), &pRawRootSig, &RawRootSigSize);
+    bool from_library = false;
+    HRESULT hr = RootSignaturePart(blob_.data(), blob_.size(), &pRawRootSig, &RawRootSigSize, nullptr, &from_library);
     if (FAILED(hr))
       return hr;
+
+    uint32_t Version;
+    if (RawRootSigSize < sizeof(Version))
+      return E_INVALIDARG;
+    memcpy(&Version, pRawRootSig, sizeof(Version));
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE support{RootSignatureVersion12};
+    hr = device_->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &support, sizeof(support));
+    if (FAILED(hr))
+      return hr;
+    if (support.HighestVersion < Version)
+      return E_INVALIDARG;
 
     RootSignatureDeserializer deserializer;
     hr = deserializer.Deserialize(pRawRootSig, RawRootSigSize);
@@ -419,6 +483,14 @@ public:
       return hr;
 
     auto &desc = deserializer.desc_1_1_.Desc_1_1;
+    if (from_library) {
+      Com<ID3DBlob> serialized;
+      hr = D3D12SerializeVersionedRootSignature(&deserializer.desc_1_1_, &serialized, nullptr);
+      if (FAILED(hr))
+        return hr;
+      auto bytes = static_cast<const uint8_t *>(serialized->GetBufferPointer());
+      blob_.assign(bytes, bytes + serialized->GetBufferSize());
+    }
 
     if (desc.NumParameters) {
       if (desc.NumParameters > D3D12_MAX_ROOT_COST)
@@ -512,7 +584,7 @@ public:
       WARN("D3D12RootSignature: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12DeviceChild::QueryInterface(riid, ppvObject);
   }
 
   UINT

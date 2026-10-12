@@ -53,28 +53,51 @@ public:
       desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     }
 
-    if (pHeap) {
+    if (pHeap && !pHeap->memory) {
       auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
       if (size_and_align.size + Offset > pHeap->GetDesc().SizeInBytes)
         return E_INVALIDARG;
     }
 
-    buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
+    std::shared_ptr<void> memory;
+    uint64_t length = desc_.Width;
+    if (pHeap && pHeap->memory) {
+      auto size = pHeap->GetDesc().SizeInBytes;
+      length = align(length, desc_.Alignment);
+      if (Offset % desc_.Alignment || Offset > size || length > size - Offset)
+        return E_INVALIDARG;
+      memory = std::shared_ptr<void>(pHeap->memory, (char *)pHeap->memory.get() + Offset);
+    } else if (HeapFlags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) {
+      SYSTEM_INFO system;
+      GetSystemInfo(&system);
+      length = align(length, system.dwAllocationGranularity);
+      memory = std::shared_ptr<void>(
+          VirtualAlloc(nullptr, length, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE),
+          [](void *address) { if (address) VirtualFree(address, 0, MEM_RELEASE); }
+      );
+      if (!memory)
+        return E_OUTOFMEMORY;
+    }
+    buffer = new Buffer(length, device_->GetMTLDevice());
 
     Flags<BufferAllocationFlag> flags;
     if (Reserved)
       buffer->rename(buffer->allocate(flags, device_->GetSparsePageSize()));
+    else if (memory)
+      buffer->rename(buffer->allocate(flags, 0, std::move(memory)));
     else if (pHeap)
       buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
     else
       buffer->rename(buffer->allocate(flags));
+    if (!buffer->current()->buffer())
+      return E_OUTOFMEMORY;
     device_->RegisterResidencyAndVA(buffer->current());
 
     return S_OK;
   };
 
   ~MTLD3D12Buffer() {
-    if (buffer)
+    if (buffer && buffer->current()->buffer())
       device_->UnregisterResidencyAndVA(buffer->current());
   }
 
@@ -97,7 +120,7 @@ public:
       WARN("D3D12Buffer: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
   }
 
   virtual HRESULT STDMETHODCALLTYPE

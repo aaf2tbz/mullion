@@ -26,6 +26,7 @@
 #include "thread.hpp"
 #include "util_flags.hpp"
 #include "util_svector.hpp"
+#include <memory>
 
 namespace dxmt {
 
@@ -150,7 +151,10 @@ public:
   small_vector<GenericAccessTracker, 1> fenceTrackers;
 
 private:
-  BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, uint32_t names);
+  BufferAllocation(
+      WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, uint32_t names,
+      std::shared_ptr<void> memory
+  );
   BufferAllocation(
       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMT::Heap heap,
       uint64_t heap_offset
@@ -163,6 +167,7 @@ private:
   BufferAllocation(const BufferAllocation &) = delete;
   BufferAllocation(BufferAllocation &&) = delete;
 
+  std::shared_ptr<void> memory_;
   WMT::Reference<WMT::Buffer> obj_;
   WMTBufferInfo info_;
   uint32_t version_ = 0;
@@ -189,8 +194,9 @@ public:
     return current_.ptr();
   }
 
-  // names: how many the allocation holds, for a buffer that suballocates; none asks for a page's worth
-  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, uint32_t names = 0);
+  // names: how many the allocation holds, for a buffer that suballocates; none asks for a page's worth.
+  // memory: the application's own pages to wrap, kept for the allocation's life
+  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, uint32_t names = 0, std::shared_ptr<void> memory = {});
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
   // a placement sparse buffer, whose tiles are mapped to heaps later
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size);

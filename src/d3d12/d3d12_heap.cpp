@@ -53,7 +53,7 @@ public:
       WARN("D3D12Heap: Unknown interface query ", str::format(riid));
     }
 
-    return E_NOINTERFACE;
+    return MTLD3D12Pageable::QueryInterface(riid, ppvObject);
   }
 
   HRESULT
@@ -81,6 +81,17 @@ public:
     if (!size_aligned)
       return E_INVALIDARG;
 
+    if (pDesc->Flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) {
+      SYSTEM_INFO system;
+      GetSystemInfo(&system);
+      memory = std::shared_ptr<void>(
+          VirtualAlloc(nullptr, align(size_aligned, system.dwAllocationGranularity),
+                       MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE),
+          [](void *address) { if (address) VirtualFree(address, 0, MEM_RELEASE); }
+      );
+      return memory ? S_OK : E_OUTOFMEMORY;
+    }
+
     WMTHeapInfo info;
     info.options = {}; // FIXME: ensure this agrees with {Buffer|Texture}AllocationFlag?
     info.size = size_aligned;
@@ -95,12 +106,39 @@ public:
     return S_OK;
   }
 
+  HRESULT
+  Import(const void *Address, HANDLE Mapping) {
+    void *address = Mapping ? MapViewOfFile(Mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0) : const_cast<void *>(Address);
+    memory = std::shared_ptr<void>(address, [Mapping](void *pointer) { if (Mapping && pointer) UnmapViewOfFile(pointer); });
+    MEMORY_BASIC_INFORMATION region, next;
+    if (!address || !VirtualQuery(address, &region, sizeof(region)) || region.AllocationBase != address ||
+        region.BaseAddress != address || region.State != MEM_COMMIT || region.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+      return E_INVALIDARG;
+    if (VirtualQuery((char *)address + region.RegionSize, &next, sizeof(next)) && next.AllocationBase == address)
+      return E_INVALIDARG;
+    desc_ = {region.RegionSize,
+             {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1},
+             D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+             D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER};
+    return S_OK;
+  }
+
   virtual D3D12_HEAP_DESC *STDMETHODCALLTYPE
   GetDesc(D3D12_HEAP_DESC *__ret) {
     *__ret = desc_;
     return __ret;
   };
 };
+
+HRESULT
+OpenHeap(MTLD3D12Device *pDevice, const void *Address, HANDLE Mapping, REFIID riid, void **ppHeap) {
+  InitReturnPtr(ppHeap);
+  auto heap = Com(new MTLD3D12HeapImpl(pDevice));
+  HRESULT hr = heap->Import(Address, Mapping);
+  if (FAILED(hr))
+    return hr;
+  return ppHeap ? heap->QueryInterface(riid, ppHeap) : S_FALSE;
+}
 
 HRESULT
 CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap) {
