@@ -7,6 +7,7 @@ namespace dxmt {
 
 struct MTLDXGIOutput : public MTLDXGIObject<IDXGIOutput6> {
   virtual const DXMTGammaRamp *STDMETHODCALLTYPE GetGammaRamp() = 0;
+  virtual void STDMETHODCALLTYPE SetFullscreen(bool fullscreen) = 0;
 };
 
 } // namespace dxmt

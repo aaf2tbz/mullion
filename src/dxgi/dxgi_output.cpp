@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <numeric>
 #include <map>
+#include <atomic>
 
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
@@ -136,22 +137,28 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
 }
 
 // a monitor's gamma ramp is the monitor's, whichever output object set it: the identity until one does
-static DXMTGammaRamp &
-MonitorGammaRamp(HMONITOR monitor) {
+struct DXGIMonitorState {
+  DXMTGammaRamp gamma;
+  std::atomic_uint fullscreens{0};
+};
+
+static DXGIMonitorState &
+MonitorState(HMONITOR monitor) {
   static dxmt::mutex mutex;
-  static std::map<HMONITOR, DXMTGammaRamp> ramps;
+  static std::map<HMONITOR, DXGIMonitorState> ramps;
   std::lock_guard<dxmt::mutex> lock(mutex);
   auto [ramp, added] = ramps.try_emplace(monitor);
   if (added)
     for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++)
-      ramp->second.red[i] = ramp->second.green[i] = ramp->second.blue[i] = float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
+      ramp->second.gamma.red[i] = ramp->second.gamma.green[i] = ramp->second.gamma.blue[i] =
+          float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
   return ramp->second;
 }
 
 class MTLDXGIOutputImpl : public MTLDXGIOutput {
 public:
   MTLDXGIOutputImpl(IMTLDXGIAdapter *adapter, HMONITOR monitor, DxgiOptions &options)
-      : adapter_(adapter), monitor_(monitor), options_(options), gamma_ramp_(MonitorGammaRamp(monitor)) {
+      : adapter_(adapter), monitor_(monitor), options_(options), monitor_state_(MonitorState(monitor)) {
     WMTGetDisplayDescription(monitor_ == wsi::getDefaultMonitor()
                                  ? WMTGetPrimaryDisplayId()
                                  : WMTGetSecondaryDisplayId(),
@@ -163,7 +170,14 @@ public:
   const DXMTGammaRamp *
   STDMETHODCALLTYPE
   GetGammaRamp() override {
-    return &gamma_ramp_;
+    return &monitor_state_.gamma;
+  }
+
+  void STDMETHODCALLTYPE SetFullscreen(bool fullscreen) override {
+    if (fullscreen)
+      monitor_state_.fullscreens++;
+    else
+      monitor_state_.fullscreens--;
   }
 
   HRESULT
@@ -301,7 +315,7 @@ public:
   STDMETHODCALLTYPE
   GetGammaControlCapabilities(
       DXGI_GAMMA_CONTROL_CAPABILITIES *gamma_caps) final {
-    if (gamma_caps == nullptr)
+    if (gamma_caps == nullptr || !monitor_state_.fullscreens)
       return DXGI_ERROR_INVALID_CALL;
 
     gamma_caps->ScaleAndOffsetSupported = false;
@@ -320,11 +334,11 @@ public:
       return DXGI_ERROR_INVALID_CALL;
 
     for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
-      gamma_ramp_.red[i] = gamma_control->GammaCurve[i].Red;
-      gamma_ramp_.green[i] = gamma_control->GammaCurve[i].Green;
-      gamma_ramp_.blue[i] = gamma_control->GammaCurve[i].Blue;
+      monitor_state_.gamma.red[i] = gamma_control->GammaCurve[i].Red;
+      monitor_state_.gamma.green[i] = gamma_control->GammaCurve[i].Green;
+      monitor_state_.gamma.blue[i] = gamma_control->GammaCurve[i].Blue;
     }
-    gamma_ramp_.version++;
+    monitor_state_.gamma.version++;
     return S_OK;
   }
 
@@ -337,9 +351,9 @@ public:
     gamma_control->Scale = { 1.0f, 1.0f, 1.0f };
     gamma_control->Offset = { 0.0f, 0.0f, 0.0f };
     for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
-      gamma_control->GammaCurve[i].Red = gamma_ramp_.red[i];
-      gamma_control->GammaCurve[i].Green = gamma_ramp_.green[i];
-      gamma_control->GammaCurve[i].Blue = gamma_ramp_.blue[i];
+      gamma_control->GammaCurve[i].Red = monitor_state_.gamma.red[i];
+      gamma_control->GammaCurve[i].Green = monitor_state_.gamma.green[i];
+      gamma_control->GammaCurve[i].Blue = monitor_state_.gamma.blue[i];
     }
   
     return S_OK;
@@ -646,7 +660,7 @@ private:
   HMONITOR monitor_ = nullptr;
   WMTDisplayDescription native_desc_;
   DxgiOptions &options_;
-  DXMTGammaRamp &gamma_ramp_;
+  DXGIMonitorState &monitor_state_;
 };
 
 Com<IDXGIOutput> CreateOutput(IMTLDXGIAdapter *pAadapter, HMONITOR monitor, DxgiOptions &options) {

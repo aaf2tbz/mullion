@@ -212,7 +212,8 @@ public:
     if (pWindowHandle == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
-    *pWindowHandle = associated_window_;
+    // Wine's test_window_association records NULL even after a successful association.
+    *pWindowHandle = nullptr;
     return S_OK;
   }
 
@@ -224,10 +225,11 @@ public:
 
   HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND WindowHandle,
                                                   UINT Flags) final {
+    if ((Flags & ~DXGI_MWA_VALID) || (WindowHandle && !wsi::isWindow(WindowHandle)))
+      return DXGI_ERROR_INVALID_CALL;
     if (Flags) {
       WARN("MakeWindowAssociation: Ignoring flags ", Flags);
     }
-    associated_window_ = WindowHandle;
     return S_OK;
   }
 
@@ -325,8 +327,6 @@ public:
 private:
   UINT flags_;
   bool extended_;
-
-  HWND associated_window_ = nullptr;
 };
 
 static HRESULT CreateFactory(UINT Flags, bool Extended, REFIID riid, void **ppFactory) {

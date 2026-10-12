@@ -33,8 +33,9 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pWeight);
  * \param [in] pState The swapchain's window state
  * \param [in] width The new width
  * \param [in] height The new height
+ * \returns \c true on success, \c false on failure
  */
-void resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
                   uint32_t weight);
 
 /**
@@ -98,10 +99,12 @@ bool isWindow(HWND hWindow);
  *
  * \param [in] hMonitor The monitor
  * \param [in] hWindow The window
+ * \param [in,out] pState The swapchain's window state
  * \param [in] forceTopmost Whether to force the window to become topmost again
  * (D3D9 behaviour)
+ * \returns \c true on success, \c false on failure
  */
-void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, bool forceTopmost);
+bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, DXMTWindowState *pState, bool forceTopmost);
 
 bool isForeground(HWND hWindow);
 

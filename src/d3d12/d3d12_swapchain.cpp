@@ -194,10 +194,8 @@ public:
       wsi::getWindowSize(hWnd, &desc_.Width, &desc_.Height);
     }
 
-    if (pFullscreenDesc) {
-      fullscreen_desc_ = *pFullscreenDesc;
-    }
-    fullscreen_desc_.Windowed = true;
+    fullscreen_desc_ = pFullscreenDesc ? *pFullscreenDesc : DXGI_SWAP_CHAIN_FULLSCREEN_DESC{};
+    fullscreen_desc_.Windowed = TRUE;
 
     preferred_max_frame_rate = Config::getInstance().getOption<int>("d3d12.preferredMaxFrameRate", 0);
     wsi::WsiMode current_mode;
@@ -229,6 +227,8 @@ public:
   }
 
   ~MTLD3D12SwapChain() {
+    if (!fullscreen_desc_.Windowed)
+      static_cast<MTLDXGIOutput *>(target_.ptr())->SetFullscreen(false);
     WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
     CloseHandle(present_semaphore_);
@@ -281,13 +281,20 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
+    if (!Fullscreen && pTarget)
+      return DXGI_ERROR_INVALID_CALL;
+    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
+    if (modeset_inprogress)
+      return !!Fullscreen == !fullscreen_desc_.Windowed ? S_OK : DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
     Com<IDXGIOutput1> target;
 
     if (pTarget) {
       DXGI_OUTPUT_DESC desc;
 
-      pTarget->QueryInterface(IID_PPV_ARGS(&target));
-      target->GetDesc(&desc);
+      if (HRESULT hr = pTarget->QueryInterface(IID_PPV_ARGS(&target)); FAILED(hr))
+        return hr;
+      if (HRESULT hr = target->GetDesc(&desc); FAILED(hr))
+        return hr;
 
       if (!fullscreen_desc_.Windowed && Fullscreen && monitor_ != desc.Monitor) {
         HRESULT hr = LeaveFullscreenMode();
@@ -301,15 +308,13 @@ public:
     else if (!fullscreen_desc_.Windowed && !Fullscreen)
       return LeaveFullscreenMode();
 
+    if (target && !fullscreen_desc_.Windowed)
+      target_ = std::move(target);
     return S_OK;
   };
 
   HRESULT
   EnterFullscreenMode(IDXGIOutput1 *pTarget) {
-    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
-    if (modeset_inprogress)
-      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
-
     Com<IDXGIOutput1> output = pTarget;
 
     if (!wsi::isWindow(hWnd))
@@ -322,67 +327,58 @@ public:
       }
     }
 
-    std::unique_lock<dxmt::mutex> lock(mutex_);
+    if (!GetWindowRect(hWnd, &window_state_.rect))
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+    DXGI_OUTPUT_DESC desc;
+    if (HRESULT hr = output->GetDesc(&desc); FAILED(hr))
+      return hr;
 
     DXGI_MODE_DESC1 preferred_display_mode = {
         desc_.Width,
         desc_.Height,
         fullscreen_desc_.RefreshRate,
         desc_.Format,
-        DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
-        DXGI_MODE_SCALING_UNSPECIFIED
+        fullscreen_desc_.ScanlineOrdering,
+        fullscreen_desc_.Scaling
     };
-    if (FAILED(ChangeDisplayMode(output.ptr(), &preferred_display_mode))) {
+    bool modeSwitch = (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u;
+    if (modeSwitch && FAILED(ChangeDisplayMode(output.ptr(), &preferred_display_mode))) {
       ERR("DXGI: EnterFullscreenMode: Failed to change display mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
 
-    // Update swap chain description
-    fullscreen_desc_.Windowed = FALSE;
-
-    // Move the window so that it covers the entire output
-    bool modeSwitch = (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u;
-
-    DXGI_OUTPUT_DESC desc;
-    output->GetDesc(&desc);
-
-    monitor_ = desc.Monitor;
-    target_ = std::move(output);
-
-    lock = {};
-
     if (!wsi::enterFullscreenMode(desc.Monitor, hWnd, &window_state_, modeSwitch)) {
+      if (modeSwitch && FAILED(RestoreDisplayMode(desc.Monitor)))
+        ERR("DXGI: EnterFullscreenMode: Failed to restore display mode");
       ERR("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-
+    std::lock_guard<dxmt::mutex> lock(mutex_);
+    fullscreen_desc_.Windowed = FALSE;
+    static_cast<MTLDXGIOutput *>(output.ptr())->SetFullscreen(true);
+    monitor_ = desc.Monitor;
+    target_ = std::move(output);
     return S_OK;
   }
 
   HRESULT
   LeaveFullscreenMode() {
-    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
-    if (modeset_inprogress)
-      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
-
-    std::lock_guard<dxmt::mutex> lock(mutex_);
-
-    if (FAILED(RestoreDisplayMode(monitor_)))
+    if (HRESULT hr = RestoreDisplayMode(monitor_); FAILED(hr)) {
       WARN("DXGI: LeaveFullscreenMode: Failed to restore display mode");
+      return hr;
+    }
 
-    // Restore internal state
-    fullscreen_desc_.Windowed = TRUE;
-    target_ = nullptr;
-    monitor_ = wsi::getWindowMonitor(hWnd);
-
-    if (!wsi::isWindow(hWnd))
-      return S_OK;
-
-    if (!wsi::leaveFullscreenMode(hWnd, &window_state_, true)) {
+    if (wsi::isWindow(hWnd) && !wsi::leaveFullscreenMode(hWnd, &window_state_, true)) {
       ERR("DXGI: LeaveFullscreenMode: Failed to exit fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-
+    auto monitor = wsi::getWindowMonitor(hWnd);
+    std::lock_guard<dxmt::mutex> lock(mutex_);
+    fullscreen_desc_.Windowed = TRUE;
+    static_cast<MTLDXGIOutput *>(target_.ptr())->SetFullscreen(false);
+    target_ = nullptr;
+    monitor_ = monitor;
     presenter->changeGammaRamp(nullptr);
 
     return S_OK;
@@ -397,11 +393,6 @@ public:
 
     DXGI_MODE_DESC1 preferred_mode = *pDisplayMode;
     DXGI_MODE_DESC1 selected_mode = {};
-
-    if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)) {
-      preferred_mode.Width = 0;
-      preferred_mode.Height = 0;
-    }
 
     if (preferred_mode.Format == DXGI_FORMAT_UNKNOWN)
       preferred_mode.Format = desc_.Format;
@@ -424,7 +415,8 @@ public:
       selected_mode.RefreshRate.Denominator = 1;
 
     DXGI_OUTPUT_DESC output_desc;
-    pOutput->GetDesc(&output_desc);
+    if (HRESULT hr = pOutput->GetDesc(&output_desc); FAILED(hr))
+      return hr;
     wsi::WsiMode wsi_mode{
         selected_mode.Width,
         selected_mode.Height,
@@ -555,7 +547,9 @@ public:
     if (!wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
 
-    std::unique_lock<dxmt::mutex> lock(mutex_);
+    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
+    if (modeset_inprogress)
+      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
 
     // Promote display mode
     DXGI_MODE_DESC1 newDisplayMode = {};
@@ -566,21 +560,32 @@ public:
     newDisplayMode.ScanlineOrdering = pDesc->ScanlineOrdering;
     newDisplayMode.Scaling = pDesc->Scaling;
 
-    // Update the swap chain description
-    if (newDisplayMode.RefreshRate.Numerator != 0)
-      fullscreen_desc_.RefreshRate = newDisplayMode.RefreshRate;
-
-    fullscreen_desc_.ScanlineOrdering = newDisplayMode.ScanlineOrdering;
-    fullscreen_desc_.Scaling = newDisplayMode.Scaling;
-
     if (fullscreen_desc_.Windowed) {
-      wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width, newDisplayMode.Height);
+      if (!wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width, newDisplayMode.Height))
+        return DXGI_ERROR_INVALID_CALL;
     } else {
-      ChangeDisplayMode(target_.ptr(), &newDisplayMode);
-      lock = {};
-      wsi::updateFullscreenWindow(monitor_, hWnd, false);
+      RECT bounds{}, rect{};
+      if (!wsi::getDesktopCoordinates(monitor_, &bounds) || !GetWindowRect(hWnd, &rect))
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      auto state = window_state_;
+      if (rect.right - rect.left != bounds.right - bounds.left ||
+          rect.bottom - rect.top != bounds.bottom - bounds.top) {
+        state.rect = rect;
+        state.style = GetWindowLongW(hWnd, GWL_STYLE);
+        state.exstyle = GetWindowLongW(hWnd, GWL_EXSTYLE);
+      }
+      if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)
+        if (HRESULT hr = ChangeDisplayMode(target_.ptr(), &newDisplayMode); FAILED(hr))
+          return hr;
+      if (!wsi::updateFullscreenWindow(monitor_, hWnd, &state, false))
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      window_state_ = state;
     }
-
+    std::lock_guard<dxmt::mutex> lock(mutex_);
+    if (pDesc->RefreshRate.Numerator != 0)
+      fullscreen_desc_.RefreshRate = pDesc->RefreshRate;
+    fullscreen_desc_.ScanlineOrdering = pDesc->ScanlineOrdering;
+    fullscreen_desc_.Scaling = pDesc->Scaling;
     return S_OK;
   };
 
@@ -798,8 +803,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetMaximumFrameLatency(UINT max_latency) override {
+    if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
+      return DXGI_ERROR_INVALID_CALL;
     if (max_latency == 0 || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS) {
-      return E_INVALIDARG;
+      return DXGI_ERROR_INVALID_CALL;
     }
     if (max_latency > frame_latency) {
       ReleaseSemaphore(present_semaphore_, max_latency - frame_latency, nullptr);
@@ -811,6 +818,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   GetMaximumFrameLatency(UINT *max_latency) override {
+    if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
+      return DXGI_ERROR_INVALID_CALL;
     if (max_latency) {
       *max_latency = frame_latency;
     }
@@ -870,6 +879,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) override {
+    UINT support = 0;
+    CheckColorSpaceSupport(ColorSpace, &support);
+    if (!(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+      return E_INVALIDARG;
     auto target_color_space = ConvertColorSpace(ColorSpace, LayerSupportEDR());
     if (presenter->changeLayerColorSpace(target_color_space)) {
       // TODO(d3d12): flush command queue
