@@ -220,6 +220,8 @@ public:
 
   ~CommandQueue();
 
+  void Shutdown();
+
   CommandChunk *
   CurrentChunk() {
     auto id = ready_for_encode.load(std::memory_order_relaxed);

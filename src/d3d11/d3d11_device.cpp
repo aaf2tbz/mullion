@@ -1092,6 +1092,8 @@ public:
   }
 
   ~MTLD3D11DXGIDevice() {
+    // queued command lists must release their private references before their pool is destroyed
+    cmd_queue_.Shutdown();
     if (local_kmt_) {
       D3DKMT_DESTROYDEVICE destroy = {};
       destroy.hDevice = local_kmt_;

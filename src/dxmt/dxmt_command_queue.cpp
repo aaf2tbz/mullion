@@ -163,8 +163,14 @@ CommandQueue::CommandQueue(WMT::Device device) :
 }
 
 CommandQueue::~CommandQueue() {
+  Shutdown();
+}
+
+void
+CommandQueue::Shutdown() {
+  if (stopped.exchange(true))
+    return;
   TRACE("Destructing command queue");
-  stopped.store(true);
   ready_for_encode++;
   ready_for_encode.notify_one();
   ready_for_commit++;
