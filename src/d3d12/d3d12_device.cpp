@@ -1203,7 +1203,9 @@ public:
 
   LUID *STDMETHODCALLTYPE
   GetAdapterLuid(LUID *ret) {
-    *ret = std::bit_cast<LUID>(__builtin_bswap64(adapter_->GetMTLDevice().registryID()));
+    DXGI_ADAPTER_DESC desc;
+    adapter_->GetDesc(&desc);
+    *ret = desc.AdapterLuid;
     return ret;
   }
 

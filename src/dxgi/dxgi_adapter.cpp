@@ -22,20 +22,38 @@ const GUID kWineDXGIAdapterUUID = {0x17399d75,
 Com<IDXGIOutput> CreateOutput(IMTLDXGIAdapter *pAadapter, HMONITOR monitor, DxgiOptions &options);
 
 LUID GetAdapterLuid(WMT::Device device) {
-    // NOTE: use big-endian registryID, be consistent with MVK
+#ifdef _WIN32
+  // one Metal device makes Wine's primary display an unambiguous match (D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME).
+  if (WMT::CopyAllDevices().count() == 1) {
+    auto gdi = GetModuleHandleA("gdi32.dll");
+    auto open_adapter = gdi ? reinterpret_cast<NTSTATUS(WINAPI *)(D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME *)>(
+                                  GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName"))
+                            : nullptr;
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open = {};
+    if (open_adapter && wsi::getDisplayName(wsi::getDefaultMonitor(), open.DeviceName) && !open_adapter(&open)) {
+      D3DKMT_CLOSEADAPTER close = {};
+      close.hAdapter = open.hAdapter;
+      if (D3DKMTCloseAdapter(&close))
+        WARN("Failed to close D3DKMT identity query adapter");
+      return open.AdapterLuid;
+    }
+  }
+#endif
+  WARN("Wine adapter identity unavailable; using Metal registry ID");
+  // without a host mapping, keep distinct Metal devices distinct, in MoltenVK's byte order.
   return std::bit_cast<LUID>(__builtin_bswap64(device.registryID()));
 }
 
 class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
 public:
   MTLDXGIAdapter(WMT::Device device, IDXGIFactory *factory, Config &config)
-      : device_(device), factory_(factory), options_(config) {
+      : device_(device), adapter_luid_(GetAdapterLuid(device)), factory_(factory), options_(config) {
     // said once: the preview is tested on the Apple9 family (M3) and later
     static std::atomic_flag said;
     if (!device_.supportsFamily(WMTGPUFamilyApple9) && !said.test_and_set())
       ERR("This preview of Mullion supports Apple GPUs of the M3 generation and later.");
     D3DKMT_OPENADAPTERFROMLUID open = {};
-    open.AdapterLuid = GetAdapterLuid(device_);
+    open.AdapterLuid = adapter_luid_;
     if (D3DKMTOpenAdapterFromLuid(&open))
       WARN("Failed to open D3DKMT adapter");
     else
@@ -190,7 +208,7 @@ public:
     pDesc->DedicatedVideoMemory = std::min<uint64_t>(memory, std::numeric_limits<SIZE_T>::max());
     pDesc->DedicatedSystemMemory = 0;
     pDesc->SharedSystemMemory = 0;
-    pDesc->AdapterLuid = GetAdapterLuid(device_);
+    pDesc->AdapterLuid = adapter_luid_;
     pDesc->Flags = DXGI_ADAPTER_FLAG3_NONE;
     pDesc->GraphicsPreemptionGranularity = DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     pDesc->ComputePreemptionGranularity = DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -301,6 +319,7 @@ public:
 private:
   WMT::Reference<WMT::Device> device_;
   D3DKMT_HANDLE local_kmt_ = 0;
+  const LUID adapter_luid_;
   Com<IDXGIFactory> factory_;
   DxgiOptions options_;
   uint64_t mem_reserved_[2] = {0, 0};

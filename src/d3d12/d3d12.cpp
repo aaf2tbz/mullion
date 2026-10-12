@@ -20,6 +20,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "dxgi_interfaces.h"
+#include "dxcore_interface.h"
 #include "log/log.hpp"
 #include "util_md5.hpp"
 #include "DXBCParser/BlobContainer.h"
@@ -35,7 +36,7 @@ extern "C" HRESULT WINAPI
 D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice) {
 
   Com<IDXGIAdapter> dxgi_adapter = nullptr;
-  Com<IDXGIFactory> dxgi_factory = nullptr;
+  Com<IDXGIFactory4> dxgi_factory = nullptr;
   Com<IMTLDXGIAdapter> dxgi_adapter_mtl = nullptr;
 
   if (MinimumFeatureLevel < D3D_FEATURE_LEVEL_11_0)
@@ -57,8 +58,16 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
     }
   } else {
     dxgi_adapter = com_cast<IDXGIAdapter>(pAdapter);
-    if (!dxgi_adapter)
-      return E_INVALIDARG;
+    if (!dxgi_adapter) {
+      auto dxcore_adapter = com_cast<IDXCoreAdapter>(pAdapter);
+      if (!dxcore_adapter)
+        return E_INVALIDARG;
+      LUID luid;
+      if (FAILED(hr = dxcore_adapter->GetProperty(DXCoreAdapterProperty::InstanceLuid, sizeof(luid), &luid)) ||
+          FAILED(hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory))) ||
+          FAILED(hr = dxgi_factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&dxgi_adapter))))
+        return hr;
+    }
   }
 
   if (FAILED(hr = dxgi_adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter_mtl)))) {
