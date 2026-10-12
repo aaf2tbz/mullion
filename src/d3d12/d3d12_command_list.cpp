@@ -578,13 +578,13 @@ public:
 
       unsigned effective_rtvs = 0;
       for (unsigned i = 0; i < num_rtvs; i++) {
-        if (!rtvs[i].ptr)
+        if (!rtvs[i].ptr || !(pso_graphics_->rtv_mask & (1u << i)))
           continue;
-        effective_rtvs++;
         auto [Heap, Index] = GetRenderTargetHeap(device_, rtvs[i]);
         auto AttachmentDesc = Heap->GetRenderTarget(Index);
         if (!AttachmentDesc.Texture)
           continue;
+        effective_rtvs++;
         auto &rt = render->colors[i];
         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
         rt.depth_plane = AttachmentDesc.DepthPlane;
@@ -594,13 +594,14 @@ public:
         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
         render_target_array_length = std::max(render_target_array_length, AttachmentDesc.RenderTargetArrayLength);
       }
-      while (dsv.ptr) {
-        effective_rtvs++;
+      while (dsv.ptr && pso_graphics_->dsv_mask) {
         auto [Heap, Index] = GetRenderTargetHeap(device_, dsv);
         auto AttachmentDesc = Heap->GetRenderTarget(Index);
         if (!AttachmentDesc.Texture)
           continue;
-        auto dsv_planar_flags = DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
+        effective_rtvs++;
+        auto dsv_planar_flags =
+            DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View)) & pso_graphics_->dsv_mask;
         if (dsv_planar_flags & 1) {
           auto &rt = render->depth;
           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
@@ -643,7 +644,8 @@ public:
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       // a pipeline for a topology with adjacency is made here, and may fail
       auto pipeline = Pipeline();
-      if (!pipeline)
+      if (!pipeline || (pso_graphics_->stream_output &&
+                        (!Pipeline(true) || (StreamOutputRasterizes() && !RenderTargets(pso_graphics_->so_raster)))))
         return DrawCallStatus::Invalid;
       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd_setpso.type = WMTRenderCommandSetPSO;
@@ -872,16 +874,26 @@ public:
     return pso_graphics_->so_raster && !PassesAdjacency();
   }
 
+  WMT::RenderPipelineState
+  RenderTargets(WMT::RenderPipelineState Pipeline) {
+    auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+    uint32_t mask = 0;
+    for (unsigned i = 0; i < std::size(pass->colors); i++)
+      if (pass->colors[i].attachment)
+        mask |= 1u << i;
+    return pso_graphics_->RenderTargets(Pipeline, mask, pass->dsv_planar_flags);
+  }
+
   // the pipeline's variant for the topology: a geometry pipeline has one for strips, and with stream output one
   // for each that only counts
   WMT::RenderPipelineState
   Pipeline(bool counting = false) {
     bool strip = Strip(topology_);
     if (PassesAdjacency())
-      return pso_graphics_->AdjacencyPipeline(strip, counting);
+      return RenderTargets(pso_graphics_->AdjacencyPipeline(strip, counting));
     if (counting)
-      return strip ? pso_graphics_->so_count_strip : pso_graphics_->so_count;
-    return pso_graphics_->geometry_shader && strip ? pso_graphics_->pso_strip : pso_graphics_->pso;
+      return RenderTargets(strip ? pso_graphics_->so_count_strip : pso_graphics_->so_count);
+    return RenderTargets(pso_graphics_->geometry_shader && strip ? pso_graphics_->pso_strip : pso_graphics_->pso);
   }
 
   // a geometry-shader draw runs its vertices in warps of object threadgroups (airconv's layout), which read the draw's
@@ -964,7 +976,7 @@ public:
     barrier(WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
     // without a geometry shader the caller then draws as usual
     if (StreamOutputRasterizes())
-      set_pso(pso_graphics_->so_raster);
+      set_pso(RenderTargets(pso_graphics_->so_raster));
   }
 
   void STDMETHODCALLTYPE
@@ -1775,6 +1787,10 @@ public:
     };
     if (!pso_graphics_ || stages(pso_graphics_.ptr()) != stages(graphics_pso))
       dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+    if (!pso_graphics_ || pso_graphics_->forced_sample_count != graphics_pso->forced_sample_count ||
+        ((pso_graphics_->rtv_mask ^ graphics_pso->rtv_mask) & ((1u << num_rtvs) - 1)) ||
+        (dsv.ptr && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
+      allocator_->InvalidateCurrentPass();
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;
     dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState, DirtyState::VertexBuffer);

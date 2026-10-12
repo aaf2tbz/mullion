@@ -32,6 +32,7 @@
 #include <fstream>
 #include <array>
 #include <unordered_set>
+#include <variant>
 
 namespace dxmt {
 
@@ -542,6 +543,33 @@ protected:
   MTL_SHADER_REFLECTION ref_vs;
   MTL_SHADER_REFLECTION ref_ps{};
 
+  struct PipelineDescriptor {
+    std::variant<WMTRenderPipelineInfo, WMTMeshRenderPipelineInfo> info;
+    std::vector<WMT::Reference<WMT::Function>> functions;
+    std::unordered_map<uint32_t, WMT::Reference<WMT::RenderPipelineState>> variants;
+  };
+  std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
+  dxmt::mutex render_targets_mutex_;
+
+  template <typename Info>
+  WMT::Reference<WMT::RenderPipelineState>
+  CreatePipeline(const Info &info, WMT::Reference<WMT::Error> &error) {
+    auto pipeline = device_->GetMTLDevice().newRenderPipelineState(info, error);
+    if (!pipeline || (!rtv_mask && !dsv_mask))
+      return pipeline;
+    std::lock_guard<dxmt::mutex> lock(render_targets_mutex_);
+    auto &descriptor = pipeline_descriptors_[pipeline.handle];
+    descriptor.info = info;
+    descriptor.functions.emplace_back(WMT::Function(info.fragment_function));
+    if constexpr (std::is_same_v<Info, WMTRenderPipelineInfo>) {
+      descriptor.functions.emplace_back(WMT::Function(info.vertex_function));
+    } else {
+      descriptor.functions.emplace_back(WMT::Function(info.object_function));
+      descriptor.functions.emplace_back(WMT::Function(info.mesh_function));
+    }
+    return pipeline;
+  }
+
   WMT::Reference<WMT::DepthStencilState> dsso;
   WMT::Reference<WMT::DepthStencilState> dsso_depth_readonly;
   WMT::Reference<WMT::DepthStencilState> dsso_stencil_readonly;
@@ -641,7 +669,7 @@ protected:
     info.fragment_function = rasterized ? in.ps.handle : obj_handle_t{};
     info.rasterization_enabled = rasterized;
     info.payload_memory_length = SM50_GEOMETRY_PAYLOAD_SIZE;
-    if (!(variant = device_->GetMTLDevice().newRenderPipelineState(info, err))) {
+    if (!(variant = CreatePipeline(info, err))) {
       ERR("Failed to create geometry PSO of shaders ", name, ": ", err.description().getUTF8String());
       DumpShaders({VS, GS});
     }
@@ -698,6 +726,7 @@ public:
         return hr;
       }
       rt.pixel_format = format_desc.PixelFormat;
+      rtv_mask |= 1u << i;
 
       auto renderTarget = pDesc->BlendState.RenderTarget[pDesc->BlendState.IndependentBlendEnable ? i : 0];
 
@@ -707,7 +736,10 @@ public:
       if (pDesc->BlendState.IndependentBlendEnable && renderTarget.LogicOpEnable)
         return E_INVALIDARG;
 
-      rt.write_mask = kColorWriteMaskMap[renderTarget.RenderTargetWriteMask];
+      // an undeclared output leaves the target alone even with blending (D3D11.3 16.9.1)
+      rt.write_mask = (ref_ps.PixelShader.ValidRenderTargets & (1u << i))
+                          ? kColorWriteMaskMap[renderTarget.RenderTargetWriteMask]
+                          : WMTColorWriteMaskNone;
 
       if (rt.pixel_format == WMTPixelFormatRGB9E5Float)
         rt.write_mask = (rt.write_mask & ~WMTColorWriteMaskAlpha) ? WMTColorWriteMaskAll : 0;
@@ -751,7 +783,7 @@ public:
       if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->DSVFormat, format_desc))) {
         return hr;
       }
-      auto dsv_flags = DepthStencilPlanarFlags(format_desc.PixelFormat);
+      auto dsv_flags = dsv_mask = DepthStencilPlanarFlags(format_desc.PixelFormat);
       if (dsv_flags & 1)
         info.depth_pixel_format = format_desc.PixelFormat;
       if (dsv_flags & 2)
@@ -909,7 +941,6 @@ public:
 
     SM50Shader shader_vs, shader_hs, shader_ds, shader_gs, shader_ps, shader_as, shader_ms;
     MTL_SHADER_REFLECTION ref_hs, ref_ds, ref_gs, ref_as, ref_ms;
-    auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> err;
 
     SM50_SHADER_COMMON_DATA common;
@@ -1080,7 +1111,7 @@ public:
       mesh_info.rasterization_enabled = true;
       // the most a payload may be (D3D12 mesh shader specification, "Amplification shader output payload")
       mesh_info.payload_memory_length = 16384;
-      if (!(pso = metal.newRenderPipelineState(mesh_info, err))) {
+      if (!(pso = CreatePipeline(mesh_info, err))) {
         ERR("Failed to create mesh shader PSO of shaders ", name, ": ", err.description().getUTF8String());
         DumpShaders({AS, MS, pDesc->PS});
         return E_FAIL;
@@ -1116,7 +1147,7 @@ public:
           return E_INVALIDARG;
         info.vertex_function = vs_func.handle;
         info.fragment_function = ps_func.handle;
-        if (!(so_raster = metal.newRenderPipelineState(info, err))) {
+        if (!(so_raster = CreatePipeline(info, err))) {
           ERR("Failed to create PSO of shaders ", name, ": ", err.description().getUTF8String());
           return E_FAIL;
         }
@@ -1129,7 +1160,7 @@ public:
         return E_INVALIDARG;
       info.vertex_function = vs_func.handle;
       info.fragment_function = ps_func.handle;
-      if (!(pso = metal.newRenderPipelineState(info, err))) {
+      if (!(pso = CreatePipeline(info, err))) {
         ERR("Failed to create PSO of shaders ", name, ": ", err.description().getUTF8String());
         DumpShaders({pDesc->VS, pDesc->PS});
         return E_FAIL;
@@ -1199,7 +1230,8 @@ public:
         if (!vshs_func)
           return E_INVALIDARG;
         mesh_info.object_function = vshs_func.handle;
-        if (!(pso = metal.newRenderPipelineState(mesh_info, err))) {
+        pipeline_descriptors_.erase(pso.handle);
+        if (!(pso = CreatePipeline(mesh_info, err))) {
           ERR("Failed to create tessellation PSO of shaders ", name, ": ", err.description().getUTF8String());
           DumpShaders({pDesc->VS, pDesc->HS, pDesc->DS, pDesc->GS, pDesc->PS});
           return E_FAIL;
@@ -1250,6 +1282,38 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   GetCachedBlob(ID3DBlob **blob) {
     return GetCachedPipelineBlob(blob);
+  }
+
+  WMT::RenderPipelineState
+  RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar) override {
+    Mask &= rtv_mask;
+    DSVPlanar &= dsv_mask;
+    if (!Pipeline || (Mask == rtv_mask && DSVPlanar == dsv_mask))
+      return Pipeline;
+    std::lock_guard<dxmt::mutex> lock(render_targets_mutex_);
+    auto &descriptor = pipeline_descriptors_.at(Pipeline.handle);
+    auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+    auto found = descriptor.variants.find(key);
+    if (found != descriptor.variants.end())
+      return found->second;
+    WMT::Reference<WMT::Error> error;
+    // Metal's pipeline formats must match its pass, including the slots with no texture (Metal Programming Guide,
+    // Graphics Rendering: Render Command Encoder, Creating and Configuring a Render Pipeline Descriptor)
+    auto pipeline = std::visit([&](auto info) {
+      for (unsigned i = 0; i < std::size(info.colors); i++)
+        if (!(Mask & (1u << i)))
+          info.colors[i] = {.pixel_format = WMTPixelFormatInvalid};
+      if (!(DSVPlanar & 1))
+        info.depth_pixel_format = WMTPixelFormatInvalid;
+      if (!(DSVPlanar & 2))
+        info.stencil_pixel_format = WMTPixelFormatInvalid;
+      return device_->GetMTLDevice().newRenderPipelineState(info, error);
+    }, descriptor.info);
+    if (!pipeline) {
+      ERR("Failed to create attachment PSO of shaders ", name, ": ", error.description().getUTF8String());
+      return {};
+    }
+    return descriptor.variants.emplace(key, std::move(pipeline)).first->second;
   }
 
   virtual WMT::DepthStencilState
