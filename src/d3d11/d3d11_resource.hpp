@@ -11,7 +11,6 @@
 #include "d3d11_view.hpp"
 #include "dxgi_resource.hpp"
 #include "d3d11_surface.hpp"
-#include <deque>
 #include "log/log.hpp"
 #include "../d3d10/d3d10_buffer.hpp"
 #include "../d3d10/d3d10_texture.hpp"
@@ -199,6 +198,10 @@ GetTexture(ID3D11Resource *pResource) {
   return static_cast<D3D11ResourceCommon *>(pResource)->texture();
 }
 
+template <typename TEXTURE_DESC>
+void GetMipmapSize(const TEXTURE_DESC *pDesc, uint32_t level, uint32_t *pWidth,
+                   uint32_t *pHeight, uint32_t *pDepth);
+
 template <typename tag, typename... Base>
 class TResourceBase : public MTLD3D11DeviceChild<D3D11ResourceCommon, Base...> {
 public:
@@ -265,13 +268,21 @@ public:
       return S_OK;
     }
 
-    // a texture that is one surface is that surface
+    // a single-subresource 1D or 2D texture is its surface (Wine's test_texture1d_interfaces and IDXGISurface)
     if (riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1) || riid == __uuidof(IDXGISurface2)) {
-      auto surface = Subresources() == 1 ? Surface(0) : nullptr;
-      if (!surface)
-        return E_NOINTERFACE;
-      *ppvObject = ref(surface);
-      return S_OK;
+      if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ||
+                    tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (Subresources() == 1) {
+          try {
+            std::call_once(surfaces_once, [this] { surface.reset(Surface(0, true)); });
+          } catch (const std::bad_alloc &) {
+            return E_OUTOFMEMORY;
+          }
+          *ppvObject = ref(surface.get());
+          return S_OK;
+        }
+      }
+      return E_NOINTERFACE;
     }
 
     if (logQueryInterfaceError(__uuidof(typename tag::COM), riid)) {
@@ -326,41 +337,51 @@ public:
     return device->QueryInterface(riid, ppDevice);
   };
 
-  // how many surfaces the texture is: its array's elements, if it is a 2D texture of one mip level (IDXGISurface:
-  // a 2D texture with "only a single MIP-map level"; IDXGIResource1::CreateSubresourceSurface: "a valid surface if
-  // the original resource would have been a valid surface had its array size been equal to 1")
+  // Wine's test_subresource_surface records Windows rejecting a whole volume, even its depth-one mips
   UINT
   Subresources() {
-    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-      return desc.MipLevels == 1 ? desc.ArraySize : 0;
-    return 0;
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+      return 1;
+    else if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+      return desc.Depth == 1 ? desc.MipLevels : 0;
+    else
+      return desc.MipLevels * desc.ArraySize;
   }
 
-  // one of them, made with the others when the first is asked for
   MTLD3D11Surface *
-  Surface(UINT Index) {
-    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
-      if (Index >= Subresources())
-        return nullptr;
-      std::call_once(surfaces_once, [this] {
-        for (UINT i = 0; i < desc.ArraySize; i++)
-          surfaces.emplace_back(
-              reinterpret_cast<tag::COM *>(this), this->m_parent->GetImmediateContextPrivate(), i, desc.ArraySize == 1
-          );
-      });
-      return &surfaces[Index];
+  Surface(UINT Index, bool Whole) {
+    if (Index >= Subresources())
+      return nullptr;
+    DXGI_SURFACE_DESC surface_desc{0, 1, DXGI_FORMAT_UNKNOWN, {1, 0}};
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      surface_desc.Width = desc.ByteWidth;
+    } else {
+      UINT depth;
+      GetMipmapSize(&desc, Index % desc.MipLevels, &surface_desc.Width, &surface_desc.Height, &depth);
+      surface_desc.Format = desc.Format;
+      if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        surface_desc.SampleDesc = desc.SampleDesc;
     }
-    return nullptr;
+    if (desc.MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE)
+      std::call_once(gdi_once, [this] { gdi = std::make_unique<MTLD3D11Surface::GDIState[]>(Subresources()); });
+    return new MTLD3D11Surface(
+        this, this->m_parent->GetImmediateContextPrivate(), Index, Whole, surface_desc, gdi ? &gdi[Index] : nullptr
+    );
   }
 
   HRESULT
   CreateSubresourceSurface(UINT Index, IDXGISurface2 **ppSurface) {
     if (!ppSurface)
       return E_INVALIDARG;
-    if (!(*ppSurface = Surface(Index)))
-      return E_INVALIDARG;
-    (*ppSurface)->AddRef();
-    return S_OK;
+    try {
+      auto created = Surface(Index, false);
+      if (!created)
+        return E_INVALIDARG;
+      *ppSurface = ref(created);
+      return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
   }
 
   virtual HRESULT GetDXGIUsage(DXGI_USAGE *pUsage) {
@@ -410,7 +431,9 @@ protected:
   MTLDXGIKeyedMutex<TResourceBase<tag, Base...>, IMTLD3D11DeviceContext> keyed_mutex;
   tag::D3D10_IMPL d3d10;
   std::once_flag surfaces_once;
-  std::deque<MTLD3D11Surface> surfaces;
+  std::unique_ptr<MTLD3D11Surface> surface;
+  std::once_flag gdi_once;
+  std::unique_ptr<MTLD3D11Surface::GDIState[]> gdi;
 };
 
 template <typename RESOURCE_IMPL_ = ID3D11Resource,
@@ -686,10 +709,6 @@ HRESULT InitializeAndNormalizeViewDescriptor(
     MTLD3D11Device *pDevice, unsigned MiplevelCount, unsigned ArraySize, Texture* pTexture,
     VIEW_DESC &ViewDesc, MTL_RENDER_PASS_ATTACHMENT_DESC &AttachmentDesc, TextureViewDescriptor &Descriptor
 );
-
-template <typename TEXTURE_DESC>
-void GetMipmapSize(const TEXTURE_DESC *pDesc, uint32_t level, uint32_t *pWidth,
-                   uint32_t *pHeight, uint32_t *pDepth);
 
 template <typename TEXTURE_DESC>
 HRESULT GetLinearTextureLayout(MTLD3D11Device *pDevice,
