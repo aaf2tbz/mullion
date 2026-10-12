@@ -10,7 +10,8 @@ public:
   void incRef();
   void decRef();
 
-  Rc<BufferAllocation> allocate(uint64_t coherent_seq_id);
+  // filled: the names of the allocation a command list has just filled, none for its first; without, the immediate name
+  Rc<BufferAllocation> allocate(uint64_t coherent_seq_id, std::optional<uint32_t> filled = {});
   void updateImmediateName(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation, uint32_t suballocation, bool owned_by_command_list);
   void recycle(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation);
   uint32_t nextSuballocation();

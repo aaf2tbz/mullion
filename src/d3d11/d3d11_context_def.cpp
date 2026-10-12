@@ -146,7 +146,8 @@ public:
         return allocation->mappedMemory(suballocation);
       }
     }
-    Rc<BufferAllocation> new_allocation = dynamic->allocate(ctx_state.cmd_queue.CoherentSeqId());
+    Rc<BufferAllocation> new_allocation = dynamic->allocate(ctx_state.cmd_queue.CoherentSeqId(),
+        ret == ctx_state.current_dynamic_buffer_allocations.end() ? 0 : ret->second.suballocation + 1);
     uint32_t id = ctx_state.current_cmdlist->used_dynamic_buffers.size();
     // track the current allocation in case of a following NO_OVERWRITE map
     if (ret == ctx_state.current_dynamic_buffer_allocations.end()) {

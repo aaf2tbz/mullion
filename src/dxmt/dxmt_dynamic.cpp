@@ -1,5 +1,6 @@
 #include "dxmt_dynamic.hpp"
 #include "dxmt_texture.hpp"
+#include "dxmt_ring_bump_allocator.hpp"
 
 namespace dxmt {
 DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
@@ -19,24 +20,17 @@ DynamicBuffer::decRef() {
 };
 
 Rc<BufferAllocation>
-DynamicBuffer::allocate(uint64_t coherent_seq_id) {
+DynamicBuffer::allocate(uint64_t coherent_seq_id, std::optional<uint32_t> filled) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
-  Rc<BufferAllocation> ret;
-  for (;;) {
-    if (fifo.empty()) {
-      break;
-    }
-    auto entry = fifo.front();
-    if (entry.will_free_at > coherent_seq_id) {
-      break;
-    }
-    ret = std::move(entry.allocation);
+  if (!fifo.empty() && fifo.front().will_free_at <= coherent_seq_id) {
+    auto ret = std::move(fifo.front().allocation);
     fifo.pop();
-    break;
+    return ret;
   }
-  if (!ret.ptr())
-    ret = buffer->allocate(flags_);
-  return ret;
+  // a command list's filled allocation, or an immediate one with an older name pending, doubles within a staging block
+  // round its stride as BufferAllocation does (D3D11.3 5.6.1: Map pointers are 16-byte aligned)
+  auto names = 2ull * filled.value_or(fifo.empty() ? 0 : name_suballocation_ + 1);
+  return buffer->allocate(flags_, std::min(names, kStagingBlockSize / align(name_->suballocation_size_, 16)));
 }
 
 void

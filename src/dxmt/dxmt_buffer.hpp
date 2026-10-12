@@ -87,6 +87,7 @@ struct BufferView {
 
 class BufferAllocation final : public Allocation {
   friend class Buffer;
+  friend class DynamicBuffer;
 
 public:
 
@@ -147,7 +148,7 @@ public:
   small_vector<GenericAccessTracker, 1> fenceTrackers;
 
 private:
-  BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
+  BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, uint32_t names);
   BufferAllocation(
       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMT::Heap heap,
       uint64_t heap_offset
@@ -186,7 +187,8 @@ public:
     return current_.ptr();
   }
 
-  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+  // names: how many the allocation holds, for a buffer that suballocates; none asks for a page's worth
+  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, uint32_t names = 0);
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
   // a placement sparse buffer, whose tiles are mapped to heaps later
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size);
