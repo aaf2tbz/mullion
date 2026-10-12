@@ -78,7 +78,8 @@
   "verdict": "passed"
  },
  "test_buffer_descriptor_byte_offset": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'CreateByteOffsetViewsSupported not set.'"
  },
  "test_buffer_feedback_instructions_dxil": {
   "verdict": "failed",
@@ -150,7 +151,8 @@
   "verdict": "passed"
  },
  "test_clear_uav_extreme_values": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Format #43 is unsupported, skipping.'"
  },
  "test_clear_uav_mismatch_heap": {
   "verdict": "passed"
@@ -211,10 +213,12 @@
   "verdict": "passed"
  },
  "test_conservative_rasterization_dxbc": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Conservative rasterization not supported by device.'"
  },
  "test_conservative_rasterization_dxil": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Conservative rasterization not supported by device.'"
  },
  "test_conservative_ssbo_vectorization_dxbc_heap_desc": {
   "verdict": "passed"
@@ -416,7 +420,8 @@
   "verdict": "passed"
  },
  "test_create_sampler2": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'ID3D12Device11 not supported.'"
  },
  "test_create_unordered_access_view": {
   "verdict": "passed"
@@ -458,7 +463,8 @@
   "verdict": "passed"
  },
  "test_denorm_behavior_dxbc": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'FP64 not supported.'"
  },
  "test_denorm_behavior_dxil": {
   "verdict": "failed",
@@ -488,7 +494,8 @@
   "verdict": "passed"
  },
  "test_depth_stencil_front_and_back": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'IndependentFrontAndBackStencilRefMaskSupported not supported.'"
  },
  "test_depth_stencil_layout_tracking": {
   "verdict": "passed"
@@ -555,13 +562,16 @@
   "failures": 3
  },
  "test_device_factory": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get SDK configuration interface.'"
  },
  "test_device_factory_create_device": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get SDK configuration interface.'"
  },
  "test_device_factory_creation": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get device factory interface.'"
  },
  "test_device_removed_reason": {
   "verdict": "failed",
@@ -606,7 +616,8 @@
   "verdict": "passed"
  },
  "test_dstorage_decompression": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'DirectStorage meta command not supported.'"
  },
  "test_dual_source_blending_dxbc": {
   "verdict": "failed",
@@ -621,13 +632,15 @@
   "failures": 4
  },
  "test_dynamic_depth_bias": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'DynamicDepthBiasSupported not supported.'"
  },
  "test_dynamic_depth_stencil_write": {
   "verdict": "passed"
  },
  "test_dynamic_index_strip_cut": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Dynamic index buffer strip cut is broken on AMD (native).'"
  },
  "test_early_depth_stencil_tests": {
   "verdict": "passed"
@@ -636,16 +649,20 @@
   "verdict": "passed"
  },
  "test_enhanced_barrier_castable_dsv": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'RelaxedFormatCasting is not supported.'"
  },
  "test_enhanced_barrier_castable_formats": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'RelaxedFormatCasting is not supported.'"
  },
  "test_enhanced_barrier_castable_formats_buffer": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'RelaxedFormatCasting is not supported.'"
  },
  "test_enhanced_barrier_castable_formats_validation": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'RelaxedFormatCasting is not supported.'"
  },
  "test_enhanced_barrier_discard_behavior": {
   "verdict": "passed"
@@ -687,7 +704,8 @@
   "verdict": "passed"
  },
  "test_execute_indirect_state_tier_11": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'ExecuteIndirect tier 1.1 not supported.'"
  },
  "test_execute_indirect_state_vbo_offsets": {
   "verdict": "passed"
@@ -790,7 +808,8 @@
   "verdict": "passed"
  },
  "test_get_resource_tiling": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Tiled resources tier 3 not supported.'; 'Tiled resources tier 4 not supported.'"
  },
  "test_gpu_signal_fence": {
   "verdict": "passed"
@@ -941,7 +960,8 @@
   "verdict": "passed"
  },
  "test_mesh_shader_rendering": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Derivatives in mesh and amplification shaders not supported.'"
  },
  "test_misc_agility_sdk_feature_checks": {
   "verdict": "passed"
@@ -992,7 +1012,8 @@
   "verdict": "passed"
  },
  "test_negative_viewports": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Device does not support negative viewport height.'"
  },
  "test_node_count": {
   "verdict": "passed"
@@ -1029,7 +1050,8 @@
   "verdict": "passed"
  },
  "test_nvx_cubin": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'ID3D12DeviceExt magic interface not exposed, skipping.'"
  },
  "test_object_interface": {
   "verdict": "passed"
@@ -1067,7 +1089,8 @@
   "verdict": "passed"
  },
  "test_planar_video_formats": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Format 0x67 unsupported.'; 'Format 0x68 unsupported.'; 'Format 0x69 unsupported.'"
  },
  "test_primitive_id_read_tess_geom": {
   "verdict": "failed",
@@ -1133,7 +1156,8 @@
   "failures": 2
  },
  "test_quad_vote_sm67_compute": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_query_heap_cpu_resolve_occlusion": {
   "verdict": "crashed",
@@ -1212,7 +1236,8 @@
   "verdict": "passed"
  },
  "test_raytracing_create_root_signature_from_subobject": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'ID3D12Device14 not supported.'"
  },
  "test_raytracing_default_association_tiebreak": {
   "verdict": "passed"
@@ -1261,10 +1286,12 @@
   "verdict": "passed"
  },
  "test_raytracing_opacity_micro_map": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Raytracing tier #c is not supported on this device. Skipping RT test.'"
  },
  "test_raytracing_opacity_micro_map_ray_query": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Raytracing tier #c is not supported on this device. Skipping RT test.'"
  },
  "test_raytracing_reject_duplicate_objects": {
   "verdict": "passed"
@@ -1316,13 +1343,16 @@
   "verdict": "passed"
  },
  "test_renderpass_rendering": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Render passes not supported.'"
  },
  "test_renderpass_resolve_suspend_resume": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Render passes not supported.'"
  },
  "test_renderpass_validation": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Render passes not supported.'"
  },
  "test_reserved_resource_mapping": {
   "verdict": "passed"
@@ -1379,7 +1409,8 @@
   "verdict": "passed"
  },
  "test_root_descriptor_offset_sign": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Skipping exploratory test for root descriptor over/underflow test.'"
  },
  "test_root_parameter_preservation": {
   "verdict": "passed"
@@ -1502,7 +1533,8 @@
   "failures": 4
  },
  "test_sampler_non_normalized_coordinates": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Non-normalized sampler coordinates not supported.'"
  },
  "test_sampler_rounding": {
   "verdict": "failed",
@@ -1517,13 +1549,16 @@
   "verdict": "passed"
  },
  "test_sdk_configuration1": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get SDK configuration interface.'"
  },
  "test_sdk_configuration_creation": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get SDK configuration interface.'"
  },
  "test_sdk_configuration_set_sdk_path": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get SDK configuration interface.'"
  },
  "test_separate_bindings": {
   "verdict": "passed"
@@ -1538,13 +1573,16 @@
   "verdict": "passed"
  },
  "test_shader_execution_reordering_basic": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping Shader Execution Reordering test.'"
  },
  "test_shader_execution_reordering_ray_query": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping Shader Execution Reordering test.'"
  },
  "test_shader_execution_reordering_trace": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping Shader Execution Reordering test.'"
  },
  "test_shader_fp16": {
   "verdict": "passed"
@@ -1559,7 +1597,8 @@
   "verdict": "passed"
  },
  "test_shader_instructions": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Skipping FP64 test due to lack of feature support.'"
  },
  "test_shader_instructions_dxil": {
   "verdict": "failed",
@@ -1627,52 +1666,68 @@
   "failures": 16
  },
  "test_sm67_dynamic_texture_offset": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm67_helper_lane_only_wave_ops": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm67_helper_lane_wave_ops": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm67_integer_sampling": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm67_multi_sample_uav": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm67_raw_gather": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm67_sample_cmp_level": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Shader model 6.7 is not supported.'"
  },
  "test_sm68_draw_parameters": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Device does not support SM 6.8.'"
  },
  "test_sm68_sample_cmp_bias_grad": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Device does not support SM 6.8.'"
  },
  "test_sm68_wave_size_range": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Device does not support SM 6.8.'"
  },
  "test_sm69_fp16_isspecial": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping.'"
  },
  "test_sm69_long_vector_intrinsics": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping.'"
  },
  "test_sm69_long_vector_load_store_heap_desc": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping.'"
  },
  "test_sm69_long_vector_load_store_root_desc": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping.'"
  },
  "test_sm69_long_vector_storage": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping.'"
  },
  "test_sm69_long_vector_waveops": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'SM 6.9 not supported, skipping.'"
  },
  "test_sparse_buffer_memory_lifetime": {
   "verdict": "failed",
@@ -1681,10 +1736,12 @@
   "failures": 4
  },
  "test_sparse_default_mapping": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Skipping test to avoid crash inside AMD driver.'"
  },
  "test_sparse_depth_stencil_rendering": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Tiled is not supported for D32.'"
  },
  "test_srgb_unorm_mismatch_usage_aliasing": {
   "verdict": "passed"
@@ -1726,7 +1783,8 @@
   "verdict": "passed"
  },
  "test_sv_barycentric": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Context does not support barycentrics, hr #0.'"
  },
  "test_tessellation_dcl_index_range_complex_dxbc": {
   "verdict": "passed"
@@ -1783,10 +1841,12 @@
   "verdict": "passed"
  },
  "test_tight_resource_alignment": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Tight resource alignment not supported.'"
  },
  "test_topology_triangle_fan": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Triangle fan topology not supported by device.'"
  },
  "test_typed_buffer_uav": {
   "verdict": "passed"
@@ -1837,10 +1897,12 @@
   "verdict": "passed"
  },
  "test_uav_robustness_oob_structure_element_dxbc": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Driver checks robustness based on byte offset.'"
  },
  "test_uav_robustness_oob_structure_element_dxil": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Driver checks robustness based on byte offset.'"
  },
  "test_unaligned_vertex_stride": {
   "verdict": "passed"
@@ -1990,10 +2052,12 @@
   "verdict": "passed"
  },
  "test_view_instancing": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'View instancing not supported by device.'"
  },
  "test_view_instancing_indirect_state": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'View instancing not supported by device.'"
  },
  "test_view_min_lod": {
   "verdict": "failed",
@@ -2005,31 +2069,39 @@
   "verdict": "passed"
  },
  "test_vkd3d_dxvk_cmdbuf_interop": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'ID3D12DXVKInteropDevice1 not implemented.'"
  },
  "test_vkd3d_out_of_band_interop": {
   "verdict": "passed"
  },
  "test_vrs": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading not supported.'"
  },
  "test_vrs_clip_distance": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading TIER_1 not supported.'"
  },
  "test_vrs_depth_write_dxbc": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading TIER_1 not supported.'"
  },
  "test_vrs_depth_write_dxil": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading TIER_1 not supported.'"
  },
  "test_vrs_dxil": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading TIER_2 not supported.'"
  },
  "test_vrs_image": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading TIER_2 not supported.'"
  },
  "test_vrs_sample_mask": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'VariableRateShading TIER_1 not supported.'"
  },
  "test_vs_instance_input_nonuniform_workarounds": {
   "verdict": "passed"
@@ -2122,34 +2194,44 @@
   "failures": 252
  },
  "test_workgraph_basic": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_basic_recursion": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_broadcast_input": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_coalesced_input": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_cross_group_sharing": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_local_root_signature": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_shared_inputs": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_thread_input": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_two_level_broadcast": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_workgraph_two_level_empty": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Workgraphs not supported.'"
  },
  "test_write_buffer_immediate": {
   "verdict": "failed",

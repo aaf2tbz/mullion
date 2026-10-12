@@ -211,7 +211,8 @@
   "verdict": "passed"
  },
  "test_depth_stencil_sampling": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Some AMD drivers have a bug affecting the test.'"
  },
  "test_depthstencil_view_interfaces": {
   "verdict": "passed"
@@ -259,7 +260,8 @@
   "verdict": "passed"
  },
  "test_filter_minmax": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Min/max reduction filtering is not supported.'"
  },
  "test_fl10_stream_output_desc": {
   "verdict": "failed",
@@ -313,7 +315,8 @@
   "failures": 15
  },
  "test_h264_decoder": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'Failed to get ID3D11VideoDevice.'"
  },
  "test_high_resource_count": {
   "verdict": "passed"
@@ -394,7 +397,8 @@
   "verdict": "passed"
  },
  "test_nv12": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "missing: a capability that is not reported, so the test skips: 'NV12 textures are not supported.'"
  },
  "test_occlusion_query": {
   "verdict": "failed",
@@ -602,7 +606,8 @@
   "verdict": "passed"
  },
  "test_unaligned_raw_buffer_access": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Feature level 11_0 required for unaligned UAV test.'"
  },
  "test_unbind_shader_resource_view": {
   "verdict": "passed"

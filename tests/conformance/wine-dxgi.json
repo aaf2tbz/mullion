@@ -61,7 +61,8 @@
   "failures": 2
  },
  "test_get_containing_output": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'This test requires two outputs.'"
  },
  "test_inexact_modes": {
   "verdict": "failed",
@@ -73,10 +74,12 @@
   "verdict": "passed"
  },
  "test_mode_change": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Following tests require two monitors.'"
  },
  "test_multi_adapter": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'WARP adapter missing, skipping tests.'"
  },
  "test_object_wrapping": {
   "verdict": "passed"

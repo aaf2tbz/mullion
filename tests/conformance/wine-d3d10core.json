@@ -144,7 +144,8 @@
   "failures": 3
  },
  "test_depth_stencil_sampling": {
-  "verdict": "partly"
+  "verdict": "partly",
+  "why": "test: skips part of itself for a reason of its own or of this machine: 'Some AMD drivers have a bug affecting the test.'"
  },
  "test_depthstencil_view_interfaces": {
   "verdict": "passed"
