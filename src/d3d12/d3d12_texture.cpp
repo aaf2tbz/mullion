@@ -24,12 +24,21 @@
 namespace dxmt {
 
 HRESULT
-PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc) {
+PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc, UINT Plane) {
   MTL_DXGI_FORMAT_DESC Format;
   HRESULT hr = MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, Format);
   if (FAILED(hr))
     return hr;
 
+  if (Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    if (Desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !Desc.Width || !Desc.Height || !Desc.DepthOrArraySize ||
+        ((Desc.Width | Desc.Height) & 1) || Desc.MipLevels != 1 || Desc.SampleDesc.Count != 1 ||
+        Desc.SampleDesc.Quality || Desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
+        (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+      return E_INVALIDARG;
+    if (Plane != ~0u && FAILED(MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, Format, Plane)))
+      return E_INVALIDARG;
+  }
   InfoOut.pixel_format = Format.PixelFormat;
 
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
@@ -105,6 +114,8 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
   }
   }
 
+  InfoOut.width /= Format.SubsampleWidth;
+  InfoOut.height /= Format.SubsampleHeight;
   InfoOut.mipmap_level_count = 32 - __builtin_clz(InfoOut.width | InfoOut.height | InfoOut.depth);
   if (Desc.MipLevels)
     InfoOut.mipmap_level_count = std::min<uint32_t>(InfoOut.mipmap_level_count, Desc.MipLevels);
@@ -156,9 +167,19 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
       info_one_slice.mipmap_level_count = 1;
       info_one_slice.array_length = 1;
       auto size_and_align = Device->GetMTLDevice().heapTextureSizeAndAlign(info_one_slice);
+      uint64_t size = size_and_align.size;
+      if (Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+        MTL_DXGI_FORMAT_DESC chroma;
+        MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, chroma, 1);
+        info_one_slice.width /= chroma.SubsampleWidth;
+        info_one_slice.height /= chroma.SubsampleHeight;
+        info_one_slice.pixel_format = chroma.PixelFormat;
+        auto chroma_size = Device->GetMTLDevice().heapTextureSizeAndAlign(info_one_slice);
+        size = align(size, chroma_size.align) + chroma_size.size;
+      }
       // Applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
       // total of the larger alignment restriction or less.
-      if (size_and_align.size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+      if (size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
         return E_INVALIDARG;
     }
   }
@@ -214,7 +235,7 @@ public:
     }
 
     WMTTextureInfo texture_info{};
-    HRESULT hr = PopulateWMTTextureInfo(device_, texture_info, desc_);
+    HRESULT hr = PopulateWMTTextureInfo(device_, texture_info, desc_, ~0u);
     if (FAILED(hr))
       return hr;
 
@@ -242,31 +263,50 @@ public:
                                                    : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     }
 
-    if (pHeap) {
-      auto size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
-      if (size_and_align.size + HeapOffset > pHeap->GetDesc().SizeInBytes)
+    MTL_DXGI_FORMAT_DESC format;
+    MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, format);
+    UINT planes = format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR ? format.PlanarCount : 1;
+    uint64_t offset = HeapOffset;
+    for (UINT plane = 0; plane < planes; plane++) {
+      if (plane && FAILED(PopulateWMTTextureInfo(device_, texture_info, desc_, plane)))
         return E_INVALIDARG;
-    }
-
-    Flags<TextureAllocationFlag> flags = {};
-    if (Reserved) {
-      texture_info.placement_sparse_page_size = device_->GetSparsePageSize();
-      flags.set(TextureAllocationFlag::CpuInvisible);
-    }
-    texture = new Texture(texture_info, device_->GetMTLDevice());
-    if (pHeap) {
-      texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
-    } else {
-      texture->rename(texture->allocate(flags));
-      device_->RegisterResidency(texture->current()->texture());
+      Flags<TextureAllocationFlag> flags = {};
+      if (Reserved) {
+        if (planes > 1)
+          return E_INVALIDARG;
+        texture_info.placement_sparse_page_size = device_->GetSparsePageSize();
+        flags.set(TextureAllocationFlag::CpuInvisible);
+      }
+      WMTSizeAndAlign size_and_align{};
+      if (pHeap) {
+        size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+        if (planes > 1 && !plane && offset % std::max<uint64_t>(desc_.Alignment, size_and_align.align))
+          return E_INVALIDARG;
+        if (plane)
+          offset = align(offset, size_and_align.align);
+        if (offset > pHeap->GetDesc().SizeInBytes || size_and_align.size > pHeap->GetDesc().SizeInBytes - offset)
+          return E_INVALIDARG;
+      }
+      Rc<Texture> storage = new Texture(texture_info, device_->GetMTLDevice());
+      storage->rename(pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
+      if (!storage->current()->texture())
+        return E_OUTOFMEMORY;
+      if (!pHeap)
+        device_->RegisterResidency(storage->current()->texture());
+      if (plane)
+        texture->chroma = std::move(storage);
+      else
+        texture = std::move(storage);
+      offset += size_and_align.size;
     }
 
     return S_OK;
   };
 
   ~MTLD3D12Texture() {
-    if (texture && texture->current() && !texture->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
-      device_->UnregisterResidency(texture->current()->texture());
+    for (auto storage = texture.ptr(); storage; storage = storage->chroma.ptr())
+      if (storage->current() && !storage->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
+        device_->UnregisterResidency(storage->current()->texture());
   }
 
   HRESULT
@@ -298,6 +338,10 @@ public:
     UINT subresource_count = desc_.MipLevels;
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       subresource_count *= desc_.DepthOrArraySize;
+    MTL_DXGI_FORMAT_DESC format;
+    MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, format);
+    if (format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)
+      subresource_count *= format.PlanarCount;
     if (Subresource >= subresource_count)
       return E_INVALIDARG;
     if (ppData || (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc_.MipLevels > 1))
@@ -328,9 +372,16 @@ public:
       return E_INVALIDARG;
     uint32_t Level = 0, Slice = 0, Plane = 0;
     DecomposeSubresource(desc_, DstSubresource, &Level, &Slice, &Plane);
-    if (Plane)
+    MTL_DXGI_FORMAT_DESC Format;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
       return E_INVALIDARG;
+    if (Plane >= Format.PlanarCount || (Plane && !(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
+        !IsCpuVisibleHeap(&heap_props_))
+      return E_INVALIDARG;
+    auto storage = texture->plane(Plane);
     D3D12_BOX full_box = GetResourceExtent(desc_, Level);
+    full_box.right = std::max(1u, storage->width() >> Level);
+    full_box.bottom = std::max(1u, storage->height() >> Level);
     D3D12_BOX box = pDstBox ? *pDstBox : full_box;
 
     if (!IsD3D12BoxInBounds(box, full_box))
@@ -339,16 +390,12 @@ public:
     if (box.left == box.right || box.top == box.bottom || box.front == box.back)
       return S_OK;
 
-    MTL_DXGI_FORMAT_DESC Format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
-      return E_INVALIDARG;
-
     if (Format.Flag & MTL_DXGI_FORMAT_BC) {
       if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
         return E_INVALIDARG;
     }
 
-    texture->current()->texture().replaceRegion(
+    storage->current()->texture().replaceRegion(
         {box.left, box.top, box.front}, {box.right - box.left, box.bottom - box.top, box.back - box.front}, Level,
         Slice, pSrcData, SrcRowPitch, SrcSlicePitch
     );
@@ -365,9 +412,16 @@ public:
       return E_INVALIDARG;
     uint32_t Level = 0, Slice = 0, Plane = 0;
     DecomposeSubresource(desc_, SrcSubresource, &Level, &Slice, &Plane);
-    if (Plane)
+    MTL_DXGI_FORMAT_DESC Format;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
       return E_INVALIDARG;
+    if (Plane >= Format.PlanarCount || (Plane && !(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
+        !IsCpuVisibleHeap(&heap_props_))
+      return E_INVALIDARG;
+    auto storage = texture->plane(Plane);
     D3D12_BOX full_box = GetResourceExtent(desc_, Level);
+    full_box.right = std::max(1u, storage->width() >> Level);
+    full_box.bottom = std::max(1u, storage->height() >> Level);
     D3D12_BOX box = pSrcBox ? *pSrcBox : full_box;
 
     if (!IsD3D12BoxInBounds(box, full_box))
@@ -376,16 +430,12 @@ public:
     if (box.left == box.right || box.top == box.bottom || box.front == box.back)
       return S_OK;
 
-    MTL_DXGI_FORMAT_DESC Format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
-      return E_INVALIDARG;
-
     if (Format.Flag & MTL_DXGI_FORMAT_BC) {
       if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
         return E_INVALIDARG;
     }
 
-    texture->current()->texture().getBytes(
+    storage->current()->texture().getBytes(
         {box.left, box.top, box.front}, {box.right - box.left, box.bottom - box.top, box.back - box.front}, Level,
         Slice, pDstData, DstRowPitch, DstSlicePitch
     );
@@ -418,6 +468,15 @@ public:
     }
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
+    UINT plane = ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ? ViewDesc.Texture2D.PlaneSlice
+                 : ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+                     ? ViewDesc.Texture2DArray.PlaneSlice : 0;
+    auto texture = this->texture->plane(plane);
+    if (this->texture->chroma) {
+      if (plane >= 2 || (plane ? ViewDesc.Format != DXGI_FORMAT_R8G8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8G8_UINT
+                              : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
+        return E_INVALIDARG;
+    }
     TextureViewKey View = texture->fullView;
 
     TextureViewDescriptor view_descriptor;
@@ -566,7 +625,7 @@ public:
     ResourceMinLODClamp -= view_descriptor.firstMiplevel;
 
     return Heap->AddShaderResourceView(
-        Index, texture.ptr(), View, ResourceMinLODClamp, BorderColorRange(metal_format),
+        Index, texture, View, ResourceMinLODClamp, BorderColorRange(metal_format),
         ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS ||
             ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
     );
@@ -589,6 +648,15 @@ public:
     }
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
+    UINT plane = ViewDesc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D ? ViewDesc.Texture2D.PlaneSlice
+                 : ViewDesc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+                     ? ViewDesc.Texture2DArray.PlaneSlice : 0;
+    auto texture = this->texture->plane(plane);
+    if (this->texture->chroma) {
+      if (plane >= 2 || (plane ? ViewDesc.Format != DXGI_FORMAT_R8G8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8G8_UINT
+                              : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
+        return E_INVALIDARG;
+    }
     TextureViewKey View = texture->fullView;
     UINT FirstWSlice = 0, WSize = 0; // the W range of a 3D view
 
@@ -659,7 +727,7 @@ public:
       return E_INVALIDARG;
     }
 
-    return Heap->AddUnorderedAccessView(Index, texture.ptr(), View, FirstWSlice, WSize);
+    return Heap->AddUnorderedAccessView(Index, texture, View, FirstWSlice, WSize);
   };
 
   virtual HRESULT STDMETHODCALLTYPE
@@ -677,6 +745,15 @@ public:
     }
 
     auto [Heap, Index] = GetRenderTargetHeap(device_, Descriptor);
+    UINT plane = ViewDesc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D ? ViewDesc.Texture2D.PlaneSlice
+                 : ViewDesc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+                     ? ViewDesc.Texture2DArray.PlaneSlice : 0;
+    auto texture = this->texture->plane(plane);
+    if (this->texture->chroma) {
+      if (plane >= 2 || (plane ? ViewDesc.Format != DXGI_FORMAT_R8G8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8G8_UINT
+                              : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
+        return E_INVALIDARG;
+    }
     TextureViewKey View = texture->fullView;
 
     TextureViewDescriptor view_descriptor;
@@ -714,8 +791,7 @@ public:
       break;
     }
     case D3D12_RTV_DIMENSION_TEXTURE2D: {
-      // only video formats have a second plane to render to, and no texture here is of one
-      if (ViewDesc.Texture2D.PlaneSlice)
+      if (ViewDesc.Texture2D.PlaneSlice && !this->texture->chroma)
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MipSlice;
@@ -726,7 +802,7 @@ public:
       break;
     }
     case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: {
-      if (ViewDesc.Texture2DArray.PlaneSlice)
+      if (ViewDesc.Texture2DArray.PlaneSlice && !this->texture->chroma)
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureType2DArray;
       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MipSlice;
@@ -774,7 +850,7 @@ public:
       return E_INVALIDARG;
     }
 
-    RenderTargetDesc.Texture = texture.ptr();
+    RenderTargetDesc.Texture = texture;
     RenderTargetDesc.View = View;
     RenderTargetDesc.Width = std::max<uint32_t>(1u, texture->width() >> view_descriptor.firstMiplevel);
     RenderTargetDesc.Height = std::max<uint32_t>(1u, texture->height() >> view_descriptor.firstMiplevel);
@@ -784,6 +860,8 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   CreateDepthStencilView(const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
+    if (texture->chroma)
+      return E_INVALIDARG;
     HRESULT hr;
     D3D12_DEPTH_STENCIL_VIEW_DESC ViewDesc;
     if (!pDesc) {

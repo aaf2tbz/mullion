@@ -275,6 +275,12 @@ public:
   }
 
   TextureViewKey fullView;
+  Rc<Texture> chroma;
+
+  Texture *
+  plane(unsigned index) {
+    return index && chroma ? chroma.ptr() : this;
+  }
   // the most detailed level a shader samples (ID3D11DeviceContext::SetResourceMinLOD), as of the commands encoded
   float minLOD = 0;
 

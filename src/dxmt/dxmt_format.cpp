@@ -507,12 +507,14 @@ uint32_t DXGIFormatType(uint32_t format) {
 }
 
 int32_t
-MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description) {
+MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description, uint32_t plane) {
   description.PixelFormat = WMTPixelFormatInvalid;
   description.AttributeFormat = WMTAttributeFormatInvalid;
   description.BytesPerTexel = 0;
   description.PlanarCount = 1;
   description.Flag = 0;
+  description.PlaneFormat = format;
+  description.SubsampleWidth = description.SubsampleHeight = 1;
 
   switch (format) {
   case DXGI_FORMAT_R32G32B32A32_TYPELESS: {
@@ -1132,8 +1134,22 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   case DXGI_FORMAT_A8P8:
   case DXGI_FORMAT_UNKNOWN:
     return E_FAIL;
+  case DXGI_FORMAT_NV12: {
+    // DirectX-Headers, GetPlaneCount and GetPlaneSubsampledSizeAndFormatForCopyableLayout
+    if (plane != ~0u && plane >= 2)
+      return E_INVALIDARG;
+    description.PlanarCount = plane == ~0u ? 2 : 1;
+    description.Flag = plane == ~0u ? MTL_DXGI_FORMAT_VIDEO_PLANAR : 0;
+    description.PlaneFormat = plane == 1 ? DXGI_FORMAT_R8G8_TYPELESS : DXGI_FORMAT_R8_TYPELESS;
+    description.PixelFormat = plane == 1 ? WMTPixelFormatRG8Unorm : WMTPixelFormatR8Unorm;
+    description.BytesPerTexel = MTLGetTexelSize(description.PixelFormat);
+    if (plane == 1) {
+      description.SubsampleWidth = 2;
+      description.SubsampleHeight = 2;
+    }
+    break;
+  }
   // layout metadata exists even without Metal storage (DirectX-Headers, GetPlaneCount)
-  case DXGI_FORMAT_NV12:
   case DXGI_FORMAT_P010:
   case DXGI_FORMAT_P016:
   case DXGI_FORMAT_NV11:
@@ -1587,6 +1603,25 @@ MTLQueryDXGIFormatSupport(
     Support2 = D3D11_FORMAT_SUPPORT2_SHAREABLE;
     if (any_bit_set(GetMTLPixelFormatCapability(metal_format.PixelFormat) & FormatCapability::Sparse))
       Support2 |= D3D11_FORMAT_SUPPORT2_TILED;
+    return S_OK;
+  }
+
+  if (metal_format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    auto capability = GetMTLPixelFormatCapability(metal_format.PixelFormat);
+    MTLQueryDXGIFormat(device, Format, metal_format, 1);
+    capability = capability & GetMTLPixelFormatCapability(metal_format.PixelFormat);
+    Support1 = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD |
+               D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+    if (any_bit_set(capability & FormatCapability::Filter))
+      Support1 |= D3D11_FORMAT_SUPPORT_SHADER_SAMPLE;
+    if (any_bit_set(capability & FormatCapability::Color))
+      Support1 |= D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+    if (any_bit_set(capability & FormatCapability::Blend))
+      Support1 |= D3D11_FORMAT_SUPPORT_BLENDABLE;
+    if (any_bit_set(capability & FormatCapability::Write)) {
+      Support1 |= D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+      Support2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    }
     return S_OK;
   }
 

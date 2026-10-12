@@ -267,7 +267,6 @@ InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D11_UAV_DIMENSION_TEXTURE2D: {
-    D3D11_ASSERT(ViewDesc.Texture2D.PlaneSlice == 0);
     if (TextureType == WMTTextureType2D || TextureType == WMTTextureType2DArray ||
         TextureType == WMTTextureTypeCube) {
       Descriptor.type = WMTTextureType2D;
@@ -377,7 +376,6 @@ HRESULT InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D11_RTV_DIMENSION_TEXTURE2D: {
-    D3D11_ASSERT(ViewDesc.Texture2D.PlaneSlice == 0);
     if (texture_type == WMTTextureType2D || texture_type == WMTTextureType2DArray ||
         texture_type == WMTTextureTypeCube || texture_type == WMTTextureTypeCubeArray) {
       Descriptor.type = WMTTextureType2D;

@@ -54,6 +54,7 @@ enum MTL_DXGI_FORMAT_FLAG {
   MTL_DXGI_FORMAT_STENCIL_PLANER = 32,
   MTL_DXGI_FORMAT_EMULATED_D24 = 256,
   MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL = 512,
+  MTL_DXGI_FORMAT_VIDEO_PLANAR = 1024,
 };
 
 struct MTL_DXGI_FORMAT_DESC {
@@ -65,9 +66,14 @@ struct MTL_DXGI_FORMAT_DESC {
   };
   uint16_t PlanarCount;
   uint16_t Flag;
+  uint32_t PlaneFormat = 0;
+  uint16_t SubsampleWidth = 1;
+  uint16_t SubsampleHeight = 1;
 };
 
-int32_t MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description);
+int32_t MTLQueryDXGIFormat(
+    WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description, uint32_t plane = ~0u
+);
 
 int32_t MTLQueryDXGIFormatSupport(
     WMT::Device device, uint32_t format, const std::function<FormatCapability(WMTPixelFormat)> &GetMTLPixelFormatCapability,

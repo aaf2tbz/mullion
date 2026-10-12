@@ -49,7 +49,7 @@ private:
                const tag_shader_resource_view<>::DESC1 *pDesc,
                DeviceTexture *pResource, MTLD3D11Device *pDevice)
         : SRVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pResource->viewTexture(pDesc->Format);
       this->view_id_ = this->texture_->createView(descriptor);
       this->subset_ = ResourceSubsetState(
         &descriptor,
@@ -68,7 +68,7 @@ private:
                const tag_unordered_access_view<>::DESC1 *pDesc,
                DeviceTexture *pResource, MTLD3D11Device *pDevice)
         : UAVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pResource->viewTexture(pDesc->Format);
       this->view_id_ = this->texture_->createView(descriptor);
       if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>)
         this->w_range_ =
@@ -91,7 +91,7 @@ private:
         DeviceTexture *pResource, MTLD3D11Device *pDevice, const MTL_RENDER_PASS_ATTACHMENT_DESC &mtl_rtv_desc
     ) :
         RTVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pResource->viewTexture(pDesc->Format);
       this->view_id_ = this->texture_->createView(descriptor);
       this->format_ = view_format;
       this->pass_desc_ = mtl_rtv_desc;
@@ -126,6 +126,22 @@ private:
       );
     }
   };
+
+  Texture *
+  viewTexture(DXGI_FORMAT format) {
+    if (!this->texture_->chroma)
+      return this->texture_.ptr();
+    switch (format) {
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8_UINT:
+      return this->texture_.ptr();
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_UINT:
+      return this->texture_->chroma.ptr();
+    default:
+      return nullptr;
+    }
+  }
 
 public:
   DeviceTexture(const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, MTLD3D11Device *pDevice) :
@@ -178,6 +194,9 @@ public:
           finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY)
         return E_INVALIDARG;
     }
+    auto texture = viewTexture(finalDesc.Format);
+    if (!texture)
+      return E_INVALIDARG;
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -187,7 +206,7 @@ public:
     }
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
     auto hr = InitializeAndNormalizeViewDescriptor(
-        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, attachment_desc, descriptor
+        this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc, attachment_desc, descriptor
     );
     if (FAILED(hr)) {
       return hr;
@@ -201,6 +220,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDepthStencilView(const D3D11_DEPTH_STENCIL_VIEW_DESC *pDesc,
                                  ID3D11DepthStencilView **ppView) override {
+    if (this->texture_->chroma)
+      return E_INVALIDARG;
     D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc;
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
@@ -251,6 +272,9 @@ public:
           finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY)
         return E_INVALIDARG;
     }
+    auto texture = viewTexture(finalDesc.Format);
+    if (!texture)
+      return E_INVALIDARG;
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -259,7 +283,7 @@ public:
       arraySize = this->desc.ArraySize;
     }
     auto hr = InitializeAndNormalizeViewDescriptor(
-        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+        this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc, descriptor
     );
     if (FAILED(hr)) {
       ERR("DeviceTexture: Failed to create texture SRV");
@@ -281,6 +305,9 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    auto texture = viewTexture(finalDesc.Format);
+    if (!texture)
+      return E_INVALIDARG;
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -289,7 +316,7 @@ public:
       arraySize = this->desc.ArraySize;
     }
     auto hr = InitializeAndNormalizeViewDescriptor(
-        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+        this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc, descriptor
     );
     if (FAILED(hr)) {
       ERR("DeviceTexture: Failed to create texture UAV");
@@ -389,10 +416,39 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   MTL_DXGI_FORMAT_DESC format_desc;
   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format_desc);
 
+  if (format_desc.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    MTL_DXGI_FORMAT_DESC plane;
+    MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, plane, 1);
+    auto chroma_info = info;
+    chroma_info.pixel_format = plane.PixelFormat;
+    chroma_info.width /= plane.SubsampleWidth;
+    chroma_info.height /= plane.SubsampleHeight;
+    texture->chroma = new Texture(chroma_info, pDevice->GetMTLDevice());
+  }
+
   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
 
-  auto initialize = [&](Rc<TextureAllocation> &&allocation) {
+  auto initialize = [&](Rc<TextureAllocation> &&allocation) -> HRESULT {
+    if (!allocation->texture())
+      return E_OUTOFMEMORY;
     texture->rename(std::move(allocation));
+    if (texture->chroma) {
+      auto chroma = texture->chroma;
+      chroma->rename(chroma->allocate(texture->current()->flags()));
+      if (!chroma->current()->texture())
+        return E_OUTOFMEMORY;
+      for (auto sub : EnumerateSubresources(finalDesc)) {
+        if (!pInitialData) {
+          initializer.initWithZero(chroma.ptr(), chroma->current(), sub.ArraySlice, sub.MipLevel);
+        } else {
+          auto &data = pInitialData[sub.SubresourceId];
+          initializer.initWithData(
+              chroma.ptr(), chroma->current(), sub.ArraySlice, sub.MipLevel,
+              ptr_add(data.pSysMem, std::uintptr_t(data.SysMemPitch) * texture->height()), data.SysMemPitch, 0, 0
+          );
+        }
+      }
+    }
     if (!pInitialData) {
       for (auto sub : EnumerateSubresources(finalDesc)) {
         initializer.initWithZero(texture.ptr(), texture->current(), sub.ArraySlice, sub.MipLevel);
@@ -406,6 +462,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
         );
       }
     }
+    return S_OK;
   };
 
   auto shared_flag =
@@ -431,12 +488,19 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       ERR("DeviceTexture: Failed to get mach port for shared texture");
       return E_FAIL;
     }
+    HRESULT hr = initialize(std::move(allocation));
+    if (FAILED(hr))
+      return hr;
     SharedResourceData runtimeData;
     MakeUniqueSharedName(runtimeData.mach_port_name);
     if (!WMTBootstrapRegister(runtimeData.mach_port_name, mach_port)) {
       ERR("DeviceTexture: Failed to register mach port for shared texture");
       return E_FAIL;
     }
+    if (texture->chroma &&
+        !WMTBootstrapRegister((std::string(runtimeData.mach_port_name) + ".uv").c_str(),
+                              texture->chroma->current()->machPort))
+      return E_FAIL;
     runtimeData.dimension = tag::dimension;
     memcpy(&runtimeData.desc, pDesc, sizeof(typename tag::DESC1));
 
@@ -468,7 +532,6 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       return E_FAIL;
     }
 
-    initialize(std::move(allocation));
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
                                    create.hGlobalShare, std::move(keyed_mutex), pDevice))
@@ -484,11 +547,15 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     flags.set(TextureAllocationFlag::GpuReadonly);
   if (single_subresource && (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
     Rc<RenamableTexturePool> renamable = new RenamableTexturePool(texture.ptr(), 32, flags);
-    initialize(renamable->getNext(0));
+    HRESULT hr = initialize(renamable->getNext(0));
+    if (FAILED(hr))
+      return hr;
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(renamable), pDevice)));
   } else {
-    initialize(texture->allocate(flags));
+    HRESULT hr = initialize(texture->allocate(flags));
+    if (FAILED(hr))
+      return hr;
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
   }
@@ -526,7 +593,8 @@ template <typename tag>
 HRESULT
 ImportSharedTextureInternal(
     MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, mach_port_t MachPort, 
-    D3DKMT_HANDLE &hResource, D3DKMT_HANDLE hGlobalShare, D3DKMT_HANDLE hSharedKeyedMutex, REFIID riid, void **ppTexture
+    D3DKMT_HANDLE &hResource, D3DKMT_HANDLE hGlobalShare, D3DKMT_HANDLE hSharedKeyedMutex, REFIID riid,
+    void **ppTexture, const char *Name = nullptr
 ) {
   WMTTextureInfo info{};
   typename tag::DESC1 finalDesc;
@@ -538,6 +606,22 @@ ImportSharedTextureInternal(
   if (!allocation)
     return E_FAIL;
   texture->rename(std::move(allocation));
+  MTL_DXGI_FORMAT_DESC format;
+  MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format);
+  if (format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    mach_port_t chroma_port;
+    if (!Name || !WMTBootstrapLookUp((std::string(Name) + ".uv").c_str(), &chroma_port))
+      return E_FAIL;
+    MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format, 1);
+    info.pixel_format = format.PixelFormat;
+    info.width /= format.SubsampleWidth;
+    info.height /= format.SubsampleHeight;
+    texture->chroma = new Texture(info, pDevice->GetMTLDevice());
+    auto chroma = texture->chroma->import(chroma_port);
+    if (!chroma)
+      return E_FAIL;
+    texture->chroma->rename(std::move(chroma));
+  }
 
   Rc<KeyedMutex> keyed_mutex;
   if (hSharedKeyedMutex & 0xc0000000)
@@ -607,7 +691,7 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     hr = ImportSharedTextureInternal<tag_texture_2d>(
         pDevice, &runtimeData.desc.desc2d, mach_port, open.hResource, open.hGlobalShare, runtimeData.mutex_handle, riid,
-        ppTexture
+        ppTexture, runtimeData.mach_port_name
     );
     break;
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
@@ -701,7 +785,8 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
     break;
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     hr = ImportSharedTextureInternal<tag_texture_2d>(
-        pDevice, &runtimeData.desc.desc2d, mach_port, open.hResource, 0, runtimeData.mutex_handle, riid, ppTexture
+        pDevice, &runtimeData.desc.desc2d, mach_port, open.hResource, 0, runtimeData.mutex_handle, riid, ppTexture,
+        runtimeData.mach_port_name
     );
     break;
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:

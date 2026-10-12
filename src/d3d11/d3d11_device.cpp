@@ -522,6 +522,14 @@ public:
     if (pDesc) {
       D3D11_SHADER_RESOURCE_VIEW_DESC1 desc1;
       UpgradeViewDescription(pDesc, desc1);
+      auto texture = pResource ? GetTexture(pResource) : nullptr;
+      if (texture && texture->chroma) {
+        UINT plane = pDesc->Format == DXGI_FORMAT_R8G8_UNORM || pDesc->Format == DXGI_FORMAT_R8G8_UINT;
+        if (pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D)
+          desc1.Texture2D.PlaneSlice = plane;
+        else if (pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY)
+          desc1.Texture2DArray.PlaneSlice = plane;
+      }
       return CreateShaderResourceView1(pResource, &desc1,
                                        (ID3D11ShaderResourceView1 **)ppSRView);
     }
@@ -535,6 +543,14 @@ public:
     if (pDesc) {
       D3D11_UNORDERED_ACCESS_VIEW_DESC1 desc1;
       UpgradeViewDescription(pDesc, desc1);
+      auto texture = pResource ? GetTexture(pResource) : nullptr;
+      if (texture && texture->chroma) {
+        UINT plane = pDesc->Format == DXGI_FORMAT_R8G8_UNORM || pDesc->Format == DXGI_FORMAT_R8G8_UINT;
+        if (pDesc->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D)
+          desc1.Texture2D.PlaneSlice = plane;
+        else if (pDesc->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY)
+          desc1.Texture2DArray.PlaneSlice = plane;
+      }
       return CreateUnorderedAccessView1(
           pResource, &desc1, (ID3D11UnorderedAccessView1 **)ppUAView);
     }
@@ -548,6 +564,14 @@ public:
     if (pDesc) {
       D3D11_RENDER_TARGET_VIEW_DESC1 desc1;
       UpgradeViewDescription(pDesc, desc1);
+      auto texture = pResource ? GetTexture(pResource) : nullptr;
+      if (texture && texture->chroma) {
+        UINT plane = pDesc->Format == DXGI_FORMAT_R8G8_UNORM || pDesc->Format == DXGI_FORMAT_R8G8_UINT;
+        if (pDesc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D)
+          desc1.Texture2D.PlaneSlice = plane;
+        else if (pDesc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY)
+          desc1.Texture2DArray.PlaneSlice = plane;
+      }
       return CreateRenderTargetView1(pResource, &desc1,
                                      (ID3D11RenderTargetView1 **)ppRTView);
     }
@@ -896,10 +920,13 @@ public:
       if (FeatureSupportDataSize != sizeof(*info))
         return E_INVALIDARG;
       uint32_t support1;
-      return MTLQueryDXGIFormatSupport(
+      auto hr = MTLQueryDXGIFormatSupport(
           GetMTLDevice(), info->InFormat, [this](WMTPixelFormat f) { return GetMTLPixelFormatCapability(f); }, support1,
           *reinterpret_cast<uint32_t *>(&info->OutFormatSupport2)
       );
+      if (SUCCEEDED(hr) && info->InFormat == DXGI_FORMAT_NV12)
+        info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_SHAREABLE;
+      return hr;
     }
     default:
       // For everything else, we can use the device feature struct
@@ -1099,7 +1126,8 @@ public:
     // a positive answer says the format and count can be created (ID3D11Device::CheckMultisampleQualityLevels),
     // which is what CheckFormatSupport says of the format and Metal of the count; Metal has one quality. no tiled
     // resource is multisampled
-    bool multisample = any_bit_set(GetMTLPixelFormatCapability(desc.PixelFormat) & FormatCapability::MSAA);
+    bool multisample = !(desc.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) &&
+                       any_bit_set(GetMTLPixelFormatCapability(desc.PixelFormat) & FormatCapability::MSAA);
     if (SUCCEEDED(hr) && !Flags && (SampleCount == 1 || multisample) &&
         GetMTLDevice().supportsTextureSampleCount(SampleCount))
       *pNumQualityLevels = 1;
@@ -1193,8 +1221,14 @@ public:
     if (!pResource)
       return E_INVALIDARG;
 
-    if (!ppSRView)
-      return S_FALSE;
+    auto texture = GetTexture(pResource);
+    if (texture && texture->chroma && pDesc) {
+      UINT plane = pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D ? pDesc->Texture2D.PlaneSlice
+                   : pDesc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? pDesc->Texture2DArray.PlaneSlice
+                                                                             : ~0u;
+      if (plane != UINT(pDesc->Format == DXGI_FORMAT_R8G8_UNORM || pDesc->Format == DXGI_FORMAT_R8G8_UINT))
+        return E_INVALIDARG;
+    }
 
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateShaderResourceView(pDesc, ppSRView);
   }
@@ -1208,8 +1242,14 @@ public:
         (GetResourceCommon(pResource)->dxgi_usage_ & DXGI_USAGE_READ_ONLY))
       return E_INVALIDARG;
 
-    if (!ppUAView)
-      return S_FALSE;
+    auto texture = GetTexture(pResource);
+    if (texture && texture->chroma && pDesc) {
+      UINT plane = pDesc->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D ? pDesc->Texture2D.PlaneSlice
+                   : pDesc->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY ? pDesc->Texture2DArray.PlaneSlice
+                                                                             : ~0u;
+      if (plane != UINT(pDesc->Format == DXGI_FORMAT_R8G8_UNORM || pDesc->Format == DXGI_FORMAT_R8G8_UINT))
+        return E_INVALIDARG;
+    }
 
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateUnorderedAccessView(pDesc, ppUAView);
   }
@@ -1223,8 +1263,14 @@ public:
         (GetResourceCommon(pResource)->dxgi_usage_ & DXGI_USAGE_READ_ONLY))
       return E_INVALIDARG;
 
-    if (!ppRTView)
-      return S_FALSE;
+    auto texture = GetTexture(pResource);
+    if (texture && texture->chroma && pDesc) {
+      UINT plane = pDesc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D ? pDesc->Texture2D.PlaneSlice
+                   : pDesc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ? pDesc->Texture2DArray.PlaneSlice
+                                                                             : ~0u;
+      if (plane != UINT(pDesc->Format == DXGI_FORMAT_R8G8_UNORM || pDesc->Format == DXGI_FORMAT_R8G8_UINT))
+        return E_INVALIDARG;
+    }
 
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateRenderTargetView(pDesc, ppRTView);
   }

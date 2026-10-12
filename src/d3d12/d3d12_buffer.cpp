@@ -202,7 +202,8 @@ public:
     }
 
     MTL_DXGI_FORMAT_DESC Format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, Format))) {
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, Format)) ||
+        (Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) {
       ERR("D3D12Buffer::CreateShaderResourceView: not an ordinary or packed format: ", ViewDesc.Format);
       return E_FAIL;
     }
@@ -252,7 +253,8 @@ public:
     }
 
     MTL_DXGI_FORMAT_DESC Format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, Format))) {
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, Format)) ||
+        (Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) {
       ERR("D3D12Buffer::CreateUnorderedAccessView: not an ordinary or packed format: ", ViewDesc.Format);
       return E_FAIL;
     }

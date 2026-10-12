@@ -1384,6 +1384,11 @@ public:
     } else {
       DecomposeSubresource(src_desc, pSrc->SubresourceIndex, &src_level, &src_slice, &src_planar);
       full_src_box = GetResourceExtent(src_desc, src_level);
+      auto texture = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture.ptr();
+      if (texture && texture->chroma) {
+        full_src_box.right = texture->plane(src_planar)->width();
+        full_src_box.bottom = texture->plane(src_planar)->height();
+      }
     }
     src_box = pSrcBox ? *pSrcBox : full_src_box;
 
@@ -1392,14 +1397,19 @@ public:
       return;
 
     if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
-      auto &dst = static_cast<MTLD3D12Resource *>(pDst->pResource)->texture;
-      if (!dst)
-        return;
-
       DecomposeSubresource(dst_desc, pDst->SubresourceIndex, &dst_level, &dst_slice, &dst_planar);
+      auto resource = static_cast<MTLD3D12Resource *>(pDst->pResource);
+      if (!resource->texture)
+        return;
+      auto dst = resource->texture->plane(dst_planar);
+      auto dst_extent = GetResourceExtent(dst_desc, dst_level);
+      if (resource->texture->chroma) {
+        dst_extent.right = dst->width();
+        dst_extent.bottom = dst->height();
+      }
 
       MTL_DXGI_FORMAT_DESC dst_format;
-      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_desc.Format, dst_format))) {
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_desc.Format, dst_format, dst_planar))) {
         WARN("CopyTextureRegion: unsupported format ", dst_desc.Format);
         return;
       }
@@ -1430,12 +1440,11 @@ public:
         cmd_cp.bytes_per_row = pSrc->PlacedFootprint.Footprint.RowPitch;
         cmd_cp.bytes_per_image = src_depth_pitch;
         // D3D10.1 reinterpret copies carry one source unit into one destination unit (CopyResource, Remarks)
-        auto extent = GetResourceExtent(dst_desc, dst_level);
         cmd_cp.size = {
             std::min<uint64_t>(align(src_box.right - src_box.left, block_width) / block_width * dst_block_width,
-                               extent.right - DstX),
+                               dst_extent.right - DstX),
             std::min<uint64_t>(align(src_box.bottom - src_box.top, block_width) / block_width * dst_block_width,
-                               extent.bottom - DstY),
+                               dst_extent.bottom - DstY),
             src_box.back - src_box.front};
         cmd_cp.dst = dst->current()->texture();
         cmd_cp.level = dst_level;
@@ -1445,12 +1454,13 @@ public:
                              : WMTBlitOptionNone;
         cmd_cp.origin = {DstX, DstY, DstZ};
       } else {
-        auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
-        if (!src)
+        auto resource = static_cast<MTLD3D12Resource *>(pSrc->pResource);
+        if (!resource->texture)
           return;
+        auto src = resource->texture->plane(src_planar);
 
         MTL_DXGI_FORMAT_DESC src_format;
-        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_format))) {
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_format, src_planar))) {
           WARN("CopyTextureRegion: unsupported format ", src_desc.Format);
           return;
         }
@@ -1506,9 +1516,9 @@ public:
         }
 
         CopyTexels(
-            src.ptr(), src_format, src_level, src_slice, {src_box.left, src_box.top, src_box.front},
-            {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front}, dst.ptr(),
-            dst_format, dst_level, dst_slice, {DstX, DstY, DstZ}, GetResourceExtent(dst_desc, dst_level)
+            src, src_format, src_level, src_slice, {src_box.left, src_box.top, src_box.front},
+            {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front}, dst,
+            dst_format, dst_level, dst_slice, {DstX, DstY, DstZ}, dst_extent
         );
       }
     } else if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
@@ -1523,12 +1533,13 @@ public:
       }
 
       if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
-        auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
-        if (!src)
+        auto resource = static_cast<MTLD3D12Resource *>(pSrc->pResource);
+        if (!resource->texture)
           return;
+        auto src = resource->texture->plane(src_planar);
 
         MTL_DXGI_FORMAT_DESC src_format;
-        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_format))) {
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_format, src_planar))) {
           WARN("CopyTextureRegion: unsupported format ", src_desc.Format);
           return;
         }
@@ -1585,6 +1596,19 @@ public:
       cmd_cp.src_offset = 0;
       cmd_cp.dst = pDst->buffer->current()->buffer();
       cmd_cp.dst_offset = 0;
+      return;
+    }
+
+    if (pSrc->texture->chroma || pDst->texture->chroma) {
+      MTL_DXGI_FORMAT_DESC format;
+      MTLQueryDXGIFormat(device_->GetMTLDevice(), SrcDesc.Format, format);
+      UINT subresources = SrcDesc.MipLevels * SrcDesc.DepthOrArraySize * format.PlanarCount;
+      for (UINT sub = 0; sub < subresources; sub++) {
+        D3D12_TEXTURE_COPY_LOCATION src{
+            pSrcResource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = sub}},
+            dst{pDstResource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = sub}};
+        CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      }
       return;
     }
 

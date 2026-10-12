@@ -253,6 +253,7 @@ public:
 
 class TextureCopyCommand {
 public:
+  UINT Plane = 0;
   ID3D11Resource *pSrc;
   ID3D11Resource *pDst;
   uint32_t SrcSubresource;
@@ -420,6 +421,7 @@ public:
 
 class TextureUpdateCommand {
 public:
+  UINT Plane = 0;
   ID3D11Resource *pDst;
   UINT DstSubresource;
   Subresource Dst;
@@ -4169,6 +4171,28 @@ public:
                         (dst_type == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && src_type == DXGI_FORMAT_R32_TYPELESS));
     if (src_type != dst_type && !reinterpret)
       return;
+    if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+      if (!(cmd.DstFormat.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) ||
+          ((cmd.SrcOrigin.x | cmd.SrcOrigin.y | cmd.SrcSize.width | cmd.SrcSize.height |
+            cmd.DstOrigin.x | cmd.DstOrigin.y) & 1))
+        return;
+      auto chroma = cmd;
+      chroma.Plane = 1;
+      MTLQueryDXGIFormat(device->GetMTLDevice(), cmd.Src.Format, chroma.SrcFormat, chroma.Plane);
+      MTLQueryDXGIFormat(device->GetMTLDevice(), cmd.Dst.Format, chroma.DstFormat, chroma.Plane);
+      chroma.Src.Width /= chroma.SrcFormat.SubsampleWidth;
+      chroma.Src.Height /= chroma.SrcFormat.SubsampleHeight;
+      chroma.SrcOrigin.x /= chroma.SrcFormat.SubsampleWidth;
+      chroma.SrcOrigin.y /= chroma.SrcFormat.SubsampleHeight;
+      chroma.SrcSize.width /= chroma.SrcFormat.SubsampleWidth;
+      chroma.SrcSize.height /= chroma.SrcFormat.SubsampleHeight;
+      chroma.DstOrigin.x /= chroma.DstFormat.SubsampleWidth;
+      chroma.DstOrigin.y /= chroma.DstFormat.SubsampleHeight;
+      chroma.Dst.Width /= chroma.DstFormat.SubsampleWidth;
+      chroma.Dst.Height /= chroma.DstFormat.SubsampleHeight;
+      CopyTextureBitcast(std::move(cmd));
+      return CopyTextureBitcast(std::move(chroma));
+    }
     // a staging texture is rows of bytes, a block or a texel after another: a copy with one goes by those, which the
     // two formats' compression does not change
     bool staging = GetStagingResource(cmd.pDst, cmd.DstSubresource) || GetStagingResource(cmd.pSrc, cmd.SrcSubresource);
@@ -4192,9 +4216,9 @@ public:
                    units_high = align(cmd.SrcSize.height, src_unit) / src_unit;
     // where a unit is in a staging texture's bytes
     auto unit_offset = [](const Rc<StagingResource> &staging, const MTL_DXGI_FORMAT_DESC &format, uint32_t unit,
-                          WMTOrigin origin) {
-      return origin.z * staging->bytesPerImage + origin.y / unit * staging->bytesPerRow +
-             origin.x / unit * format.BytesPerTexel;
+                          WMTOrigin origin, UINT plane, UINT height) {
+      return plane * height * format.SubsampleHeight * staging->bytesPerRow + origin.z * staging->bytesPerImage +
+             origin.y / unit * staging->bytesPerRow + origin.x / unit * format.BytesPerTexel;
     };
     if (auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource)) {
       if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
@@ -4207,9 +4231,9 @@ public:
           auto [dst, dst_sub_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
           for (unsigned offset_z = 0; offset_z < cmd.SrcSize.depth; offset_z++) {
             for (unsigned row = 0; row < units_high; row++) {
-              auto src_offset = unit_offset(src_, cmd.SrcFormat, src_unit, cmd.SrcOrigin) +
+              auto src_offset = unit_offset(src_, cmd.SrcFormat, src_unit, cmd.SrcOrigin, cmd.Plane, cmd.Src.Height) +
                                 offset_z * src_->bytesPerImage + row * src_->bytesPerRow;
-              auto dst_offset = unit_offset(dst_, cmd.DstFormat, dst_unit, cmd.DstOrigin) +
+              auto dst_offset = unit_offset(dst_, cmd.DstFormat, dst_unit, cmd.DstOrigin, cmd.Plane, cmd.Dst.Height) +
                                 offset_z * dst_->bytesPerImage + row * dst_->bytesPerRow;
               auto &cmdcp = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
               cmdcp.type = WMTBlitCommandCopyFromBufferToBuffer;
@@ -4222,7 +4246,7 @@ public:
           }
         });
         promote_flush = true;
-      } else if (auto src = GetTexture(cmd.pSrc)) {
+      } else if (auto src = GetTexture(cmd.pSrc, cmd.Plane)) {
         if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
           InvalidateCurrentPass(true);
           UseCopyDestination(staging_dst);
@@ -4242,7 +4266,7 @@ public:
               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
-          auto offset = unit_offset(dst_, cmd.DstFormat, dst_unit, cmd.DstOrigin);
+          auto offset = unit_offset(dst_, cmd.DstFormat, dst_unit, cmd.DstOrigin, cmd.Plane, cmd.Dst.Height);
           auto &cmd_cpbuf = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
           cmd_cpbuf.type = WMTBlitCommandCopyFromTextureToBuffer;
           cmd_cpbuf.src = src;
@@ -4259,7 +4283,7 @@ public:
       } else {
         UNREACHABLE
       }
-    } else if (auto dst = GetTexture(cmd.pDst)) {
+    } else if (auto dst = GetTexture(cmd.pDst, cmd.Plane)) {
       if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
         if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
           InvalidateCurrentPass(true);
@@ -4280,7 +4304,7 @@ public:
               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
-          auto offset = unit_offset(src_, cmd.SrcFormat, src_unit, cmd.SrcOrigin);
+          auto offset = unit_offset(src_, cmd.SrcFormat, src_unit, cmd.SrcOrigin, cmd.Plane, cmd.Src.Height);
           auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
           cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
           cmd_cptex.src = src->buffer();
@@ -4296,7 +4320,7 @@ public:
           cmd_cptex.level = cmd.Dst.MipLevel;
           cmd_cptex.origin = cmd.DstOrigin;
         });
-      } else if (auto src = GetTexture(cmd.pSrc)) {
+      } else if (auto src = GetTexture(cmd.pSrc, cmd.Plane)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
         EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
@@ -4469,23 +4493,42 @@ public:
     if (cmd.Invalid)
       return;
 
+    if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+      if ((cmd.DstOrigin.x | cmd.DstOrigin.y | cmd.DstSize.width | cmd.DstSize.height) & 1)
+        return;
+      auto chroma = cmd;
+      chroma.Plane = 1;
+      MTLQueryDXGIFormat(device->GetMTLDevice(), cmd.Dst.Format, chroma.DstFormat, chroma.Plane);
+      chroma.DstOrigin.x /= chroma.DstFormat.SubsampleWidth;
+      chroma.DstOrigin.y /= chroma.DstFormat.SubsampleHeight;
+      chroma.DstSize.width /= chroma.DstFormat.SubsampleWidth;
+      chroma.DstSize.height /= chroma.DstFormat.SubsampleHeight;
+      chroma.EffectiveRows = chroma.DstSize.height;
+      chroma.EffectiveBytesPerRow = chroma.DstSize.width * chroma.DstFormat.BytesPerTexel;
+      cmd.DstFormat.Flag &= ~MTL_DXGI_FORMAT_VIDEO_PLANAR;
+      auto uv = ptr_add(pSrcData, std::uintptr_t(SrcRowPitch) * cmd.DstSize.height);
+      UpdateTexture(std::move(cmd), pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
+      return UpdateTexture(std::move(chroma), uv, SrcRowPitch, SrcDepthPitch, CopyFlags);
+    }
+
     std::lock_guard<mutex_t> lock(mutex);
 
     auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource);
-    if (auto dst = GetTexture(cmd.pDst); dst || staging_dst) {
+    if (auto dst = GetTexture(cmd.pDst, cmd.Plane); dst || staging_dst) {
       auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
       auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);
       if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
         for (unsigned depthSlice = 0; depthSlice < cmd.DstSize.depth; depthSlice++) {
           auto dst_offset = offset + depthSlice * bytes_per_depth_slice;
-          const char *src = ((const char *)pSrcData) + depthSlice * SrcDepthPitch;
+          const char *src = ((const char *)pSrcData) + std::uintptr_t(depthSlice) * SrcDepthPitch;
           staging_buffer.updateContents(dst_offset, src, bytes_per_depth_slice);
         }
       } else {
         for (unsigned depthSlice = 0; depthSlice < cmd.DstSize.depth; depthSlice++) {
           for (unsigned row = 0; row < cmd.EffectiveRows; row++) {
             auto dst_offset = offset + row * cmd.EffectiveBytesPerRow + depthSlice * bytes_per_depth_slice;
-            const char *src = ((const char *)pSrcData) + row * SrcRowPitch + depthSlice * SrcDepthPitch;
+            const char *src = ((const char *)pSrcData) + std::uintptr_t(row) * SrcRowPitch +
+                              std::uintptr_t(depthSlice) * SrcDepthPitch;
             staging_buffer.updateContents(dst_offset, src,  cmd.EffectiveBytesPerRow);
           }
         }
@@ -4506,7 +4549,8 @@ public:
               copy.src = staging_buffer;
               copy.src_offset = offset + slice * bytes_per_depth_slice + row * cmd.EffectiveBytesPerRow;
               copy.dst = buffer->buffer();
-              copy.dst_offset = buffer_offset + (cmd.DstOrigin.z + slice) * dst->bytesPerImage +
+              copy.dst_offset = buffer_offset + cmd.Plane * cmd.Dst.Height * dst->bytesPerRow +
+                                (cmd.DstOrigin.z + slice) * dst->bytesPerImage +
                                 (cmd.DstOrigin.y / unit + row) * dst->bytesPerRow +
                                 cmd.DstOrigin.x / unit * cmd.DstFormat.BytesPerTexel;
             }
@@ -4540,9 +4584,27 @@ public:
     if (cmd.Invalid)
       return;
 
+    if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+      if ((cmd.DstOrigin.x | cmd.DstOrigin.y | cmd.DstSize.width | cmd.DstSize.height) & 1)
+        return;
+      auto chroma = cmd;
+      chroma.Plane = 1;
+      MTLQueryDXGIFormat(device->GetMTLDevice(), cmd.Dst.Format, chroma.DstFormat, chroma.Plane);
+      chroma.DstOrigin.x /= chroma.DstFormat.SubsampleWidth;
+      chroma.DstOrigin.y /= chroma.DstFormat.SubsampleHeight;
+      chroma.DstSize.width /= chroma.DstFormat.SubsampleWidth;
+      chroma.DstSize.height /= chroma.DstFormat.SubsampleHeight;
+      chroma.EffectiveRows = chroma.DstSize.height;
+      chroma.EffectiveBytesPerRow = chroma.DstSize.width * chroma.DstFormat.BytesPerTexel;
+      cmd.DstFormat.Flag &= ~MTL_DXGI_FORMAT_VIDEO_PLANAR;
+      Rc<Buffer> uv = src;
+      UpdateTexture(std::move(cmd), std::move(src), SrcRowPitch, SrcDepthPitch);
+      return UpdateTexture(std::move(chroma), std::move(uv), SrcRowPitch, SrcDepthPitch);
+    }
+
     std::lock_guard<mutex_t> lock(mutex);
 
-    if (auto dst = GetTexture(cmd.pDst)) {
+    if (auto dst = GetTexture(cmd.pDst, cmd.Plane)) {
 
       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
@@ -4551,7 +4613,7 @@ public:
         auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
         cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
         cmd_cptex.src = src_buffer->buffer();
-        cmd_cptex.src_offset = src_offset;
+        cmd_cptex.src_offset = src_offset + cmd.Plane * cmd.Dst.Height * SrcRowPitch;
         cmd_cptex.bytes_per_row = SrcRowPitch;
         cmd_cptex.bytes_per_image = SrcDepthPitch;
         cmd_cptex.size = cmd.DstSize;

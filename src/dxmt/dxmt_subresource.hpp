@@ -60,12 +60,7 @@ public:
     buffer.length = buffer_length;
   }
 
-  /**
-  NOTE: we assume the view format is in the same 'format family' of resource allocation format, so that we can conclude
-  the total planar count from view format. This is not really the case for video format (e.g. NV12, YUY2), where the
-  view format can be ordinary format like RG8 or R16
-  So don't use this constructor for video textures/views (which is not implemented yet).
-  */
+  // D3D11.3 5.3.11 makes video-plane views conflict; their color formats share the same plane mask.
   ResourceSubsetState(const TextureViewDescriptor *desc, uint32_t total_mip_count, uint32_t total_array_size, uint32_t ignore_planar_mask = 0);
 
 private:

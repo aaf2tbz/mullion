@@ -82,7 +82,9 @@ struct D3D12_FEATURE_DATA_BARRIER_LAYOUT {
 
 const GUID kD3D12DeviceDownlevelUUID = {0x74eaee3f, 0x2f4b, 0x476d, {0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10}};
 
-HRESULT PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
+HRESULT PopulateWMTTextureInfo(
+    MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc, UINT Plane = ~0u
+);
 
 template <typename T>
 static HRESULT
@@ -425,7 +427,8 @@ public:
       MTLQueryDXGIFormat(metal, out->Format, format_desc);
       if (!format_desc.PlanarCount && !IsSamplerFeedback(out->Format))
         return E_INVALIDARG;
-      bool multisample = any_bit_set(GetMTLPixelFormatCapability(format_desc.PixelFormat) & FormatCapability::MSAA);
+      bool multisample = !(format_desc.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) &&
+                         any_bit_set(GetMTLPixelFormatCapability(format_desc.PixelFormat) & FormatCapability::MSAA);
       if (out->SampleCount == 1 || (!out->Flags && multisample && metal.supportsTextureSampleCount(out->SampleCount)))
         out->NumQualityLevels = 1;
       return S_OK;
@@ -1130,6 +1133,7 @@ public:
       UINT PerPlaneSubresources = DecomposeSubresource(*pDesc, 0);
       DXGI_FORMAT PlaneFormats[2] = {};
       UINT PlaneBytesPerTexel[2] = {};
+      UINT SubsampleWidth[2] = {1, 1}, SubsampleHeight[2] = {1, 1};
 
       MTL_DXGI_FORMAT_DESC FormatDesc;
 
@@ -1148,7 +1152,20 @@ public:
         if (FormatDesc.Flag & MTL_DXGI_FORMAT_BC)
           BlockWidth = 4;
 
-        if (FormatDesc.PlanarCount > 1) {
+        if (FormatDesc.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+          WMTTextureInfo info{};
+          if (FAILED(PopulateWMTTextureInfo(this, info, *pDesc)))
+            break;
+          PlaneCount = FormatDesc.PlanarCount;
+          for (UINT plane = 0; plane < PlaneCount; plane++) {
+            MTL_DXGI_FORMAT_DESC layout;
+            MTLQueryDXGIFormat(GetMTLDevice(), pDesc->Format, layout, plane);
+            PlaneFormats[plane] = DXGI_FORMAT(layout.PlaneFormat);
+            PlaneBytesPerTexel[plane] = layout.BytesPerTexel;
+            SubsampleWidth[plane] = layout.SubsampleWidth;
+            SubsampleHeight[plane] = layout.SubsampleHeight;
+          }
+        } else if (FormatDesc.PlanarCount > 1) {
           assert(FormatDesc.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER));
           PlaneCount = FormatDesc.PlanarCount;
           PlaneFormats[0] = DXGI_FORMAT_R32_TYPELESS;
@@ -1178,8 +1195,8 @@ public:
         auto Plane = 0u, MipLevel = 0u;
         DecomposeSubresource(*pDesc, Subresource, &MipLevel, NULL, &Plane);
         auto Extent = GetResourceExtent(*pDesc, MipLevel);
-        auto Width = align(Extent.right, BlockWidth);
-        auto Height = align(Extent.bottom, BlockWidth);
+        auto Width = align(Extent.right, BlockWidth) / SubsampleWidth[Plane];
+        auto Height = align(Extent.bottom, BlockWidth) / SubsampleHeight[Plane];
         auto RowCount = Height / BlockWidth;
         auto Depth = Extent.back;
         auto RowSize = (Width / BlockWidth) * PlaneBytesPerTexel[Plane];
@@ -1692,9 +1709,18 @@ public:
           DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
           goto invalid;
         }
-        auto size_and_align = GetMTLDevice().heapTextureSizeAndAlign(texture_info);
-        resource_info.SizeInBytes = size_and_align.size;
-        resource_info.Alignment = size_and_align.align;
+        MTL_DXGI_FORMAT_DESC format;
+        MTLQueryDXGIFormat(GetMTLDevice(), desc->Format, format);
+        UINT planes = format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR ? format.PlanarCount : 1;
+        resource_info.SizeInBytes = 0;
+        resource_info.Alignment = 0;
+        for (UINT plane = 0; plane < planes; plane++) {
+          if (plane)
+            PopulateWMTTextureInfo(this, texture_info, *desc, plane);
+          auto size_and_align = GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+          resource_info.SizeInBytes = align(resource_info.SizeInBytes, size_and_align.align) + size_and_align.size;
+          resource_info.Alignment = std::max<UINT64>(resource_info.Alignment, size_and_align.align);
+        }
         auto requested_alignment = desc->Alignment              ? desc->Alignment
                                    : desc->SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                                 : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;

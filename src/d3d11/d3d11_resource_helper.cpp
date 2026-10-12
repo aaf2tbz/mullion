@@ -333,6 +333,13 @@ CreateMTLTextureDescriptorInternal(
     return E_FAIL;
   }
 
+  if (metal_format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    if (Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || ((Width | Height) & 1) || MipLevels != 1 ||
+        SampleCount != 1 || (MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) ||
+        (BindFlags & D3D11_BIND_DEPTH_STENCIL) || (Usage == D3D11_USAGE_STAGING && ArraySize > 1))
+      return E_INVALIDARG;
+  }
+
   auto shared_flag = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
   // 10Level9 ID3D11Device::CreateTexture2D excludes shared RGBA8 textures below feature level 10_0.
   if ((MiscFlags & shared_flag) == shared_flag ||
@@ -404,7 +411,7 @@ CreateMTLTextureDescriptorInternal(
     // decoder not supported: D3D11_BIND_DECODER, D3D11_BIND_VIDEO_ENCODER
   }
 
-  if (metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) {
+  if (metal_format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_VIDEO_PLANAR)) {
     // well this is necessary for passing validation layer
     metal_usage |= WMTTextureUsagePixelFormatView;
   }
@@ -514,6 +521,8 @@ HRESULT CreateMTLTextureDescriptor(MTLD3D11Device *pDevice,
                                    const D3D11_TEXTURE2D_DESC1 *pDesc,
                                    D3D11_TEXTURE2D_DESC1 *pOutDesc,
                                    WMTTextureInfo *pMtlDescOut) {
+  if (pDesc->Format == DXGI_FORMAT_NV12 && pDesc->SampleDesc.Quality)
+    return E_INVALIDARG;
   UINT quality_levels = 0;
   if (FAILED(pDevice->CheckMultisampleQualityLevels(pDesc->Format, pDesc->SampleDesc.Count, &quality_levels)) ||
       !quality_levels ||
@@ -660,9 +669,15 @@ GetLinearTextureLayout(
     return S_OK;
   }
   auto bytes_per_row_unaligned = metal_format.BytesPerTexel * w;
-  auto alignment = std::max(1u, metal_format.BytesPerTexel);
+  uint64_t alignment = std::max(1u, metal_format.BytesPerTexel);
   if (Aligned && !(metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
     alignment = metal.minimumLinearTextureAlignmentForPixelFormat(metal_format.PixelFormat);
+  }
+  if (metal_format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    MTLQueryDXGIFormat(metal, Desc.Format, metal_format, 1);
+    if (Aligned)
+      alignment = std::max(alignment, metal.minimumLinearTextureAlignmentForPixelFormat(metal_format.PixelFormat));
+    h += h / metal_format.SubsampleHeight;
   }
   auto aligned_bytes_per_row = align(bytes_per_row_unaligned, alignment);
   BytesPerRow = aligned_bytes_per_row;

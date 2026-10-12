@@ -194,8 +194,9 @@ GetStagingResource(ID3D11Resource *pResource, UINT Subresource) {
   return static_cast<D3D11ResourceCommon *>(pResource)->staging(Subresource);
 };
 inline Rc<Texture>
-GetTexture(ID3D11Resource *pResource) {
-  return static_cast<D3D11ResourceCommon *>(pResource)->texture();
+GetTexture(ID3D11Resource *pResource, UINT plane = 0) {
+  auto texture = static_cast<D3D11ResourceCommon *>(pResource)->texture();
+  return texture ? texture->plane(plane) : nullptr;
 }
 
 template <typename TEXTURE_DESC>

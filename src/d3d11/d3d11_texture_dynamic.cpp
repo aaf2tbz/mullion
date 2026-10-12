@@ -25,6 +25,17 @@ private:
   std::vector<Subresource> subresources_;
   float min_lod = 0.0;
 
+  Texture *
+  viewTexture(DXGI_FORMAT format) {
+    if (!this->texture_->chroma)
+      return this->texture_.ptr();
+    if (format == DXGI_FORMAT_R8_UNORM || format == DXGI_FORMAT_R8_UINT)
+      return this->texture_.ptr();
+    if (format == DXGI_FORMAT_R8G8_UNORM || format == DXGI_FORMAT_R8G8_UINT)
+      return this->texture_->chroma.ptr();
+    return nullptr;
+  }
+
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DynamicTexture<tag_texture>>>;
   class TextureSRV : public SRVBase {
@@ -33,7 +44,7 @@ private:
                const tag_shader_resource_view<>::DESC1 *pDesc,
                DynamicTexture *pResource, MTLD3D11Device *pDevice)
         : SRVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pResource->viewTexture(pDesc->Format);
       this->view_id_ = this->texture_->createView(descriptor);
       this->subset_ = ResourceSubsetState(
         &descriptor,
@@ -90,8 +101,11 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    auto texture = viewTexture(finalDesc.Format);
+    if (!texture)
+      return E_INVALIDARG;
     auto hr = InitializeAndNormalizeViewDescriptor(
-        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+        this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc, descriptor
     );
     if (FAILED(hr)) {
       ERR("DynamicTexture: Failed to create texture SRV");
@@ -146,9 +160,32 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
   }
 
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
+  MTL_DXGI_FORMAT_DESC format;
+  MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format);
+  if (format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format, 1);
+    auto chroma_info = info;
+    chroma_info.pixel_format = format.PixelFormat;
+    chroma_info.width /= format.SubsampleWidth;
+    chroma_info.height /= format.SubsampleHeight;
+    texture->chroma = new Texture(chroma_info, pDevice->GetMTLDevice());
+  }
   Flags<TextureAllocationFlag> flags;
   flags.set(TextureAllocationFlag::GpuManaged);
   flags.set(TextureAllocationFlag::ShaderReadonly);
+  if (texture->chroma) {
+    texture->chroma->rename(texture->chroma->allocate(flags));
+    if (!texture->chroma->current()->texture())
+      return E_OUTOFMEMORY;
+    if (pInitialData)
+      for (auto sub : EnumerateSubresources(finalDesc)) {
+        auto &data = pInitialData[sub.SubresourceId];
+        pDevice->GetDXMTDevice().queue().initializer.initWithData(
+            texture->chroma.ptr(), texture->chroma->current(), sub.ArraySlice, sub.MipLevel,
+            ptr_add(data.pSysMem, std::uintptr_t(data.SysMemPitch) * texture->height()), data.SysMemPitch, 0, 0
+        );
+      }
+  }
   if (pInitialData) {
     auto default_allocation = texture->allocate(flags);
     InitializeTextureData(pDevice, default_allocation->texture(), finalDesc, pInitialData);
