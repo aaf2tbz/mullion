@@ -171,16 +171,52 @@ MTLD3D12CommandAllocatorImpl::GPURecordsFor(EncoderData *Root) {
 }
 
 MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
-  if (diag::profile)
-    for (auto &list : encoder_lists_)
-      for (auto pass = list.next; pass; pass = pass->next)
-        device_->PassName(pass);
   ReleaseRuns();
   delete records_;
 }
 
 void
+MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
+  for (auto pass = std::exchange(Root->next, nullptr); pass;) {
+    auto next = pass->next;
+    if (diag::profile)
+      device_->PassName(pass);
+    switch (pass->type) {
+    case EncoderType::Null:
+    case EncoderType::Predicate:
+    case EncoderType::Later:
+      break;
+    case EncoderType::Clear:
+      reinterpret_cast<ClearEncoderData *>(pass)->~ClearEncoderData();
+      break;
+    case EncoderType::Render:
+      reinterpret_cast<RenderEncoderData *>(pass)->~RenderEncoderData();
+      break;
+    case EncoderType::Blit:
+      reinterpret_cast<BlitEncoderData *>(pass)->~BlitEncoderData();
+      break;
+    case EncoderType::Compute:
+      reinterpret_cast<ComputeEncoderData *>(pass)->~ComputeEncoderData();
+      break;
+    case EncoderType::AccelerationStructure:
+      reinterpret_cast<AccelerationStructureEncoderData *>(pass)->~AccelerationStructureEncoderData();
+      break;
+    case EncoderType::Resolve:
+      reinterpret_cast<ResolveEncoderData *>(pass)->~ResolveEncoderData();
+      break;
+    case EncoderType::ResolveTimestamps:
+      reinterpret_cast<ResolveTimestampsData *>(pass)->~ResolveTimestampsData();
+      break;
+    }
+    pass = next;
+  }
+}
+
+void
 MTLD3D12CommandAllocatorImpl::ReleaseRuns() {
+  for (auto &list : encoder_lists_)
+    Discard(&list);
+  encoder_lists_.clear();
   if (records_)
     records_->Clear();
   for (auto [arena, cursor] : {std::pair{&device_->recording.commands, &cpu_cursor_},
@@ -295,41 +331,6 @@ MTLD3D12CommandAllocatorImpl::Reset() {
   // the GPU still reads
   if (pending)
     ERR("CommandAllocator: Reset while ", pending.load(), " of its submitted lists have not completed");
-
-  for (auto &encoder_list : encoder_lists_) {
-    EncoderData *next = encoder_list.next;
-    while (next) {
-      if (diag::profile)
-        device_->PassName(next);
-      switch (next->type) {
-      case EncoderType::Null:
-        break;
-      case EncoderType::Clear:
-        reinterpret_cast<ClearEncoderData *>(next)->~ClearEncoderData();
-        break;
-      case EncoderType::Render:
-        reinterpret_cast<RenderEncoderData *>(next)->~RenderEncoderData();
-        break;
-      case EncoderType::Blit:
-        reinterpret_cast<BlitEncoderData *>(next)->~BlitEncoderData();
-        break;
-      case EncoderType::Compute:
-        reinterpret_cast<ComputeEncoderData *>(next)->~ComputeEncoderData();
-        break;
-      case EncoderType::AccelerationStructure:
-        reinterpret_cast<AccelerationStructureEncoderData *>(next)->~AccelerationStructureEncoderData();
-        break;
-      case EncoderType::Resolve:
-        reinterpret_cast<ResolveEncoderData *>(next)->~ResolveEncoderData();
-        break;
-      case EncoderType::ResolveTimestamps:
-        reinterpret_cast<ResolveTimestampsData *>(next)->~ResolveTimestampsData();
-        break;
-      }
-      next = next->next;
-    }
-  }
-  encoder_lists_.clear();
 
   return Initialize();
 };

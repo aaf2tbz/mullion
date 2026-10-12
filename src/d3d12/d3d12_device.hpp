@@ -417,9 +417,8 @@ public:
 
   // the width of the GPU's SIMD groups, which run D3D12's waves
   virtual uint32_t GetSIMDWidth() = 0;
-  // the GPU failed a command buffer: what it was to do is lost, and the device is removed, as after a timeout
-  // detection and recovery on Windows (GetDeviceRemovedReason)
-  virtual void LoseDevice() = 0;
+  // later GPU errors must not replace the original removal reason (ID3D12Device::GetDeviceRemovedReason)
+  virtual void LoseDevice(HRESULT Reason = DXGI_ERROR_DEVICE_HUNG) = 0;
   // how many threads of a compute shader go to the GPU at once when its threadgroups wait for one another: the
   // lanes it runs at once (the estimate behind TotalLaneCount)
   virtual uint64_t ThreadsAtOnce() = 0;

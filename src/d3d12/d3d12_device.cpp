@@ -311,6 +311,9 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue) {
+    InitReturnPtr(ppCommandQueue);
+    if (FAILED(removed_))
+      return DXGI_ERROR_DEVICE_REMOVED;
     if (pDesc->Flags)
       WARN("CreateCommandQueue: flags ignored: ", pDesc->Flags);
     return dxmt::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
@@ -987,6 +990,11 @@ public:
     hr = ValidateResourceStates(InitialState, &heap_desc.Properties);
     if (FAILED(hr))
       return hr;
+    D3D12_RESOURCE_ALLOCATION_INFO info;
+    GetResourceAllocationInfo(&info, 0, 1, pDesc);
+    if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
+        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes)
+      return E_INVALIDARG;
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -1011,8 +1019,12 @@ public:
       return E_NOTIMPL;
     }
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    if (HRESULT hr = ValidateResourceDescs(pDesc, &heap); FAILED(hr))
+      return hr;
     if (HRESULT hr = ValidateResourceStates(InitialState, &heap); FAILED(hr))
       return hr;
+    if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && OptimizedClearValue)
+      return E_INVALIDARG;
     return pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
                ? CreateReservedBuffer(this, pDesc, riid, resource)
                : CreateReservedTexture(this, pDesc, InitialState, riid, resource);
@@ -1057,8 +1069,9 @@ public:
   };
 
   void
-  LoseDevice() {
-    removed_ = DXGI_ERROR_DEVICE_HUNG;
+  LoseDevice(HRESULT Reason) {
+    HRESULT present = S_OK;
+    removed_.compare_exchange_strong(present, Reason);
   }
 
   void STDMETHODCALLTYPE GetCopyableFootprints(
@@ -1220,6 +1233,8 @@ public:
       ID3D12Fence *const *pFences, const UINT64 *pValues, UINT FenceCount, D3D12_MULTIPLE_FENCE_WAIT_FLAGS Flags,
       HANDLE hEvent
   ) {
+    if (!FenceCount || (Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
+      return E_INVALIDARG;
     auto set = std::make_shared<std::atomic<bool>>();
     auto done = [=] {
       if (hEvent)
@@ -1229,8 +1244,6 @@ public:
     };
     // each fence counts down as it has its value. the count is one when any of them is enough
     auto left = std::make_shared<std::atomic<UINT>>(Flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY ? 1 : FenceCount);
-    if (!FenceCount)
-      done();
     for (UINT i = 0; i < FenceCount; i++)
       static_cast<MTLD3D12Fence *>(pFences[i])->Expect(pValues[i], [=] {
         if (left->fetch_sub(1) == 1)

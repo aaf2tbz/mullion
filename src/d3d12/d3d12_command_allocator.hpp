@@ -179,6 +179,7 @@ public:
 
   // gives what the lists recorded into back to the device
   void ReleaseRuns();
+  void Discard(EncoderData *Root);
 
   HRESULT
   Initialize();

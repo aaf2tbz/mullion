@@ -124,6 +124,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
 
   Flags<DirtyState> dirty_state_;
   D3D12_COMMAND_LIST_TYPE type_;
+  HRESULT recording_error_ = S_OK;
   // the resolves the render pass runs when it ends
   std::vector<std::pair<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS, D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS>>
       pass_resolves_;
@@ -497,18 +498,20 @@ public:
     EndPredication();
     HRESULT hr = allocator_->EndRecord(&encoder_count);
     recorded_on = allocator_.ptr();
-    // a list that did not fit is closed with nothing in it ("If an error was encountered during recording, the error
-    // code is returned here", ID3D12GraphicsCommandList::Close)
-    if (FAILED(hr))
-      entry->next = nullptr;
-    return hr;
+    if (SUCCEEDED(recording_error_))
+      recording_error_ = hr;
+    // a list whose recording failed is closed with nothing in it ("If an error was encountered during recording,
+    // the error code is returned here", ID3D12GraphicsCommandList::Close)
+    if (FAILED(recording_error_))
+      allocator_->Discard(entry);
+    return recording_error_;
   };
 
   HRESULT STDMETHODCALLTYPE
   Reset(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState) {
     if (encoder_count == std::numeric_limits<size_t>::max())
       return E_FAIL;
-    return Initialize(pAllocator, pInitialState);
+    return FAILED(recording_error_) ? recording_error_ : Initialize(pAllocator, pInitialState);
   };
 
   void STDMETHODCALLTYPE
@@ -2706,9 +2709,32 @@ public:
     if (!dst->texture || !src->texture || (dst == src && ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS))
       return;
     MTL_DXGI_FORMAT_DESC format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format))) {
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format)) ||
+        ((format.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+         !(format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)))) {
       ERR("ResolveSubresourceRegion: invalid format ", Format);
+      recording_error_ = E_INVALIDARG;
       return;
+    }
+    // a type group keeps its component layout (D3D11.3 19.1.1); bit-copy casts also permit other layouts
+    auto color_group = [](WMTPixelFormat pixel) {
+      pixel = Forget_sRGB(pixel);
+      auto integer = MTLGetUnsignedIntegerFormat(pixel);
+      return pixel == WMTPixelFormatBGRA8Unorm || pixel == WMTPixelFormatBGRX8Unorm || pixel == WMTPixelFormatA8Unorm ||
+                     integer == WMTPixelFormatInvalid
+                 ? pixel
+                 : integer;
+    };
+    for (auto resource : {src, dst}) {
+      if (DepthStencilPlanarFlags(resource->texture->pixelFormat()))
+        continue;
+      MTL_DXGI_FORMAT_DESC original;
+      MTLQueryDXGIFormat(device_->GetMTLDevice(), resource->GetDesc().Format, original);
+      if (original.BytesPerTexel != format.BytesPerTexel ||
+          color_group(original.PixelFormat) != color_group(format.PixelFormat)) {
+        recording_error_ = E_INVALIDARG;
+        return;
+      }
     }
     UINT level[2], slice[2], plane[2];
     DecomposeSubresource(dst->GetDesc(), DstSubresource, &level[0], &slice[0], &plane[0]);
@@ -2759,6 +2785,13 @@ public:
   WriteBufferImmediate(
       UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE *pModes
   ) {
+    if (pModes)
+      for (auto mode : std::span(pModes, Count))
+        if (mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT && mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN &&
+            mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT) {
+          recording_error_ = E_INVALIDARG;
+          return;
+        }
     // each value is written in order with the list's other work, whatever the marker mode
     for (auto &param : std::span(pParams, Count))
       WriteImmediate(param.Dest, &param.Value, sizeof(param.Value));

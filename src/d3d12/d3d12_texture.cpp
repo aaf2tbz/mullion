@@ -221,6 +221,22 @@ public:
     if (!desc_.MipLevels)
       desc_.MipLevels = texture_info.mipmap_level_count;
 
+    if (Reserved) {
+      if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+          desc_.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE ||
+          (DepthStencilPlanarFlags(texture_info.pixel_format) & DepthStencilPlanarFlags(WMTPixelFormatStencil8)))
+        return E_INVALIDARG;
+      if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc_.DepthOrArraySize > 1) {
+        auto size = device_->GetMTLDevice().sparseTileSize(
+            texture_info.type, texture_info.pixel_format, texture_info.sample_count, device_->GetSparsePageSize()
+        );
+        auto extent = GetResourceExtent(desc_, texture_info.mipmap_level_count - 1);
+        // tier 2 arrays cannot contain packed mips (D3D11.3 5.9.7.2)
+        if (extent.right < size.width || extent.bottom < size.height)
+          return E_INVALIDARG;
+      }
+    }
+
     if (!desc_.Alignment) {
       desc_.Alignment = desc_.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                    : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -378,6 +394,8 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {
+    if (reserved_)
+      return E_INVALIDARG;
     if (pHeapProps)
       *pHeapProps = heap_props_;
     if (pFlags)

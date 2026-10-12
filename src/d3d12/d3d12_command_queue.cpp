@@ -610,6 +610,12 @@ public:
 
   void STDMETHODCALLTYPE
   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
+    for (UINT i = 0; i < Count; i++)
+      if (static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i])->encoder_count ==
+          std::numeric_limits<size_t>::max()) {
+        device_->LoseDevice(DXGI_ERROR_INVALID_CALL);
+        return;
+      }
     // what the lists recorded, which is theirs no longer: the application may record them again at once
     std::vector<EncoderData *> recorded(Count);
     std::vector<Com<MTLD3D12CommandAllocator>> allocators(Count);
@@ -683,20 +689,31 @@ public:
           // the queue's waits completed its last recording; the completion thread may not have compared it
           if (record_totals_)
             CompareGPURecords(own_checks_, record_totals_);
-          own_allocator_->Reset();
-          own_list_->Reset(own_allocator_.ptr(), nullptr);
-        } else if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&own_allocator_))) ||
-                   FAILED(device_->CreateCommandList(
-                       0, D3D12_COMMAND_LIST_TYPE_DIRECT, own_allocator_.ptr(), nullptr, IID_PPV_ARGS(&own_list_)
-                   ))) {
+          if (HRESULT hr = own_allocator_->Reset(); FAILED(hr)) {
+            ERR("CommandQueue: private allocator Reset failed: ", hr);
+            return;
+          }
+          if (FAILED(own_list_->Reset(own_allocator_.ptr(), nullptr)))
+            own_list_ = nullptr;
+        }
+        if (!own_allocator_ &&
+            FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&own_allocator_))))
+          return;
+        if (!own_list_ && FAILED(device_->CreateCommandList(
+                             0, D3D12_COMMAND_LIST_TYPE_DIRECT, own_allocator_.ptr(), nullptr, IID_PPV_ARGS(&own_list_)
+                         ))) {
           return;
         }
         auto list = static_cast<MTLD3D12GraphicsCommandList *>(own_list_.ptr());
         list->leaves_for_later = false;
         own_buffers_.clear();
-        if (!commands(list))
+        bool recorded = commands(list);
+        if (HRESULT hr = list->Close(); FAILED(hr)) {
+          ERR("CommandQueue: private list Close failed: ", hr);
           return;
-        list->Close();
+        }
+        if (!recorded)
+          return;
         own++;
         encode(encode, list->entry, static_cast<MTLD3D12CommandAllocator *>(own_allocator_.ptr()));
         if (record_totals_)

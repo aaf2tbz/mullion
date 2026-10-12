@@ -27,6 +27,7 @@ class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  bool reserved_ = false;
 
 public:
   MTLD3D12Buffer(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
@@ -41,6 +42,7 @@ public:
 
     // TODO: validate and normalize
     desc_ = *pDesc;
+    reserved_ = Reserved;
     heap_props_ = *pHeapProps;
     heap_flags_ = HeapFlags;
 
@@ -140,6 +142,8 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {
+    if (reserved_)
+      return E_INVALIDARG;
     if (pHeapProps)
       *pHeapProps = heap_props_;
     if (pFlags)
