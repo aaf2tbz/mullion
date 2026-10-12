@@ -42,21 +42,6 @@ struct EncoderData {
   uint64_t id;
 };
 
-struct ClearEncoderData : EncoderData {
-  union {
-    WMTClearColor color;
-    std::pair<float, uint8_t> depth_stencil;
-  };
-  TextureViewRef attachment;
-  unsigned clear_dsv;
-  unsigned array_length;
-  unsigned width;
-  unsigned height;
-  unsigned depth_plane;
-
-  ClearEncoderData() {}
-};
-
 struct RenderEncoderColorAttachmentData {
   TextureViewRef attachment;
   enum WMTLoadAction load_action;
@@ -92,6 +77,7 @@ struct RenderEncoderStencilAttachmentData {
 };
 
 struct RenderEncoderData : EncoderData {
+  EncoderData *previous;
   std::array<RenderEncoderColorAttachmentData, 8> colors;
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;
@@ -99,11 +85,11 @@ struct RenderEncoderData : EncoderData {
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;
-  wmtcmd_render_nop cmd_head;
-  wmtcmd_base *cmd_tail;
+  wmtcmd_render_nop cmd_head{WMTRenderCommandNop};
+  wmtcmd_base *cmd_tail = (wmtcmd_base *)&cmd_head;
   // compute commands that run before the pass: the resolvers of its indirect commands, whose commands it then runs
-  wmtcmd_compute_nop before_head;
-  wmtcmd_base *before_tail;
+  wmtcmd_compute_nop before_head{WMTComputeCommandNop};
+  wmtcmd_base *before_tail = (wmtcmd_base *)&before_head;
   // DXMT_D3D12_GPU_ERRORS: where each of the pass's indirect commands' resolvers keeps its largest numbers
   struct Most {
     const uint32_t *words;

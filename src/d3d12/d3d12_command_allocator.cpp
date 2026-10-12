@@ -187,8 +187,6 @@ MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
     case EncoderType::Later:
       break;
     case EncoderType::Clear:
-      reinterpret_cast<ClearEncoderData *>(pass)->~ClearEncoderData();
-      break;
     case EncoderType::Render:
       reinterpret_cast<RenderEncoderData *>(pass)->~RenderEncoderData();
       break;
@@ -660,15 +658,6 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startRenderPass() {
   ctx.InvalidateCurrentPass();
   auto render = ctx.AllocatePass<RenderEncoderData>();
   render->type = EncoderType::Render;
-  render->before_head.type = WMTComputeCommandNop;
-  render->before_head.next.set(0);
-  render->before_tail = (wmtcmd_base *)&render->before_head;
-  render->most = nullptr;
-  render->cmd_head.type = WMTRenderCommandNop;
-  render->cmd_head.next.set(0);
-  render->cmd_tail = (wmtcmd_base *)&render->cmd_head;
-  render->dsv_planar_flags = 0;
-  render->dsv_readonly_flags = 0;
   render->render_target_count = 0;
   render->render_target_width = 16384;
   render->render_target_height = 16384;

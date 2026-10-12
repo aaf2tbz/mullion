@@ -141,8 +141,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   uint64_t so_statistics_[4]{};
 
   UINT num_rtvs;
-  D3D12_CPU_DESCRIPTOR_HANDLE rtvs[8];
-  D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+  MTL_RENDER_TARGET_DESC rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+  MTL_RENDER_TARGET_DESC dsv;
 
   D3D12_PRIMITIVE_TOPOLOGY topology_;
 
@@ -401,7 +401,7 @@ public:
     }
 
     num_rtvs = {};
-    memset(rtvs, 0, sizeof(rtvs));
+    std::fill(std::begin(rtvs), std::end(rtvs), MTL_RENDER_TARGET_DESC{});
     dsv = {};
 
     topology_ = {};
@@ -563,25 +563,15 @@ public:
       allocator_->InvalidateCurrentPass();
       auto render = allocator_->AllocatePass<RenderEncoderData>();
       render->type = EncoderType::Render;
-      render->cmd_head.type = WMTRenderCommandNop;
-      render->cmd_head.next.set(0);
-      render->cmd_tail = (wmtcmd_base *)&render->cmd_head;
-      render->before_head.type = WMTComputeCommandNop;
-      render->before_head.next.set(0);
-      render->before_tail = (wmtcmd_base *)&render->before_head;
-      render->most = nullptr;
-      render->dsv_planar_flags = 0;
-      render->dsv_readonly_flags = 0;
       render->render_target_count = num_rtvs;
 
       unsigned render_target_width = 16384, render_target_height = 16384, render_target_array_length = 0;
 
       unsigned effective_rtvs = 0;
       for (unsigned i = 0; i < num_rtvs; i++) {
-        if (!rtvs[i].ptr || !(pso_graphics_->rtv_mask & (1u << i)))
+        if (!(pso_graphics_->rtv_mask & (1u << i)))
           continue;
-        auto [Heap, Index] = GetRenderTargetHeap(device_, rtvs[i]);
-        auto AttachmentDesc = Heap->GetRenderTarget(Index);
+        auto &AttachmentDesc = rtvs[i];
         if (!AttachmentDesc.Texture)
           continue;
         effective_rtvs++;
@@ -594,11 +584,8 @@ public:
         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
         render_target_array_length = std::max(render_target_array_length, AttachmentDesc.RenderTargetArrayLength);
       }
-      while (dsv.ptr && pso_graphics_->dsv_mask) {
-        auto [Heap, Index] = GetRenderTargetHeap(device_, dsv);
-        auto AttachmentDesc = Heap->GetRenderTarget(Index);
-        if (!AttachmentDesc.Texture)
-          continue;
+      if (dsv.Texture && pso_graphics_->dsv_mask) {
+        auto &AttachmentDesc = dsv;
         effective_rtvs++;
         auto dsv_planar_flags =
             DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View)) & pso_graphics_->dsv_mask;
@@ -623,13 +610,44 @@ public:
         render_target_width = std::min(render_target_width, AttachmentDesc.Width);
         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
         render_target_array_length = std::max(render_target_array_length, AttachmentDesc.RenderTargetArrayLength);
-        break;
       }
       render->render_target_width = render_target_width;
       render->render_target_height = render_target_height;
       render->render_target_array_length = render_target_array_length;
       if (effective_rtvs == 0) {
         render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
+      }
+
+      while (allocator_->encoder_last->type == EncoderType::Clear) {
+        auto clear = static_cast<RenderEncoderData *>(allocator_->encoder_last);
+        // D3D11.3 5.2.3.1: "The full extent of the resource view is always cleared."
+        if (clear->render_target_width != render_target_width || clear->render_target_height != render_target_height ||
+            clear->render_target_array_length != render_target_array_length)
+          break;
+        auto color = std::find_if(render->colors.begin(), render->colors.end(), [&](auto &rt) {
+          return clear->colors[0].attachment && rt.attachment == clear->colors[0].attachment &&
+                 rt.depth_plane == clear->colors[0].depth_plane;
+        });
+        if ((clear->colors[0].attachment && color == render->colors.end()) ||
+            (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
+            (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment))
+          break;
+        if (color != render->colors.end() && color->load_action == WMTLoadActionLoad) {
+          color->load_action = WMTLoadActionClear;
+          color->clear_color = clear->colors[0].clear_color;
+        }
+        if (clear->depth.attachment && render->depth.load_action == WMTLoadActionLoad) {
+          render->depth.load_action = WMTLoadActionClear;
+          render->depth.clear_depth = clear->depth.clear_depth;
+        }
+        if (clear->stencil.attachment && render->stencil.load_action == WMTLoadActionLoad) {
+          render->stencil.load_action = WMTLoadActionClear;
+          render->stencil.clear_stencil = clear->stencil.clear_stencil;
+        }
+        allocator_->encoder_last = clear->previous;
+        allocator_->encoder_last->next = nullptr;
+        allocator_->encoder_count_--;
+        clear->~RenderEncoderData();
       }
 
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
@@ -774,7 +792,7 @@ public:
 
     // stored depth passes inside the range, clamped to [0, 1]; an inverted range fails everything, and a pass without
     // a depth buffer passes. Metal's test is off at [0, 1]
-    bool bounded = pso_graphics_->depth_bounds && dsv.ptr;
+    bool bounded = pso_graphics_->depth_bounds && dsv.Texture;
     if (bounded && depth_bounds_[0] > depth_bounds_[1])
       return DrawCallStatus::Invalid;
     if (dirty_state_.test(DirtyState::DepthBounds) && (bounded || depth_bounds_set_)) {
@@ -1813,7 +1831,7 @@ public:
       dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
     if (!pso_graphics_ || pso_graphics_->forced_sample_count != graphics_pso->forced_sample_count ||
         ((pso_graphics_->rtv_mask ^ graphics_pso->rtv_mask) & ((1u << num_rtvs) - 1)) ||
-        (dsv.ptr && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
+        (dsv.Texture && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
       allocator_->InvalidateCurrentPass();
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;
@@ -2081,15 +2099,24 @@ public:
       UINT NumRTV, const D3D12_CPU_DESCRIPTOR_HANDLE *RTVs, WINBOOL SingleDescriptor,
       const D3D12_CPU_DESCRIPTOR_HANDLE *DSV
   ) {
-    allocator_->InvalidateCurrentPass();
-
+    bool changed = num_rtvs != NumRTV;
+    // the views as they are now: a descriptor written over after this call is not the bound one
+    auto bind = [&](MTL_RENDER_TARGET_DESC &bound, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+      MTL_RENDER_TARGET_DESC target{};
+      if (handle.ptr) {
+        auto [Heap, Index] = GetRenderTargetHeap(device_, handle);
+        target = Heap->GetRenderTarget(Index);
+      }
+      changed |= bound != target;
+      bound = target;
+    };
     num_rtvs = NumRTV;
-    for (unsigned i = 0; i < NumRTV; i++) {
-      auto RTV = SingleDescriptor ? D3D12_CPU_DESCRIPTOR_HANDLE{RTVs[0].ptr + i * 32 /* kRTVDSVHeapIncrementalSize */}
-                                  : RTVs[i];
-      rtvs[i] = RTV;
-    }
-    dsv = DSV ? *DSV : D3D12_CPU_DESCRIPTOR_HANDLE();
+    auto step = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (unsigned i = 0; i < NumRTV; i++)
+      bind(rtvs[i], SingleDescriptor ? D3D12_CPU_DESCRIPTOR_HANDLE{RTVs[0].ptr + i * step} : RTVs[i]);
+    bind(dsv, DSV ? *DSV : D3D12_CPU_DESCRIPTOR_HANDLE{});
+    if (changed)
+      allocator_->InvalidateCurrentPass();
   };
 
   void STDMETHODCALLTYPE
@@ -2121,15 +2148,26 @@ public:
       return;
     }
     allocator_->InvalidateCurrentPass();
-    auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
+    auto encoder_info = allocator_->AllocatePass<RenderEncoderData>();
     encoder_info->type = EncoderType::Clear;
-    encoder_info->clear_dsv = CheckedFlags;
-    encoder_info->depth_stencil = {Depth, Stencil};
-    encoder_info->attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
-    encoder_info->array_length = AttachmentDesc.RenderTargetArrayLength;
-    encoder_info->width = AttachmentDesc.Width;
-    encoder_info->height = AttachmentDesc.Height;
-    encoder_info->depth_plane = 0;
+    encoder_info->previous = allocator_->encoder_last;
+    if (CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) {
+      auto &rt = encoder_info->depth;
+      rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+      rt.load_action = WMTLoadActionClear;
+      rt.store_action = WMTStoreActionStore;
+      rt.clear_depth = Depth;
+    }
+    if (CheckedFlags & D3D12_CLEAR_FLAG_STENCIL) {
+      auto &rt = encoder_info->stencil;
+      rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+      rt.load_action = WMTLoadActionClear;
+      rt.store_action = WMTStoreActionStore;
+      rt.clear_stencil = Stencil;
+    }
+    encoder_info->render_target_array_length = AttachmentDesc.RenderTargetArrayLength;
+    encoder_info->render_target_width = AttachmentDesc.Width;
+    encoder_info->render_target_height = AttachmentDesc.Height;
 
     allocator_->InvalidateCurrentPass();
   };
@@ -2162,16 +2200,19 @@ public:
       return;
     }
     allocator_->InvalidateCurrentPass();
-    auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
+    auto encoder_info = allocator_->AllocatePass<RenderEncoderData>();
     encoder_info->type = EncoderType::Clear;
-    encoder_info->clear_dsv = 0;
-    encoder_info->color = {Color[0], Color[1], Color[2], Color[3]};
-    SanitizeRTVClearColor(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View), encoder_info->color);
-    encoder_info->attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
-    encoder_info->array_length = AttachmentDesc.RenderTargetArrayLength;
-    encoder_info->width = AttachmentDesc.Width;
-    encoder_info->height = AttachmentDesc.Height;
-    encoder_info->depth_plane = AttachmentDesc.DepthPlane;
+    encoder_info->previous = allocator_->encoder_last;
+    auto &rt = encoder_info->colors[0];
+    rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+    rt.depth_plane = AttachmentDesc.DepthPlane;
+    rt.load_action = WMTLoadActionClear;
+    rt.store_action = WMTStoreActionStore;
+    rt.clear_color = {Color[0], Color[1], Color[2], Color[3]};
+    SanitizeRTVClearColor(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View), rt.clear_color);
+    encoder_info->render_target_array_length = AttachmentDesc.RenderTargetArrayLength;
+    encoder_info->render_target_width = AttachmentDesc.Width;
+    encoder_info->render_target_height = AttachmentDesc.Height;
 
     allocator_->InvalidateCurrentPass();
   };

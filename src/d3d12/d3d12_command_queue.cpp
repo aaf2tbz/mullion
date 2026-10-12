@@ -779,45 +779,7 @@ public:
         switch (current->type) {
         case EncoderType::Null:
           break;
-        case EncoderType::Clear: {
-          auto data = static_cast<ClearEncoderData *>(current);
-          {
-            WMTRenderPassInfo info;
-            WMT::InitializeRenderPassInfo(info);
-            if (data->clear_dsv) {
-              if (data->clear_dsv & 1) {
-                info.depth.clear_depth = data->depth_stencil.first;
-                info.depth.texture = data->attachment.texture();
-                info.depth.load_action = WMTLoadActionClear;
-                info.depth.store_action = WMTStoreActionStore;
-                info.depth.depth_plane = data->depth_plane;
-              }
-              if (data->clear_dsv & 2) {
-                info.stencil.clear_stencil = data->depth_stencil.second;
-                info.stencil.texture = data->attachment.texture();
-                info.stencil.load_action = WMTLoadActionClear;
-                info.stencil.store_action = WMTStoreActionStore;
-                info.stencil.depth_plane = data->depth_plane;
-              }
-              info.render_target_width = data->width;
-              info.render_target_height = data->height;
-            } else {
-              info.colors[0].clear_color = data->color;
-              info.colors[0].texture = data->attachment.texture();
-              info.colors[0].load_action = WMTLoadActionClear;
-              info.colors[0].store_action = WMTStoreActionStore;
-              info.colors[0].depth_plane = data->depth_plane;
-            }
-            info.render_target_array_length = data->array_length;
-            auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(info, attachment)
-                                                    : cmdbuf.renderCommandEncoder(info);
-            encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
-            encoder.waitForFence(fence_, WMTRenderStageFragment);
-            encoder.updateFence(fence_, WMTRenderStageFragment);
-            encoder.endEncoding();
-          }
-          break;
-        }
+        case EncoderType::Clear:
         case EncoderType::Render: {
           auto data = static_cast<RenderEncoderData *>(current);
           WMTRenderPassInfo render_pass_info;
@@ -877,13 +839,15 @@ public:
           }
           auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
                                                   : cmdbuf.renderCommandEncoder(render_pass_info);
-          if (record_totals_) {
+          if (record_totals_ && current->type == EncoderType::Render) {
             auto label = "render " + device_->PassName(current, !profile_);
             SnapshotGPURecords(records, current, label, scope.inflight->records);
             encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
             for (auto most = data->most; most; most = most->next)
               scope.inflight->most.emplace_back(label, most);
           }
+          if (current->type == EncoderType::Clear)
+            encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
           // the object and mesh stages read what earlier passes wrote as the vertex stage does
           encoder.waitForFence(fence_, WMTRenderStagePreRaster);
           if (sparse_mappings) {

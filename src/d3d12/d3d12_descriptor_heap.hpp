@@ -185,6 +185,7 @@ struct MTL_RENDER_TARGET_DESC {
   UINT DepthPlane;
   UINT RenderTargetArrayLength;
   UINT Flags;
+  bool operator==(const MTL_RENDER_TARGET_DESC &) const = default;
 };
 
 class alignas(DXMT_PAGE_SIZE) MTLD3D12RenderTargetDescriptorHeap : public ID3D12DescriptorHeap {
