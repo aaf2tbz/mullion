@@ -159,6 +159,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       mapping_queue_.signalEvent(mapped_->sharedEvent(), ++mapping_value_);
       Trace("tile mappings: waits for mapping ", mapping_value_);
       mapped_->wait(mapping_value_);
+      // a GPU wait orders mapping memory across queues (Metal, Resource synchronization: events)
+      scope.Start();
+      scope.inflight->cmdbuf.encodeWaitForEvent(mapped_->sharedEvent(), mapping_value_);
       Trace("tile mappings: done");
     };
     if (!Hold(work))
