@@ -91,16 +91,29 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   for (uint32_t flId = 0; flId < FeatureLevels; flId++) {
     minFeatureLevel = pFeatureLevels[flId];
 
-    if (minFeatureLevel <= maxFeatureLevel) {
-      devFeatureLevel = minFeatureLevel;
+    switch (minFeatureLevel) {
+    case D3D_FEATURE_LEVEL_9_1:
+    case D3D_FEATURE_LEVEL_9_2:
+    case D3D_FEATURE_LEVEL_9_3:
+    case D3D_FEATURE_LEVEL_10_0:
+    case D3D_FEATURE_LEVEL_10_1:
+    case D3D_FEATURE_LEVEL_11_0:
+    case D3D_FEATURE_LEVEL_11_1:
+    case D3D_FEATURE_LEVEL_12_0:
+    case D3D_FEATURE_LEVEL_12_1:
+    case D3D_FEATURE_LEVEL_12_2:
       break;
+    default:
+      return E_INVALIDARG;
     }
+    if (!devFeatureLevel && minFeatureLevel <= maxFeatureLevel)
+      devFeatureLevel = minFeatureLevel;
   }
 
   if (!devFeatureLevel) {
     Logger::err(str::format("Minimum required feature level ", minFeatureLevel,
                             " not supported"));
-    return E_INVALIDARG;
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   try {
@@ -139,11 +152,13 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
 
   HRESULT hr;
 
-  if (ppSwapChain && !pSwapChainDesc)
+  if ((ppSwapChain && !pSwapChainDesc) || SDKVersion != D3D11_SDK_VERSION)
     return E_INVALIDARG;
 
   if (!pAdapter) {
-    // Ignore DriverType
+    if (DriverType <= D3D_DRIVER_TYPE_UNKNOWN || DriverType > D3D_DRIVER_TYPE_WARP ||
+        (DriverType == D3D_DRIVER_TYPE_SOFTWARE ? !Software : Software != nullptr))
+      return E_INVALIDARG;
     if (DriverType != D3D_DRIVER_TYPE_HARDWARE)
       WARN("D3D11CreateDevice: Unsupported driver type ", DriverType);
     // We'll use the first adapter returned by a DXGI factory

@@ -20,7 +20,7 @@ D3D10CoreCreateDevice(
 
   Com<ID3D11Device> d3d11_device;
 
-  if (!pAdapter)
+  if (!pAdapter || !ppDevice || FeatureLevel > D3D_FEATURE_LEVEL_10_1)
     return E_INVALIDARG;
 
   HRESULT hr = pAdapter->CheckInterfaceSupport(__uuidof(ID3D10Device), nullptr);
