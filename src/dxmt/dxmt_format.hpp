@@ -3,6 +3,7 @@
 #include <functional>
 
 #include "Metal.hpp"
+#include "dxgi.h"
 #include <map>
 
 namespace dxmt {
@@ -27,6 +28,9 @@ public:
   std::map<WMTPixelFormat, FormatCapability> textureCapabilities{};
   void Inspect(WMT::Device device);
 };
+
+WMTPixelFormat ConvertSwapChainFormat(DXGI_FORMAT format);
+bool IsFlipSwapChainFormat(DXGI_FORMAT format);
 
 WMTPixelFormat Forget_sRGB(WMTPixelFormat format);
 WMTPixelFormat Recall_sRGB(WMTPixelFormat format);

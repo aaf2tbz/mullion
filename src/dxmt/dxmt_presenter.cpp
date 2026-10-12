@@ -37,7 +37,7 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
 
 bool
 Presenter::changeLayerProperties(
-    WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
+    DXGI_FORMAT format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
 ) {
   bool should_invalidated = colorspace_ != colorspace;
   should_invalidated |= source_format_ != format;
@@ -45,7 +45,7 @@ Presenter::changeLayerProperties(
   should_invalidated |= sample_count_ != sample_count;
   sample_count_ = sample_count;
   // a 32-bit GDI bitmap is BGRA
-  layer_props_.pixel_format = layer_ ? Forget_sRGB(format) : WMTPixelFormatBGRA8Unorm;
+  layer_props_.pixel_format = layer_ ? Forget_sRGB(ConvertSwapChainFormat(format)) : WMTPixelFormatBGRA8Unorm;
   layer_props_.drawable_height = height;
   layer_props_.drawable_width = width;
   colorspace_ = colorspace;
@@ -259,25 +259,17 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
   auto library = lib_.getLibrary();
 
   uint32_t true_data = true, false_data = false;
-  WMTFunctionConstant constants[6];
-  constants[0].data.set(&true_data);
-  constants[0].type = WMTDataTypeBool;
-  constants[0].index = kPresentFCIndex_BackbufferSizeMatched;
-  constants[1].data.set(is_pq ? &true_data : &false_data);
-  constants[1].type = WMTDataTypeBool;
-  constants[1].index = kPresentFCIndex_HDRPQ;
-  constants[2].data.set(with_hdr_metadata ? &true_data : &false_data);
-  constants[2].type = WMTDataTypeBool;
-  constants[2].index = kPresentFCIndex_WithHDRMetadata;
-  constants[3].data.set(Is_sRGBVariant(source_format_) ? &true_data : &false_data);
-  constants[3].type = WMTDataTypeBool;
-  constants[3].index = kPresentFCIndex_BackbufferIsSRGB;
-  constants[4].data.set(is_ms ? &true_data : &false_data);
-  constants[4].type = WMTDataTypeBool;
-  constants[4].index = kPresentFCIndex_BackbufferIsMS;
-  constants[5].data.set(gamma_enable ? &true_data : &false_data);
-  constants[5].type  = WMTDataTypeBool;
-  constants[5].index = kPresentFCIndex_GammaEnabled;
+  WMTFunctionConstant constants[] = {
+      {{&true_data}, WMTDataTypeBool, kPresentFCIndex_BackbufferSizeMatched},
+      {{is_pq ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_HDRPQ},
+      {{with_hdr_metadata ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_WithHDRMetadata},
+      {{Is_sRGBVariant(ConvertSwapChainFormat(source_format_)) ? &true_data : &false_data}, WMTDataTypeBool,
+       kPresentFCIndex_BackbufferIsSRGB},
+      {{is_ms ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_BackbufferIsMS},
+      {{gamma_enable ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_GammaEnabled},
+      {{source_format_ == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM ? &true_data : &false_data}, WMTDataTypeBool,
+       kPresentFCIndex_BackbufferIsXRBias},
+  };
 
   WMT::Reference<WMT::Error> error;
   auto vs_present_quad = library.newFunction("vs_present_quad");

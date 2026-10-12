@@ -12,6 +12,7 @@
 #include "dxmt_hud_state.hpp"
 #include "dxmt_statistics.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_format.hpp"
 #include "dxgi_swapchain_settings.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
@@ -38,23 +39,6 @@ This value is 1 by default.
 constexpr size_t kSwapchainLatency = 1;
 
 namespace dxmt {
-
-WMTPixelFormat ConvertSwapChainFormat(DXGI_FORMAT format) {
-  switch (format) {
-  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    return WMTPixelFormatBGRA8Unorm_sRGB;
-  case DXGI_FORMAT_B8G8R8A8_UNORM:
-  case DXGI_FORMAT_R8G8B8A8_UNORM:
-    return WMTPixelFormatBGRA8Unorm;
-  case DXGI_FORMAT_R10G10B10A2_UNORM:
-    return WMTPixelFormatRGB10A2Unorm;
-  case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    return WMTPixelFormatRGBA16Float;
-  default:
-    return WMTPixelFormatInvalid;
-  }
-}
 
 WMTColorSpace ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
   switch (color_space) {
@@ -485,9 +469,13 @@ public:
     // chain's from now on, except that tearing is allowed for a swap chain's whole life (IDXGISwapChain::ResizeBuffers).
     // a resize that is refused leaves the swap chain as it was
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
+    auto format = Format == DXGI_FORMAT_UNKNOWN ? desc_.Format : Format;
+    if ((desc_.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || desc_.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) &&
+        !IsFlipSwapChainFormat(format))
+      return DXGI_ERROR_INVALID_CALL;
     UINT support;
-    if (FAILED(device_->CheckFormatSupport(Format == DXGI_FORMAT_UNKNOWN ? desc_.Format : Format, &support)) ||
-        !(support & D3D11_FORMAT_SUPPORT_DISPLAY) || BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+    if (FAILED(device_->CheckFormatSupport(format, &support)) || !(support & D3D11_FORMAT_SUPPORT_DISPLAY) ||
+        BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
       return E_INVALIDARG;
     if ((flags ^ desc_.Flags) & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
       return DXGI_ERROR_INVALID_CALL;
@@ -620,7 +608,7 @@ public:
                               : colorspace_,
                           LayerSupportEDR());
     if (presenter->changeLayerProperties(
-            ConvertSwapChainFormat(desc_.Format), target_color_space, settings_.target_width * scale_factor,
+            desc_.Format, target_color_space, settings_.target_width * scale_factor,
             settings_.target_height * scale_factor, desc_.SampleDesc.Count
         ))
       device_context_->WaitUntilGPUIdle();

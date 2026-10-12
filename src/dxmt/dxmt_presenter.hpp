@@ -1,6 +1,7 @@
 #pragma once
 #include <cstring>
 #include "Metal.hpp"
+#include "dxgi.h"
 #include "dxmt_command.hpp"
 #include "rc/util_rc.hpp"
 #include "thread.hpp"
@@ -56,7 +57,7 @@ public:
   );
 
   bool changeLayerProperties(
-      WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
+      DXGI_FORMAT format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
   );
 
   bool changeLayerColorSpace(WMTColorSpace colorspace);
@@ -118,7 +119,7 @@ private:
   WMTColorSpace colorspace_ = WMTColorSpaceSRGB;
   WMTHDRMetadata hdr_metadata_;
   bool has_hdr_metadata_ = false;
-  WMTPixelFormat source_format_ = WMTPixelFormatInvalid;
+  DXGI_FORMAT source_format_ = DXGI_FORMAT_UNKNOWN;
   uint64_t display_setting_version_ = 0;
   WMTColorSpace display_colorspace_ = WMTColorSpaceSRGB;
   WMTHDRMetadata display_hdr_metadata_;

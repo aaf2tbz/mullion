@@ -8,6 +8,7 @@
 #include "util_string.hpp"
 #include "wsi_window.hpp"
 #include "Metal.hpp"
+#include "dxmt_format.hpp"
 
 namespace dxmt {
 
@@ -108,6 +109,11 @@ public:
     InitReturnPtr(ppSwapChain);
 
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
+      return DXGI_ERROR_INVALID_CALL;
+
+    if (pDesc->Format != DXGI_FORMAT_UNKNOWN &&
+        (pDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || pDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) &&
+        !IsFlipSwapChainFormat(pDesc->Format))
       return DXGI_ERROR_INVALID_CALL;
 
     Com<IMTLSwapChainFactory> swapchain_factory;

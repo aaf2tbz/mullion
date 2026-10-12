@@ -23,6 +23,7 @@
 #include "dxgi_output.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_format.hpp"
 #include "dxgi_swapchain_settings.hpp"
 #include "dxmt_info.hpp"
 #include "com/com_pointer.hpp"
@@ -43,24 +44,6 @@ TODO: some implementations can be shared with d3d11 swapchain
 */
 
 namespace dxmt {
-
-WMTPixelFormat
-ConvertSwapChainFormat(DXGI_FORMAT format) {
-  switch (format) {
-  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    return WMTPixelFormatBGRA8Unorm_sRGB;
-  case DXGI_FORMAT_B8G8R8A8_UNORM:
-  case DXGI_FORMAT_R8G8B8A8_UNORM:
-    return WMTPixelFormatBGRA8Unorm;
-  case DXGI_FORMAT_R10G10B10A2_UNORM:
-    return WMTPixelFormatRGB10A2Unorm;
-  case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    return WMTPixelFormatRGBA16Float;
-  default:
-    return WMTPixelFormatInvalid;
-  }
-}
 
 WMTColorSpace
 ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
@@ -529,7 +512,9 @@ public:
       desc.Format = Format;
     if (BufferCount)
       desc.BufferCount = BufferCount;
-    if (ConvertSwapChainFormat(desc.Format) == WMTPixelFormatInvalid || desc.BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+    if (!IsFlipSwapChainFormat(desc.Format))
+      return DXGI_ERROR_INVALID_CALL;
+    if (desc.BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
       return E_INVALIDARG;
     if ((flags ^ desc_.Flags) & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
       return DXGI_ERROR_INVALID_CALL;
@@ -607,7 +592,7 @@ public:
         LayerSupportEDR()
     );
     if (presenter->changeLayerProperties(
-            ConvertSwapChainFormat(desc_.Format), target_color_space, settings_.target_width * scale_factor,
+            desc_.Format, target_color_space, settings_.target_width * scale_factor,
             settings_.target_height * scale_factor, desc_.SampleDesc.Count
         )) {
       // TODO(d3d12): flush command queue
@@ -907,6 +892,9 @@ CreateSwapChain(
     const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
     IDXGISwapChain1 **ppSwapChain
 ) {
+  // Direct3D 12 Swap Chains, Swap effects: only flip sequential and flip discard are supported
+  if (pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
+    return DXGI_ERROR_INVALID_CALL;
   auto swapchain = Com<MTLD3D12SwapChain>::transfer(new MTLD3D12SwapChain(pFactory, pDevice, pQueue, hWnd, pDesc, pFullscreenDesc));
   HRESULT hr = swapchain->ResizeBuffers(0, pDesc->Width, pDesc->Height, DXGI_FORMAT_UNKNOWN, pDesc->Flags);
   if (FAILED(hr))

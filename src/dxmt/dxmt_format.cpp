@@ -12,6 +12,40 @@
 
 namespace dxmt {
 
+WMTPixelFormat
+ConvertSwapChainFormat(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    return WMTPixelFormatBGRA8Unorm_sRGB;
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+    return WMTPixelFormatBGRA8Unorm;
+  case DXGI_FORMAT_R10G10B10A2_UNORM:
+    return WMTPixelFormatRGB10A2Unorm;
+  case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
+    return WMTPixelFormatBGR10_XR;
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    return WMTPixelFormatRGBA16Float;
+  default:
+    return WMTPixelFormatInvalid;
+  }
+}
+
+bool
+IsFlipSwapChainFormat(DXGI_FORMAT format) {
+  // DXGI_SWAP_CHAIN_DESC1, Remarks: these four formats are permitted for flip-model back buffers
+  switch (format) {
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_R10G10B10A2_UNORM:
+    return true;
+  default:
+    return false;
+  }
+}
+
 constexpr FormatCapability ALL_CAP = static_cast<FormatCapability>(
     FormatCapability::Filter | FormatCapability::Write | FormatCapability::Color | FormatCapability::MSAA |
     FormatCapability::Blend | FormatCapability::Sparse | FormatCapability::Resolve
@@ -1014,8 +1048,13 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     description.BytesPerTexel = 4;
     break;
   }
-  case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-    return E_FAIL;
+  case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: {
+    // only scan-out decodes XR; views are ordinary 10:10:10:2 (Microsoft Learn, Casting Ability of XR Formats)
+    description.PixelFormat = WMTPixelFormatRGB10A2Unorm;
+    description.BytesPerTexel = sizeof(uint32_t);
+    description.Flag = MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_BACKBUFFER;
+    break;
+  }
   case DXGI_FORMAT_B8G8R8A8_TYPELESS: {
     description.PixelFormat = WMTPixelFormatBGRA8Unorm;
     description.BytesPerTexel = 4;
@@ -1538,6 +1577,17 @@ MTLQueryDXGIFormatSupport(
   MTL_DXGI_FORMAT_DESC metal_format;
   if (FAILED(MTLQueryDXGIFormat(device, Format, metal_format))) {
     return E_FAIL;
+  }
+
+  if (Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) {
+    // RGB10A2's Metal capabilities describe typed views; XR itself has only storage, scan-out and casts
+    // (Microsoft Learn, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM)
+    Support1 = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE | D3D11_FORMAT_SUPPORT_DISPLAY |
+               D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT | D3D11_FORMAT_SUPPORT_BACK_BUFFER_CAST;
+    Support2 = D3D11_FORMAT_SUPPORT2_SHAREABLE;
+    if (any_bit_set(GetMTLPixelFormatCapability(metal_format.PixelFormat) & FormatCapability::Sparse))
+      Support2 |= D3D11_FORMAT_SUPPORT2_TILED;
+    return S_OK;
   }
 
   if (metal_format.PixelFormat) {

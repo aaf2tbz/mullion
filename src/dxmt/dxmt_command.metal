@@ -377,6 +377,7 @@ constant bool present_with_hdr_metadata [[function_constant(kPresentFCIndex_With
 constant bool present_backbuffer_is_ms [[function_constant(kPresentFCIndex_BackbufferIsMS)]];
 constant bool present_backbuffer_is_not_ms = !present_backbuffer_is_ms;
 constant bool present_gamma_enabled [[function_constant(kPresentFCIndex_GammaEnabled)]];
+constant bool present_backbuffer_is_xr_bias [[function_constant(kPresentFCIndex_BackbufferIsXRBias)]];
 
 constexpr sampler s(coord::normalized);
 constexpr sampler gamma_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -422,6 +423,9 @@ float3 to_srgb(float3 linear) {
       ? source.read(uint2(input.position.xy))
       : source.sample(s, uv);
   }
+  // Microsoft Learn, XR_BIAS to Float Conversion Rules: RGB codes decode as (code - 0x180) / 510.f
+  if (present_backbuffer_is_xr_bias)
+    output.rgb = (output.rgb * 0x3ff - 0x180) / 510.f;
   if (any(at >= 1))
     output = meta.background;
   float3 output_rgb = output.xyz;
