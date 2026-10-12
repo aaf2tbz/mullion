@@ -17,7 +17,7 @@ Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
 class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {
 
 public:
-  MTLDXGIFactory(UINT Flags) : flags_(Flags) {};
+  MTLDXGIFactory(UINT Flags, bool Extended) : flags_(Flags), extended_(Extended) {};
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
@@ -26,8 +26,9 @@ public:
 
     *ppvObject = nullptr;
 
+    // Windows hides only IDXGIFactory1 on legacy factories (Wine's test_create_factory).
     if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
-        riid == __uuidof(IDXGIFactory) || riid == __uuidof(IDXGIFactory1) ||
+        riid == __uuidof(IDXGIFactory) || (riid == __uuidof(IDXGIFactory1) && extended_) ||
         riid == __uuidof(IDXGIFactory2) || riid == __uuidof(IDXGIFactory2) ||
         riid == __uuidof(IDXGIFactory3) || riid == __uuidof(IDXGIFactory4) ||
         riid == __uuidof(IDXGIFactory5) || riid == __uuidof(IDXGIFactory6)) {
@@ -317,14 +318,14 @@ public:
 
 private:
   UINT flags_;
+  bool extended_;
 
   HWND associated_window_ = nullptr;
 };
 
-extern "C" HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid,
-                                                void **ppFactory) {
+static HRESULT CreateFactory(UINT Flags, bool Extended, REFIID riid, void **ppFactory) {
   try {
-    MTLDXGIFactory* factory = new MTLDXGIFactory(Flags);
+    MTLDXGIFactory* factory = new MTLDXGIFactory(Flags, Extended);
     HRESULT hr = factory->QueryInterface(riid, ppFactory);
     factory->Release();
 
@@ -338,12 +339,16 @@ extern "C" HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid,
   }
 }
 
+extern "C" HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory) {
+  return CreateFactory(Flags, true, riid, ppFactory);
+}
+
 extern "C" HRESULT __stdcall CreateDXGIFactory1(REFIID riid, void **ppFactory) {
   return CreateDXGIFactory2(0, riid, ppFactory);
 }
 
 extern "C" HRESULT __stdcall CreateDXGIFactory(REFIID riid, void **factory) {
-  return CreateDXGIFactory2(0, riid, factory);
+  return CreateFactory(0, false, riid, factory);
 }
 
 } // namespace dxmt

@@ -114,6 +114,8 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   } catch (const MTLD3DError &e) {
     Logger::err("D3D11CoreCreateDevice: Failed to create D3D11 device");
     return E_FAIL;
+  } catch (const std::bad_alloc &) {
+    return E_OUTOFMEMORY;
   }
 }
 

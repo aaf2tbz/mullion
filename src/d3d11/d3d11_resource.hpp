@@ -250,6 +250,8 @@ public:
     if (riid == __uuidof(ID3D10DeviceChild) ||
         riid == __uuidof(ID3D10Resource) ||
         riid == __uuidof(typename tag::D3D10)) {
+      if (desc.MiscFlags & (D3D11_RESOURCE_MISC_RESOURCE_CLAMP | D3D11_RESOURCE_MISC_BUFFER_STRUCTURED))
+        return E_NOINTERFACE;
       *ppvObject = ref_and_cast<typename tag::D3D10>(&d3d10);
       return S_OK;
     }

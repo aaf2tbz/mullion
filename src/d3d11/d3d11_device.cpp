@@ -25,6 +25,10 @@
 #include "dxgi_object.hpp"
 #include <atomic>
 #include <memory>
+#include <d3d11sdklayers.h>
+#include <deque>
+#include <mutex>
+#include <set>
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
 
@@ -43,6 +47,330 @@ const GUID kGpaUUID = {0xccffef16,
                        0x468f,
                        {0xbc, 0xe3, 0xcd, 0x95, 0x33, 0x69, 0xa3, 0x9a}};
 
+class D3D11InfoQueue final : public ID3D11InfoQueue {
+  struct FilterList {
+    std::vector<D3D11_MESSAGE_CATEGORY> categories;
+    std::vector<D3D11_MESSAGE_SEVERITY> severities;
+    std::vector<D3D11_MESSAGE_ID> ids;
+
+    bool empty() const { return categories.empty() && severities.empty() && ids.empty(); }
+    bool matches(D3D11_MESSAGE_CATEGORY category, D3D11_MESSAGE_SEVERITY severity, D3D11_MESSAGE_ID id) const {
+      return std::find(categories.begin(), categories.end(), category) != categories.end() ||
+             std::find(severities.begin(), severities.end(), severity) != severities.end() ||
+             std::find(ids.begin(), ids.end(), id) != ids.end();
+    }
+    template <typename T> static void append(std::vector<T> &values, UINT count, const T *entries) {
+      for (UINT i = 0; i < count; ++i)
+        if (std::find(values.begin(), values.end(), entries[i]) == values.end())
+          values.push_back(entries[i]);
+    }
+    bool add(const D3D11_INFO_QUEUE_FILTER_DESC &desc) {
+      if ((desc.NumCategories && !desc.pCategoryList) || (desc.NumSeverities && !desc.pSeverityList) ||
+          (desc.NumIDs && !desc.pIDList))
+        return false;
+      append(categories, desc.NumCategories, desc.pCategoryList);
+      append(severities, desc.NumSeverities, desc.pSeverityList);
+      append(ids, desc.NumIDs, desc.pIDList);
+      return true;
+    }
+    SIZE_T bytes() const {
+      return categories.size() * sizeof(D3D11_MESSAGE_CATEGORY) + severities.size() * sizeof(D3D11_MESSAGE_SEVERITY) +
+             ids.size() * sizeof(D3D11_MESSAGE_ID);
+    }
+    template <typename T> static void write(const std::vector<T> &values, UINT &count, T *&entries, char *&data) {
+      count = values.size();
+      entries = values.empty() ? nullptr : reinterpret_cast<T *>(data);
+      if (!values.empty())
+        memcpy(data, values.data(), values.size() * sizeof(T));
+      data += values.size() * sizeof(T);
+    }
+    void write(D3D11_INFO_QUEUE_FILTER_DESC &desc, char *&data) const {
+      write(categories, desc.NumCategories, desc.pCategoryList, data);
+      write(severities, desc.NumSeverities, desc.pSeverityList, data);
+      write(ids, desc.NumIDs, desc.pIDList, data);
+    }
+  };
+  struct Filter {
+    FilterList allow, deny;
+    bool accepts(D3D11_MESSAGE_CATEGORY category, D3D11_MESSAGE_SEVERITY severity, D3D11_MESSAGE_ID id) const {
+      return (allow.empty() || allow.matches(category, severity, id)) && !deny.matches(category, severity, id);
+    }
+    bool add(const D3D11_INFO_QUEUE_FILTER &filter) { return allow.add(filter.AllowList) && deny.add(filter.DenyList); }
+  };
+  struct Message {
+    D3D11_MESSAGE_CATEGORY category;
+    D3D11_MESSAGE_SEVERITY severity;
+    D3D11_MESSAGE_ID id;
+    std::string description;
+  };
+
+public:
+  D3D11InfoQueue(IUnknown *container) : container_(container) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+    return container_->QueryInterface(iid, out);
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return container_->AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() override { return container_->Release(); }
+
+  HRESULT STDMETHODCALLTYPE SetMessageCountLimit(UINT64 limit) override {
+    std::lock_guard lock(mutex_);
+    limit_ = limit;
+    while (messages_.size() > limit_) {
+      messages_.pop_front();
+      ++discarded_;
+    }
+    return S_OK;
+  }
+  void STDMETHODCALLTYPE ClearStoredMessages() override {
+    std::lock_guard lock(mutex_);
+    messages_.clear();
+    allowed_ = denied_ = discarded_ = 0;
+  }
+  HRESULT STDMETHODCALLTYPE GetMessage(UINT64 index, D3D11_MESSAGE *out, SIZE_T *bytes) override {
+    std::lock_guard lock(mutex_);
+    if (!bytes)
+      return E_INVALIDARG;
+    for (const auto &message : messages_) {
+      if (!retrieval_.back().accepts(message.category, message.severity, message.id))
+        continue;
+      if (index--)
+        continue;
+      auto size = sizeof(*out) + message.description.size() + 1;
+      auto available = out ? *bytes : 0;
+      *bytes = size;
+      if (!out)
+        return S_OK;
+      if (available < size)
+        return DXGI_ERROR_MORE_DATA;
+      auto data = reinterpret_cast<char *>(out + 1);
+      memcpy(data, message.description.c_str(), message.description.size() + 1);
+      *out = {message.category, message.severity, message.id, data, message.description.size() + 1};
+      return S_OK;
+    }
+    return E_INVALIDARG;
+  }
+  UINT64 STDMETHODCALLTYPE GetNumMessagesAllowedByStorageFilter() override {
+    std::lock_guard lock(mutex_);
+    return allowed_;
+  }
+  UINT64 STDMETHODCALLTYPE GetNumMessagesDeniedByStorageFilter() override {
+    std::lock_guard lock(mutex_);
+    return denied_;
+  }
+  UINT64 STDMETHODCALLTYPE GetNumStoredMessages() override {
+    std::lock_guard lock(mutex_);
+    return messages_.size();
+  }
+  UINT64 STDMETHODCALLTYPE GetNumStoredMessagesAllowedByRetrievalFilter() override {
+    std::lock_guard lock(mutex_);
+    return std::count_if(messages_.begin(), messages_.end(), [&](const Message &message) {
+      return retrieval_.back().accepts(message.category, message.severity, message.id);
+    });
+  }
+  UINT64 STDMETHODCALLTYPE GetNumMessagesDiscardedByMessageCountLimit() override {
+    std::lock_guard lock(mutex_);
+    return discarded_;
+  }
+  UINT64 STDMETHODCALLTYPE GetMessageCountLimit() override {
+    std::lock_guard lock(mutex_);
+    return limit_;
+  }
+
+  HRESULT STDMETHODCALLTYPE AddStorageFilterEntries(D3D11_INFO_QUEUE_FILTER *filter) override {
+    return AddFilter(storage_, filter, false);
+  }
+  HRESULT STDMETHODCALLTYPE GetStorageFilter(D3D11_INFO_QUEUE_FILTER *out, SIZE_T *bytes) override {
+    return GetFilter(storage_, out, bytes);
+  }
+  void STDMETHODCALLTYPE ClearStorageFilter() override {
+    std::lock_guard lock(mutex_);
+    storage_.back() = {};
+  }
+  HRESULT STDMETHODCALLTYPE PushEmptyStorageFilter() override {
+    D3D11_INFO_QUEUE_FILTER empty{};
+    return AddFilter(storage_, &empty, true);
+  }
+  HRESULT STDMETHODCALLTYPE PushCopyOfStorageFilter() override { return CopyFilter(storage_); }
+  HRESULT STDMETHODCALLTYPE PushStorageFilter(D3D11_INFO_QUEUE_FILTER *filter) override {
+    return AddFilter(storage_, filter, true);
+  }
+  void STDMETHODCALLTYPE PopStorageFilter() override {
+    std::lock_guard lock(mutex_);
+    if (storage_.size() > 1)
+      storage_.pop_back();
+  }
+  UINT STDMETHODCALLTYPE GetStorageFilterStackSize() override {
+    std::lock_guard lock(mutex_);
+    return storage_.size();
+  }
+  HRESULT STDMETHODCALLTYPE AddRetrievalFilterEntries(D3D11_INFO_QUEUE_FILTER *filter) override {
+    return AddFilter(retrieval_, filter, false);
+  }
+  HRESULT STDMETHODCALLTYPE GetRetrievalFilter(D3D11_INFO_QUEUE_FILTER *out, SIZE_T *bytes) override {
+    return GetFilter(retrieval_, out, bytes);
+  }
+  void STDMETHODCALLTYPE ClearRetrievalFilter() override {
+    std::lock_guard lock(mutex_);
+    retrieval_.back() = {};
+  }
+  HRESULT STDMETHODCALLTYPE PushEmptyRetrievalFilter() override {
+    D3D11_INFO_QUEUE_FILTER empty{};
+    return AddFilter(retrieval_, &empty, true);
+  }
+  HRESULT STDMETHODCALLTYPE PushCopyOfRetrievalFilter() override { return CopyFilter(retrieval_); }
+  HRESULT STDMETHODCALLTYPE PushRetrievalFilter(D3D11_INFO_QUEUE_FILTER *filter) override {
+    return AddFilter(retrieval_, filter, true);
+  }
+  void STDMETHODCALLTYPE PopRetrievalFilter() override {
+    std::lock_guard lock(mutex_);
+    if (retrieval_.size() > 1)
+      retrieval_.pop_back();
+  }
+  UINT STDMETHODCALLTYPE GetRetrievalFilterStackSize() override {
+    std::lock_guard lock(mutex_);
+    return retrieval_.size();
+  }
+
+  HRESULT STDMETHODCALLTYPE AddMessage(D3D11_MESSAGE_CATEGORY category, D3D11_MESSAGE_SEVERITY severity,
+                                       D3D11_MESSAGE_ID id, LPCSTR description) override {
+    if (!description || category < D3D11_MESSAGE_CATEGORY_APPLICATION_DEFINED ||
+        category > D3D11_MESSAGE_CATEGORY_SHADER || severity < D3D11_MESSAGE_SEVERITY_CORRUPTION ||
+        severity > D3D11_MESSAGE_SEVERITY_MESSAGE)
+      return E_INVALIDARG;
+    std::unique_lock lock(mutex_);
+    if (!storage_.back().accepts(category, severity, id)) {
+      ++denied_;
+      return S_OK;
+    }
+    try {
+      if (limit_) {
+        messages_.push_back({category, severity, id, description});
+        if (messages_.size() > limit_) {
+          messages_.pop_front();
+          ++discarded_;
+        }
+      } else {
+        ++discarded_;
+      }
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
+    ++allowed_;
+    bool output = !mute_;
+    bool stop = break_categories_.contains(category) || break_severities_.contains(severity) || break_ids_.contains(id);
+    lock.unlock();
+    if (output)
+      OutputDebugStringA(description);
+    if (stop)
+      DebugBreak();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE AddApplicationMessage(D3D11_MESSAGE_SEVERITY severity, LPCSTR description) override {
+    return AddMessage(D3D11_MESSAGE_CATEGORY_APPLICATION_DEFINED, severity, D3D11_MESSAGE_ID_STRING_FROM_APPLICATION,
+                      description);
+  }
+  HRESULT STDMETHODCALLTYPE SetBreakOnCategory(D3D11_MESSAGE_CATEGORY category, BOOL enable) override {
+    if (category < D3D11_MESSAGE_CATEGORY_APPLICATION_DEFINED || category > D3D11_MESSAGE_CATEGORY_SHADER)
+      return E_INVALIDARG;
+    return SetBreak(break_categories_, category, enable);
+  }
+  HRESULT STDMETHODCALLTYPE SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY severity, BOOL enable) override {
+    if (severity < D3D11_MESSAGE_SEVERITY_CORRUPTION || severity > D3D11_MESSAGE_SEVERITY_MESSAGE)
+      return E_INVALIDARG;
+    return SetBreak(break_severities_, severity, enable);
+  }
+  HRESULT STDMETHODCALLTYPE SetBreakOnID(D3D11_MESSAGE_ID id, BOOL enable) override {
+    return SetBreak(break_ids_, id, enable);
+  }
+  BOOL STDMETHODCALLTYPE GetBreakOnCategory(D3D11_MESSAGE_CATEGORY category) override {
+    std::lock_guard lock(mutex_);
+    return break_categories_.contains(category);
+  }
+  BOOL STDMETHODCALLTYPE GetBreakOnSeverity(D3D11_MESSAGE_SEVERITY severity) override {
+    std::lock_guard lock(mutex_);
+    return break_severities_.contains(severity);
+  }
+  BOOL STDMETHODCALLTYPE GetBreakOnID(D3D11_MESSAGE_ID id) override {
+    std::lock_guard lock(mutex_);
+    return break_ids_.contains(id);
+  }
+  void STDMETHODCALLTYPE SetMuteDebugOutput(BOOL mute) override {
+    std::lock_guard lock(mutex_);
+    mute_ = !!mute;
+  }
+  BOOL STDMETHODCALLTYPE GetMuteDebugOutput() override {
+    std::lock_guard lock(mutex_);
+    return mute_;
+  }
+
+private:
+  HRESULT AddFilter(std::vector<Filter> &stack, const D3D11_INFO_QUEUE_FILTER *filter, bool push) {
+    if (!filter)
+      return E_INVALIDARG;
+    std::lock_guard lock(mutex_);
+    try {
+      auto next = push ? Filter{} : stack.back();
+      if (!next.add(*filter))
+        return E_INVALIDARG;
+      if (push)
+        stack.push_back(std::move(next));
+      else
+        stack.back() = std::move(next);
+      return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
+  }
+  HRESULT CopyFilter(std::vector<Filter> &stack) {
+    std::lock_guard lock(mutex_);
+    try {
+      stack.push_back(stack.back());
+      return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
+  }
+  HRESULT GetFilter(const std::vector<Filter> &stack, D3D11_INFO_QUEUE_FILTER *out, SIZE_T *bytes) {
+    if (!bytes)
+      return E_INVALIDARG;
+    std::lock_guard lock(mutex_);
+    const auto &filter = stack.back();
+    auto size = sizeof(*out) + filter.allow.bytes() + filter.deny.bytes();
+    auto available = out ? *bytes : 0;
+    *bytes = size;
+    if (!out)
+      return S_OK;
+    if (available < size)
+      return DXGI_ERROR_MORE_DATA;
+    auto data = reinterpret_cast<char *>(out + 1);
+    filter.allow.write(out->AllowList, data);
+    filter.deny.write(out->DenyList, data);
+    return S_OK;
+  }
+  template <typename T> HRESULT SetBreak(std::set<T> &conditions, T value, BOOL enable) {
+    std::lock_guard lock(mutex_);
+    try {
+      if (enable)
+        conditions.insert(value);
+      else
+        conditions.erase(value);
+      return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
+  }
+
+  IUnknown *container_;
+  std::mutex mutex_;
+  std::vector<Filter> storage_{1}, retrieval_{1};
+  std::deque<Message> messages_;
+  std::set<D3D11_MESSAGE_CATEGORY> break_categories_;
+  std::set<D3D11_MESSAGE_SEVERITY> break_severities_;
+  std::set<D3D11_MESSAGE_ID> break_ids_;
+  UINT64 limit_ = D3D11_INFO_QUEUE_DEFAULT_MESSAGE_COUNT_LIMIT;
+  UINT64 allowed_ = 0, denied_ = 0, discarded_ = 0;
+  BOOL mute_ = FALSE;
+};
 class MTLD3D11DeviceImpl final : public MTLD3D11Device, public IMTLD3D11DeviceExt, public IMTLSwapChainFactory {
 friend class MTLD3D11DXGIDevice;
 public:
@@ -63,6 +391,8 @@ public:
     pipeline_cache_ = InitializePipelineCache(this);
     context_ = InitializeImmediateContext(this, device_.queue());
     d3d10_ = std::make_unique<MTLD3D10Device>(this, context_.get());
+    if (FeatureFlags & D3D11_CREATE_DEVICE_DEBUG)
+      info_queue_ = std::make_unique<D3D11InfoQueue>(container);
     is_traced_ = !!::GetModuleHandle("dxgitrace.dll");
     format_inspector_.Inspect(GetMTLDevice());
   }
@@ -1111,6 +1441,7 @@ private:
   std::unique_ptr<MTLD3D10Device> d3d10_;
   std::atomic<bool> d3d10_interfaces_ = GetDirectXVersion() == 10;
   D3D11Multithread d3dmt_;
+  std::unique_ptr<D3D11InfoQueue> info_queue_;
 };
 
 /**
@@ -1191,6 +1522,11 @@ public:
 
     if (riid == __uuidof(ID3D11Multithread)) {
       *ppvObject = ref_and_cast<ID3D11Multithread>(&d3d11_device_.d3dmt_);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D11InfoQueue) && d3d11_device_.info_queue_) {
+      *ppvObject = ref(d3d11_device_.info_queue_.get());
       return S_OK;
     }
 
