@@ -28,6 +28,7 @@
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "dxmt_diag.hpp"
+#include "dxmt_command_constants.hpp"
 #include <atomic>
 #include <charconv>
 #include <fstream>
@@ -177,6 +178,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   struct InflightCommandBuffer {
     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+    WMT::Reference<WMT::Buffer> sparse_mappings{};
     std::shared_ptr<GPURecordChecks> records{};
     HANDLE semaphore{};
     std::function<void()> completed{};
@@ -557,7 +559,7 @@ public:
     }
     if (operations.empty())
       return;
-    Map([texture = tiling.texture, res = Com(static_cast<MTLD3D12Resource *>(resource)),
+    Map([this, texture = tiling.texture, res = Com(static_cast<MTLD3D12Resource *>(resource)),
          heap = Com(static_cast<MTLD3D12Heap *>(heap)), operations = std::move(operations)](WMT::MTL4CommandQueue queue) {
       WMT::Object heap_handle = heap != nullptr ? heap->heap : WMT::Heap{};
       if (texture) {
@@ -569,6 +571,7 @@ public:
       for (auto &op : operations)
         ranges.push_back({op.mode, op.origin.x, op.size.width, op.heap_tile});
       queue.updateMappings(res->buffer->current()->buffer(), false, heap_handle, ranges);
+      device_->UpdateSparseBufferMappings(res->buffer->current(), ranges);
     });
   };
 
@@ -594,7 +597,7 @@ public:
         destination.index(*dst_region_start_coordinate, *region_size, 0) >
             source.index(*src_region_start_coordinate, *region_size, 0))
       std::reverse(operations.begin(), operations.end());
-    Map([texture = source.texture, src = Com(static_cast<MTLD3D12Resource *>(src_resource)),
+    Map([this, texture = source.texture, src = Com(static_cast<MTLD3D12Resource *>(src_resource)),
          dst = Com(static_cast<MTLD3D12Resource *>(dst_resource)),
          operations = std::move(operations)](WMT::MTL4CommandQueue queue) {
       if (texture) {
@@ -605,6 +608,7 @@ public:
       for (auto &op : operations)
         ranges.push_back({op.origin.x, 1, op.destination_origin.x});
       queue.copyMappings(src->buffer->current()->buffer(), dst->buffer->current()->buffer(), false, ranges);
+      device_->CopySparseBufferMappings(src->buffer->current(), dst->buffer->current(), ranges);
     });
   };
 
@@ -647,6 +651,17 @@ public:
       std::vector<Com<MTLD3D12CommandAllocator>> allocators;
       ~Keeps() { scope.inflight->allocators = std::move(allocators); }
     } keeps{scope, std::move(allocators)};
+    WMT::Reference<WMT::Buffer> sparse_mappings;
+    auto mappings = device_->SparseBufferMappings();
+    if (!mappings.empty()) {
+      WMTBufferInfo info{mappings.size() * sizeof(mappings[0]), WMTResourceStorageModeShared};
+      sparse_mappings = device_->GetMTLDevice().newBuffer(info);
+      if (!sparse_mappings) {
+        device_->LoseDevice();
+        return;
+      }
+      sparse_mappings.updateContents(0, mappings.data(), info.length);
+    }
     static const bool isolate = !env::getEnvVar("DXMT_D3D12_ISOLATE").empty();
     WMT::CommandBuffer cmdbuf = scope.inflight->cmdbuf;
     uint64_t queries = 0;
@@ -871,6 +886,13 @@ public:
           }
           // the object and mesh stages read what earlier passes wrote as the vertex stage does
           encoder.waitForFence(fence_, WMTRenderStagePreRaster);
+          if (sparse_mappings) {
+            scope.inflight->sparse_mappings = sparse_mappings;
+            encoder.setVertexBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+            encoder.setFragmentBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+            encoder.setObjectBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+            encoder.setMeshBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+          }
           encoder.encodeCommands(&data->cmd_head);
           encoder.updateFence(fence_, WMTRenderStageFragment);
           encoder.endEncoding();
@@ -944,6 +966,14 @@ public:
             encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
           }
           encoder.waitForFence(fence_);
+          if (sparse_mappings) {
+            scope.inflight->sparse_mappings = sparse_mappings;
+            wmtcmd_compute_setbuffer binding{};
+            binding.type = WMTComputeCommandSetBuffer;
+            binding.buffer = sparse_mappings;
+            binding.index = kSparseBufferArgumentIndex;
+            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
+          }
           encoder.encodeCommands(&data->cmd_head);
           encoder.updateFence(fence_);
           encoder.endEncoding();

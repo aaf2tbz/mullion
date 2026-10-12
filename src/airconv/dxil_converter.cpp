@@ -632,6 +632,7 @@ enum RayContextField : unsigned {
   RayCommitted,
   RayCallable,
   RayAttributes,
+  RaySparseBuffers,
 };
 
 StructType *
@@ -647,7 +648,8 @@ ray_context_type(LLVMContext &ctx) {
       ctx,
       {table->getPointerTo(1), i32->getPointerTo(2), i64->getPointerTo(2), i64->getPointerTo(2), i64,
        Type::getInt8PtrTy(ctx), ArrayType::get(i32, 3), i32, vector, f32, vector, f32, vector, i32, vector, i32,
-       matrix, matrix, i32, i32, i32, i32, f32, i32, i32, i32, i32, i32, i32, i32, ArrayType::get(i32, 8)},
+       matrix, matrix, i32, i32, i32, i32, f32, i32, i32, i32, i32, i32, i32, i32, ArrayType::get(i32, 8),
+       i64->getPointerTo(2)},
       "dxmt.ray_context"
   );
 }
@@ -2686,10 +2688,15 @@ convert_dxil(
       if (!store)
         for (auto user : call->users()) {
           auto extract = dyn_cast<ExtractValueInst>(user);
-          mask |= extract ? 1u << extract->getIndices()[0] : 0xfu;
+          mask |= extract ? 1u << extract->getIndices()[0]
+                          : llvm::maskTrailingOnes<uint32_t>(cast<StructType>(ty)->getNumElements());
         }
       auto element = ir.getIntNTy(bits);
       Value *v = UndefValue::get(FixedVectorType::get(element, 4));
+      bool feedback = !store && (mask & (1u << 4));
+      if (feedback)
+        mask |= op == RawBufferLoad ? constant(a(4)) : (mask & kMaskAll ? 0 : kMaskAll);
+      Value *residency = ir.getInt32(0);
       for (unsigned i = 0; i < 4; i++) {
         if (!(mask & (1u << i)))
           continue;
@@ -2697,6 +2704,8 @@ convert_dxil(
         Value *loaded = ConstantInt::get(element, 0);
         for (unsigned part = 0; part < parts; part++) {
           auto ptr = unit_ptr(b, unit, ir.CreateAdd(base, ir.getInt64(i * parts + part)));
+          if (feedback)
+            residency = ir.CreateOr(residency, dxbc.BufferResidency(ptr));
           auto shift = part * unit->getBitWidth();
           if (store) {
             auto piece = ir.CreateTrunc(ir.CreateLShr(x, shift), unit);
@@ -2713,7 +2722,7 @@ convert_dxil(
           v = ir.CreateInsertElement(v, loaded, i);
       }
       if (!store)
-        ret = to_struct(ty, v, nullptr);
+        ret = to_struct(ty, v, residency);
       break;
     }
     case GetDimensions: {
@@ -3923,7 +3932,9 @@ convert_dxil_ray_shader(
     return builder.CreateLoad(context_ty->getElementType(i), builder.CreateStructGEP(context_ty, ray_context, i));
   };
   if (global)
-    bind_rootsig_arguments(*global, builder, field(RayRootArguments), field(RayStaticSamplers));
+    bind_rootsig_arguments(
+        *global, builder, field(RayRootArguments), field(RayStaticSamplers), field(RaySparseBuffers)
+    );
   if (local)
     bind_rootsig_arguments(
         *local, builder,
@@ -3932,7 +3943,8 @@ convert_dxil_ray_shader(
                                              builder.getInt64(local_rootsig->static_samplers),
                                              context_ty->getElementType(RayStaticSamplers)
                                          )
-                                       : nullptr
+                                       : nullptr,
+        field(RaySparseBuffers)
     );
   auto binding_map = combine_bindings(std::move(local), std::move(global));
   resource_map.ray_context = ray_context;

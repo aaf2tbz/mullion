@@ -131,6 +131,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
   uint32_t next_ray_function_ = SM50_RAY_FUNCTION_FIRST_SHADER;
   WMT::Reference<WMT::ResidencySet> residency_set_;
   std::map<uint64_t, BufferAllocation *> interval_map_;
+  std::map<uint64_t, std::vector<uint64_t>> sparse_buffer_mappings_;
   // what a null acceleration structure is to a ray query: a top-level structure of nothing
   std::unique_ptr<AccelerationStructure> null_scene_;
 
@@ -1766,6 +1767,10 @@ public:
   RegisterResidencyAndVA(BufferAllocation *allocation) {
     std::unique_lock<dxmt::mutex> lock(residency_lock_);
     interval_map_.emplace(allocation->gpuAddress(), allocation);
+    if (allocation->sparse_tile_bytes)
+      sparse_buffer_mappings_.emplace(
+          allocation->gpuAddress(), std::vector<uint64_t>(allocation->sparse_tile_count)
+      );
     if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
       return S_OK;
     auto buffer = allocation->buffer();
@@ -1791,6 +1796,7 @@ public:
       acceleration_structures_.erase(first, last);
     }
     interval_map_.erase(allocation->gpuAddress());
+    sparse_buffer_mappings_.erase(allocation->gpuAddress());
     if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
       return S_OK;
     auto buffer = allocation->buffer();
@@ -1810,6 +1816,41 @@ public:
     --iter;
     *pOffset = VA - iter->first;
     return iter->second;
+  }
+
+  void
+  UpdateSparseBufferMappings(BufferAllocation *buffer, const std::vector<WMTSparseBufferMapping> &ranges) {
+    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    auto &tiles = sparse_buffer_mappings_.at(buffer->gpuAddress());
+    for (auto &range : ranges)
+      std::fill_n(tiles.begin() + range.first_tile, range.tile_count, range.mode == WMTSparseMappingModeMap);
+  }
+
+  void
+  CopySparseBufferMappings(
+      BufferAllocation *src, BufferAllocation *dst, const std::vector<WMTSparseBufferMappingCopy> &ranges
+  ) {
+    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    auto &from = sparse_buffer_mappings_.at(src->gpuAddress());
+    auto &to = sparse_buffer_mappings_.at(dst->gpuAddress());
+    for (auto &range : ranges)
+      memmove(&to[range.destination_tile], &from[range.first_tile], range.tile_count * sizeof(from[0]));
+  }
+
+  std::vector<uint64_t>
+  SparseBufferMappings() {
+    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    if (sparse_buffer_mappings_.empty())
+      return {};
+    std::vector<uint64_t> words{sparse_buffer_mappings_.size()};
+    for (auto &[address, tiles] : sparse_buffer_mappings_) {
+      SM50_SPARSE_BUFFER_MAPPING header{address, tiles.size(), interval_map_.at(address)->sparse_tile_bytes};
+      auto first = words.size();
+      words.resize(first + sizeof(header) / sizeof(words[0]));
+      memcpy(&words[first], &header, sizeof(header));
+      words.insert(words.end(), tiles.begin(), tiles.end());
+    }
+    return words;
   }
 
   std::shared_ptr<AccelerationStructure>

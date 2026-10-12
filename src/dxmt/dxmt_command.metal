@@ -1061,9 +1061,10 @@ struct DXMTRayContext {
   uint committed;
   uint callable;
   uint attributes[8]; // of the accepted report (D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES)
+  constant ulong *sparse_buffers;
 };
 
-static_assert(sizeof(DXMTRayContext) == 304, "ray_context_type mirrors this layout");
+static_assert(sizeof(DXMTRayContext) == 304 + sizeof(constant ulong *), "ray_context_type mirrors this layout");
 
 static device const SM50_RAY_SHADER_IDENTIFIER *ray_record(ulong table, ulong stride, uint index) {
   return (device const SM50_RAY_SHADER_IDENTIFIER *)(table + stride * index);
@@ -1256,6 +1257,7 @@ enum {
     constant ulong *static_samplers [[buffer(1)]],
     constant SM50_RAY_DISPATCH &dispatch [[buffer(SM50_RAY_BINDING_DISPATCH)]],
     visible_function_table<DXMTRayShader> shaders [[buffer(SM50_RAY_BINDING_FUNCTIONS)]],
+    constant ulong *sparse_buffers [[buffer(kSparseBufferArgumentIndex)]],
     uint3 index [[thread_position_in_grid]]
 ) {
   auto record = (device const SM50_RAY_SHADER_IDENTIFIER *)dispatch.ray_generation_record;
@@ -1267,6 +1269,7 @@ enum {
   c.dispatch = &dispatch;
   c.root_arguments = root_arguments;
   c.static_samplers = static_samplers;
+  c.sparse_buffers = sparse_buffers;
   for (uint i = 0; i < 3; i++)
     c.index[i] = index[i];
   ray_shader(c, record, record->function[0], nullptr, nullptr);

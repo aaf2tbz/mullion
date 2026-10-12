@@ -83,7 +83,9 @@ BufferAllocation::BufferAllocation(
     info_(info),
     flags_(flags) {
   // whole tiles, which map one by one
-  info_.length = align(info_.length, device.sparseTileSizeInBytes(page_size));
+  sparse_tile_bytes = device.sparseTileSizeInBytes(page_size);
+  info_.length = align(info_.length, sparse_tile_bytes);
+  sparse_tile_count = info_.length / sparse_tile_bytes;
   suballocation_size_ = info_.length;
   fenceTrackers.resize(suballocation_count_);
   obj_ = device.newPlacementSparseBuffer(info_.length, info_.options, page_size, gpuAddress_);

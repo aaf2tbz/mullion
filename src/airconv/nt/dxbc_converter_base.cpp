@@ -1363,6 +1363,62 @@ Converter::StoreFeedback(const std::optional<DstOperand> &Feedback, llvm::Value 
     );
 }
 
+llvm::Value *
+Converter::BufferResidency(llvm::Value *Pointer) {
+  auto Table = ctx.binding.GetSparseBufferMappings(air);
+  if (!Table)
+    return ir.getInt32(0);
+  auto Module = air.getModule();
+  auto Function = Module->getFunction("dxmt.buffer_residency");
+  if (!Function) {
+    Function = llvm::Function::Create(
+        llvm::FunctionType::get(ir.getInt32Ty(), {Table->getType(), ir.getInt64Ty()}, false),
+        llvm::GlobalValue::InternalLinkage, "dxmt.buffer_residency", Module
+    );
+    Function->addFnAttr(llvm::Attribute::AlwaysInline);
+    auto Entry = llvm::BasicBlock::Create(ctx.llvm, "entry", Function);
+    auto Start = llvm::BasicBlock::Create(ctx.llvm, "start", Function);
+    auto Loop = llvm::BasicBlock::Create(ctx.llvm, "loop", Function);
+    auto Test = llvm::BasicBlock::Create(ctx.llvm, "test", Function);
+    auto Hit = llvm::BasicBlock::Create(ctx.llvm, "hit", Function);
+    auto Next = llvm::BasicBlock::Create(ctx.llvm, "next", Function);
+    auto Mapped = llvm::BasicBlock::Create(ctx.llvm, "mapped", Function);
+    llvm::IRBuilder<> B(Entry);
+    auto Table = Function->getArg(0), Address = Function->getArg(1);
+    B.CreateCondBr(B.CreateIsNull(Table), Mapped, Start);
+    B.SetInsertPoint(Start);
+    auto Count = B.CreateLoad(B.getInt64Ty(), Table);
+    auto First = B.CreateGEP(B.getInt64Ty(), Table, B.getInt64(1));
+    B.CreateBr(Loop);
+    B.SetInsertPoint(Loop);
+    auto Remaining = B.CreatePHI(B.getInt64Ty(), 2);
+    auto Current = B.CreatePHI(Table->getType(), 2);
+    Remaining->addIncoming(Count, Start);
+    Current->addIncoming(First, Start);
+    B.CreateCondBr(B.CreateICmpEQ(Remaining, B.getInt64(0)), Mapped, Test);
+    B.SetInsertPoint(Test);
+    auto Field = [&](size_t Offset) {
+      return B.CreateLoad(B.getInt64Ty(), B.CreateGEP(B.getInt64Ty(), Current, B.getInt64(Offset / sizeof(uint64_t))));
+    };
+    auto Base = Field(offsetof(SM50_SPARSE_BUFFER_MAPPING, address));
+    auto Tiles = Field(offsetof(SM50_SPARSE_BUFFER_MAPPING, tile_count));
+    auto TileBytes = Field(offsetof(SM50_SPARSE_BUFFER_MAPPING, tile_bytes));
+    auto Offset = B.CreateSub(Address, Base);
+    auto Bits = B.CreateGEP(B.getInt64Ty(), Current, B.getInt64(sizeof(SM50_SPARSE_BUFFER_MAPPING) / sizeof(uint64_t)));
+    B.CreateCondBr(B.CreateICmpULT(Offset, B.CreateMul(Tiles, TileBytes)), Hit, Next);
+    B.SetInsertPoint(Hit);
+    auto Tile = B.CreateGEP(B.getInt64Ty(), Bits, B.CreateUDiv(Offset, TileBytes));
+    B.CreateRet(B.CreateZExt(B.CreateICmpEQ(B.CreateLoad(B.getInt64Ty(), Tile), B.getInt64(0)), B.getInt32Ty()));
+    B.SetInsertPoint(Next);
+    Remaining->addIncoming(B.CreateSub(Remaining, B.getInt64(1)), Next);
+    Current->addIncoming(B.CreateGEP(B.getInt64Ty(), Bits, Tiles), Next);
+    B.CreateBr(Loop);
+    B.SetInsertPoint(Mapped);
+    B.CreateRet(B.getInt32(0));
+  }
+  return ir.CreateCall(Function, {Table, ir.CreatePtrToInt(Pointer, ir.getInt64Ty())});
+}
+
 void
 Converter::operator()(const InstLoad &load) {
   auto Tex = LoadTexture(load.src_resource);
@@ -2376,23 +2432,27 @@ Converter::operator()(const InstLoadRaw &load) {
 
   auto Index = ir.CreateLShr(LoadOperand(load.src_byte_offset, kMaskComponentX), 2);
 
-  StoreFeedback(load.feedback, nullptr);
-
   if (auto Comp = ComponentFromScalarMask(Mask, Buf->Swizzle); Comp >= 0) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), Comp)));
+    if (load.feedback)
+      StoreFeedback(load.feedback, BufferResidency(Ptr));
     auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
                                         : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
   }
 
   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
+  llvm::Value *Residency = ir.getInt32(0);
   for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), DstComp)));
+    if (load.feedback)
+      Residency = ir.CreateOr(Residency, BufferResidency(Ptr));
     auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
                                         : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
+  StoreFeedback(load.feedback, Residency);
 }
 
 void
@@ -2414,23 +2474,27 @@ Converter::operator()(const InstLoadStructured &load) {
       IndexStruct, ir.CreateZExt(ir.CreateLShr(LoadOperand(load.src_byte_offset, kMaskComponentX), 2), ir.getInt64Ty())
   );
 
-  StoreFeedback(load.feedback, nullptr);
-
   if (auto Comp = ComponentFromScalarMask(Mask, Buf->Swizzle); Comp >= 0) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), Comp)));
+    if (load.feedback)
+      StoreFeedback(load.feedback, BufferResidency(Ptr));
     auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
                                         : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
   }
 
   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
+  llvm::Value *Residency = ir.getInt32(0);
   for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), DstComp)));
+    if (load.feedback)
+      Residency = ir.CreateOr(Residency, BufferResidency(Ptr));
     auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
                                         : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
+  StoreFeedback(load.feedback, Residency);
 }
 
 void

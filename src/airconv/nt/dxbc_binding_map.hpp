@@ -63,6 +63,10 @@ public:
   GetAtomicLocks(llvm::air::AIRBuilder &Builder) {
     return nullptr;
   }
+  virtual llvm::Value *
+  GetSparseBufferMappings(llvm::air::AIRBuilder &Builder) {
+    return nullptr;
+  }
 };
 
 } // namespace dxmt::dxbc

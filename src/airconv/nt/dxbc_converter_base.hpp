@@ -636,6 +636,8 @@ public:
 
   llvm::Value * CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Value* Index);
 
+  llvm::Value *BufferResidency(llvm::Value *Pointer);
+
   llvm::Value * CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm::Value* Index);
 
   [[nodiscard]]

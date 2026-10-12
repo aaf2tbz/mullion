@@ -145,6 +145,8 @@ public:
   }
 
   DXMT_RESOURCE_RESIDENCY_STATE residencyState;
+  uint64_t sparse_tile_bytes = 0;
+  uint64_t sparse_tile_count = 0;
   small_vector<GenericAccessTracker, 1> fenceTrackers;
 
 private:

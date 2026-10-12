@@ -20,6 +20,7 @@
 #include "dxbc_converter.hpp"
 #include "dxbc_root_signature.hpp"
 #include "shader_common.hpp"
+#include "../dxmt/dxmt_command_constants.hpp"
 #include "llvm/IR/DerivedTypes.h"
 #include <algorithm>
 #include <cassert>
@@ -337,12 +338,20 @@ public:
     return GetArgument(Builder, RootSignatureArgumentIndex, AtomicLocksArgIndex);
   }
 
+  llvm::Value *
+  GetSparseBufferMappings(llvm::air::AIRBuilder &Builder) override {
+    return SparseBufferMappings ? SparseBufferMappings
+                                : Builder.builder.GetInsertBlock()->getParent()->getArg(SparseBufferMappingsIndex);
+  }
+
   uint32_t RootSignatureArgumentIndex = ~0u;
   uint32_t StaticSamplerArgumentIndex = ~0u;
   uint32_t AtomicLocksArgIndex = ~0u;
   llvm::StructType *RootArgumentsType = nullptr;
   llvm::Value *RootArguments = nullptr;
   llvm::Value *StaticSamplers = nullptr;
+  uint32_t SparseBufferMappingsIndex;
+  llvm::Value *SparseBufferMappings = nullptr;
 
   std::map<RangeId, std::pair<ConstantBufferInfo, uint64_t>> ConstantBuffers;
   std::map<RangeId, std::pair<SamplerInfo, uint64_t>> Samplers;
@@ -362,6 +371,16 @@ setup_binding_rootsig(
   using namespace dxmt::shader::common;
 
   auto binding_map = std::make_unique<RootSignatureBindingMap>();
+  binding_map->SparseBufferMappingsIndex = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = {},
+      .location_index = kSparseBufferArgumentIndex,
+      .array_size = 0,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_ulong,
+      .arg_name = "sparse_buffers",
+      .raster_order_group = {},
+  });
 
   const void *pRawRootSig;
   UINT RawRootSigSize;
@@ -708,13 +727,15 @@ setup_binding_rootsig(
 
 void
 bind_rootsig_arguments(
-    BindingMap &map, llvm::IRBuilder<> &builder, llvm::Value *arguments, llvm::Value *static_samplers
+    BindingMap &map, llvm::IRBuilder<> &builder, llvm::Value *arguments, llvm::Value *static_samplers,
+    llvm::Value *sparse_buffers
 ) {
   auto &rootsig = static_cast<RootSignatureBindingMap &>(map);
   rootsig.RootArguments = builder.CreatePointerCast(
       arguments, rootsig.RootArgumentsType->getPointerTo(arguments->getType()->getPointerAddressSpace())
   );
   rootsig.StaticSamplers = static_samplers;
+  rootsig.SparseBufferMappings = sparse_buffers;
 }
 
 class CombinedBindingMap : public BindingMap {
@@ -763,6 +784,10 @@ public:
   llvm::Value *
   GetAtomicLocks(llvm::air::AIRBuilder &Builder) override {
     return maps[1] ? maps[1]->GetAtomicLocks(Builder) : nullptr;
+  }
+  llvm::Value *
+  GetSparseBufferMappings(llvm::air::AIRBuilder &Builder) override {
+    return First([&](BindingMap &map) { return map.GetSparseBufferMappings(Builder); });
   }
 };
 

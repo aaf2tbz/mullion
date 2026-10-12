@@ -605,7 +605,8 @@ std::unique_ptr<BindingMap> setup_binding_rootsig(
 // a ray tracing shader finds a root signature's arguments through its context, not its function's arguments:
 // `arguments` points to them, the global ones or a shader record's local ones, in their address space
 void bind_rootsig_arguments(
-    BindingMap &map, llvm::IRBuilder<> &builder, llvm::Value *arguments, llvm::Value *static_samplers
+    BindingMap &map, llvm::IRBuilder<> &builder, llvm::Value *arguments, llvm::Value *static_samplers,
+    llvm::Value *sparse_buffers
 );
 
 // a resource is in `first` or else in `second`; either may be null

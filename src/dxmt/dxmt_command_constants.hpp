@@ -10,6 +10,7 @@ namespace dxmt {
 
 constexpr CONSTANT auto kCustomBufferArgumentIndex0 = 30;
 constexpr CONSTANT auto kCustomBufferArgumentIndex1 = 29;
+constexpr CONSTANT auto kSparseBufferArgumentIndex = kCustomBufferArgumentIndex1 - 1;
 
 constexpr CONSTANT auto kPresentFCIndex_BackbufferSizeMatched = 0x100;
 constexpr CONSTANT auto kPresentFCIndex_BackbufferIsSRGB = 0x103;

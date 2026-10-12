@@ -458,6 +458,14 @@ public:
 
   virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
 
+  virtual void UpdateSparseBufferMappings(
+      BufferAllocation *buffer, const std::vector<WMTSparseBufferMapping> &ranges
+  ) = 0;
+  virtual void CopySparseBufferMappings(
+      BufferAllocation *src, BufferAllocation *dst, const std::vector<WMTSparseBufferMappingCopy> &ranges
+  ) = 0;
+  virtual std::vector<uint64_t> SparseBufferMappings() = 0;
+
   virtual InternalCommandLibrary& GetLib() = 0;
 
   // acceleration structures, by the GPU address of their memory (d3d12_acceleration_structure.hpp). one set at an
