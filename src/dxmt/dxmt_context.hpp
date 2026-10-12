@@ -876,6 +876,7 @@ public:
     return deferred_visibility_query_stack_.back()[query_id];
   }
 
+  Rc<TimestampQuery> *deferred_timestamp_queries = nullptr;
   void sampleTimestamp(Rc<TimestampQuery> &&query);
 
   void barrierOnQueue(WMT::CommandBuffer cmdbuf) {

@@ -480,12 +480,13 @@ renderCommandEncoder(void *obj, const struct WMTSampleBufferAttachmentInfo *samp
 
   if (sample) {
     MTLRenderPassSampleBufferAttachmentDescriptor *samples = descriptor.sampleBufferAttachments[0];
-    bool vertex =
+    bool vertex = sample->start_of_encoder_sample_index != MTLCounterDontSample &&
         sample->end_of_encoder_sample_index - sample->start_of_encoder_sample_index + 1 == WMTRenderTimestampSamples;
     samples.sampleBuffer = (id<MTLCounterSampleBuffer>)sample->sample_buffer;
     samples.startOfVertexSampleIndex = vertex ? sample->start_of_encoder_sample_index : MTLCounterDontSample;
     samples.endOfVertexSampleIndex = vertex ? sample->start_of_encoder_sample_index + 1 : MTLCounterDontSample;
-    samples.startOfFragmentSampleIndex = sample->end_of_encoder_sample_index - 1;
+    samples.startOfFragmentSampleIndex = vertex ? sample->start_of_encoder_sample_index + 2
+                                               : sample->start_of_encoder_sample_index;
     samples.endOfFragmentSampleIndex = sample->end_of_encoder_sample_index;
   }
   params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];

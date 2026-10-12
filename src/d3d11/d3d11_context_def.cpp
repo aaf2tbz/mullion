@@ -326,8 +326,13 @@ public:
       ctx_state.current_cmdlist->issued_event_query.push_back(static_cast<MTLD3D11EventQuery *>(pAsync));
       break;
     case D3D11_QUERY_TIMESTAMP: {
-      promote_flush = true;
-      ctx_state.current_cmdlist->issued_timestamp_query.push_back(static_cast<MTLD3D11TimestampQuery *>(pAsync));
+      auto &queries = ctx_state.current_cmdlist->regions.back().issued_timestamp_query;
+      auto query_id = queries.size();
+      queries.push_back(static_cast<MTLD3D11TimestampQuery *>(pAsync));
+      InvalidateCurrentPass(true);
+      EmitST([query_id](ArgumentEncodingContext &enc) {
+        enc.sampleTimestamp(Rc(enc.deferred_timestamp_queries[query_id]));
+      });
       break;
     }
     case D3D11_QUERY_OCCLUSION:

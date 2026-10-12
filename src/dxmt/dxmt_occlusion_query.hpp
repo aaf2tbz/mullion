@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Metal.hpp"
+#include "dxmt_diag.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "wsi_platform.hpp"
 #include <algorithm>
@@ -212,6 +213,9 @@ public:
 
 class TimestampQuery {
 public:
+  // Metal MTLCounters.h defines MTLCounterErrorValue as all bits set.
+  static constexpr uint64_t kCounterErrorValue = UINT64_MAX;
+
   void
   incRef() {
     refcount_.fetch_add(1u, std::memory_order_acquire);
@@ -222,103 +226,97 @@ public:
       delete this;
   }
 
-  bool
+  HRESULT
   getValue(uint64_t *value) {
-    if (cached_value_ == ~0ull)
-      return false;
-
-    *value = cached_value_;
-    return true;
+    auto status = status_.load(std::memory_order_acquire);
+    if (status == S_OK)
+      *value = cached_value_;
+    return status;
   }
 
   void
   issue(uint64_t sampled_data) {
     cached_value_ = sampled_data;
+    status_.store(sampled_data == kCounterErrorValue ? E_FAIL : S_OK, std::memory_order_release);
   }
 
 private:
-  uint64_t cached_value_ = ~0ull;
+  uint64_t cached_value_ = 0;
+  std::atomic<HRESULT> status_ = {S_FALSE};
   std::atomic<uint32_t> refcount_ = {0u};
 };
 
 using TimestampQueryList = std::vector<std::pair<Rc<TimestampQuery>, uint64_t>>;
 
-class TimestampReadbackSBuf {
+class TimestampReadback {
 public:
-  TimestampReadbackSBuf(
-      WMT::Device device, WMT::CommandBuffer cmdbuf, uint64_t num_samples, TimestampQueryList &&queries
+  TimestampReadback(
+      WMT::Device device, WMT::CommandBuffer cmdbuf, diag::TimestampSamples &pool, uint64_t num_samples,
+      TimestampQueryList &&queries
   ) :
-      queries_(std::move(queries)),
-      num_samples_(num_samples) {
-    sample_buffer_ = device.newCounterSampleBuffer(num_samples, true);
+      queries_(std::move(queries)), pool_(pool), num_samples_(num_samples), cmdbuf_(cmdbuf) {
+    samples_ = pool_.Take(device, false);
+    if (!samples_)
+      return;
+    results_info_.options = WMTResourceStorageModeShared;
+    results_info_.length = num_samples_ * sizeof(uint64_t);
+#ifdef __i386__
+    results_info_.length = (results_info_.length + DXMT_PAGE_SIZE - 1) / DXMT_PAGE_SIZE * DXMT_PAGE_SIZE;
+    results_info_.memory.set(wsi::aligned_malloc(results_info_.length, DXMT_PAGE_SIZE));
+    if (!results_info_.memory.get())
+      return;
+#endif
+    results_buffer_ = device.newBuffer(results_info_);
+    if (results_buffer_ && results_info_.memory.get())
+      std::fill_n(static_cast<uint64_t *>(results_info_.memory.get()), num_samples_,
+                  TimestampQuery::kCounterErrorValue);
   }
 
-  ~TimestampReadbackSBuf() {
-    // TODO: small_vector opt
-    std::vector<uint64_t> results(num_samples_);
-    sample_buffer_.resolveCounterRange(0, num_samples_, results.data(), num_samples_ * sizeof(uint64_t));
-    for (const auto &[query, sample_index] : queries_) {
-      query->issue(results[sample_index]);
-    }
+  ~TimestampReadback() {
+    auto results = results_buffer_ && cmdbuf_.status() == WMTCommandBufferStatusCompleted
+                       ? static_cast<const uint64_t *>(results_info_.memory.get()) : nullptr;
+    for (const auto &[query, sample_index] : queries_)
+      query->issue(results ? results[sample_index] : TimestampQuery::kCounterErrorValue);
+    if (samples_)
+      pool_.Return(std::move(samples_));
+#ifdef __i386__
+    results_buffer_ = nullptr;
+    wsi::aligned_free(results_info_.memory.get());
+#endif
   }
 
-  TimestampReadbackSBuf(const TimestampReadbackSBuf &) = delete;
-  TimestampReadbackSBuf(TimestampReadbackSBuf &&) = delete;
+  TimestampReadback(const TimestampReadback &) = delete;
+  TimestampReadback(TimestampReadback &&) = delete;
 
-  WMT::CounterSampleBuffer
-  sampleBuffer() {
-    return sample_buffer_;
-  };
+  WMTSampleBufferAttachmentInfo
+  sampleBuffer(uint64_t index) {
+    return {results_buffer_ ? samples_.handle : 0, ~0ull /* MTLCounterDontSample */, index % pool_.limit};
+  }
+
+  void
+  resolve(WMT::CommandBuffer cmdbuf, uint64_t index, WMTSampleBufferAttachmentInfo source, bool single) {
+    if (!source.sample_buffer || !results_buffer_)
+      return;
+    auto count = single ? 1 : index % pool_.limit + 1;
+    if (!single && count != pool_.limit && index + 1 != num_samples_)
+      return;
+    auto encoder = cmdbuf.blitCommandEncoder();
+    // Metal's resolveCounters destination alignment is 4 bytes on Apple GPUs (Metal feature set tables, Resources).
+    encoder.resolveCounters(WMT::CounterSampleBuffer{source.sample_buffer},
+                            source.end_of_encoder_sample_index + 1 - count, count, results_buffer_,
+                            (index + 1 - count) * sizeof(uint64_t));
+    encoder.endEncoding();
+  }
 
 private:
   TimestampQueryList queries_;
-  WMT::Reference<WMT::CounterSampleBuffer> sample_buffer_;
-  uint64_t num_samples_;
-};
-
-class TimestampReadbackCBuf {
-public:
-  TimestampReadbackCBuf(
-      WMT::Device device, WMT::CommandBuffer cmdbuf, uint64_t num_samples, TimestampQueryList &&queries
-  ) :
-      queries_(std::move(queries)),
-      num_samples_(num_samples),
-      cmdbuf_(cmdbuf) {}
-
-  ~TimestampReadbackCBuf() {
-    // TODO: small_vector opt
-    std::vector<uint64_t> results(num_samples_);
-    /**
-    There is no implicit relationship between `gpuEndTime` and order of commit, but we still want a later issued query
-    to return a timestamp greater or equal to previous ones, so check and use maximum.
-
-    `thread_local` makes sense because this destructor is only called on 1. finishing thread 2. (abnormal) device
-    destruction
-    */
-    thread_local uint64_t latest_ts_on_finish_thread = 0;
-    latest_ts_on_finish_thread = std::max(cmdbuf_.gpuEndTime(), latest_ts_on_finish_thread);
-    std::fill(results.begin(), results.end(), latest_ts_on_finish_thread);
-    for (const auto &[query, sample_index] : queries_) {
-      query->issue(results[sample_index]);
-    }
-  }
-
-  TimestampReadbackCBuf(const TimestampReadbackCBuf &) = delete;
-  TimestampReadbackCBuf(TimestampReadbackCBuf &&) = delete;
-
-  WMT::CounterSampleBuffer
-  sampleBuffer() {
-    return {};
-  };
-
-private:
-  TimestampQueryList queries_;
+  diag::TimestampSamples &pool_;
+  WMT::Reference<WMT::CounterSampleBuffer> samples_;
+  WMTBufferInfo results_info_{};
+  WMT::Reference<WMT::Buffer> results_buffer_;
   uint64_t num_samples_;
   WMT::CommandBuffer cmdbuf_;
 };
-
-// compile-time: choose a timestamp impl: SBuf (sample buffer) or CBuf (command buffer `gpuEndTime`)
-using TimestampReadback = TimestampReadbackCBuf;
 
 class TimestampQueryState {
 public:
@@ -337,11 +335,11 @@ public:
   }
 
   std::unique_ptr<TimestampReadback>
-  flush(WMT::CommandBuffer cmdbuf) {
+  flush(WMT::CommandBuffer cmdbuf, diag::TimestampSamples &pool) {
     if (num_samples_ == 0)
       return {};
 
-    auto ret = std::make_unique<TimestampReadback>(device_, cmdbuf, num_samples_, std::move(queries_));
+    auto ret = std::make_unique<TimestampReadback>(device_, cmdbuf, pool, num_samples_, std::move(queries_));
     num_samples_ = 0;
     queries_ = {};
     return ret;

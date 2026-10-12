@@ -64,6 +64,7 @@ class MTLD3D11TimestampQueryImpl : public MTLD3DQueryBase<MTLD3D11TimestampQuery
 
   Rc<TimestampQuery> query_ = new TimestampQuery();
   uint64_t latest_value_ = 0;
+  HRESULT latest_status_ = S_FALSE;
 
   virtual UINT STDMETHODCALLTYPE
   GetDataSize() override {
@@ -72,13 +73,16 @@ class MTLD3D11TimestampQueryImpl : public MTLD3DQueryBase<MTLD3D11TimestampQuery
 
   virtual HRESULT
   GetData(void *data) override {
-    if (state_ == QueryState::Signaled || query_->getValue(&latest_value_)) {
-      *((uint64_t *)data) = latest_value_;
+    if (state_ != QueryState::Signaled) {
+      latest_status_ = query_->getValue(&latest_value_);
+      if (latest_status_ == S_FALSE)
+        return S_FALSE;
       query_ = new TimestampQuery();
       state_ = QueryState::Signaled;
-      return S_OK;
     }
-    return S_FALSE;
+    if (latest_status_ == S_OK)
+      *((uint64_t *)data) = latest_value_;
+    return latest_status_;
   }
 
   virtual TimestampQuery *

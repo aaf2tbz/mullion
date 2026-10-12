@@ -347,7 +347,6 @@ public:
         EmitOP([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
           enc.sampleTimestamp(std::move(query));
         });
-        promote_flush = true;
       }
       break;
     }
@@ -568,10 +567,6 @@ public:
       End(query.ptr());
     }
 
-    for (const auto &query : cmdlist->issued_timestamp_query) {
-      End(query.ptr());
-    }
-
     for (const auto &staging : cmdlist->read_staging_resources) {
       staging->useCopySource(seq_id);
     }
@@ -597,12 +592,21 @@ public:
         Execute(nested.ptr());
         continue;
       }
+      std::shared_ptr<std::vector<Rc<TimestampQuery>>> timestamp_queries;
+      if (auto &queries = cmdlist->regions[region].issued_timestamp_query; !queries.empty()) {
+        timestamp_queries = std::make_shared<std::vector<Rc<TimestampQuery>>>();
+        for (const auto &query : queries)
+          timestamp_queries->emplace_back(query->End());
+      }
       bool skips = Skips(cmdlist->regions[region].predicate.ptr(), cmdlist->regions[region].value);
-      EmitOP([cmdlist, query_list, region, skips](ArgumentEncodingContext &enc) {
+      EmitOP([cmdlist, query_list, timestamp_queries, region, skips](ArgumentEncodingContext &enc) {
         // Finished command list should clean up the encoding context
         enc.pushDeferredVisibilityQueries(query_list->data());
         enc.skips_predicated = skips;
+        auto previous = enc.deferred_timestamp_queries;
+        enc.deferred_timestamp_queries = timestamp_queries ? timestamp_queries->data() : nullptr;
         cmdlist->Execute(enc, region);
+        enc.deferred_timestamp_queries = previous;
         enc.skips_predicated = false;
         enc.popDeferredVisibilityQueries();
       });

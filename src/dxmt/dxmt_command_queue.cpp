@@ -107,12 +107,12 @@ CommandQueue::ProfilePass(EncoderData *pass, diag::ProfileBuffer *&profiled) {
     target("exposure", 0, data->exposure, 0, 0);
   }
   const uint32_t count = pass->type == EncoderType::Render ? WMTRenderTimestampSamples : WMTTimestampSamplesPerStage;
-  if (buffer.samples.empty() || count > profile_->samples.limit - buffer.samples.back().used)
-    buffer.samples.push_back({profile_->samples.Take(device, false)});
+  if (buffer.samples.empty() || count > timestamp_samples.limit - buffer.samples.back().used)
+    buffer.samples.push_back({timestamp_samples.Take(device, false)});
   auto &samples = buffer.samples.back();
   uint32_t first = ~0u;
   WMTSampleBufferAttachmentInfo attachment{};
-  if (samples.buffer && count <= profile_->samples.limit - samples.used) {
+  if (samples.buffer && count <= timestamp_samples.limit - samples.used) {
     first = samples.used;
     samples.used += count;
     attachment = {samples.buffer, first, first + count - 1};
@@ -337,7 +337,7 @@ CommandQueue::WaitForFinishThread() {
       diag::Write(lines);
       for (auto &samples : buffer.samples)
         if (samples.buffer)
-          profile_->samples.Return(std::move(samples.buffer));
+          timestamp_samples.Return(std::move(samples.buffer));
       buffer = {};
     }
 

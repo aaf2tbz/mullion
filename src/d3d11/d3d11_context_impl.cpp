@@ -5787,7 +5787,6 @@ public:
     written_staging_resources.clear();
     issued_visibility_query.clear();
     issued_event_query.clear();
-    issued_timestamp_query.clear();
     regions.clear();
     regions.emplace_back();
     staging_allocator.free_blocks(~0uLL);
@@ -5872,7 +5871,6 @@ public:
   std::vector<Rc<StagingResource>> written_staging_resources;
   std::vector<std::pair<Com<MTLD3D11OcclusionQuery>, bool>> issued_visibility_query;
   std::vector<Com<MTLD3D11EventQuery>> issued_event_query;
-  std::vector<Com<MTLD3D11TimestampQuery>> issued_timestamp_query;
 
   // a list is regions of one predication each: the immediate context decides each as it executes the list, so a
   // predicate may get its data from the regions before
@@ -5882,6 +5880,7 @@ public:
     BOOL value = FALSE;
     // a list that a deferred context executed here (it has no commands of its own then)
     Com<ID3D11CommandList> nested;
+    std::vector<Com<MTLD3D11TimestampQuery>> issued_timestamp_query;
     // the stream output queries that end here: their statistics are there once the region has run
     std::vector<Com<MTLD3D11StreamOutputQuery>> ended_stream_output_queries;
   };

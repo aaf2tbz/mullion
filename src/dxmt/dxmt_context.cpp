@@ -974,14 +974,35 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   visibility_result_offsets_.clear();
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
 
-  readbacks.timestamp = timestamp_state_.flush(cmdbuf);
+  readbacks.timestamp = timestamp_state_.flush(cmdbuf, queue_.timestamp_samples);
 
+  WMTSampleBufferAttachmentInfo timestamp_sample{};
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
     diag::ProfileBuffer *profiled = nullptr;
     WMTSampleBufferAttachmentInfo samples{};
     if constexpr (Profile)
       samples = queue_.ProfilePass(current, profiled);
+    if (readbacks.timestamp && encoder_index > 1 &&
+        encoders[encoder_count - encoder_index + 1]->type == EncoderType::SampleTimestamp) {
+      switch (current->type) {
+      case EncoderType::Render:
+      case EncoderType::Compute:
+      case EncoderType::Blit:
+      case EncoderType::Clear:
+      case EncoderType::Resolve: {
+        auto next = static_cast<SampleTimestampData *>(encoders[encoder_count - encoder_index + 1]);
+        if (!samples.sample_buffer)
+          samples = readbacks.timestamp->sampleBuffer(next->readback_index);
+        timestamp_sample = samples;
+        // D3D11.3 20.4.3 requires every preceding pass to complete, including unrelated resources.
+        barrierOnQueue(cmdbuf);
+        break;
+      }
+      default:
+        break;
+      }
+    }
     auto scaler_boundary = [&](bool end) {
       if constexpr (Profile) {
         if (samples.sample_buffer) {
@@ -1364,39 +1385,23 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::SampleTimestamp: {
       auto data = static_cast<SampleTimestampData *>(current);
-      if (auto readback = readbacks.timestamp.get(); readback->sampleBuffer()) {
-
-        /**
-        Since Metal driver may change the execution order of encoders, implement a "barrier" to prevent that
-        FIXME: Not an elegant implementation, should get rid of it when fence-based synchronization is done
-        */
-        barrierOnQueue(cmdbuf);
-
-        WMTSampleBufferAttachmentInfo sample_buffer_info{};
-        sample_buffer_info.sample_buffer = readback->sampleBuffer();
-        sample_buffer_info.start_of_encoder_sample_index = data->readback_index;
-        sample_buffer_info.end_of_encoder_sample_index = ~0ull; /* MTLCounterDontSample */
-        auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&sample_buffer_info, 1);
-        encoder.setLabel(WMT::String::string("SampleTimestamp", WMTUTF8StringEncoding));
-        {
-          /**
-          `sampleBufferAttachments` does not work when the blit encoder is empty, just do something
-          FIXME: potential perf overhead? 
-          */
-          struct wmtcmd_blit_fillbuffer fill;
-          fill.next.set(nullptr);
+      barrierOnQueue(cmdbuf);
+      if (!timestamp_sample.sample_buffer) {
+        timestamp_sample = readbacks.timestamp->sampleBuffer(data->readback_index);
+        if (timestamp_sample.sample_buffer) {
+          auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&timestamp_sample, 1);
+          // an empty blit pass does not sample its counters.
+          wmtcmd_blit_fillbuffer fill{};
           fill.type = WMTBlitCommandFillBuffer;
           fill.buffer = dummy_cbuffer_;
-          fill.offset = 0;
-          fill.length = 4;
-          fill.value = 0;
+          fill.length = sizeof(uint32_t);
           MTLBlitCommandEncoder_encodeCommands(encoder, (const struct wmtcmd_base *)&fill);
+          encoder.endEncoding();
+          barrierOnQueue(cmdbuf);
         }
-        encoder.endEncoding();
-
-      } else {
-        // Use timestamp from command buffer's `gpuEndTime`
       }
+      readbacks.timestamp->resolve(cmdbuf, data->readback_index, timestamp_sample, Profile);
+      timestamp_sample = {};
       data->~SampleTimestampData();
       break;
     }

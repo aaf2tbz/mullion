@@ -19,7 +19,7 @@ struct TimestampSamples {
   WMT::Reference<WMT::CounterSampleBuffer>
   Take(WMT::Device metal, bool wait = true) {
     std::unique_lock<dxmt::mutex> lock(mutex);
-    if (!limit)
+    if (!made)
       for (limit = 1; metal.newCounterSampleBuffer(limit * 2); limit *= 2)
         ;
     for (;;) {

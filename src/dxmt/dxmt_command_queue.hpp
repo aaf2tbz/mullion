@@ -181,7 +181,6 @@ private:
   struct ProfileQueue {
     static inline std::atomic_uint64_t queues{0};
     std::string id = str::format("d3d11:", ++queues);
-    diag::TimestampSamples samples;
     std::array<diag::ProfileBuffer, kCommandChunkCount> buffers;
   };
   std::unique_ptr<ProfileQueue> profile_ = diag::profile ? std::make_unique<ProfileQueue>() : nullptr;
@@ -215,6 +214,7 @@ public:
   FrameStatisticsContainer statistics;
   ResourceInitializer initializer;
   CounterPool counter_pool;
+  diag::TimestampSamples timestamp_samples;
 
   CommandQueue(WMT::Device device);
 
