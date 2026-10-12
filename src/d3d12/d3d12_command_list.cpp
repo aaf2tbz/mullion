@@ -1404,7 +1404,8 @@ public:
           return;
         }
 
-        auto block_width = src_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+        const uint32_t block_width = src_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1,
+                       dst_block_width = dst_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
         auto src_depth_pitch = dst->textureType() == WMTTextureType3D
                                    ? (pSrc->PlacedFootprint.Footprint.Height / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch
                                    : 0;
@@ -1416,11 +1417,14 @@ public:
                             (src_box.top / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch + src_box.front * src_depth_pitch;
         cmd_cp.bytes_per_row = pSrc->PlacedFootprint.Footprint.RowPitch;
         cmd_cp.bytes_per_image = src_depth_pitch;
-        // a footprint is whole blocks, which a level smaller than one does not have all the texels of
+        // D3D10.1 reinterpret copies carry one source unit into one destination unit (CopyResource, Remarks)
         auto extent = GetResourceExtent(dst_desc, dst_level);
-        cmd_cp.size = {std::min<uint64_t>(src_box.right - src_box.left, extent.right - DstX),
-                       std::min<uint64_t>(src_box.bottom - src_box.top, extent.bottom - DstY),
-                       src_box.back - src_box.front};
+        cmd_cp.size = {
+            std::min<uint64_t>(align(src_box.right - src_box.left, block_width) / block_width * dst_block_width,
+                               extent.right - DstX),
+            std::min<uint64_t>(align(src_box.bottom - src_box.top, block_width) / block_width * dst_block_width,
+                               extent.bottom - DstY),
+            src_box.back - src_box.front};
         cmd_cp.dst = dst->current()->texture();
         cmd_cp.level = dst_level;
         cmd_cp.slice = dst_slice;

@@ -31,6 +31,8 @@ public:
 WMTPixelFormat Forget_sRGB(WMTPixelFormat format);
 WMTPixelFormat Recall_sRGB(WMTPixelFormat format);
 
+uint32_t DXGIFormatType(uint32_t format);
+
 inline bool
 Is_sRGBVariant(WMTPixelFormat format) {
   return Forget_sRGB(format) != format;

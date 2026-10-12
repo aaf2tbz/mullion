@@ -4153,6 +4153,19 @@ public:
   CopyTexture(TextureCopyCommand &&cmd) {
     if (cmd.Invalid)
       return;
+    auto src_type = DXGIFormatType(cmd.Src.Format), dst_type = DXGIFormatType(cmd.Dst.Format);
+    bool src_bc = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC, dst_bc = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC;
+    auto linear_type = src_bc ? dst_type : src_type;
+    // D3D10.1 reinterpret copies preserve one texel's bits as a block (CopyResource, Remarks)
+    bool reinterpret = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_10_1 &&
+                       cmd.SrcFormat.BytesPerTexel == cmd.DstFormat.BytesPerTexel &&
+                       ((src_bc != dst_bc && (linear_type == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+                                              linear_type == DXGI_FORMAT_R32G32_TYPELESS ||
+                                              linear_type == DXGI_FORMAT_R32G32B32A32_TYPELESS)) ||
+                        (src_type == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && dst_type == DXGI_FORMAT_R32_TYPELESS) ||
+                        (dst_type == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && src_type == DXGI_FORMAT_R32_TYPELESS));
+    if (src_type != dst_type && !reinterpret)
+      return;
     // a staging texture is rows of bytes, a block or a texel after another: a copy with one goes by those, which the
     // two formats' compression does not change
     bool staging = GetStagingResource(cmd.pDst, cmd.DstSubresource) || GetStagingResource(cmd.pSrc, cmd.SrcSubresource);
