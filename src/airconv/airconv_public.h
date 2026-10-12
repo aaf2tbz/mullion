@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 34
+#define AIRCONV_VERSION 35
 
 #ifdef __cplusplus
 #include <string>
@@ -504,6 +504,7 @@ AIRCONV_API int SM50Initialize(
   struct MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
 );
 AIRCONV_API void SM50Destroy(sm50_shader_t pShader);
+enum SM50_COMPILE_RESULT { SM50_COMPILE_SUCCESS, SM50_COMPILE_FAILED, SM50_COMPILE_UNRESOLVED };
 AIRCONV_API int SM50Compile(
   sm50_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError

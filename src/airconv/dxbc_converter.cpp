@@ -1411,9 +1411,14 @@ AIRCONV_API int SM50Compile(
   if (auto err = dxmt::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
       )) {
-    errorOut << llvm::toString(std::move(err));
+    int result = SM50_COMPILE_FAILED;
+    llvm::handleAllErrors(std::move(err), [&](const llvm::ErrorInfoBase &error) {
+      if (error.convertToErrorCode() == std::errc::no_such_file_or_directory)
+        result = SM50_COMPILE_UNRESOLVED;
+      error.log(errorOut);
+    });
     *ppError = (sm50_error_t)errorObj;
-    return 1;
+    return result;
   }
 
   if (shader_info.use_msad)

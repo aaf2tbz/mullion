@@ -770,7 +770,7 @@ public:
   CreateShaderResourceView(
       ID3D12Resource *pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor
   ) {
-    if (!pResource) {
+    if (!pResource || (pDesc && pDesc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)) {
       auto [Heap, Index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
       if (pDesc && pDesc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
         Heap->AddAccelerationStructureView(Index, pDesc->RaytracingAccelerationStructure.Location);

@@ -45,7 +45,7 @@ struct RayShader {
   std::shared_ptr<RayLibrary> library;
   std::string function;
   SM50_RAY_SHADER_INFO info;
-  // the collection it came from uncompiled, which is a scope of its own
+  // the collection it came from, which is a scope of its own
   const void *collection = nullptr;
 };
 
@@ -155,8 +155,7 @@ struct Association {
   Strength strength;
   // the export, or none for every export of the scope
   std::wstring name;
-  // the scopes of one without an export: the library whose subobjects made it, and the collection it was made in,
-  // if its shaders were left for the state object that takes the collection to compile
+  // the scopes of one without an export: the library whose subobjects made it, and the collection it was made in
   const RayLibrary *library;
   const void *collection;
   // an unresolved library subobject (DXR "Explicit associations": the subobject need not "be visible yet")
@@ -168,6 +167,7 @@ struct Association {
 struct RayFunction {
   MTLD3D12Device *device;
   uint32_t slot;
+  ID3D12RootSignature *global, *local;
   WMT::Reference<WMT::Function> function;
 
   ~RayFunction() {
@@ -178,7 +178,7 @@ struct RayFunction {
 // what a shader identifier names: a ray generation, miss or callable shader, or a hit group's closest hit, any hit
 // and intersection shaders, in the identifier's order
 struct RayExport {
-  SM50_RAY_SHADER_IDENTIFIER identifier{};
+  std::shared_ptr<SM50_RAY_SHADER_IDENTIFIER> identifier = std::make_shared<SM50_RAY_SHADER_IDENTIFIER>();
   std::shared_ptr<RayFunction> functions[3];
   uint32_t kinds[3]{}; // SM50_RAY_SHADER_KIND
 };
@@ -199,15 +199,14 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
   // every shader the state object has seen, by name, for the hit groups that import them
   std::unordered_map<std::wstring, RayShader> shaders_;
   std::unordered_map<std::wstring, RayExport> exports_;
-  std::vector<Com<ID3D12RootSignature>> root_signatures_;
+  std::vector<Com<MTLD3D12RootSignature, false>> root_signatures_;
   D3D12_RAYTRACING_PIPELINE_CONFIG1 pipeline_config_{};
   std::optional<std::pair<uint32_t, uint32_t>> configurations_[SubobjectKinds - ShaderConfig];
   uint64_t stack_size_ = 0;
+  uint64_t max_call_depth_ = UINT32_MAX;
   // the libraries of this state object's own description, whose functions its shaders may call
   std::vector<std::shared_ptr<RayLibrary>> libraries_;
-  // of a collection whose exports may depend on what the state object that takes it defines
-  // (D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS): nothing is compiled, and its hit
-  // groups and associations wait for that state object
+  // collections retain associations and uncompiled hit groups for the objects that use their exports
   bool deferred_ = false;
   std::vector<HitGroup> deferred_hit_groups_;
   std::vector<Association> deferred_associations_;
@@ -311,7 +310,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
   std::shared_ptr<RayFunction>
   Compile(
       const RayShader &shader, ID3D12RootSignature *pGlobal, ID3D12RootSignature *pLocal,
-      std::span<const sm50_shader_t> libraries
+      std::span<const sm50_shader_t> libraries, bool &unresolved
   ) {
     auto blob = [](ID3D12RootSignature *root, SM50_SHADER_COMPILATION_ARGUMENT_TYPE type, void *next) {
       SM50_SHADER_ROOT_SIGNATURE_DATA data{next, type};
@@ -319,7 +318,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
       data.static_samplers = static_cast<MTLD3D12RootSignature *>(root)->StaticSamplersAddress;
       return data;
     };
-    auto function = std::make_shared<RayFunction>(device_, device_->AllocateRayFunction());
+    auto function = std::make_shared<RayFunction>(device_, device_->AllocateRayFunction(), pGlobal, pLocal);
     auto name = "dxmt_ray_shader_" + std::to_string(function->slot);
 
     SM50_SHADER_LIBRARIES_DATA linkable{nullptr, SM50_SHADER_LIBRARIES, libraries.data(), (uint32_t)libraries.size()};
@@ -336,10 +335,12 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
 
     SM50ShaderBitcode bitcode;
     SM50Error error;
-    if (SM50Compile(
+    if (auto result = SM50Compile(
             shader.library->shader, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, name.c_str(), &bitcode, &error
         )) {
-      ERR("CreateStateObject: failed to compile ", shader.function, ": ", SM50GetErrorMessageString(error));
+      unresolved = result == SM50_COMPILE_UNRESOLVED;
+      if (!unresolved)
+        ERR("CreateStateObject: failed to compile ", shader.function, ": ", SM50GetErrorMessageString(error));
       return nullptr;
     }
     SM50_COMPILED_BITCODE compiled;
@@ -368,6 +369,8 @@ public:
     type_ = pDesc->Type;
     libraries_.clear();
     if (pParent) {
+      if (type_ != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE || pParent->type_ != type_)
+        return E_INVALIDARG;
       if (device_->NamesPasses())
         name = pParent->name;
       shaders_ = pParent->shaders_;
@@ -442,7 +445,7 @@ public:
         break;
       case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
       case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE:
-        root_signatures_.push_back(definition(&subobject).root);
+        root_signatures_.push_back(static_cast<MTLD3D12RootSignature *>(definition(&subobject).root));
         break;
       case D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY:
         if (HRESULT hr = AddLibrary(*(const D3D12_DXIL_LIBRARY_DESC *)subobject.pDesc, library_subobjects); FAILED(hr))
@@ -540,7 +543,7 @@ public:
           ERR("CreateStateObject: a DXIL library's root signature is not usable");
           return E_INVALIDARG;
         }
-        root_signatures_.push_back(root);
+        root_signatures_.push_back(static_cast<MTLD3D12RootSignature *>(root.ptr()));
         library_definitions[subobject.name] = {
             (SubobjectKind)kind(subobject.type), root.ptr(), LibraryDeclared, {}, library};
         break;
@@ -607,7 +610,9 @@ public:
         association.root = found->second.root;
         association.values = found->second.values;
         association.subobject.clear();
-      } else if (type_ == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE && !library_names_.count(association.subobject)) {
+      } else if (library_names_.count(association.subobject)) {
+        association.subobject.clear();
+      } else if (type_ == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE) {
         ERR("CreateStateObject: an association names a subobject that no DXIL library defines");
         return E_INVALIDARG;
       }
@@ -618,19 +623,17 @@ public:
       return E_INVALIDARG;
     deferred_ = type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
                 (flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS);
-    if (deferred_) {
+    if (type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION) {
       for (auto &[name, shader] : shaders_)
         shader.collection = this;
       for (auto &association : associations)
         association.collection = association.collection ? association.collection : this;
-      deferred_hit_groups_ = std::move(hit_groups);
-      deferred_associations_ = std::move(associations);
-      return S_OK;
     }
 
     std::vector<sm50_shader_t> linkable;
     for (auto &library : libraries_)
       linkable.push_back(library->shader);
+    bool unresolved = false;
     // the subobject of a shader: the strongest association with the shader, by the name it exports under or,
     // from its own library, the name it has there, with its hit group ("Subobject associations for hit groups"), or
     // with every export of a scope the shader is in. two of one strength that name exports must agree
@@ -643,16 +646,19 @@ public:
       auto source = ExportName(shader.function);
       const Association *best[2] = {};
       auto applies = [&](const Association &a) {
-        return a.kind == of && (a.name.empty() ? (!a.library || a.library == shader.library.get()) &&
-                                                     (!a.collection || a.collection == shader.collection)
-                                               : a.name == name || (group && a.name == *group) ||
-                                                     (a.library == shader.library.get() && a.name == source));
+        return a.name.empty() ? (!a.library || a.library == shader.library.get()) &&
+                                    (!a.collection || a.collection == shader.collection)
+                              : a.name == name || (group && a.name == *group) ||
+                                    (a.library == shader.library.get() && a.name == source);
       };
       bool ambiguous[std::size(best)] = {};
       for (auto &a : associations) {
         unsigned scope = shader.collection && a.collection == shader.collection;
         auto &strongest = best[scope];
         if (!applies(a))
+          continue;
+        unresolved |= !a.subobject.empty();
+        if (a.kind != of)
           continue;
         if (!strongest || a.strength > strongest->strength) {
           strongest = &a;
@@ -687,9 +693,12 @@ public:
         if (!config) {
           if (inherited && configurations_[of - ShaderConfig])
             continue;
-          ERR("CreateStateObject: a ray tracing shader has no unambiguous configuration");
-          failed = true;
-          return;
+          unresolved = true;
+          if (!deferred_) {
+            ERR("CreateStateObject: a ray tracing shader has no unambiguous configuration");
+            failed = true;
+          }
+          continue;
         }
         configuration((SubobjectKind)of, config->values);
       }
@@ -701,40 +710,56 @@ public:
     auto function = [&](RayExport &to, unsigned index, const std::wstring &name, const std::wstring *group) {
       auto shader = shaders_.find(name);
       if (shader == shaders_.end()) {
-        ERR("CreateStateObject: a hit group imports a shader that no library exports");
-        failed = true;
-        return;
+        if (!deferred_) {
+          ERR("CreateStateObject: a hit group imports a shader that no library exports");
+          failed = true;
+        }
+        return false;
       }
+      unresolved = false;
       validate(name, shader->second, group, configured.count(shader->second.library.get()));
       if (failed)
-        return;
+        return false;
       auto global_association = resolve(Global, name, shader->second, group),
            local_association = resolve(Local, name, shader->second, group);
       auto global = global_association ? global_association->root : nullptr,
            local = local_association ? local_association->root : nullptr;
-      if (failed)
-        return;
-      auto &made = compiled[{shader->second.library->shader, shader->second.function, global, local}];
-      if (!made && !(made = Compile(shader->second, global, local, linkable))) {
-        failed = true;
-        return;
+      if (failed || unresolved) {
+        failed |= !deferred_;
+        return false;
       }
+      auto previous = to.functions[index];
+      if (previous && same({Global, global}, {Global, previous->global}) &&
+          same({Local, local}, {Local, previous->local}))
+        return true;
+      auto &made = compiled[{shader->second.library->shader, shader->second.function, global, local}];
+      if (!made && !(made = Compile(shader->second, global, local, linkable, unresolved))) {
+        failed |= !deferred_ || !unresolved;
+        return false;
+      }
+      if (previous)
+        to.identifier = std::make_shared<SM50_RAY_SHADER_IDENTIFIER>(*to.identifier);
       to.functions[index] = made;
       to.kinds[index] = shader->second.info.kind;
-      to.identifier.function[index] = made->slot;
+      to.identifier->function[index] = made->slot;
+      return true;
     };
     for (auto &[name, shader] : shaders_) {
       auto of = shader.info.kind;
       bool named = of == SM50_RAY_SHADER_RAY_GENERATION || of == SM50_RAY_SHADER_MISS || of == SM50_RAY_SHADER_CALLABLE;
-      if (named && !exports_.count(name))
-        function(exports_[name], 0, name, nullptr);
-      else if ((!pParent || !pParent->shaders_.count(name)) &&
+      if (named && (!pParent || !pParent->shaders_.count(name))) {
+        RayExport to = exports_.count(name) ? exports_.at(name) : RayExport{};
+        if (function(to, 0, name, nullptr))
+          exports_.insert_or_assign(name, std::move(to));
+      } else if ((!pParent || !pParent->shaders_.count(name)) &&
                std::none_of(hit_groups.begin(), hit_groups.end(), [&](const HitGroup &group) {
                  return std::find(std::begin(group.imports), std::end(group.imports), name) != std::end(group.imports);
                })) {
-        if (named || configured.count(shader.library.get()))
+        if (configured.count(shader.library.get())) {
+          unresolved = false;
           validate(name, shader, nullptr, configured.count(shader.library.get()));
-        else {
+          failed |= unresolved && !deferred_;
+        } else {
           RayExport checked;
           function(checked, 0, name, nullptr);
         }
@@ -745,11 +770,18 @@ public:
         ERR("CreateStateObject: two exports have a hit group's name");
         return E_INVALIDARG;
       }
-      auto &to = exports_[group.name];
+      RayExport to;
+      bool complete = true;
       for (unsigned i = 0; i < std::size(group.imports); i++)
         if (!group.imports[i].empty())
-          function(to, i, group.imports[i], &group.name);
+          complete &= function(to, i, group.imports[i], &group.name);
+      if (complete)
+        exports_.insert({group.name, std::move(to)});
+      else if (deferred_)
+        deferred_hit_groups_.push_back(group);
     }
+    if (type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION)
+      deferred_associations_ = std::move(associations);
     if (failed)
       return E_INVALIDARG;
     if (auto &config = configurations_[PipelineConfig - ShaderConfig]; config)
@@ -769,6 +801,10 @@ public:
                     std::max(hit, most[SM50_RAY_SHADER_INTERSECTION] + most[SM50_RAY_SHADER_ANY_HIT]) *
                         std::min<uint64_t>(1, recursion) +
                     hit * (std::max<uint64_t>(recursion, 1) - 1) + 2 * most[SM50_RAY_SHADER_CALLABLE];
+      // without callable recursion, DXR's ray recursion limit bounds every native call chain, regardless of spare
+      // bytes requested by SetPipelineStackSize (DXR spec, "Ray recursion limit"; Metal maxCallStackDepth)
+      if (!most[SM50_RAY_SHADER_CALLABLE])
+        max_call_depth_ = stack_size_;
       if (pParent)
         stack_size_ = pParent->stack_size_;
     }
@@ -799,7 +835,7 @@ public:
   void *STDMETHODCALLTYPE
   GetShaderIdentifier(const WCHAR *pExportName) {
     auto found = exports_.find(pExportName);
-    return found == exports_.end() ? nullptr : &found->second.identifier;
+    return found == exports_.end() ? nullptr : found->second.identifier.get();
   }
 
   // a hit group's shaders are named "group::closesthit", "group::anyhit" and "group::intersection"; the group
@@ -839,7 +875,7 @@ public:
   GetPipeline(WMT::ComputePipelineState &Pipeline, WMT::VisibleFunctionTable &Table, uint32_t &Flags) {
     std::unique_lock<dxmt::mutex> lock(pipeline_lock_);
     Flags = pipeline_config_.Flags;
-    uint32_t depth = std::max<uint64_t>(stack_size_, 1);
+    uint32_t depth = std::max<uint64_t>(std::min(stack_size_, max_call_depth_), 1);
     auto &made = pipelines_[depth];
     if (!made.pipeline) {
       auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();

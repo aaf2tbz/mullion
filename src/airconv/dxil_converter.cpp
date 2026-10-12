@@ -783,13 +783,22 @@ if (auto resources = M.getNamedMetadata("dx.resources")) {
 // links into a library's module the functions it calls that another library of its state object defines, with their
 // resources: a library numbers its resource ranges from 0, so the other library's follow the module's own
 Error
-link_libraries(Module &M, ArrayRef<SM50ShaderInternal *> libraries, bool &linked) {
+link_libraries(Module &M, StringRef entry, ArrayRef<SM50ShaderInternal *> libraries, bool &linked) {
   auto &context = M.getContext();
   auto i32 = Type::getInt32Ty(context);
   auto missing = [&]() -> Function * {
-    for (auto &F : M)
-      if (F.isDeclaration() && !F.use_empty() && !F.isIntrinsic() && !F.getName().startswith("dx.op."))
-        return &F;
+    std::set<Function *> seen;
+    std::vector<Function *> functions{M.getFunction(entry)};
+    for (size_t i = 0; i < functions.size(); i++) {
+      auto F = functions[i];
+      if (!F || !seen.insert(F).second || F->isIntrinsic() || F->getName().startswith("dx.op."))
+        continue;
+      if (F->isDeclaration())
+        return F;
+      for (auto &I : instructions(F))
+        if (auto call = dyn_cast<CallInst>(&I); call && call->getCalledFunction())
+          functions.push_back(call->getCalledFunction());
+    }
     return nullptr;
   };
   // a module's lists of resources by class, of which some may be null
@@ -813,7 +822,10 @@ link_libraries(Module &M, ArrayRef<SM50ShaderInternal *> libraries, bool &linked
       }
     }
     if (!definition)
-      return make_error<UnsupportedFeature>(std::format("no library defines {}", needed->getName().str()));
+      return make_error<StringError>(
+          std::format("no library defines {}", needed->getName().str()),
+          std::make_error_code(std::errc::no_such_file_or_directory)
+      );
     auto lists = lists_of(M), other_lists = lists_of(*definition);
     std::vector<Metadata *> merged;
     for (unsigned cls = SRV; cls <= SamplerClass; cls++) {
@@ -2188,7 +2200,10 @@ convert_dxil(
         break;
       }
       if (!h.texture && !h.buffer && !h.cbuffer && !h.sampler)
-        return make_error<UnsupportedFeature>(std::format("DXIL resource class {} range {} has no binding", cls, id));
+        return make_error<StringError>(
+            std::format("DXIL resource class {} range {} has no binding", cls, id),
+            std::make_error_code(std::errc::no_such_file_or_directory)
+        );
       handles[call] = h;
       continue;
     }
@@ -3844,6 +3859,10 @@ convert_dxil_ray_shader(
   auto linked = parse(pShaderInternal->dxil, context);
   if (!linked)
     return linked.takeError();
+  SM50_SHADER_RAY_SHADER_DATA *ray = nullptr;
+  args_get_data<SM50_SHADER_RAY_SHADER, SM50_SHADER_RAY_SHADER_DATA>(pArgs, &ray);
+  if (!ray || !ray->name)
+    return make_error<UnsupportedFeature>("a library compiles one ray tracing shader at a time, and none is named");
   ShaderInfo linked_info;
   SM50_SHADER_LIBRARIES_DATA *libraries = nullptr;
   if (args_get_data<SM50_SHADER_LIBRARIES, SM50_SHADER_LIBRARIES_DATA>(pArgs, &libraries)) {
@@ -3852,7 +3871,7 @@ convert_dxil_ray_shader(
     for (uint32_t i = 0; i < libraries->count; i++)
       if (auto other = (SM50ShaderInternal *)libraries->libraries[i]; other != pShaderInternal)
         others.push_back(other);
-    if (auto err = link_libraries(**linked, others, any))
+    if (auto err = link_libraries(**linked, ray->name, others, any))
       return err;
     if (any) {
       read_resources(**linked, linked_info);
@@ -3862,11 +3881,6 @@ convert_dxil_ray_shader(
   SM50_SHADER_ROOT_SIGNATURE_DATA *global_rootsig = nullptr, *local_rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &global_rootsig);
   args_get_data<SM50_SHADER_ROOT_SIGNATURE2, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &local_rootsig);
-  SM50_SHADER_RAY_SHADER_DATA *ray = nullptr;
-  args_get_data<SM50_SHADER_RAY_SHADER, SM50_SHADER_RAY_SHADER_DATA>(pArgs, &ray);
-  if (!ray || !ray->name)
-    return make_error<UnsupportedFeature>("a library compiles one ray tracing shader at a time, and none is named");
-
   // the root signatures' argument blocks are not arguments of this function: bind_rootsig_arguments says where
   // they are. a root parameter is visible to these shaders only as D3D12_SHADER_VISIBILITY_ALL, which the
   // library's kind makes of it
