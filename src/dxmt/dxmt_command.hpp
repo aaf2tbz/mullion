@@ -140,19 +140,25 @@ public:
   }
 
   void
-  ClearTexture3DFloat(WMT::Texture texture, const std::array<float, 4> &value) {
+  ClearTexture3DFloat(
+      WMT::Texture texture, const std::array<float, 4> &value, uint32_t firstSlice, uint32_t sliceCount
+  ) {
     setComputePipelineState(clear_texture_3d_float_pipeline, {8, 4, 1});
     setComputeTexture(texture, 0);
     setComputeBytes(value.data(), 16, 1);
-    dispatchThreads({texture.width(), texture.height(), texture.depth()});
+    setComputeBytes(&firstSlice, sizeof(firstSlice), 2);
+    dispatchThreads({texture.width(), texture.height(), sliceCount});
   }
 
   void
-  ClearTexture3DUint(WMT::Texture texture, const std::array<uint32_t, 4> &value) {
+  ClearTexture3DUint(
+      WMT::Texture texture, const std::array<uint32_t, 4> &value, uint32_t firstSlice, uint32_t sliceCount
+  ) {
     setComputePipelineState(clear_texture_3d_uint_pipeline, {8, 4, 1});
     setComputeTexture(texture, 0);
     setComputeBytes(value.data(), 16, 1);
-    dispatchThreads({texture.width(), texture.height(), texture.depth()});
+    setComputeBytes(&firstSlice, sizeof(firstSlice), 2);
+    dispatchThreads({texture.width(), texture.height(), sliceCount});
   }
 
   void

@@ -135,9 +135,9 @@ struct ShaderVisibleDescriptorCPUStorage {
 
 class alignas(DXMT_PAGE_SIZE) MTLD3D12DescriptorHeap : public ID3D12DescriptorHeap {
 public:
-  virtual HRESULT
-  AddShaderResourceView(
-      UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp, std::array<float, 2> BorderRange
+  virtual HRESULT AddShaderResourceView(
+      UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp, std::array<float, 2> BorderRange,
+      bool Multisample
   ) = 0;
 
   virtual HRESULT AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) = 0;

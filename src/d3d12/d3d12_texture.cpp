@@ -525,7 +525,7 @@ public:
       break;
     }
     case D3D12_SRV_DIMENSION_TEXTURE2DMS: {
-      view_descriptor.type = WMTTextureType2DMultisample; // FIXME: lowering to 2d array
+      view_descriptor.type = texture->sampleCount() == 1 ? WMTTextureType2D : WMTTextureType2DMultisample;
       view_descriptor.firstMiplevel = 0;
       view_descriptor.miplevelCount = 1;
       view_descriptor.firstArraySlice = 0;
@@ -534,7 +534,7 @@ public:
       break;
     }
     case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: {
-      view_descriptor.type = WMTTextureType2DMultisampleArray;
+      view_descriptor.type = texture->sampleCount() == 1 ? WMTTextureType2DArray : WMTTextureType2DMultisampleArray;
       view_descriptor.firstMiplevel = 0;
       view_descriptor.miplevelCount = 1;
       view_descriptor.firstArraySlice = ViewDesc.Texture2DMSArray.FirstArraySlice;
@@ -565,7 +565,11 @@ public:
     // into the view's mip numbering, keeping the fraction (D3D12_TEX2D_SRV: a clamp of 0.5 is not 0)
     ResourceMinLODClamp -= view_descriptor.firstMiplevel;
 
-    return Heap->AddShaderResourceView(Index, texture.ptr(), View, ResourceMinLODClamp, BorderColorRange(metal_format));
+    return Heap->AddShaderResourceView(
+        Index, texture.ptr(), View, ResourceMinLODClamp, BorderColorRange(metal_format),
+        ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS ||
+            ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+    );
   };
 
   virtual HRESULT STDMETHODCALLTYPE

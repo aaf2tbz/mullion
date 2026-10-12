@@ -264,8 +264,10 @@ public:
                             : Texture::MemoryAccess::access_read;
     auto [Handle, Metadata, FormatRange] =
         GetTextureDescriptor(Builder, HeapPointer, Index, ResourceKind, UAV.range.lower_bound, DescriptorOffset);
-    return TextureDescirptor{Handle,       Metadata,  UAV.global_coherent, ResourceKind, ResourceKindLogical,
-                             MemoryAccess, SampleType};
+    return TextureDescirptor{
+        Handle,  Metadata, UAV.global_coherent, ResourceKind, ResourceKindLogical, MemoryAccess, SampleType,
+        nullptr, true
+    };
   }
 
   virtual llvm::Optional<BufferDescriptor>

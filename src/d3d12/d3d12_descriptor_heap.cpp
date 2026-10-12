@@ -170,7 +170,8 @@ public:
 
   virtual HRESULT
   AddShaderResourceView(
-      UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp, std::array<float, 2> BorderRange
+      UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp, std::array<float, 2> BorderRange,
+      bool Multisample
   ) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
@@ -183,6 +184,9 @@ public:
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.SRVTexture.resource_id = texture_view.gpuResourceID;
       gpu_storage.SRVTexture.metadata = TextureMetadata(Texture->arrayLength(View), ResourceMinLODClamp);
+      if (Multisample)
+        gpu_storage.SRVTexture.metadata =
+            TextureMetadata(Texture->arrayLength(View), 0) | (Texture->sampleCount() == 1);
       gpu_storage.SRVTexture.padding[0] = std::bit_cast<uint64_t>(BorderRange);
       // the view's place in its resource, which sampler feedback is recorded for: the first mip and how many mips the
       // resource has, a byte each, then 16 bits each for the first slice and the resource's width and height

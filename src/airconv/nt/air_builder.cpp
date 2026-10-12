@@ -635,6 +635,40 @@ AIRBuilder::CreateRead(
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
 
+  if (Texture.SingleSample) {
+    auto Head = builder.GetInsertBlock();
+    auto Fn = Head->getParent();
+    auto Tail = builder.GetInsertPoint() == Head->end() ? BasicBlock::Create(getContext(), "", Fn)
+                                                        : Head->splitBasicBlock(builder.GetInsertPoint());
+    if (Head->getTerminator())
+      Head->getTerminator()->eraseFromParent();
+    auto Single = BasicBlock::Create(getContext(), "", Fn, Tail);
+    auto Multiple = BasicBlock::Create(getContext(), "", Fn, Tail);
+    builder.SetInsertPoint(Head);
+    builder.CreateCondBr(Texture.SingleSample, Single, Multiple);
+    auto Native = Texture;
+    Native.SingleSample = nullptr;
+    builder.SetInsertPoint(Multiple);
+    auto Many = CreateRead(Native, Handle, Pos, ArrayIndex, SampleIndexOrCubeFace, Level, DeviceCoherent);
+    builder.CreateBr(Tail);
+    Native.kind = TexInfo.is_depth ? (TexInfo.is_array ? Texture::depth2d_array : Texture::depth2d)
+                                   : (TexInfo.is_array ? Texture::texture2d_array : Texture::texture2d);
+    builder.SetInsertPoint(Single);
+    auto One = CreateRead(
+        Native, builder.CreateBitCast(Handle, getTextureHandleType(Native)), Pos, ArrayIndex, nullptr, getInt(0),
+        DeviceCoherent
+    );
+    builder.CreateBr(Tail);
+    builder.SetInsertPoint(Tail, Tail->begin());
+    auto Value = builder.CreatePHI(One.first->getType(), 2);
+    Value->addIncoming(One.first, Single);
+    Value->addIncoming(Many.first, Multiple);
+    auto Residency = builder.CreatePHI(One.second->getType(), 2);
+    Residency->addIncoming(One.second, Single);
+    Residency->addIncoming(Many.second, Multiple);
+    return {Value, Residency};
+  }
+
   auto &Context = getContext();
   auto Attrs = AttributeList::get(
       Context,
@@ -936,6 +970,37 @@ Value *
 AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Query Query, Value *Level) {
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
+
+  if (Texture.SingleSample) {
+    auto Head = builder.GetInsertBlock();
+    auto Fn = Head->getParent();
+    auto Tail = builder.GetInsertPoint() == Head->end() ? BasicBlock::Create(getContext(), "", Fn)
+                                                        : Head->splitBasicBlock(builder.GetInsertPoint());
+    if (Head->getTerminator())
+      Head->getTerminator()->eraseFromParent();
+    auto Single = BasicBlock::Create(getContext(), "", Fn, Tail);
+    auto Multiple = BasicBlock::Create(getContext(), "", Fn, Tail);
+    builder.SetInsertPoint(Head);
+    builder.CreateCondBr(Texture.SingleSample, Single, Multiple);
+    auto Native = Texture;
+    Native.SingleSample = nullptr;
+    builder.SetInsertPoint(Multiple);
+    auto Many = CreateTextureQuery(Native, Handle, Query, Level);
+    builder.CreateBr(Tail);
+    Native.kind = TexInfo.is_depth ? (TexInfo.is_array ? Texture::depth2d_array : Texture::depth2d)
+                                   : (TexInfo.is_array ? Texture::texture2d_array : Texture::texture2d);
+    builder.SetInsertPoint(Single);
+    auto One =
+        Query == Texture::num_samples
+            ? builder.CreateSelect(builder.CreateIsNull(Handle), getInt(0), getInt(1))
+            : CreateTextureQuery(Native, builder.CreateBitCast(Handle, getTextureHandleType(Native)), Query, getInt(0));
+    builder.CreateBr(Tail);
+    builder.SetInsertPoint(Tail, Tail->begin());
+    auto Value = builder.CreatePHI(getIntTy(), 2);
+    Value->addIncoming(One, Single);
+    Value->addIncoming(Many, Multiple);
+    return Value;
+  }
 
   static const char *QUERIES[] = {
       "get_width", "get_height", "get_depth", "get_array_size", "get_num_mip_levels", "get_num_samples",

@@ -84,6 +84,7 @@ public:
   enum ResourceKind kind;
   enum SampleType sample_type;
   enum MemoryAccess memory_access;
+  Value *SingleSample = nullptr;
 };
 
 enum class Signedness { DontCare, Signed, Unsigned };

@@ -54,6 +54,7 @@ struct TextureResourceHandle {
   Swizzle Swizzle;
   bool GlobalCoherent;
   llvm::Value *Range = nullptr;
+  bool IsUAV = false;
 };
 
 struct BufferResourceHandle {
@@ -563,6 +564,10 @@ public:
     Texture.kind = Descriptor.ResourceKind;
     Texture.memory_access = Descriptor.MemoryAccess;
     Texture.sample_type = Descriptor.SampleType;
+    // Metal's MS textures require more than one sample (Metal Programming Guide, listing 5-2); 1 in the low word
+    // names the regular texture used for a one-sample view (D3D11.3 22.4.7)
+    if (llvm::air::AIRBuilder::getTextureInfo(Texture.kind).is_ms)
+      Texture.SingleSample = ir.CreateICmpEQ(ir.CreateTrunc(Descriptor.Metadata, air.getIntTy()), air.getInt(1));
     return {
         Texture,
         Descriptor.ResourceKindLogical,
@@ -570,7 +575,8 @@ public:
         Descriptor.Metadata,
         Swizzle,
         Descriptor.GlobalCoherent && SupportsMemoryCoherency(),
-        Descriptor.Range
+        Descriptor.Range,
+        Descriptor.IsUAV
     };
   }
 
@@ -578,7 +584,7 @@ public:
   // its array length, and the W size in the low half (0: the whole texture). null for other textures
   llvm::Value *
   UAVWSize(const TextureResourceHandle &Tex) {
-    if (Tex.Logical != llvm::air::Texture::texture3d || Tex.Texture.memory_access != llvm::air::Texture::acesss_readwrite)
+    if (Tex.Logical != llvm::air::Texture::texture3d || !Tex.IsUAV)
       return nullptr;
     return ir.CreateTrunc(Tex.Metadata, air.getIntTy());
   }

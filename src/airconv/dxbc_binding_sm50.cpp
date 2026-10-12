@@ -99,8 +99,10 @@ public:
                                                                   : Texture::MemoryAccess::access_write)
                                              : Texture::MemoryAccess::access_read;
 
-    return TextureDescirptor{Handle,       Metadata,  Iter->second.global_coherent, ResourceKind, ResourceKindLogical,
-                             MemoryAccess, SampleType};
+    return TextureDescirptor{
+        Handle,  Metadata, Iter->second.global_coherent, ResourceKind, ResourceKindLogical, MemoryAccess, SampleType,
+        nullptr, true
+    };
   }
 
   virtual llvm::Optional<BufferDescriptor>

@@ -96,6 +96,7 @@ struct ResourceViewBinding {
 
 struct UnorderedAccessViewBinding {
   uint64_t viewId;
+  uint64_t w_range;
   Rc<Buffer> buffer;
   Rc<Texture> texture;
   Rc<Counter> counter;
@@ -264,6 +265,7 @@ struct ClearEncoderData : EncoderData {
   TextureViewRef attachment;
   unsigned clear_dsv;
   unsigned array_length;
+  unsigned depth_plane = 0;
   unsigned width;
   unsigned height;
 
@@ -505,7 +507,8 @@ public:
   template <PipelineStage stage>
   void bindOutputBuffer(unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Counter> &&counter, BufferSlice slice);
 
-  template <PipelineStage stage> void bindOutputTexture(unsigned slot, Rc<Texture> &&texture, uint64_t viewId);
+  template <PipelineStage stage>
+  void bindOutputTexture(unsigned slot, Rc<Texture> &&texture, uint64_t viewId, uint64_t w_range);
 
   void bindStreamOutputBuffer(unsigned slot, Rc<Buffer> &&buffer, Rc<Counter> &&filled) {
     so_[slot] = {std::move(buffer), std::move(filled)};
@@ -757,7 +760,9 @@ public:
     return encoder_id_++;
   };
 
-  void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, WMTClearColor color);
+  void clearColor(
+      Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned depthPlane, WMTClearColor color
+  );
   void clearDepthStencil(
       Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
   );
@@ -1037,22 +1042,24 @@ ArgumentEncodingContext::bindOutputBuffer<PipelineStage::Pixel>(
 template <>
 inline void
 ArgumentEncodingContext::bindOutputTexture<PipelineStage::Compute>(
-    unsigned slot, Rc<Texture> &&texture, uint64_t viewId
+    unsigned slot, Rc<Texture> &&texture, uint64_t viewId, uint64_t w_range
 ) {
   auto &entry = cs_uav_[slot];
   entry.buffer = {};
   entry.texture = std::move(texture);
   entry.viewId = viewId;
+  entry.w_range = w_range;
 }
 template <>
 inline void
 ArgumentEncodingContext::bindOutputTexture<PipelineStage::Pixel>(
-    unsigned slot, Rc<Texture> &&texture, uint64_t viewId
+    unsigned slot, Rc<Texture> &&texture, uint64_t viewId, uint64_t w_range
 ) {
   auto &entry = om_uav_[slot];
   entry.buffer = {};
   entry.texture = std::move(texture);
   entry.viewId = viewId;
+  entry.w_range = w_range;
 }
 
 template <PipelineStage stage>

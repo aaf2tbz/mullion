@@ -26,6 +26,7 @@ struct TextureDescirptor {
   llvm::air::Texture::MemoryAccess MemoryAccess;
   llvm::air::Texture::SampleType SampleType;
   llvm::Value *Range = nullptr; // where its format range is (SM50_SAMPLER_BORDER), when the binding has one
+  bool IsUAV = false;
 };
 
 struct BufferDescriptor {

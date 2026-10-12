@@ -80,6 +80,7 @@ struct D3D11UnorderedAccessView : ID3D11UnorderedAccessView1 {
   BufferSlice slice_{};
   Texture *texture_{};
   uint64_t view_id_{};
+  uint64_t w_range_{};
   Rc<Counter> counter_;
   ResourceSubsetState subset_{};
   uint32_t bind_flags_{};

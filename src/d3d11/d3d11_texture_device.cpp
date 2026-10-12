@@ -27,6 +27,8 @@
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 
+#include <limits>
+
 namespace dxmt {
 
 #pragma region DeviceTexture
@@ -68,6 +70,10 @@ private:
         : UAVBase(pDesc, pResource, pDevice) {
       this->texture_ = pResource->texture_.ptr();
       this->view_id_ = this->texture_->createView(descriptor);
+      if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>)
+        this->w_range_ =
+            (uint64_t(pDesc->Texture3D.FirstWSlice) << std::numeric_limits<decltype(pDesc->Texture3D.WSize)>::digits) |
+            pDesc->Texture3D.WSize;
       this->subset_ = ResourceSubsetState(
         &descriptor,
         this->texture_->miplevelCount(),
@@ -167,6 +173,11 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
+      if (finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS ||
+          finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY)
+        return E_INVALIDARG;
+    }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -175,11 +186,11 @@ public:
       arraySize = this->desc.ArraySize;
     }
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
-            attachment_desc, descriptor
-        ))) {
-      return E_FAIL;
+    auto hr = InitializeAndNormalizeViewDescriptor(
+        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, attachment_desc, descriptor
+    );
+    if (FAILED(hr)) {
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;
@@ -195,6 +206,11 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
+      if (finalDesc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMS ||
+          finalDesc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY)
+        return E_INVALIDARG;
+    }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -203,11 +219,11 @@ public:
       arraySize = this->desc.ArraySize;
     }
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
-            attachment_desc, descriptor
-        ))) {
-      return E_FAIL;
+    auto hr = InitializeAndNormalizeViewDescriptor(
+        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, attachment_desc, descriptor
+    );
+    if (FAILED(hr)) {
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;
@@ -230,6 +246,11 @@ public:
          finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) &&
         !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
       return E_INVALIDARG;
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
+      if (finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMS ||
+          finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY)
+        return E_INVALIDARG;
+    }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -237,11 +258,12 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
-        ))) {
+    auto hr = InitializeAndNormalizeViewDescriptor(
+        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+    );
+    if (FAILED(hr)) {
       ERR("DeviceTexture: Failed to create texture SRV");
-      return E_FAIL;
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;
@@ -266,11 +288,12 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
-        ))) {
+    auto hr = InitializeAndNormalizeViewDescriptor(
+        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+    );
+    if (FAILED(hr)) {
       ERR("DeviceTexture: Failed to create texture UAV");
-      return E_FAIL;
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;

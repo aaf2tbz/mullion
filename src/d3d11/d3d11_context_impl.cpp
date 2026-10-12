@@ -684,8 +684,9 @@ public:
       });
     else
       EmitOP([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
-            value = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]}),
-            dimension = desc.ViewDimension](ArgumentEncodingContext &enc) mutable {
+            value = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]})](
+                 ArgumentEncodingContext &enc
+             ) mutable {
         auto view_format = texture->pixelFormat(viewId);
         auto uint_format = MTLGetUnsignedIntegerFormat((WMTPixelFormat)view_format);
         /* RG11B10Float is a special case */
@@ -700,7 +701,7 @@ public:
         }
         auto viewChecked = texture->checkViewUseFormat(viewId, uint_format);
         WMT::Texture texture_handle = enc.access(texture, viewChecked, ResourceAccess::Write).texture;
-        switch (dimension) {
+        switch (desc.ViewDimension) {
         default:
           break;
         case D3D11_UAV_DIMENSION_TEXTURE1D:
@@ -712,7 +713,7 @@ public:
           enc.emulated_cmd.ClearTexture2DArrayUint(texture_handle, value);
           break;
         case D3D11_UAV_DIMENSION_TEXTURE3D:
-          enc.emulated_cmd.ClearTexture3DUint(texture_handle, value);
+          enc.emulated_cmd.ClearTexture3DUint(texture_handle, value, desc.Texture3D.FirstWSlice, desc.Texture3D.WSize);
           break;
         }
       });
@@ -756,10 +757,10 @@ public:
         }
       });
     else
-      EmitOP([=, texture = pUAV->texture(), viewId = pUAV->viewId(), dimension = desc.ViewDimension,
+      EmitOP([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
             value = std::array<float, 4>({Values[0], Values[1], Values[2], Values[3]})](ArgumentEncodingContext &enc) {
         WMT::Texture texture_handle = enc.access(texture, viewId, ResourceAccess::Write).texture;
-        switch (dimension) {
+        switch (desc.ViewDimension) {
         default:
           break;
         case D3D11_UAV_DIMENSION_TEXTURE1D:
@@ -771,7 +772,7 @@ public:
           enc.emulated_cmd.ClearTexture2DArrayFloat(texture_handle, value);
           break;
         case D3D11_UAV_DIMENSION_TEXTURE3D:
-          enc.emulated_cmd.ClearTexture3DFloat(texture_handle, value);
+          enc.emulated_cmd.ClearTexture3DFloat(texture_handle, value, desc.Texture3D.FirstWSlice, desc.Texture3D.WSize);
           break;
         }
       });
@@ -2744,8 +2745,9 @@ public:
             enc.bindOutputBuffer<PipelineStage::Compute>(Slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
           });
         } else {
-          EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
-            enc.bindOutputTexture<PipelineStage::Compute>(Slot, forward_rc(texture), viewId);
+          EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
+                  w_range = pUAV->w_range_](ArgumentEncodingContext &enc) mutable {
+            enc.bindOutputTexture<PipelineStage::Compute>(Slot, forward_rc(texture), viewId, w_range);
           });
         }
         ResolveSRVHazard<PipelineStage::Compute>(pUAV);
@@ -3115,8 +3117,9 @@ public:
               enc.bindOutputBuffer<PipelineStage::Pixel>(Slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
             });
           } else {
-            EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
-              enc.bindOutputTexture<PipelineStage::Pixel>(Slot, forward_rc(texture), viewId);
+            EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
+                    w_range = pUAV->w_range_](ArgumentEncodingContext &enc) mutable {
+              enc.bindOutputTexture<PipelineStage::Pixel>(Slot, forward_rc(texture), viewId, w_range);
             });
           }
 
@@ -4670,8 +4673,9 @@ public:
     auto &props = pRenderTargetView->description();
 
     EmitOP([texture = pRenderTargetView->texture(), view = pRenderTargetView->viewId(),
-          clear_color = std::move(clear_color), array_length = props.RenderTargetArrayLength](ArgumentEncodingContext &enc) mutable {
-      enc.clearColor(forward_rc(texture), view, array_length, clear_color);
+          clear_color = std::move(clear_color), array_length = props.RenderTargetArrayLength,
+          depth_plane = props.DepthPlane](ArgumentEncodingContext &enc) mutable {
+      enc.clearColor(forward_rc(texture), view, array_length, depth_plane, clear_color);
     });
   }
 
@@ -5425,8 +5429,9 @@ public:
           enc.bindOutputBuffer<PipelineStage::Pixel>(slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
         });
       } else {
-        EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
-          enc.bindOutputTexture<PipelineStage::Pixel>(slot, forward_rc(texture), viewId);
+        EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
+                w_range = pUAV->w_range_](ArgumentEncodingContext &enc) mutable {
+          enc.bindOutputTexture<PipelineStage::Pixel>(slot, forward_rc(texture), viewId, w_range);
         });
       }
     }
@@ -5438,8 +5443,9 @@ public:
           enc.bindOutputBuffer<PipelineStage::Compute>(slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
         });
       } else {
-        EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
-          enc.bindOutputTexture<PipelineStage::Compute>(slot, forward_rc(texture), viewId);
+        EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
+                w_range = pUAV->w_range_](ArgumentEncodingContext &enc) mutable {
+          enc.bindOutputTexture<PipelineStage::Compute>(slot, forward_rc(texture), viewId, w_range);
         });
       }
     }

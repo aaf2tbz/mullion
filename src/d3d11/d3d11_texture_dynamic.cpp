@@ -78,6 +78,11 @@ public:
          finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) &&
         !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
       return E_INVALIDARG;
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
+      if (finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMS ||
+          finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY)
+        return E_INVALIDARG;
+    }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -85,11 +90,12 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
-        ))) {
+    auto hr = InitializeAndNormalizeViewDescriptor(
+        this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+    );
+    if (FAILED(hr)) {
       ERR("DynamicTexture: Failed to create texture SRV");
-      return E_FAIL;
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;

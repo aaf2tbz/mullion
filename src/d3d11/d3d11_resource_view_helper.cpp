@@ -110,7 +110,7 @@ InitializeAndNormalizeViewDescriptor(
       Descriptor.arraySize = 1;
       return S_OK;
     }
-    if (TextureType == WMTTextureType2D) {
+    if (TextureType == WMTTextureType2D || TextureType == WMTTextureType2DArray) {
       // cursed use case: MS view on non-MS texture (SampleCount = 1)
       Descriptor.type = WMTTextureType2D;
       Descriptor.format = metal_format.PixelFormat;
@@ -123,8 +123,13 @@ InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D_SRV_DIMENSION_TEXTURE2DMSARRAY: {
+    if (ViewDesc.Texture2DMSArray.FirstArraySlice >= ArraySize)
+      return E_INVALIDARG;
     if (~ViewDesc.Texture2DMSArray.ArraySize == 0)
       ViewDesc.Texture2DMSArray.ArraySize = ArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice;
+    if (!ViewDesc.Texture2DMSArray.ArraySize ||
+        ViewDesc.Texture2DMSArray.ArraySize > ArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice)
+      return E_INVALIDARG;
     if (TextureType == WMTTextureType2DMultisample) {
       Descriptor.type = WMTTextureType2DMultisampleArray;
       Descriptor.format = metal_format.PixelFormat;
@@ -215,7 +220,7 @@ InitializeAndNormalizeViewDescriptor(
   }
   }
   ERR("Unhandled srv creation: \n Source: ", uint32_t(TextureType), "\n Desired: ", ViewDesc.ViewDimension);
-  return E_FAIL;
+  return E_INVALIDARG;
 }
 
 template <>
@@ -291,32 +296,30 @@ InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D11_UAV_DIMENSION_TEXTURE3D: {
-    ArraySize = std::max(ArraySize >> ViewDesc.Texture3D.MipSlice, 1u); 
+    if (ViewDesc.Texture3D.MipSlice >= MiplevelCount)
+      return E_INVALIDARG;
+    ArraySize = std::max(ArraySize >> ViewDesc.Texture3D.MipSlice, 1u);
+    if (ViewDesc.Texture3D.FirstWSlice >= ArraySize)
+      return E_INVALIDARG;
     if (~ViewDesc.Texture3D.WSize == 0)
       ViewDesc.Texture3D.WSize = ArraySize - ViewDesc.Texture3D.FirstWSlice;
+    if (!ViewDesc.Texture3D.WSize || ViewDesc.Texture3D.WSize > ArraySize - ViewDesc.Texture3D.FirstWSlice)
+      return E_INVALIDARG;
     if (TextureType == WMTTextureType3D) {
-
-      if (ViewDesc.Texture3D.FirstWSlice == 0) {
-        if (ViewDesc.Texture3D.WSize != ArraySize) {
-          WARN("Created a subview of 3D texture.");
-        }
-        Descriptor.type = WMTTextureType3D;
-        Descriptor.format = metal_format.PixelFormat;
-        Descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
-        Descriptor.miplevelCount = 1;
-        Descriptor.firstArraySlice = 0;
-        Descriptor.arraySize = 1;
-        return S_OK;
-      }
-      ERR("tex3d uav creation not properly handled: ", ViewDesc.Texture3D.FirstWSlice, ":", ViewDesc.Texture3D.WSize,
-          ":", ArraySize);
+      Descriptor.type = WMTTextureType3D;
+      Descriptor.format = metal_format.PixelFormat;
+      Descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
+      Descriptor.miplevelCount = 1;
+      Descriptor.firstArraySlice = 0;
+      Descriptor.arraySize = 1;
+      return S_OK;
     }
     break;
   }
   }
   ERR("Unhandled uav creation: \n Source: ", TextureType,
       "\n Desired: ", ViewDesc.ViewDimension);
-  return E_FAIL;
+  return E_INVALIDARG;
 }
 
 inline void
@@ -416,7 +419,7 @@ HRESULT InitializeAndNormalizeViewDescriptor(
       GetRenderTargetSize(pTexture, Descriptor.firstMiplevel, AttachmentDesc);
       return S_OK;
     }
-    if (texture_type == WMTTextureType2D) {
+    if (texture_type == WMTTextureType2D || texture_type == WMTTextureType2DArray) {
       // cursed use case: MS view on non-MS texture (SampleCount = 1)
       Descriptor.type = WMTTextureType2D;
       Descriptor.format = metal_format.PixelFormat;
@@ -430,8 +433,13 @@ HRESULT InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY: {
+    if (ViewDesc.Texture2DMSArray.FirstArraySlice >= ArraySize)
+      return E_INVALIDARG;
     if (~ViewDesc.Texture2DMSArray.ArraySize == 0)
       ViewDesc.Texture2DMSArray.ArraySize = ArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice;
+    if (!ViewDesc.Texture2DMSArray.ArraySize ||
+        ViewDesc.Texture2DMSArray.ArraySize > ArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice)
+      return E_INVALIDARG;
     if (texture_type == WMTTextureType2DMultisample) {
       Descriptor.type = WMTTextureType2DMultisampleArray;
       Descriptor.format = metal_format.PixelFormat;
@@ -454,7 +462,7 @@ HRESULT InitializeAndNormalizeViewDescriptor(
       GetRenderTargetSize(pTexture, Descriptor.firstMiplevel, AttachmentDesc);
       return S_OK;
     }
-    if (texture_type == WMTTextureType2DArray) {
+    if (texture_type == WMTTextureType2D || texture_type == WMTTextureType2DArray) {
       // cursed use case: MS view on non-MS texture (SampleCount = 1)
       Descriptor.type = WMTTextureType2DArray;
       Descriptor.format = metal_format.PixelFormat;
@@ -469,44 +477,33 @@ HRESULT InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D11_RTV_DIMENSION_TEXTURE3D: {
-    ArraySize = std::max(ArraySize >> ViewDesc.Texture3D.MipSlice, 1u); 
+    if (ViewDesc.Texture3D.MipSlice >= MiplevelCount)
+      return E_INVALIDARG;
+    ArraySize = std::max(ArraySize >> ViewDesc.Texture3D.MipSlice, 1u);
+    if (ViewDesc.Texture3D.FirstWSlice >= ArraySize)
+      return E_INVALIDARG;
     if (~ViewDesc.Texture3D.WSize == 0)
       ViewDesc.Texture3D.WSize = ArraySize - ViewDesc.Texture3D.FirstWSlice;
+    if (!ViewDesc.Texture3D.WSize || ViewDesc.Texture3D.WSize > ArraySize - ViewDesc.Texture3D.FirstWSlice)
+      return E_INVALIDARG;
     if (texture_type == WMTTextureType3D) {
-      if (ViewDesc.Texture3D.WSize == 1) {
-        Descriptor.type = WMTTextureType3D;
-        Descriptor.format = metal_format.PixelFormat;
-        Descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
-        Descriptor.miplevelCount = 1;
-        Descriptor.firstArraySlice = 0;
-        Descriptor.arraySize = 1;
-        AttachmentDesc.DepthPlane = ViewDesc.Texture3D.FirstWSlice;
-        GetRenderTargetSize(pTexture, Descriptor.firstMiplevel, AttachmentDesc);
-        return S_OK;
-      }
-      if (ViewDesc.Texture3D.FirstWSlice == 0) {
-        if (ViewDesc.Texture3D.WSize != ArraySize) {
-          WARN("Created a subview of 3D texture.");
-        }
-        Descriptor.type = WMTTextureType3D;
-        Descriptor.format = metal_format.PixelFormat;
-        Descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
-        Descriptor.miplevelCount = 1;
-        Descriptor.firstArraySlice = 0;
-        Descriptor.arraySize = 1;
-        AttachmentDesc.RenderTargetArrayLength = ArraySize;
-        GetRenderTargetSize(pTexture, Descriptor.firstMiplevel, AttachmentDesc);
-        return S_OK;
-      }
-      ERR("tex3d rtv creation not properly handled: ", ViewDesc.Texture3D.FirstWSlice, ":", ViewDesc.Texture3D.WSize,
-          ":", ArraySize);
+      Descriptor.type = WMTTextureType3D;
+      Descriptor.format = metal_format.PixelFormat;
+      Descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
+      Descriptor.miplevelCount = 1;
+      Descriptor.firstArraySlice = 0;
+      Descriptor.arraySize = 1;
+      AttachmentDesc.DepthPlane = ViewDesc.Texture3D.FirstWSlice;
+      AttachmentDesc.RenderTargetArrayLength = ViewDesc.Texture3D.WSize > 1 ? ViewDesc.Texture3D.WSize : 0;
+      GetRenderTargetSize(pTexture, Descriptor.firstMiplevel, AttachmentDesc);
+      return S_OK;
     }
     break;
   }
   }
   ERR("Unhandled rtv creation: \n Source: ", uint32_t(texture_type),
       "\n Desired: ", ViewDesc.ViewDimension);
-  return E_FAIL;
+  return E_INVALIDARG;
 }
 
 template <>
@@ -617,8 +614,13 @@ InitializeAndNormalizeViewDescriptor(
     break;
   }
   case D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY: {
+    if (ViewDesc.Texture2DMSArray.FirstArraySlice >= ArraySize)
+      return E_INVALIDARG;
     if (~ViewDesc.Texture2DMSArray.ArraySize == 0)
       ViewDesc.Texture2DMSArray.ArraySize = ArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice;
+    if (!ViewDesc.Texture2DMSArray.ArraySize ||
+        ViewDesc.Texture2DMSArray.ArraySize > ArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice)
+      return E_INVALIDARG;
     if (texture_type == WMTTextureType2DMultisample) {
       Descriptor.type = WMTTextureType2DMultisampleArray;
       Descriptor.format = metal_format.PixelFormat;
@@ -641,7 +643,7 @@ InitializeAndNormalizeViewDescriptor(
       GetRenderTargetSize(pTexture, Descriptor.firstMiplevel, AttachmentDesc);
       return S_OK;
     }
-    if (texture_type == WMTTextureType2DArray) {
+    if (texture_type == WMTTextureType2D || texture_type == WMTTextureType2DArray) {
       // cursed use case: MS view on non-MS texture (SampleCount = 1)
       Descriptor.type = WMTTextureType2DArray;
       Descriptor.format = metal_format.PixelFormat;
@@ -657,7 +659,7 @@ InitializeAndNormalizeViewDescriptor(
   }
   }
   ERR("Unhandled dsv creation: \n Source: ", uint32_t(texture_type), "\n Desired: ", ViewDesc.ViewDimension);
-  return E_FAIL;
+  return E_INVALIDARG;
 }
 
 template <>

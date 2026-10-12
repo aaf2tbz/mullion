@@ -79,8 +79,10 @@ using namespace dxmt;
 [[kernel]] void clear_texture_3d_uint(
     texture3d<uint, access::read_write> tex [[texture(0)]],
     constant uint4& value [[buffer(1)]],
+    constant uint& first_slice [[buffer(2)]],
     ushort3 pos [[thread_position_in_grid]]
 ) {
+  pos.z += first_slice;
   uint width = tex.get_width();
   uint height = tex.get_height();
   uint depth = tex.get_depth();
@@ -169,8 +171,10 @@ struct DXMTClearTextureBufferUInt {
 [[kernel]] void clear_texture_3d_float(
     texture3d<float, access::read_write> tex [[texture(0)]],
     constant float4& value [[buffer(1)]],
+    constant uint& first_slice [[buffer(2)]],
     ushort3 pos [[thread_position_in_grid]]
 ) {
+  pos.z += first_slice;
   uint width = tex.get_width();
   uint height = tex.get_height();
   uint depth = tex.get_depth();

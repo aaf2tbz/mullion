@@ -1138,6 +1138,8 @@ AIRCONV_API int SM50Initialize(
     } else {
       flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP |
                MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+      if (llvm::air::AIRBuilder::getTextureInfo(to_air_resource_type(srv.resource_type, srv.compared)).is_ms)
+        flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE;
       switch (srv.resource_type) {
       case ResourceType::Texture1DArray:
       case ResourceType::Texture2DArray:
