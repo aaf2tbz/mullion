@@ -2,10 +2,36 @@
 #include "Metal.hpp"
 #include "thread.hpp"
 #include "airconv_public.h"
+#include "dxmt_format.hpp"
+#include <span>
 
 namespace dxmt {
 
 constexpr int kDXMTShaderCacheVersion = AIRCONV_VERSION;
+
+inline auto
+PixelShaderOutputFormats(
+    const MTL_PIXEL_SHADER_REFLECTION &shader, std::span<const WMTPixelFormat> formats, bool dual
+) {
+  // hints name the 32-bit output register types (D3D11.3 7.6, 16.6), so equal types share a variant
+  static_assert(WMTPixelFormatR32Float <= UINT8_MAX && WMTPixelFormatR32Sint <= UINT8_MAX &&
+                WMTPixelFormatR32Uint <= UINT8_MAX);
+  std::array<uint8_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> outputs{};
+  for (uint32_t reg = 0; reg < outputs.size(); reg++) {
+    auto slot = dual ? 0 : reg;
+    if (!(shader.ValidRenderTargets & (1u << reg)) || (dual && reg > 1) || slot >= formats.size() ||
+        formats[slot] == WMTPixelFormatInvalid)
+      continue;
+    auto format = WMTPixelFormat(ORIGINAL_FORMAT(formats[slot]));
+    bool integer = IsIntegerFormat(format);
+    bool unsigned_output = integer && MTLGetUnsignedIntegerFormat(format) == format;
+    if (bool(shader.UintRenderTargets & (1u << reg)) != unsigned_output ||
+        bool(shader.SintRenderTargets & (1u << reg)) != (integer && !unsigned_output))
+      outputs[reg] =
+          integer ? (unsigned_output ? WMTPixelFormatR32Uint : WMTPixelFormatR32Sint) : WMTPixelFormatR32Float;
+  }
+  return outputs;
+}
 
 class ShaderCache {
 public:

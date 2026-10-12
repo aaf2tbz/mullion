@@ -1326,8 +1326,15 @@ AIRCONV_API int SM50Initialize(
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
-      pRefl->PixelShader.ValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
-      pRefl->PixelShader.HasCoverageOutput = sm50_shader->ps_has_coverage_output;
+      pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0};
+      for (auto &out : sm50_shader->output_signature) {
+        if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
+          continue;
+        pRefl->PixelShader.SintRenderTargets |=
+            uint32_t(out.componentType() == RegisterComponentType::Int) << out.reg();
+        pRefl->PixelShader.UintRenderTargets |=
+            uint32_t(out.componentType() == RegisterComponentType::Uint) << out.reg();
+      }
     }
     pRefl->NumOutputElement = sm50_shader->max_output_register;
     pRefl->CullDistances = sm50_shader->cull_distance_scalars.size();

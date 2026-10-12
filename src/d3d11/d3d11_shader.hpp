@@ -7,6 +7,7 @@
 #include "d3d11_input_layout.hpp"
 #include "sha1/sha1_util.hpp"
 #include "log/log.hpp"
+#include "dxmt_shader_cache.hpp"
 #include <variant>
 
 struct MTL_COMPILED_SHADER {
@@ -107,12 +108,8 @@ struct ShaderVariantPixel {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
-  bool operator==(const this_type &rhs) const {
-    return sample_mask == rhs.sample_mask &&
-           dual_source_blending == rhs.dual_source_blending &&
-           disable_depth_output == rhs.disable_depth_output &&
-           unorm_output_reg_mask == rhs.unorm_output_reg_mask;
-  }
+  std::array<uint8_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
+  bool operator==(const this_type &rhs) const = default;
 };
 
 struct ShaderVariantTessellationVertexHull {
@@ -209,6 +206,10 @@ public:
   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
+  CompiledShader *get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats) {
+    variant.pixel_formats = PixelShaderOutputFormats(reflection().PixelShader, formats, variant.dual_source_blending);
+    return get_shader(variant);
+  }
   virtual const Sha1Digest& sha1() = 0;
   virtual void dump() = 0;
 

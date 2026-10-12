@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 33
+#define AIRCONV_VERSION 34
 
 #ifdef __cplusplus
 #include <string>
@@ -106,6 +106,8 @@ struct MTL_POST_TESSELLATOR_REFLECTION {
 struct MTL_PIXEL_SHADER_REFLECTION {
   uint32_t ValidRenderTargets;
   uint32_t HasCoverageOutput;
+  uint32_t SintRenderTargets;
+  uint32_t UintRenderTargets;
 };
 
 struct MTL_SHADER_REFLECTION {

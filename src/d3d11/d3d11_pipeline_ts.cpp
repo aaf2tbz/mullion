@@ -61,10 +61,10 @@ public:
 
     GetTessellationShaders();
     if (pDesc->PixelShader) {
-      PixelShader = pDesc->PixelShader->get_shader(ShaderVariantPixel{
+      PixelShader = pDesc->PixelShader->get_pixel_shader(ShaderVariantPixel{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
-          unorm_output_reg_mask});
+          unorm_output_reg_mask}, {rtv_formats, num_rtvs});
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;

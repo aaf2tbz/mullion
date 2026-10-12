@@ -917,17 +917,19 @@ public:
 
       SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
       data_ps.dual_source_blending = dual_source_blending;
-      data_ps.disable_depth_output = false;
+      data_ps.disable_depth_output =
+          (mesh ? mesh_info.depth_pixel_format : info.depth_pixel_format) == WMTPixelFormatInvalid;
       data_ps.unorm_output_reg_mask = 0;
       data_ps.sample_mask = pDesc->SampleMask;
       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
       data_ps.next = &common;
 
-      memset(data_ps.pixel_formats, 0, sizeof(data_ps.pixel_formats));
-      for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
-        data_ps.pixel_formats[i] =
-            ORIGINAL_FORMAT(mesh ? mesh_info.colors[i].pixel_format : info.colors[i].pixel_format);
-      }
+      std::array<WMTPixelFormat, std::size(data_ps.pixel_formats)> formats{};
+      for (unsigned i = 0; i < pDesc->NumRenderTargets; i++)
+        formats[i] = mesh ? mesh_info.colors[i].pixel_format : info.colors[i].pixel_format;
+      auto outputs = PixelShaderOutputFormats(ref_ps.PixelShader, {formats.data(), pDesc->NumRenderTargets},
+                                             dual_source_blending);
+      std::copy(outputs.begin(), outputs.end(), data_ps.pixel_formats);
 
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       if (!(ps_func = function(shader_ps, pDesc->PS, root_signature(rootsig, &data_ps), ps_name.c_str())))

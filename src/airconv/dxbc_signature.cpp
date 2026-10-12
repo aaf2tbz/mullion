@@ -605,7 +605,7 @@ void handle_signature_ps(
       auto sig_type = sig.componentType();
       signature_handlers.push_back([=](SignatureContext &ctx) {
         auto type = component_type_from_pixel_format(ctx.pixel_formats[reg]);
-        if (ctx.dual_source_blending || type == RegisterComponentType::Unknown)
+        if (type == RegisterComponentType::Unknown)
           type = sig_type;
         uint32_t assigned_index;
         if (ctx.dual_source_blending) {
