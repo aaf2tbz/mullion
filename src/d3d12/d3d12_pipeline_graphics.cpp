@@ -348,10 +348,9 @@ CompileFunction(
     case SM50_SHADER_STREAM_OUTPUT: {
       auto &[next, type, count, elements, strides, rasterized, counting] = *(SM50_SHADER_STREAM_OUTPUT_DATA *)arg;
       hash(count, strides, rasterized, counting);
-      for (uint32_t i = 0; i < count; i++) {
-        auto &[reg, component, stream, slot, offset] = elements[i];
-        hash(reg, component, stream, slot, offset);
-      }
+      // offsets count preceding elements of each slot, including gaps (D3D11.3 14.3)
+      for (uint32_t i = 0; i < count; i++)
+        hash(elements[i].reg_id, elements[i].component, elements[i].stream, elements[i].output_slot);
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
