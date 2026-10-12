@@ -4,6 +4,7 @@
 #include "d3d11_resource.hpp"
 #include "d3d11_1.h"
 #include "util_math.hpp"
+#include <bit>
 
 namespace dxmt {
 
@@ -306,8 +307,26 @@ CreateMTLTextureDescriptorInternal(
   if (Width == 0 || Height == 0 || Depth == 0 || ArraySize == 0 || SampleCount == 0)
     return E_INVALIDARG;
 
+  UINT array_limit = pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0 ?
+                       (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? D3D11_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION :
+                                                                         D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION) :
+                       (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? D3D10_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION :
+                                                                         D3D10_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION);
+  UINT mip_limit = std::bit_width(Width | Height | Depth);
+  if (ArraySize > array_limit || MipLevels > mip_limit ||
+      (SampleCount > 1 && (MipLevels != 1 || Usage != D3D11_USAGE_DEFAULT)) ||
+      (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D && (BindFlags & D3D11_BIND_DEPTH_STENCIL)))
+    return E_INVALIDARG;
+  // D3D11.3 5.3.8: a cube view spans six square faces; Windows also accepts trailing slices at 10.1 and above
+  constexpr UINT cube_faces = 6;
+  if ((MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) &&
+      (Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || Width != Height || ArraySize < cube_faces ||
+       SampleCount != 1 || (pDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_1 && ArraySize != cube_faces)))
+    return E_INVALIDARG;
+
   MTL_DXGI_FORMAT_DESC metal_format;
-  if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), Format, metal_format))) {
+  if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), Format, metal_format)) ||
+      metal_format.PixelFormat == WMTPixelFormatInvalid || !metal_format.BytesPerTexel) {
     ERR("CreateMTLTextureDescriptorInternal: creating a texture of invalid "
         "format: ",
         Format);
@@ -342,8 +361,7 @@ CreateMTLTextureDescriptorInternal(
     case DXGI_FORMAT_R24G8_TYPELESS:
       break;
     default:
-      ERR("Unhandled depth stencil format ", Format);
-      break;
+      return E_INVALIDARG;
     }
   }
   pDescOut->pixel_format = ORIGINAL_FORMAT(metal_format.PixelFormat);
@@ -351,12 +369,25 @@ CreateMTLTextureDescriptorInternal(
   if (pDescOut->pixel_format == WMTPixelFormatX32_Stencil8)
     pDescOut->pixel_format = WMTPixelFormatDepth32Float_Stencil8;
 
+  auto capability = pDevice->GetMTLPixelFormatCapability(pDescOut->pixel_format);
+  if ((BindFlags & D3D11_BIND_RENDER_TARGET) && !any_bit_set(capability & FormatCapability::Color))
+    return E_INVALIDARG;
+  if ((BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&
+      ((BindFlags & D3D11_BIND_DEPTH_STENCIL) || !any_bit_set(capability & FormatCapability::Write)))
+    return E_INVALIDARG;
+  if ((BindFlags & D3D11_BIND_SHADER_RESOURCE) && any_bit_set(capability & FormatCapability::DepthStencil) &&
+      !(metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS))
+    return E_INVALIDARG;
+  // D3D11.3 19.1.4 only permits shader reads of the shared-exponent format, even when Metal can render it
+  if (Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && (BindFlags & ~D3D11_BIND_SHADER_RESOURCE))
+    return E_INVALIDARG;
+
   WMTTextureUsage metal_usage = WMTTextureUsageShaderRead;
 
-  if (BindFlags & (D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_VERTEX_BUFFER |
-                   D3D11_BIND_INDEX_BUFFER | D3D11_BIND_STREAM_OUTPUT)) {
+  if (BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL |
+                    D3D11_BIND_UNORDERED_ACCESS)) {
     ERR("CreateMTLTextureDescriptorInternal: invalid bind flags");
-    return E_FAIL;
+    return E_INVALIDARG;
   } else {
     if (BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
       metal_usage |= WMTTextureUsageRenderTarget;
@@ -406,7 +437,7 @@ CreateMTLTextureDescriptorInternal(
   pDescOut->options = options;
 
   if (MipLevels == 0) {
-    pDescOut->mipmap_level_count = 32 - __builtin_clz(Width | Height);
+    pDescOut->mipmap_level_count = mip_limit;
   } else {
     pDescOut->mipmap_level_count = MipLevels;
   }
@@ -428,36 +459,25 @@ CreateMTLTextureDescriptorInternal(
     }
     break;
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
-    if (MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) {
-      D3D11_ASSERT(ArraySize / 6);
-      D3D11_ASSERT((ArraySize % 6) == 0);
-      if ((ArraySize / 6) > 1) {
-        pDescOut->type = WMTTextureTypeCubeArray;
-        pDescOut->array_length = ArraySize / 6;
-      } else {
-        pDescOut->type = WMTTextureTypeCube;
+    if (SampleCount > 1) {
+      if (!pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
+        ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
+            " is not supported.");
+        return E_INVALIDARG;
       }
-    } else {
-      if (SampleCount > 1) {
-        if (!pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
-          ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
-              " is not supported.");
-          return E_INVALIDARG;
-        }
-        if (ArraySize > 1) {
-          pDescOut->type = WMTTextureType2DMultisampleArray;
-          pDescOut->array_length = ArraySize;
-        } else {
-          pDescOut->type = WMTTextureType2DMultisample;
-        }
-        pDescOut->sample_count = SampleCount;
+      if (ArraySize > 1) {
+        pDescOut->type = WMTTextureType2DMultisampleArray;
+        pDescOut->array_length = ArraySize;
       } else {
-        if (ArraySize > 1) {
-          pDescOut->type = WMTTextureType2DArray;
-          pDescOut->array_length = ArraySize;
-        } else {
-          pDescOut->type = WMTTextureType2D;
-        }
+        pDescOut->type = WMTTextureType2DMultisample;
+      }
+      pDescOut->sample_count = SampleCount;
+    } else {
+      if (ArraySize > 1) {
+        pDescOut->type = WMTTextureType2DArray;
+        pDescOut->array_length = ArraySize;
+      } else {
+        pDescOut->type = WMTTextureType2D;
       }
     }
     break;
@@ -494,6 +514,14 @@ HRESULT CreateMTLTextureDescriptor(MTLD3D11Device *pDevice,
                                    const D3D11_TEXTURE2D_DESC1 *pDesc,
                                    D3D11_TEXTURE2D_DESC1 *pOutDesc,
                                    WMTTextureInfo *pMtlDescOut) {
+  UINT quality_levels = 0;
+  if (FAILED(pDevice->CheckMultisampleQualityLevels(pDesc->Format, pDesc->SampleDesc.Count, &quality_levels)) ||
+      !quality_levels ||
+      (pDesc->SampleDesc.Quality >= quality_levels &&
+       (pDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_1 ||
+        (pDesc->SampleDesc.Quality != D3D11_STANDARD_MULTISAMPLE_PATTERN &&
+         pDesc->SampleDesc.Quality != D3D11_CENTER_MULTISAMPLE_PATTERN))))
+    return E_INVALIDARG;
   auto hr = CreateMTLTextureDescriptorInternal(
       pDevice, D3D11_RESOURCE_DIMENSION_TEXTURE2D, pDesc->Width, pDesc->Height,
       1, pDesc->ArraySize, pDesc->SampleDesc.Count, pDesc->BindFlags,

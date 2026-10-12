@@ -182,7 +182,8 @@ InitializeAndNormalizeViewDescriptor(
   case D3D_SRV_DIMENSION_TEXTURECUBE: {
     if (~ViewDesc.TextureCube.MipLevels == 0)
       ViewDesc.TextureCube.MipLevels = MiplevelCount - ViewDesc.TextureCube.MostDetailedMip;
-    if (TextureType == WMTTextureTypeCube || TextureType == WMTTextureTypeCubeArray) {
+    if (TextureType == WMTTextureTypeCube || TextureType == WMTTextureTypeCubeArray ||
+        TextureType == WMTTextureType2DArray) {
       Descriptor.type = WMTTextureTypeCube;
       Descriptor.format = metal_format.PixelFormat;
       Descriptor.firstMiplevel = ViewDesc.TextureCube.MostDetailedMip;
@@ -196,12 +197,12 @@ InitializeAndNormalizeViewDescriptor(
   }
   case D3D_SRV_DIMENSION_TEXTURECUBEARRAY: {
     D3D11_ASSERT((ViewDesc.TextureCubeArray.First2DArrayFace % 6) == 0);
-    D3D11_ASSERT((ArraySize % 6) == 0);
     if (~ViewDesc.TextureCubeArray.MipLevels == 0)
       ViewDesc.TextureCubeArray.MipLevels = MiplevelCount - ViewDesc.TextureCubeArray.MostDetailedMip;
     if (~ViewDesc.TextureCubeArray.NumCubes == 0)
       ViewDesc.TextureCubeArray.NumCubes = (ArraySize - ViewDesc.TextureCubeArray.First2DArrayFace) / 6;
-    if (TextureType == WMTTextureTypeCube || TextureType == WMTTextureTypeCubeArray) {
+    if (TextureType == WMTTextureTypeCube || TextureType == WMTTextureTypeCubeArray ||
+        TextureType == WMTTextureType2DArray) {
       Descriptor.type = WMTTextureTypeCubeArray;
       Descriptor.format = metal_format.PixelFormat;
       Descriptor.firstMiplevel = ViewDesc.TextureCubeArray.MostDetailedMip;

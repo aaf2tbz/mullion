@@ -21,6 +21,7 @@
 #include "dxmt_format.hpp"
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
+#include "d3d11_enumerable.hpp"
 #include "dxgi_object.hpp"
 #include <atomic>
 #include <memory>
@@ -87,14 +88,36 @@ public:
         (pInitialData && !pInitialData->pSysMem))
       return E_INVALIDARG;
 
+    if ((pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) &&
+        (pDesc->BindFlags != D3D11_BIND_CONSTANT_BUFFER ||
+         pDesc->ByteWidth % (sizeof(float) * D3D11_COMMONSHADER_CONSTANT_BUFFER_COMPONENTS)))
+      return E_INVALIDARG;
+    if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS) &&
+        (!(pDesc->BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) ||
+         (pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)))
+      return E_INVALIDARG;
+    D3D11_BUFFER_DESC desc = *pDesc;
+    if (desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) {
+      if (!desc.StructureByteStride || desc.StructureByteStride % sizeof(UINT) ||
+          desc.StructureByteStride > D3D11_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES ||
+          desc.ByteWidth % desc.StructureByteStride ||
+          (desc.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)))
+        return E_INVALIDARG;
+    } else {
+      desc.StructureByteStride = 0;
+    }
+    if ((desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) || UINT(desc.Usage) > D3D11_USAGE_STAGING ||
+        (desc.Usage == D3D11_USAGE_IMMUTABLE && !pInitialData))
+      return E_INVALIDARG;
+
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:
       case D3D11_USAGE_DYNAMIC:
-        return ppBuffer ? dxmt::CreateBuffer(this, pDesc, pInitialData, ppBuffer) : S_FALSE;
+        return ppBuffer ? dxmt::CreateBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
       case D3D11_USAGE_STAGING:
-        return ppBuffer ? CreateStagingBuffer(this, pDesc, pInitialData, ppBuffer) : S_FALSE;
+        return ppBuffer ? CreateStagingBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
       default:
         DXMT_UNREACHABLE
       }
@@ -117,6 +140,11 @@ public:
     if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED)
       return E_INVALIDARG; // not supported yet
 
+    if (FAILED(ValidateTexture(pDesc, pInitialData)))
+      return E_INVALIDARG;
+    if (!ppTexture1D)
+      return S_FALSE;
+
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
@@ -129,9 +157,6 @@ public:
         return CreateDynamicTexture1D(this, pDesc, pInitialData, ppTexture1D);
       }
       case D3D11_USAGE_STAGING:
-        if (pDesc->BindFlags != 0) {
-          return E_INVALIDARG;
-        }
         return CreateStagingTexture1D(this, pDesc, pInitialData, ppTexture1D);
       }
       return S_OK;
@@ -763,6 +788,11 @@ public:
     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
       return E_INVALIDARG; // not supported yet
 
+    if ((pDesc->SampleDesc.Count > 1 && pInitialData) || FAILED(ValidateTexture(pDesc, pInitialData)))
+      return E_INVALIDARG;
+    if (!ppTexture2D)
+      return S_FALSE;
+
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
@@ -775,9 +805,6 @@ public:
         return CreateDynamicTexture2D(this, pDesc, pInitialData, ppTexture2D);
       }
       case D3D11_USAGE_STAGING:
-        if (pDesc->BindFlags != 0) {
-          return E_INVALIDARG;
-        }
         return CreateStagingTexture2D(this, pDesc, pInitialData, ppTexture2D);
       }
       return S_OK;
@@ -799,6 +826,11 @@ public:
     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
       return E_INVALIDARG; // not supported yet
 
+    if (FAILED(ValidateTexture(pDesc, pInitialData)))
+      return E_INVALIDARG;
+    if (!ppTexture3D)
+      return S_FALSE;
+
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
@@ -807,9 +839,6 @@ public:
       case D3D11_USAGE_DYNAMIC:
         return CreateDynamicTexture3D(this, pDesc, pInitialData, ppTexture3D);
       case D3D11_USAGE_STAGING:
-        if (pDesc->BindFlags != 0) {
-          return E_INVALIDARG;
-        }
         return CreateStagingTexture3D(this, pDesc, pInitialData, ppTexture3D);
       }
       return S_OK;
@@ -1041,6 +1070,25 @@ public:
   }
 
 private:
+  template <typename Desc>
+  HRESULT
+  ValidateTexture(const Desc *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData) {
+    if (UINT(pDesc->Usage) > D3D11_USAGE_STAGING || (pDesc->Usage == D3D11_USAGE_IMMUTABLE && !pInitialData) ||
+        (pDesc->Usage == D3D11_USAGE_STAGING && pDesc->BindFlags))
+      return E_INVALIDARG;
+    Desc desc;
+    WMTTextureInfo info{};
+    if (FAILED(CreateMTLTextureDescriptor(this, pDesc, &desc, &info)))
+      return E_INVALIDARG;
+    if (pInitialData) {
+      for (auto sub : EnumerateSubresources(desc)) {
+        if (!pInitialData[sub.SubresourceId].pSysMem)
+          return E_INVALIDARG;
+      }
+    }
+    return S_OK;
+  }
+
   MTLDXGIObject<IMTLDXGIDevice> *container_;
   D3D_FEATURE_LEVEL feature_level_;
   UINT feature_flags_;

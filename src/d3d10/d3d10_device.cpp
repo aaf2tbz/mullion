@@ -759,7 +759,8 @@ MTLD3D10Device::CreateBuffer(
   d3d11_desc.Usage = D3D11_USAGE(pDesc->Usage);
   d3d11_desc.BindFlags = pDesc->BindFlags;
   d3d11_desc.CPUAccessFlags = pDesc->CPUAccessFlags;
-  d3d11_desc.MiscFlags = ConvertD3D10ResourceFlags(pDesc->MiscFlags);
+  if (FAILED(ConvertD3D10ResourceFlags(pDesc->MiscFlags, d3d11_desc.MiscFlags)))
+    return E_INVALIDARG;
   d3d11_desc.StructureByteStride = 0;
 
   Com<ID3D11Buffer> d3d11_buffer = nullptr;
@@ -790,7 +791,8 @@ MTLD3D10Device::CreateTexture1D(
   d3d11_desc.Usage = D3D11_USAGE(pDesc->Usage);
   d3d11_desc.BindFlags = pDesc->BindFlags;
   d3d11_desc.CPUAccessFlags = pDesc->CPUAccessFlags;
-  d3d11_desc.MiscFlags = ConvertD3D10ResourceFlags(pDesc->MiscFlags);
+  if (FAILED(ConvertD3D10ResourceFlags(pDesc->MiscFlags, d3d11_desc.MiscFlags)))
+    return E_INVALIDARG;
 
   Com<ID3D11Texture1D> d3d11_tex1d;
   HRESULT hr = d3d11_device_->CreateTexture1D(
@@ -823,7 +825,8 @@ MTLD3D10Device::CreateTexture2D(
   d3d11_desc.Usage = D3D11_USAGE(pDesc->Usage);
   d3d11_desc.BindFlags = pDesc->BindFlags;
   d3d11_desc.CPUAccessFlags = pDesc->CPUAccessFlags;
-  d3d11_desc.MiscFlags = ConvertD3D10ResourceFlags(pDesc->MiscFlags);
+  if (FAILED(ConvertD3D10ResourceFlags(pDesc->MiscFlags, d3d11_desc.MiscFlags)))
+    return E_INVALIDARG;
 
   Com<ID3D11Texture2D> d3d11_tex2d;
   HRESULT hr = d3d11_device_->CreateTexture2D(
@@ -854,7 +857,8 @@ MTLD3D10Device::CreateTexture3D(
   d3d11_desc.Usage = D3D11_USAGE(pDesc->Usage);
   d3d11_desc.BindFlags = pDesc->BindFlags;
   d3d11_desc.CPUAccessFlags = pDesc->CPUAccessFlags;
-  d3d11_desc.MiscFlags = ConvertD3D10ResourceFlags(pDesc->MiscFlags);
+  if (FAILED(ConvertD3D10ResourceFlags(pDesc->MiscFlags, d3d11_desc.MiscFlags)))
+    return E_INVALIDARG;
 
   Com<ID3D11Texture3D> d3d11_tex3d;
   HRESULT hr = d3d11_device_->CreateTexture3D(

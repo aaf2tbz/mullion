@@ -10,6 +10,6 @@ void GetD3D10Resource(ID3D11View *d3d11, ID3D10Resource **ppResource);
 
 UINT ConvertD3D11ResourceFlags(UINT MiscFlags);
 
-UINT ConvertD3D10ResourceFlags(UINT MiscFlags);
+HRESULT ConvertD3D10ResourceFlags(UINT MiscFlags, UINT &Flags);
 
 } // namespace dxmt
