@@ -213,9 +213,8 @@ public:
 
     if (pFullscreenDesc) {
       fullscreen_desc_ = *pFullscreenDesc;
-    } else {
-      fullscreen_desc_.Windowed = true;
     }
+    fullscreen_desc_.Windowed = true;
 
     preferred_max_frame_rate = Config::getInstance().getOption<int>("d3d12.preferredMaxFrameRate", 0);
     wsi::WsiMode current_mode;
@@ -912,7 +911,20 @@ CreateSwapChain(
   HRESULT hr = swapchain->ResizeBuffers(0, pDesc->Width, pDesc->Height, DXGI_FORMAT_UNKNOWN, pDesc->Flags);
   if (FAILED(hr))
     return hr;
-  return swapchain->QueryInterface(IID_PPV_ARGS(ppSwapChain));
+  if (pFullscreenDesc && !pFullscreenDesc->Windowed) {
+    hr = swapchain->SetFullscreenState(TRUE, nullptr);
+    if (FAILED(hr)) {
+      HRESULT restore_hr = swapchain->SetFullscreenState(FALSE, nullptr);
+      if (FAILED(restore_hr))
+        return restore_hr;
+      if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+        return hr;
+      // fullscreen unavailable at creation returns a windowed swap chain (IDXGIFactory::CreateSwapChain, Remarks).
+      hr = DXGI_STATUS_OCCLUDED;
+    }
+  }
+  *ppSwapChain = swapchain.takeOwnership();
+  return hr;
 }
 
 }; // namespace dxmt
