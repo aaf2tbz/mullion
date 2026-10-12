@@ -2773,6 +2773,8 @@ _MTLSharedEvent_signalValue(void *obj) {
 typedef struct {
   _Atomic(CFRunLoopRef) runloop_ref;
   MTLSharedEventListener *shared_listener;
+  pthread_mutex_t mutex;
+  bool stopped;
 } *shared_event_listener_t;
 
 extern NTSTATUS NtSetEvent(void *handle, void *prev_state);
@@ -2806,13 +2808,25 @@ static NTSTATUS
 _SharedEventListener_start(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   shared_event_listener_t q = (shared_event_listener_t)params->handle;
-  CFRunLoopRef uninited = NULL;
-  if (q && atomic_compare_exchange_strong(&q->runloop_ref, &uninited, CFRunLoopGetCurrent())) {
+  if (q) {
+    CFRunLoopRef runloop = CFRunLoopGetCurrent();
     /* Add a dummy source so the runloop stays running */
     CFRunLoopSourceContext source_context = {0};
     CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
-    CFRunLoopAddSource(q->runloop_ref, source, kCFRunLoopCommonModes);
-    CFRunLoopRun();
+    CFRunLoopAddSource(runloop, source, kCFRunLoopCommonModes);
+    pthread_mutex_lock(&q->mutex);
+    atomic_store_explicit(&q->runloop_ref, runloop, memory_order_release);
+    bool stopped = q->stopped;
+    pthread_mutex_unlock(&q->mutex);
+    if (!stopped)
+      CFRunLoopRun();
+    pthread_mutex_lock(&q->mutex);
+    [q->shared_listener release];
+    pthread_mutex_unlock(&q->mutex);
+    CFRunLoopRemoveSource(runloop, source, kCFRunLoopCommonModes);
+    CFRelease(source);
+    pthread_mutex_destroy(&q->mutex);
+    free(q);
   }
   return STATUS_SUCCESS;
 }
@@ -2824,6 +2838,8 @@ _SharedEventListener_create(void *obj) {
   if (q) {
     q->runloop_ref = NULL;
     q->shared_listener = [[MTLSharedEventListener alloc] init];
+    q->mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+    q->stopped = false;
   }
   params->ret = (obj_handle_t)q;
   return STATUS_SUCCESS;
@@ -2833,12 +2849,17 @@ static NTSTATUS
 _SharedEventListener_destroy(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   shared_event_listener_t q = (shared_event_listener_t)params->handle;
-  if (q && q->runloop_ref) {
-    CFRunLoopStop(q->runloop_ref);
-    q->runloop_ref = NULL;
-    [q->shared_listener release];
-    q->shared_listener = nil;
-    free(q);
+  if (q) {
+    pthread_mutex_lock(&q->mutex);
+    q->stopped = true;
+    CFRunLoopRef runloop = atomic_load_explicit(&q->runloop_ref, memory_order_acquire);
+    if (runloop) {
+      CFRunLoopPerformBlock(runloop, kCFRunLoopCommonModes, ^{
+        CFRunLoopStop(runloop);
+      });
+      CFRunLoopWakeUp(runloop);
+    }
+    pthread_mutex_unlock(&q->mutex);
   }
   return STATUS_SUCCESS;
 }

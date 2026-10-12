@@ -198,8 +198,6 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   ShaderCache& scache_;
 
-  task_scheduler<ThreadpoolWork *> scheduler_;
-
   MTLD3D11Device *device;
   StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
 
@@ -224,6 +222,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
   dxmt::mutex mutex_cs_;
+
+  task_scheduler<ThreadpoolWork *> scheduler_;
 
   CachedSM50Shader *CreateShader(const void *pBytecode,
                                  uint32_t BytecodeLength) {

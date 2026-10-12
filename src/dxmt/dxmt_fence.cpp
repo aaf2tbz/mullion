@@ -17,7 +17,6 @@
  */
 
 #include "dxmt_fence.hpp"
-#include <thread>
 
 namespace dxmt {
 
@@ -46,8 +45,6 @@ EventListener::EventListener() :
     event_listener_thread_([this]() { SharedEventListener_start(this->shared_event_listener_); }) {};
 
 EventListener::~EventListener() {
-  // FIXME: potential deadlock if a device is created and immediately destroyed
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
   SharedEventListener_destroy(shared_event_listener_);
   event_listener_thread_.join();
 }

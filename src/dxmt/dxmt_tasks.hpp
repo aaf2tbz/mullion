@@ -56,7 +56,12 @@ template <typename Task> task_scheduler<Task>::task_scheduler() {
 }
 
 template <typename Task> task_scheduler<Task>::~task_scheduler() {
-  destroyed.store(true);
+  {
+    std::lock_guard<dxmt::mutex> lock(worker_mutex_);
+    destroyed.store(true);
+    // a running task can submit a dependency while the workers are being joined
+    max_threads = threads;
+  }
   worker_cond_.notify_all();
 
   for (auto &worker : workers_) {
