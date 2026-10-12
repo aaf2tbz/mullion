@@ -1149,13 +1149,13 @@ Converter::operator()(const InstFloatCompare &cmp) {
 
 void
 Converter::operator()(const InstFloatMAD &mad) {
-  auto FM = UseFastMath(mad._.precise_mask);
   mask_t Mask = GetMask(mad.dst);
   auto A = LoadOperand(mad.src0, Mask);
   auto B = LoadOperand(mad.src1, Mask);
   auto C = LoadOperand(mad.src2, Mask);
 
-  StoreOperand(mad.dst, air.CreateFMA(A, B, C), mad._.saturate);
+  // D3D11.3 3.1.3.2 permits rounded intermediates; Metal fma can flush before rounding back into the normal range
+  StoreOperand(mad.dst, ir.CreateFAdd(ir.CreateFMul(A, B), C), mad._.saturate);
 }
 
 void

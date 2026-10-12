@@ -11,6 +11,8 @@ bool runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error);
 
 void linkMSAD(llvm::Module &M);
 
+void linkDenorm(llvm::Module &M);
+
 void linkSamplePos(llvm::Module &M);
 
 void linkTessellation(llvm::Module &M);

@@ -18,6 +18,7 @@
 // the DXBC path builds. Declarations go through the same handlers DXBC uses.
 
 #include "airconv_error.hpp"
+#include "airconv_context.hpp"
 #include "dxbc_converter.hpp"
 #include "nt/dxbc_converter_base.hpp"
 #include "airconv_ray.h"
@@ -1245,6 +1246,47 @@ convert_dxil(
   if (!module)
     return module.takeError();
   auto entry = read_entry(**module, function); // the signatures, which outlive the module
+  bool denorm = false;
+  // a callee can have its own mode; preserve it before inlining (DXIL.rst, Functions; DXC, Denorm Mode)
+  for (auto &F : (*module)->functions()) {
+    if (F.getFnAttribute("fp32-denorm-mode").getValueAsString() == "preserve") {
+      // precise FMad is not fused (DXIL.rst, FMad); both operations must keep their function's mode
+      for (auto &I : make_early_inc_range(instructions(F)))
+        if (auto call = dyn_cast<CallInst>(&I);
+            call && is_dx_op(call) && opcode(call) == FMad && call->getType()->isFloatTy()) {
+          IRBuilder<> ir(call);
+          call->replaceAllUsesWith(
+              ir.CreateFAdd(ir.CreateFMul(call->getArgOperand(1), call->getArgOperand(2)), call->getArgOperand(3))
+          );
+          call->eraseFromParent();
+        }
+      for (auto &I : make_early_inc_range(instructions(F))) {
+        if (!I.getType()->isFloatTy())
+          continue;
+        switch (I.getOpcode()) {
+        case llvm::Instruction::FAdd:
+        case llvm::Instruction::FSub:
+        case llvm::Instruction::FMul:
+        case llvm::Instruction::FDiv: {
+          IRBuilder<> ir(&I);
+          auto bits = IntegerType::get(ctx.llvm, I.getType()->getScalarSizeInBits());
+          auto callee = (*module)->getOrInsertFunction(
+              std::string("dxmt.denorm.") + I.getOpcodeName(), FunctionType::get(bits, {bits, bits}, false)
+          );
+          auto value = ir.CreateCall(
+              callee, {ir.CreateBitCast(I.getOperand(0), bits), ir.CreateBitCast(I.getOperand(1), bits)}
+          );
+          I.replaceAllUsesWith(ir.CreateBitCast(value, I.getType()));
+          I.eraseFromParent();
+          denorm = true;
+          break;
+        }
+        default:
+          break;
+        }
+      }
+    }
+  }
   // a stage is one function of Metal: what the function calls of its module is inlined
   if (auto start = (*module)->getFunction(function))
     for (bool inlined = true; inlined;) {
@@ -1304,6 +1346,8 @@ convert_dxil(
   (*module)->setTargetTriple(ctx.module.getTargetTriple());
   if (Linker::linkModules(ctx.module, std::move(*module)))
     return make_error<UnsupportedFeature>("failed to link the DXIL module");
+  if (denorm)
+    linkDenorm(ctx.module);
 
   // the function's body runs at this point of the stage, then continues at epilogue
   auto F = ctx.module.getFunction(name);

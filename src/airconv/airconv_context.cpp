@@ -29,6 +29,7 @@
 #include "airconv_context.hpp"
 
 #include "air_msad.h"
+#include "air_denorm.h"
 #include "air_samplepos.h"
 #include "air_tessellation.h"
 
@@ -196,6 +197,11 @@ void linkShader(llvm::Module &M, const unsigned char (&bitcode)[N]) {
 void
 linkMSAD(llvm::Module &M) {
   linkShader(M, air_msad);
+}
+
+void
+linkDenorm(llvm::Module &M) {
+  linkShader(M, air_denorm);
 }
 
 void

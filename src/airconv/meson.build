@@ -64,6 +64,7 @@ airconv_forward_dep = declare_dependency(
 )
 
 airconv_shaders = [
+  'shaders/air_denorm.metal',
   'shaders/air_msad.metal',
   'shaders/air_samplepos.metal',
   'shaders/air_tessellation.metal',
