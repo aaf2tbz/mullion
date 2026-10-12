@@ -179,6 +179,10 @@ public:
 
 class DispatchData : public Object {
 public:
+  uint64_t
+  getBytes(void *buffer, uint64_t size) const {
+    return DispatchData_getBytes(handle, buffer, size);
+  }
 };
 
 class Event : public Object {

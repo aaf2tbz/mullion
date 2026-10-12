@@ -1553,3 +1553,14 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
   UNIX_CALL(WMTUnixDiagWrite, &params);
   return params.ret;
 }
+
+WINEMETAL_API uint64_t
+DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size) {
+  struct unixcall_dispatchdata_bytes params;
+  params.data = data;
+  WMT_MEMPTR_SET(params.buffer, buffer);
+  params.size = size;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDispatchDataBytes, &params);
+  return params.ret;
+}

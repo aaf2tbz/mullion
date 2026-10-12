@@ -32,11 +32,13 @@
 #include "dxmt_presenter.hpp"
 #include "dxmt_texture.hpp"
 #include "log/log.hpp"
+#include "sha1/sha1_util.hpp"
 #include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 #define IMPLEMENT_ME                                                                                                   \
   do {                                                                                                                 \
@@ -321,9 +323,16 @@ public:
   std::vector<uint64_t> timestamps;
 };
 
+using PipelineShaderCache = std::unordered_map<Sha1Digest, WMT::Reference<WMT::DispatchData>>;
+
 class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
   UINT IsComputePipelineState;
+  Sha1Digest library_key;
+  dxmt::mutex shader_mutex;
+  PipelineShaderCache cached_shaders;
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
 
   static HRESULT
   InitializeShader(D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl);
@@ -377,9 +386,6 @@ public:
   bool depth_bounds = false;
 
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
-
-  virtual void AddRefPrivate() = 0;
-  virtual void ReleasePrivate() = 0;
 };
 
 class MTLD3D12ComputePipelineState : public MTLD3D12PipelineState {
@@ -388,9 +394,6 @@ public:
   WMTSize threadgroup_size;
   // see MTL_SHADER_REFLECTION::GroupsWorkTogether
   bool groups_work_together = false;
-
-  virtual void AddRefPrivate() = 0;
-  virtual void ReleasePrivate() = 0;
 };
 
 // timestamp queries sample the GPU's clock into counter sample buffers. Metal makes few of them, with few samples
@@ -569,12 +572,14 @@ CreateCommandSignature(
 HRESULT
 CreateGraphicsPipelineState(
     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
-    bool depth_bounds = false, D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {}
+    bool depth_bounds = false, D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {},
+    const PipelineShaderCache *cached = nullptr
 );
 
 HRESULT
 CreateComputePipelineState(
-    MTLD3D12Device *pDevice, const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
+    MTLD3D12Device *pDevice, const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
+    const PipelineShaderCache *cached = nullptr
 );
 
 HRESULT

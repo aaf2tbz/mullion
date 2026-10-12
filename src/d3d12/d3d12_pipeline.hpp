@@ -20,6 +20,7 @@
 #include "airconv_public.h"
 #include "Metal.hpp"
 #include "d3d12.h"
+#include "d3d12_device_child.hpp"
 #include "../d3d10/d3d10_blob.hpp"
 #include <cstring>
 #include <functional>
@@ -29,12 +30,62 @@ namespace dxmt {
 
 class MTLD3D12Device;
 
+// library references must survive the last public reference without retaining the device (test_pipeline_library)
+template <typename Base> class MTLD3D12PipelineObject : public MTLD3D12Object<ComObject<Base>> {
+protected:
+  MTLD3D12Device *device_;
+
+public:
+  MTLD3D12PipelineObject(MTLD3D12Device *device) : device_(device) {}
+
+  ULONG STDMETHODCALLTYPE
+  AddRef() override {
+    auto count = ComObject<Base>::AddRef();
+    if (count == 1)
+      device_->AddRef();
+    return count;
+  }
+
+  ULONG STDMETHODCALLTYPE
+  Release() override {
+    auto device = device_;
+    auto count = ComObject<Base>::Release();
+    if (!count)
+      device->Release();
+    return count;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  GetDevice(REFIID iid, void **device) override {
+    return device_->QueryInterface(iid, device);
+  }
+};
+
+HRESULT PipelineKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key);
+HRESULT PipelineKey(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key, bool DepthBounds = false,
+    D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {}
+);
+HRESULT CreatePipelineLibrary(MTLD3D12Device *Device, const void *Blob, SIZE_T Size, REFIID Iid, void **Library);
+
 WMT::Reference<WMT::Function> CompileFunction(
-    MTLD3D12Device *device, std::span<const D3D12_SHADER_BYTECODE> shaders,
+    MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, std::span<const D3D12_SHADER_BYTECODE> shaders,
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *arguments, const char *name,
     const std::function<int(SM50_SHADER_COMPILATION_ARGUMENT_DATA *, const char *, sm50_bitcode_t *, sm50_error_t *)>
         &compile
 );
+
+struct PipelineStateStream {
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc_cs{};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc_graphics{};
+  D3D12_SHADER_BYTECODE desc_as{}, desc_ms{};
+  bool depth_bounds = false;
+
+  HRESULT Parse(const D3D12_PIPELINE_STATE_STREAM_DESC *desc);
+  HRESULT Key(Sha1Digest &key) const;
+  HRESULT
+  Create(MTLD3D12Device *device, REFIID iid, void **pipeline, const PipelineShaderCache *cached = nullptr) const;
+};
 
 class SM50Shader {
   sm50_shader_t sm50_shader_{};

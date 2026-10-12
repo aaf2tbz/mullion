@@ -3848,6 +3848,21 @@ _WMTDiagWrite(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+_DispatchData_getBytes(void *obj) {
+  struct unixcall_dispatchdata_bytes *params = obj;
+  dispatch_data_t data = (dispatch_data_t)params->data;
+  params->ret = dispatch_data_get_size(data);
+  if (params->buffer.ptr && params->size >= params->ret) {
+    const void *bytes;
+    size_t length;
+    dispatch_data_t flat = dispatch_data_create_map(data, &bytes, &length);
+    memcpy(params->buffer.ptr, bytes, length);
+    dispatch_release(flat);
+  }
+  return STATUS_SUCCESS;
+}
+
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,
@@ -4018,6 +4033,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid,
     &_MTLCommandBuffer_sampledCommandEncoder,
     &_WMTDiagWrite,
+    &_DispatchData_getBytes,
 };
 
 #ifndef DXMT_NATIVE
@@ -4191,6 +4207,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid,
     &_MTLCommandBuffer_sampledCommandEncoder,
     &_WMTDiagWrite,
+    &_DispatchData_getBytes,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

@@ -6,6 +6,16 @@
 
 #pragma pack(push, 8)
 
+struct unixcall_dispatchdata_bytes {
+  obj_handle_t data;
+  struct WMTMemoryPointer buffer;
+  uint64_t size;
+  uint64_t ret;
+};
+
+STATIC_ASSERT(sizeof(struct unixcall_dispatchdata_bytes) ==
+              sizeof(obj_handle_t) + sizeof(struct WMTMemoryPointer) + 2 * sizeof(uint64_t));
+
 struct unixcall_generic_obj_ret {
   obj_handle_t ret;
 };

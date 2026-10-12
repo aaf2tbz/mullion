@@ -17,7 +17,6 @@
  */
 
 #include "d3d12_device.hpp"
-#include "d3d12_pageable.hpp"
 #include "d3d12_pipeline.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_stream_output.hpp"
@@ -283,9 +282,94 @@ MTLD3D12PipelineState::InitializeShader(
   return S_OK;
 }
 
+template <typename Desc>
+static HRESULT
+GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
+               D3D12_SHADER_BYTECODE as = {}, D3D12_SHADER_BYTECODE ms = {}) {
+  Sha1HashState h;
+  bool valid = true;
+  auto hash = [&](const auto &...values) { (h.update(values), ...); };
+  auto bytes = [&](const void *data, size_t size) {
+    hash(uint64_t(size));
+    if (size && !data)
+      valid = false;
+    else if (size)
+      h.update(data, size);
+  };
+  const void *root = nullptr;
+  UINT root_size = 0;
+  if (desc.pRootSignature) {
+    static_cast<MTLD3D12RootSignature *>(desc.pRootSignature)->GetBlob(&root);
+    if (FAILED(microsoft::DXBCGetRootSignature(root, &root, &root_size)))
+      return E_INVALIDARG;
+  }
+  bytes(root, root_size);
+  constexpr bool compute = std::is_same_v<Desc, D3D12_COMPUTE_PIPELINE_STATE_DESC>;
+  hash(compute, desc.NodeMask, desc.Flags);
+  if constexpr (compute) {
+    auto &[signature, cs, node, cached, flags] = desc;
+    bytes(cs.pShaderBytecode, cs.BytecodeLength);
+  } else {
+    // whole bindings make header additions visible, without putting padding or addresses in the key
+    auto &[signature, vs, ps, ds, hs, gs, so, blend, mask, raster, depth, layout, cut, topology, count, formats,
+           dsv, samples, node, cached, flags] = desc;
+    if (count > std::size(formats) || layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
+        (layout.NumElements && !layout.pInputElementDescs) || (so.NumEntries && !so.pSODeclaration) ||
+        so.NumStrides > D3D12_SO_BUFFER_SLOT_COUNT || (so.NumStrides && !so.pBufferStrides))
+      return E_INVALIDARG;
+    for (auto shader : {vs, ps, ds, hs, gs, as, ms})
+      bytes(shader.pShaderBytecode, shader.BytecodeLength);
+    hash(depth_bounds, so.NumEntries, so.NumStrides, so.RasterizedStream);
+    for (UINT i = 0; i < so.NumEntries; i++) {
+      auto &[stream, name, index, start, components, slot] = so.pSODeclaration[i];
+      bytes(name, name ? strlen(name) + 1 : 0);
+      hash(stream, index, start, components, slot);
+    }
+    bytes(so.pBufferStrides, so.NumStrides * sizeof(*so.pBufferStrides));
+    auto &[coverage, independent, targets] = blend;
+    hash(coverage, independent);
+    for (auto &target : std::span(targets, count)) {
+      auto &[enabled, logic, src, dst, op, src_alpha, dst_alpha, op_alpha, logic_op, write_mask] = target;
+      hash(enabled, logic, src, dst, op, src_alpha, dst_alpha, op_alpha, logic_op, write_mask);
+    }
+    auto &[fill, cull, front, bias, clamp, slope, clip, multisample, aa, forced, conservative] = raster;
+    hash(fill, cull, front, bias, clamp, slope, clip, multisample, aa, forced, conservative);
+    auto &[enabled, write, function, stencil, read_mask, write_mask, front_face, back_face] = depth;
+    hash(enabled, write, function, stencil, read_mask, write_mask);
+    for (auto &face : {front_face, back_face}) {
+      auto &[fail, depth_fail, pass, compare] = face;
+      hash(fail, depth_fail, pass, compare);
+    }
+    hash(layout.NumElements);
+    for (UINT i = 0; i < layout.NumElements; i++) {
+      auto &[name, index, format, slot, offset, classification, rate] = layout.pInputElementDescs[i];
+      if (!name)
+        return E_INVALIDARG;
+      bytes(name, strlen(name) + 1);
+      hash(index, format, slot, offset, classification, rate);
+    }
+    auto &[sample_count, quality] = samples;
+    hash(mask, cut, topology, count, dsv, sample_count, quality);
+    bytes(formats, count * sizeof(*formats));
+  }
+  key = h.final();
+  return valid ? S_OK : E_INVALIDARG;
+}
+
+HRESULT
+PipelineKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key) {
+  return GetPipelineKey(Desc, Key);
+}
+
+HRESULT
+PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key, bool DepthBounds,
+            D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS) {
+  return GetPipelineKey(Desc, Key, DepthBounds, AS, MS);
+}
+
 WMT::Reference<WMT::Function>
 CompileFunction(
-    MTLD3D12Device *device, std::span<const D3D12_SHADER_BYTECODE> shaders,
+    MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, std::span<const D3D12_SHADER_BYTECODE> shaders,
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *arguments, const char *name,
     const std::function<int(SM50_SHADER_COMPILATION_ARGUMENT_DATA *, const char *, sm50_bitcode_t *, sm50_error_t *)>
         &compile
@@ -364,6 +448,21 @@ CompileFunction(
     }
   }
   auto key = h.final();
+  WMT::Reference<WMT::DispatchData> stored;
+  {
+    std::lock_guard lock(pipeline->shader_mutex);
+    if (auto found = pipeline->cached_shaders.find(key); found != pipeline->cached_shaders.end())
+      stored = found->second;
+  }
+  if (stored) {
+    WMT::Error error;
+    auto library = device->GetMTLDevice().newLibrary(stored, error);
+    auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{};
+    if (!function)
+      ERR("Failed to load library shader ", name, ": ",
+          library ? "no such function" : error.description().getUTF8String());
+    return function;
+  }
   auto &cache = ShaderCache::getInstance(WMTMetalVersion(device->GetMetalVersion()));
   bool enabled = false;
   WMT::Reference<WMT::Error> error;
@@ -375,8 +474,11 @@ CompileFunction(
     }
     if (data) {
       auto library = device->GetMTLDevice().newLibrary(data, error);
-      if (auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{})
+      if (auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{}) {
+        std::lock_guard lock(pipeline->shader_mutex);
+        pipeline->cached_shaders.emplace(key, data);
         return function;
+      }
       if (auto writer = cache.getWriter())
         writer->set(key, {});
     }
@@ -428,10 +530,14 @@ CompileFunction(
   }
   if (auto writer = cache.getWriter())
     writer->set(key, data);
+  {
+    std::lock_guard lock(pipeline->shader_mutex);
+    pipeline->cached_shaders.emplace(key, data);
+  }
   return function;
 }
 
-class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12Pageable<MTLD3D12GraphicsPipelineState> {
+class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12PipelineObject<MTLD3D12GraphicsPipelineState> {
 protected:
   MTL_SHADER_REFLECTION ref_vs;
   MTL_SHADER_REFLECTION ref_ps{};
@@ -508,7 +614,7 @@ protected:
     SM50_SHADER_ROOT_SIGNATURE_DATA rootsig_vs, rootsig_gs;
     auto args_vs = RootSignature(rootsig_vs, in.root_signature.ptr(), &in.ia_layout);
     auto vs_func = CompileFunction(
-        device_, std::array{VS, GS}, args_vs, "vsgs_main", [&](auto args, auto name, auto bitcode, auto error) {
+        device_, this, std::array{VS, GS}, args_vs, "vsgs_main", [&](auto args, auto name, auto bitcode, auto error) {
           auto result = SM50CompileGeometryPipelineVertex(shader_vs, shader_gs, args, name, bitcode, error);
           if (result)
             status = E_INVALIDARG;
@@ -519,7 +625,7 @@ protected:
       return variant;
     auto args_gs = RootSignature(rootsig_gs, in.root_signature.ptr(), &pso_gs);
     auto gs_func = CompileFunction(
-        device_, std::array{VS, GS}, args_gs, "gs_main", [&](auto args, auto name, auto bitcode, auto error) {
+        device_, this, std::array{VS, GS}, args_gs, "gs_main", [&](auto args, auto name, auto bitcode, auto error) {
           auto result = SM50CompileGeometryPipelineGeometry(shader_vs, shader_gs, args, name, bitcode, error);
           if (result)
             status = E_INVALIDARG;
@@ -544,7 +650,7 @@ protected:
 
 public:
   MTLD3D12GraphicsPipelineStateImpl(MTLD3D12Device *pDevice) :
-      MTLD3D12Pageable<MTLD3D12GraphicsPipelineState>(pDevice) {
+      MTLD3D12PipelineObject<MTLD3D12GraphicsPipelineState>(pDevice) {
     IsComputePipelineState = FALSE;
   }
 
@@ -820,7 +926,7 @@ public:
                         const char *name, D3D12_SHADER_BYTECODE linked = {}) {
       auto shaders = std::array{code, linked};
       return CompileFunction(
-          device_, std::span(shaders).first(linked.pShaderBytecode ? 2 : 1), args, name,
+          device_, this, std::span(shaders).first(linked.pShaderBytecode ? 2 : 1), args, name,
           [shader](auto args, auto name, auto bitcode, auto error) {
             return SM50Compile(shader, args, name, bitcode, error);
           }
@@ -1068,7 +1174,7 @@ public:
         rootsig_gs.type = SM50_SHADER_ROOT_SIGNATURE2;
         auto args_ds = root_signature(rootsig_ds, &rootsig_gs);
         auto ds_func = CompileFunction(
-            device_, std::array{pDesc->HS, pDesc->DS, pDesc->GS}, args_ds, "ds_main",
+            device_, this, std::array{pDesc->HS, pDesc->DS, pDesc->GS}, args_ds, "ds_main",
             [&](auto args, auto name, auto bitcode, auto error) {
               return SM50CompileTessellationPipelineDomain(shader_hs, shader_ds, args, name, bitcode, error);
             }
@@ -1085,7 +1191,7 @@ public:
         rootsig_vs.type = SM50_SHADER_ROOT_SIGNATURE2;
         auto args_hs = root_signature(rootsig_hs, &rootsig_vs);
         auto vshs_func = CompileFunction(
-            device_, std::array{pDesc->VS, pDesc->HS, pDesc->GS}, args_hs, "vshs_main",
+            device_, this, std::array{pDesc->VS, pDesc->HS, pDesc->GS}, args_hs, "vshs_main",
             [&](auto args, auto name, auto bitcode, auto error) {
               return SM50CompileTessellationPipelineHull(shader_vs, shader_hs, args, name, bitcode, error);
             }
@@ -1176,7 +1282,7 @@ public:
 HRESULT
 CreateGraphicsPipelineState(
     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
-    bool depth_bounds, D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS
+    bool depth_bounds, D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS, const PipelineShaderCache *cached
 ) {
   InitReturnPtr(ppPipelineState);
   if (HRESULT hr = CheckCachedPipeline(pDesc->CachedPSO); FAILED(hr))
@@ -1216,11 +1322,34 @@ CreateGraphicsPipelineState(
     desc.pRootSignature = embedded.ptr();
   }
   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+  if (HRESULT hr = PipelineKey(*pDesc, pso->library_key, depth_bounds, AS, MS); FAILED(hr))
+    return hr;
+  if (cached)
+    pso->cached_shaders = *cached;
   pso->depth_bounds = depth_bounds && pDevice->GetMTLDevice().supportsFamily(WMTGPUFamilyApple10);
   HRESULT hr = pso->Initialize(&desc, AS, MS);
   if (FAILED(hr))
     return hr;
   return pso->QueryInterface(riid, ppPipelineState);
 };
+
+HRESULT
+PipelineStateStream::Key(Sha1Digest &key) const {
+  return desc_cs.CS.pShaderBytecode ? PipelineKey(desc_cs, key)
+                                  : PipelineKey(desc_graphics, key, depth_bounds, desc_as, desc_ms);
+}
+
+HRESULT
+PipelineStateStream::Create(
+    MTLD3D12Device *device, REFIID iid, void **pipeline, const PipelineShaderCache *cached
+) const {
+  auto compute = desc_cs;
+  auto graphics = desc_graphics;
+  if (cached)
+    compute.CachedPSO = {}, graphics.CachedPSO = {};
+  return compute.CS.pShaderBytecode
+             ? CreateComputePipelineState(device, &compute, iid, pipeline, cached)
+             : CreateGraphicsPipelineState(device, &graphics, iid, pipeline, depth_bounds, desc_as, desc_ms, cached);
+}
 
 } // namespace dxmt

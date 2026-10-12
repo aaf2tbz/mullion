@@ -2405,10 +2405,11 @@ enum WMTSampledEncoder {
   WMTSampledCompute, WMTSampledAccelerationStructure, WMTSampledRender, WMTSampledConcurrentCompute
 };
 // appended calls keep the preceding bridge ABI indices
-enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixCallCount };
+enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
+WINEMETAL_API uint64_t DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size);
 
 #endif
