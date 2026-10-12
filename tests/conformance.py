@@ -12,8 +12,8 @@ itself, as for a feature the device does not report: no pass), 'skipped' (it ran
 without a count), 'timeout', and 'faulted' when it passed while the GPU's work went wrong (run.FAULTS). a test that crashed
 runs once more with the libraries' addresses logged, and where it ended is named: the assertion that failed, or the
 fault's library or program, function, and source line when the build has debug information. tests/conformance has a file a suite, of
-each test's verdict, where it crashed, and why it is not 'passed'; --update records this run's verdicts and places
-and keeps the reasons.
+what a run found of each test and nothing else: its verdict, where it crashed, what its checks said they skipped, how
+many failed and what the first said. --update records this run; a test whose verdict or skips differ is printed.
 """
 import argparse
 import json
@@ -33,6 +33,9 @@ COUNTS = re.compile(r"(\d+) tests executed \(.*?(\d+) failures?.*?(\d+) skipped"
 FAULT = re.compile(r"unhandled exception \w+ at ([0-9A-Fa-f]+)|Unhandled .* at address ([0-9A-Fa-f]+)")
 LOADED = re.compile(r'Loaded L"([^"]+)" at ([0-9A-Fa-f]+)')
 ASSERTION = re.compile(r"Assertion failed: (.*)")
+# what a check says: '<source or test>:<line>: [<its context>: ]Test[s] skipped: <why>', or 'Test failed: <what>'
+SKIPPED = re.compile(r"^\S+?:\d+:.*?Tests? skipped: (.*)$", re.M)
+FAILED = re.compile(r"^\S+?:\d+:.*?Test failed:.*$", re.M)
 # Wine's Direct3D tests that are one source file
 WINE_TESTS = ("d3d11", "d3d10core", "dxgi", "d3d12")
 
@@ -168,7 +171,7 @@ def conformance(args, builds, binary, base):
         for dll in WINE_TESTS:
             suites[f"wine-{dll}"] = wine_suite(dll, args.wine_source.resolve(), args.wine_build.resolve(), out / "wine")
     if args.vkd3d_proton:
-        suites["vkd3d-proton"] = vkd3d_suite(args.vkd3d_proton.resolve(), builds, binary, base, out / "vkd3d-proton")
+        suites["vkd3d-proton-d3d12"] = vkd3d_suite(args.vkd3d_proton.resolve(), builds, binary, base, out / "vkd3d-proton")
     named = lambda suite, name, names: any(n in (suite, name, f"{suite}:{name}") for n in names)
     wanted = lambda suite, name: (not args.only or named(suite, name, args.only)) and not named(suite, name, args.skip)
     changed = 0
@@ -181,33 +184,34 @@ def conformance(args, builds, binary, base):
             argv, env = command(name)
             status = run.finish([binary, *argv], dict(base, **env), args.seconds, logs / f"{name}.txt")
             text = (logs / f"{name}.txt").read_text(errors="replace")
-            word = verdict(status, text)
+            word, at = verdict(status, text), ""
             files = dict(pe, **{Path(argv[0]).name.lower(): argv[0]})
             if word == "timeout":
                 # what went wrong under it, and where its threads are (run.where)
-                return word, "; ".join(run.faults(text.splitlines())[:1] + re.findall(r"^stuck: (.*)$", text, re.M)[-1:])
-            if word != "crashed":
-                return word, ""
-            run.finish([binary, *argv], dict(base, **env, WINEDEBUG="+loaddll"), args.seconds, logs / f"{name}.crash.txt")
-            return word, site((logs / f"{name}.crash.txt").read_text(errors="replace"), files)
+                at = "; ".join(run.faults(text.splitlines())[:1] + re.findall(r"^stuck: (.*)$", text, re.M)[-1:])
+            if word == "crashed":
+                run.finish([binary, *argv], dict(base, **env, WINEDEBUG="+loaddll"), args.seconds, logs / f"{name}.crash.txt")
+                at = site((logs / f"{name}.crash.txt").read_text(errors="replace"), files)
+            failed = FAILED.findall(text)
+            found = {"verdict": word, "at": at, "skipped": sorted(set(SKIPPED.findall(text))), "failed": len(failed),
+                     "first": failed[0] if failed else ""}
+            return {key: value for key, value in found.items() if value}
 
         with ThreadPoolExecutor(args.jobs) as pool:
             ran = dict(zip(names, pool.map(one, names)))
-        got, places = {name: word for name, (word, at) in ran.items()}, {name: at for name, (word, at) in ran.items() if at}
+        got = {name: found["verdict"] for name, found in ran.items()}
         record = RECORDS / f"{suite}.json"
         recorded = json.loads(record.read_text()) if record.exists() else {}
         for name in names:
-            was = recorded.get(name, {}).get("verdict", "unrecorded")
-            if got[name] != was:
+            was, skipped = recorded.get(name, {}), ran[name].get("skipped", [])
+            if (got[name], skipped) != (was.get("verdict"), was.get("skipped", [])):
                 changed += 1
-                print(f"{suite:14}  {name:48} {was} -> {got[name]}  {places.get(name, '')}", flush=True)
+                print(f"{suite:14}  {name:48} {was.get('verdict', 'unrecorded')} -> {got[name]}  "
+                      f"{ran[name].get('at', '')}  skipped: {skipped}", flush=True)
         if args.update:
-            # a reason goes with its verdict: a test whose verdict changed has none until someone looks
-            kept = {name: entry for name, entry in recorded.items() if name not in got}
-            new = {name: dict(recorded[name] if recorded.get(name, {}).get("verdict") == v else {"verdict": v},
-                              **({"at": places[name]} if name in places else {})) for name, v in got.items()}
+            kept = {name: entry for name, entry in recorded.items() if name not in ran}
             RECORDS.mkdir(exist_ok=True)
-            record.write_text(json.dumps(dict(sorted({**kept, **new}.items())), indent=1) + "\n")
+            record.write_text(json.dumps(dict(sorted({**kept, **ran}.items())), indent=1) + "\n")
         counts = {word: sum(v == word for v in got.values()) for word in sorted(set(got.values()))}
         print(f"{suite:14}  {len(got)} ran: " + ", ".join(f"{n} {word}" for word, n in counts.items()), flush=True)
     print(f"{changed} verdicts differ from tests/conformance; logs in {out / 'logs'}")

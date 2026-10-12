@@ -1,10 +1,7 @@
 {
  "test_create_device": {
   "verdict": "crashed",
-  "at": "d3d12_test.exe: func_d3d12 at d3d12.c:1577:38",
-  "why": "bug: D3D12CreateDevice refuses an IDXCoreAdapter (E_INVALIDARG); the test then uses the device it was not given",
-  "first": "d3d12.c:971: Test failed: Got unexpected hr 0x80070057.",
-  "failures": 1
+  "at": "d3d12_test.exe: func_d3d12 at d3d12.c:1577:38"
  },
  "test_desktop_window": {
   "verdict": "passed"
