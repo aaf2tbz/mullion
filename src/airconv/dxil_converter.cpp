@@ -1772,12 +1772,12 @@ convert_dxil(
     auto element = ir.CreateMul(wide(index), ir.getInt64(stride));
     return defined(offset) ? ir.CreateAdd(element, wide(offset)) : element;
   };
-  auto unit_ptr = [&](BufferResourceHandle &b, Type *unit, Value *index) -> Value * {
-    if (!b.StructureStride)
+  auto unit_ptr = [&](BufferResourceHandle &b, Type *unit, Value *index, bool inside = false) -> Value * {
+    if (!b.StructureStride && !inside)
       index = ir.CreateAnd(index, ir.getInt64(UINT32_MAX / (unit->getPrimitiveSizeInBits() / 8)));
     auto space = b.Pointer->getType()->getPointerAddressSpace();
     auto ptr = ir.CreateGEP(unit, ir.CreatePointerCast(b.Pointer, unit->getPointerTo(space)), {index});
-    if (!b.Metadata)
+    if (!b.Metadata || inside)
       return ptr;
     auto bytes = ir.CreateZExt(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt64Ty());
     auto units = ir.CreateUDiv(bytes, ir.getInt64(unit->getPrimitiveSizeInBits() / 8));
@@ -2690,35 +2690,42 @@ convert_dxil(
                           : llvm::maskTrailingOnes<uint32_t>(cast<StructType>(ty)->getNumElements());
         }
       auto element = ir.getIntNTy(bits);
-      Value *v = UndefValue::get(FixedVectorType::get(element, 4));
       bool feedback = !store && (mask & (1u << 4));
       if (feedback)
         mask |= op == RawBufferLoad ? constant(a(4)) : (mask & kMaskAll ? 0 : kMaskAll);
       Value *residency = ir.getInt32(0);
-      for (unsigned i = 0; i < 4; i++) {
-        if (!(mask & (1u << i)))
-          continue;
-        auto x = store ? ir.CreateBitCast(a(4 + i), element) : nullptr;
-        Value *loaded = ConstantInt::get(element, 0);
-        for (unsigned part = 0; part < parts; part++) {
-          auto ptr = unit_ptr(b, unit, ir.CreateAdd(base, ir.getInt64(i * parts + part)));
-          if (feedback)
-            residency = ir.CreateOr(residency, dxbc.BufferResidency(ptr));
-          auto shift = part * unit->getBitWidth();
-          if (store) {
-            auto piece = ir.CreateTrunc(ir.CreateLShr(x, shift), unit);
-            if (b.GlobalCoherent)
-              air.CreateDeviceCoherentStore(piece, ptr);
-            else
-              ir.CreateStore(piece, ptr);
+      auto units = [&](bool inside) {
+        Value *v = UndefValue::get(FixedVectorType::get(element, 4));
+        for (unsigned i = 0; i < 4; i++) {
+          if (!(mask & (1u << i)))
             continue;
+          auto x = store ? ir.CreateBitCast(a(4 + i), element) : nullptr;
+          Value *loaded = ConstantInt::get(element, 0);
+          for (unsigned part = 0; part < parts; part++) {
+            auto ptr = unit_ptr(b, unit, ir.CreateAdd(base, ir.getInt64(i * parts + part)), inside);
+            if (feedback)
+              residency = ir.CreateOr(residency, dxbc.BufferResidency(ptr));
+            auto shift = part * unit->getBitWidth();
+            if (store) {
+              auto piece = ir.CreateTrunc(ir.CreateLShr(x, shift), unit);
+              if (b.GlobalCoherent)
+                air.CreateDeviceCoherentStore(piece, ptr);
+              else
+                ir.CreateStore(piece, ptr);
+              continue;
+            }
+            Value *piece = dxbc.LoadBufferValue(b, unit, ptr, inside);
+            loaded = ir.CreateOr(loaded, ir.CreateShl(ir.CreateZExt(piece, element), shift));
           }
-          Value *piece = dxbc.LoadBufferValue(b, unit, ptr);
-          loaded = ir.CreateOr(loaded, ir.CreateShl(ir.CreateZExt(piece, element), shift));
+          if (!store)
+            v = ir.CreateInsertElement(v, loaded, i);
         }
-        if (!store)
-          v = ir.CreateInsertElement(v, loaded, i);
-      }
+        return v;
+      };
+      // one bound for a load of several units where its last unit is inside
+      auto read = mask & kMaskAll, last = llvm::Log2_32(read) * parts + parts - 1;
+      bool whole = !store && !feedback && read && (parts > 1 || (read & (read - 1)));
+      auto v = dxbc.LoadBufferUnits(b, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units);
       if (!store)
         ret = to_struct(ty, v, residency);
       break;

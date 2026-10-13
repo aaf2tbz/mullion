@@ -640,10 +640,19 @@ public:
       llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *Behind
   );
 
-  llvm::Value * CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Value* Index);
+  // `Inside`: the unit is known to be in bounds, and is reached and loaded as it is
+  llvm::Value * CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Value* Index, bool Inside = false);
 
   llvm::Value *BufferResidency(llvm::Value *Pointer);
-  llvm::Value *LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr);
+  // Then() where Condition holds and Else() where it does not
+  llvm::Value *Either(llvm::Value *Condition, llvm::function_ref<llvm::Value *()> Then, llvm::function_ref<llvm::Value *()> Else);
+  llvm::Value *LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr, bool Inside = false);
+  llvm::Value *LoadBufferUnits(
+      BufferResourceHandle &Buffer, llvm::Value *Last, uint32_t UnitBytes, llvm::function_ref<llvm::Value *(bool)> Read
+  );
+  void LoadBufferWords(
+      BufferResourceHandle &Buf, llvm::Value *Index, const DstOperand &Dst, const std::optional<DstOperand> &Feedback
+  );
 
   llvm::Value * CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm::Value* Index);
 

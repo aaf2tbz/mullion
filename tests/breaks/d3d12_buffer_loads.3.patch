@@ -1,0 +1,12 @@
+# a raw load that crosses the end reads zeros for the units inside too
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -3089,7 +3089,7 @@
+   auto Units = ir.CreateZExtOrTrunc(ir.CreateUDiv(Bytes, llvm::ConstantInt::get(Bytes->getType(), UnitBytes)), Last->getType());
+   llvm::Value *Whole;
+   return Either(ir.CreateICmpULT(Last, Units), [&] { return Whole = Read(true); }, [&] {
+-    return Buffer.StructureStride ? llvm::Constant::getNullValue(Whole->getType()) : Read(false);
++    return llvm::Constant::getNullValue(Whole->getType());
+   });
+ }
+ 
