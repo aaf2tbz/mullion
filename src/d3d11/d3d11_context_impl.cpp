@@ -1191,6 +1191,9 @@ public:
     BlitObject Dst(device, pDstResource);
 
     if (Dst.Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      // Windows leaves a staging buffer as it was (Wine's test_staging_buffers); a dynamic one is updated
+      if (Dst.BufferDesc.Usage == D3D11_USAGE_STAGING)
+        return;
       uint32_t copy_offset = 0;
       uint32_t copy_len = Dst.BufferDesc.ByteWidth;
       if (pDstBox) {
@@ -1217,15 +1220,9 @@ public:
           return;
         }
       }
-      // a staging buffer is updated as any other is: its memory is a buffer the GPU copies into, in order with the
-      // copies around it (only immutable and dynamic resources cannot be a destination)
       Rc<Buffer> dst;
-      if (auto staging = GetStagingResource(pDstResource, DstSubresource); unlikely(staging)) {
-        UseCopyDestination(staging);
-        dst = staging->buffer();
-      } else if (auto bindable = GetResourceCommon(pDstResource)) {
+      if (auto bindable = GetResourceCommon(pDstResource))
         dst = bindable->buffer();
-      }
       if (dst) {
         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
         staging_buffer.updateContents(offset, pSrcData, copy_len);

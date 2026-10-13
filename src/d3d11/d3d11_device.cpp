@@ -604,12 +604,6 @@ public:
     if (!pShaderBytecodeWithInputSignature)
       return E_INVALIDARG;
 
-    // TODO: must get shader reflection info
-
-    if (!ppInputLayout) {
-      return S_FALSE;
-    }
-
     return pipeline_cache_->AddInputLayout(
         pShaderBytecodeWithInputSignature, pInputElementDescs, NumElements,
         (IMTLD3D11InputLayout **)ppInputLayout);

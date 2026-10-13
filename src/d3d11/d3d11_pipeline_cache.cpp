@@ -398,6 +398,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
             NumElements, buffer.data(), &num_metal_ia_elements))) {
       return hr;
     }
+    if (!ppInputLayout)
+      return S_FALSE;
     buffer.resize(num_metal_ia_elements);
     if (!input_layouts.contains(buffer)) {
       uint32_t input_slot_mask = 0;
