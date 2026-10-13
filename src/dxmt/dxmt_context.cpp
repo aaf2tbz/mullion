@@ -30,6 +30,8 @@
 namespace dxmt {
 
 ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
+    device_(device),
+    queue_(queue),
     lib(lib),
     emulated_cmd(device, lib, *this),
     clear_rt_cmd(device, *this),
@@ -37,9 +39,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     clear_uav_cmd(device, *this),
     mv_scale_cmd(device, lib, *this),
     tile_barrier_cmd(device, lib, *this),
-    timestamp_state_(device),
-    device_(device),
-    queue_(queue) {
+    timestamp_state_(device) {
   // Metal feature set tables, "Maximum visibility query offset": 256 KB from Apple7, 65,528 B before it
   visibility_result_size_ = device.supportsFamily(WMTGPUFamilyApple7) ? 256 * 1024 : 65528 + sizeof(uint64_t);
   dummy_sampler_info_.support_argument_buffers = true;
