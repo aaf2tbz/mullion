@@ -53,9 +53,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   WMT::Reference<WMT::CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
-  // counts the timestamp resolves into buffers the GPU may read, which wait for the CPU to read their samples
-  Rc<Fence> timestamps_read_;
-  uint64_t timestamp_resolves_ = 0;
+  // the last command buffer that has completed and left nothing for the CPU to do
+  Reached retired_{};
 
   // Metal fails a command buffer that waits for an event for more than a few seconds, and ignores the queue's
   // later ones, so no command buffer waits: the CPU does. after Wait for a value the fence has yet to reach, the
@@ -361,6 +360,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         ReleaseSemaphore(inflight.semaphore, 1, nullptr);
 
       inflight = {};
+      retired_.Reach(internal_seq);
 
       inflight_cmdbuf_count_.fetch_sub(1, std::memory_order_release);
       inflight_cmdbuf_count_.notify_one();
@@ -469,7 +469,6 @@ public:
     queue_.addResidencySet(device_->GetGlobalResidencySet());
 
     fence_ = metal_device.newFence();
-    timestamps_read_ = new Fence(metal_device);
     if (profile_) {
       UINT64 cpu, gpu;
       GetClockCalibration(&gpu, &cpu);
@@ -946,15 +945,13 @@ public:
           // copies them
           WMTBufferInfo info{data->count * sizeof(uint64_t), WMTResourceStorageModeShared};
           auto staging = device_->GetMTLDevice().newBuffer(info);
-          auto value = ++timestamp_resolves_;
           scope.inflight->completed = [heap = Com(data->heap), staging, mapped = info.memory.ptr, first = data->start,
-                                       count = data->count, read = timestamps_read_, value] {
+                                       count = data->count] {
             memcpy(mapped, &heap->timestamps[first], count * sizeof(uint64_t));
-            read->signal(value);
           };
           scope.End();
-          Trace("waits for timestamps ", value);
-          timestamps_read_->wait(value);
+          Trace("waits for the timestamps of command buffer ", inflight_cmdbuf_seq_ - 1);
+          retired_.Expect(inflight_cmdbuf_seq_ - 1)->wait(false);
           scope.Start();
           cmdbuf = scope.inflight->cmdbuf;
           auto encoder = cmdbuf.blitCommandEncoder();
@@ -1144,10 +1141,10 @@ public:
   Signal(ID3D12Fence *pFence, UINT64 Value) {
     // from the CPU, once the work before has completed and what it left for the CPU is done
     auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
-      StartCommitting().inflight->completed = [this, fence, Value] {
+      retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
         fence->Reach(Value);
-      };
+      });
     };
     Trace("Signal of fence ", pFence, " to ", Value);
     if (!Hold(work))

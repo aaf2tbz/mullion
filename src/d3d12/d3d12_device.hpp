@@ -249,11 +249,8 @@ public:
   std::shared_ptr<void> memory;
 };
 
-class MTLD3D12Fence : public ID3D12Fence1 {
-public:
-  virtual void AddRefPrivate() = 0;
-  virtual void ReleasePrivate() = 0;
-
+// a value that signals move, and what waits for it
+struct Reached {
   std::atomic<uint64_t> value;
 
   // a signal runs those that wait for its value or less, each once and before it returns. what waited is not asked
@@ -286,6 +283,12 @@ public:
 private:
   dxmt::mutex mutex_;
   std::vector<std::pair<uint64_t, std::function<void()>>> waiting_;
+};
+
+class MTLD3D12Fence : public ID3D12Fence1, public Reached {
+public:
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
 };
 
 class MTLD3D12RootSignature : public ID3D12RootSignature {
