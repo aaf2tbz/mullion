@@ -1584,8 +1584,8 @@ public:
     });
   }
 
-  /* ID3D12Device10: resources start in a barrier layout instead of a state. states only check the render target
-     flag here, and every texture can be viewed in the formats D3D12 lets it cast to (no relaxed casting) */
+  /* ID3D12Device10: resources start in a barrier layout instead of a state. format lists require
+     RelaxedFormatCastingSupported (VulkanOn12, "Format List Casting") */
   static D3D12_RESOURCE_STATES
   LayoutState(D3D12_BARRIER_LAYOUT Layout) {
     return Layout == D3D12_BARRIER_LAYOUT_RENDER_TARGET ? D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -1599,6 +1599,9 @@ public:
       ID3D12ProtectedResourceSession *pSession, UINT32 NumCastableFormats, DXGI_FORMAT *pCastableFormats, REFIID riid,
       void **ppResource
   ) {
+    InitReturnPtr(ppResource);
+    if (NumCastableFormats)
+      return E_INVALIDARG;
     return CreateCommittedResource2(
         pHeapProps, HeapFlags, pDesc, LayoutState(InitialLayout), OptimizedClearValue, pSession, riid, ppResource
     );
@@ -1610,6 +1613,9 @@ public:
       const D3D12_CLEAR_VALUE *OptimizedClearValue, UINT32 NumCastableFormats, DXGI_FORMAT *pCastableFormats,
       REFIID riid, void **ppResource
   ) {
+    InitReturnPtr(ppResource);
+    if (NumCastableFormats)
+      return E_INVALIDARG;
     return CreatePlacedResource1(
         pHeap, HeapOffset, pDesc, LayoutState(InitialLayout), OptimizedClearValue, riid, ppResource
     );
@@ -1621,6 +1627,9 @@ public:
       ID3D12ProtectedResourceSession *pSession, UINT32 NumCastableFormats, DXGI_FORMAT *pCastableFormats, REFIID riid,
       void **ppResource
   ) {
+    InitReturnPtr(ppResource);
+    if (NumCastableFormats)
+      return E_INVALIDARG;
     return CreateReservedResource1(pDesc, LayoutState(InitialLayout), OptimizedClearValue, pSession, riid, ppResource);
   }
 

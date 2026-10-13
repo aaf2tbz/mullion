@@ -1323,7 +1323,7 @@ public:
       WMTOrigin dst_origin, const D3D12_BOX &dst_extent
   ) {
     bool same = src->pixelFormat() == dst->pixelFormat();
-    bool viewed = !((src_format.Flag ^ dst_format.Flag) & MTL_DXGI_FORMAT_BC) &&
+    bool viewed = DXGIFormatType(src_format.PlaneFormat) == DXGIFormatType(dst_format.PlaneFormat) &&
                   !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat());
     if (same || viewed) {
       auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
@@ -2707,8 +2707,10 @@ public:
       bool Encode, MTLD3D12Resource *pMap, UINT MapSubresource, POINT MapOffset, MTLD3D12Resource *pOther,
       UINT OtherSubresource, POINT Offset, const D3D12_RECT *pRect
   ) {
-    if (!pMap->feedback)
+    if (!pMap->feedback || (pOther->texture && pOther->GetDesc().Format != DXGI_FORMAT_R8_UINT)) {
+      recording_error_ = E_INVALIDARG;
       return;
+    }
     auto &desc = *pMap->feedback;
     auto &map = pMap->texture;
     auto &other = pOther->texture;
@@ -2790,7 +2792,6 @@ public:
       return;
     }
     auto *dst = static_cast<MTLD3D12Resource *>(pDstResource), *src = static_cast<MTLD3D12Resource *>(pSrcResource);
-    // nothing is compressed in Metal, so a resource decompressed in place is as it was
     if (!dst->texture || !src->texture || (dst == src && ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS))
       return;
     MTL_DXGI_FORMAT_DESC format;
@@ -2802,21 +2803,9 @@ public:
       return;
     }
     // a type group keeps its component layout (D3D11.3 19.1.1); bit-copy casts also permit other layouts
-    auto color_group = [](WMTPixelFormat pixel) {
-      pixel = Forget_sRGB(pixel);
-      auto integer = MTLGetUnsignedIntegerFormat(pixel);
-      return pixel == WMTPixelFormatBGRA8Unorm || pixel == WMTPixelFormatBGRX8Unorm || pixel == WMTPixelFormatA8Unorm ||
-                     integer == WMTPixelFormatInvalid
-                 ? pixel
-                 : integer;
-    };
     for (auto resource : {src, dst}) {
-      if (DepthStencilPlanarFlags(resource->texture->pixelFormat()))
-        continue;
-      MTL_DXGI_FORMAT_DESC original;
-      MTLQueryDXGIFormat(device_->GetMTLDevice(), resource->GetDesc().Format, original);
-      if (original.BytesPerTexel != format.BytesPerTexel ||
-          color_group(original.PixelFormat) != color_group(format.PixelFormat)) {
+      if (!DepthStencilPlanarFlags(resource->texture->pixelFormat()) &&
+          DXGIFormatType(resource->GetDesc().Format) != DXGIFormatType(Format)) {
         recording_error_ = E_INVALIDARG;
         return;
       }

@@ -471,7 +471,7 @@ DepthStencilPlanarFlags(WMTPixelFormat format) {
 }
 
 uint32_t DXGIFormatType(uint32_t format) {
-  // type groups from D3D11.3 19.1.4, using their bounds in the DXGI_FORMAT enum
+  // type groups from D3D11.3 19.1.4 and XR (Microsoft Learn, Casting Ability of XR Formats)
   static constexpr uint32_t groups[][2] = {
       {DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32A32_SINT},
       {DXGI_FORMAT_R32G32B32_TYPELESS, DXGI_FORMAT_R32G32B32_SINT},
@@ -503,7 +503,7 @@ uint32_t DXGIFormatType(uint32_t format) {
   for (auto &group : groups)
     if (format >= group[0] && format <= group[1])
       return group[0];
-  return format;
+  return format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM ? DXGI_FORMAT_R10G10B10A2_TYPELESS : format;
 }
 
 int32_t

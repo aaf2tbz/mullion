@@ -124,13 +124,12 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
   if (Desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)
     return E_INVALIDARG;
 
-  WMTTextureUsage Usage = WMTTextureUsagePixelFormatView;
-  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-    Usage |= WMTTextureUsageRenderTarget;
-  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+  WMTTextureUsage Usage = ORIGINAL_FORMAT(InfoOut.pixel_format) == WMTPixelFormatDepth32Float_Stencil8
+                              ? WMTTextureUsagePixelFormatView : WMTTextureUsageUnknown;
+  if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-    Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
   // a resolve reads its source's samples in a shader, whatever the resource allows the application's
   if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || InfoOut.sample_count > 1)
     Usage |= WMTTextureUsageShaderRead;
@@ -482,8 +481,8 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
-    if (FAILED(hr))
-      return hr;
+    if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+      return FAILED(hr) ? hr : E_INVALIDARG;
 
     view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, metal_format.PixelFormat);
 
@@ -663,8 +662,9 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
-    if (FAILED(hr))
-      return hr;
+    if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+      return FAILED(hr) ? hr : E_INVALIDARG;
 
     view_descriptor.format = metal_format.PixelFormat;
 
@@ -759,8 +759,8 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
-    if (FAILED(hr))
-      return hr;
+    if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+      return FAILED(hr) ? hr : E_INVALIDARG;
 
     view_descriptor.format = metal_format.PixelFormat;
 
@@ -880,8 +880,9 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
-    if (FAILED(hr))
-      return hr;
+    if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format))
+      return FAILED(hr) ? hr : E_INVALIDARG;
     view_descriptor.format = metal_format.PixelFormat;
 
     MTL_RENDER_TARGET_DESC RenderTargetDesc;
