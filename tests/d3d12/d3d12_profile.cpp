@@ -585,10 +585,12 @@ main(int argc, char **argv) {
                      "application query does not bracket the sampled kernel");
               auto at = size_t(&row - passes.data());
               if (expect(at > 0 && at + 1 < passes.size(), "kernel has no surrounding query passes")) {
+                // a query has the clock as the pass before it ends (20.4.3): each one here follows a kernel or a
+                // resolve, so its pass is a blit of its own
                 auto &before = passes[at - 1], &after = passes[at + 1];
                 expect(before[1] == row[1] && before[2] == row[2] && after[1] == row[1] && after[2] == row[2] &&
                            before[4] == "Blit" && after[4] == "Blit" && query[0] != ~UINT64(0) &&
-                           query[1] != ~UINT64(0) && query[0] == number(before[7]) && query[1] == number(after[7]),
+                           query[1] != ~UINT64(0) && query[0] == number(before[8]) && query[1] == number(after[8]),
                        "application timestamps shifted from the kernel's surrounding query passes");
               }
             }
@@ -599,8 +601,11 @@ main(int argc, char **argv) {
         for (auto &run_name : runs)
           run_counts[run_name]++;
       }
-      expect(kinds["Render"] == frames && kinds["Compute"] == 2 * frames && kinds["Clear"] == frames + capacity + 1 &&
-                 kinds["Blit"] == 5 * frames + 2 && kinds.size() == 4,
+      // a frame's clear is its render pass's load action, and that pass ends with the first kernel's first query:
+      // three queries and the copies are a frame's blits. the burst's clears stay passes; its queries are a blit
+      // at the list's start and the last clear's end
+      expect(kinds["Render"] == frames && kinds["Compute"] == 2 * frames && kinds["Clear"] == capacity + 1 &&
+                 kinds["Blit"] == 4 * frames + 1 && kinds.size() == 4,
              "pass kinds or counts differ from recording");
       expect(unsampled > 0, "overflow did not use unsampled sentinel");
       for (UINT i = 0; i < std::size(render_runs); i++)
@@ -615,7 +620,7 @@ main(int argc, char **argv) {
       for (auto &[key, group] : by_buffer)
         if (group.size() > capacity) {
           overflow_buffers++;
-          expect(group.size() == capacity + 3, "overflow command buffer split or lost passes");
+          expect(group.size() == capacity + 2, "overflow command buffer split or lost passes");
           auto &cmdbuf = buffers[key];
           const auto finish = number(cmdbuf[6]);
           const UINT64 rounding =
