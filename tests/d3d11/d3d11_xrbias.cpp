@@ -18,17 +18,24 @@
 // color need an external capture; Apple BGR10_XR documents the same decode and
 // SDR clamp, but has BGR order and padding instead of alpha:
 // https://developer.apple.com/documentation/metal/mtlpixelformat/bgr10_xr
+// GDI color stretching uses COLORONCOLOR: "This mode deletes all eliminated lines of pixels without trying to
+// preserve their information" (SetStretchBltMode). DXGI_SCALING_STRETCH says "scale to fit the presentation target
+// size", not which texel survives. GDI stretches independently decoded BGRA pixels as the oracle; dimensions
+// straddle the client size in both axes, and RGB varies across rows as well as columns.
+// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setstretchbltmode
+// https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_scaling
 #include "d3d11_test.hpp"
 #include <algorithm>
 #include <cmath>
 #include <dxgi1_4.h>
+#include <limits>
 
 static const char hlsl[] = R"hlsl(
 float4 vs(uint id : SV_VertexID) : SV_Position {
   return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 uint4 codes(float4 pos) {
-  uint r = uint(pos.x) & COLOR_MAX;
+  uint r = (uint(pos.x) + uint(pos.y)) & COLOR_MAX;
   return uint4(r, (r + BIAS) & COLOR_MAX, COLOR_MAX - r, uint(pos.y) & ALPHA_MAX);
 }
 float4 ps(float4 pos : SV_Position) : SV_Target {
@@ -225,9 +232,16 @@ main() {
         RECT client_size{};
         if (!expect(GetClientRect(window, &client_size), "GetClientRect: %lu", GetLastError()))
           return verdict();
+        const SIZE dimensions[] = {{LONG(desc.Width), LONG(desc.Height)},
+                                   {client_size.right, client_size.bottom},
+                                   {7, LONG(desc.Height)},
+                                   {client_size.right - 1, LONG(desc.Height)},
+                                   {client_size.right + 1, LONG(desc.Height)},
+                                   {client_size.right, client_size.bottom - 1},
+                                   {client_size.right, client_size.bottom + 1}};
         for (auto buffer_format : {xr, DXGI_FORMAT_R10G10B10A2_UNORM, xr})
-          for (UINT width : {desc.Width, UINT(client_size.right), 7u}) {
-            const UINT height = width == UINT(client_size.right) ? UINT(client_size.bottom) : desc.Height;
+          for (auto size : dimensions) {
+            const UINT width = size.cx, height = size.cy;
             CHECK(chain3->ResizeBuffers1(0, width, height, buffer_format, 0, nullptr, nullptr));
             CHECK(chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0));
             ComPtr<ID3D11Texture2D> back;
@@ -239,7 +253,7 @@ main() {
             std::vector<uint32_t> words(width * td.Height);
             for (UINT y = 0; y < td.Height; y++)
               for (UINT x = 0; x < width; x++) {
-                UINT r = x & colour_max;
+                UINT r = (x + y) & colour_max;
                 words[y * width + x] = r | (((r + bias) & colour_max) << colour_bits) |
                                        ((colour_max - r) << (2 * colour_bits)) | ((y & alpha_max) << (3 * colour_bits));
               }
@@ -358,9 +372,45 @@ main() {
                   }
               context->Unmap(sampled_read.Get(), 0);
             }
-            CHECK(chain->Present(0, 0));
+            step("level %#x effect %u %s, %u by %u: present format %u", level, effect,
+                 legacy ? "CreateSwapChain" : "CreateSwapChainForHwnd", width, height, buffer_format);
             RECT client{};
-            GetClientRect(window, &client);
+            if (!expect(GetClientRect(window, &client), "GetClientRect: %lu", GetLastError()))
+              return verdict();
+            std::vector<RGBQUAD> decoded(words.size()), expected(client.right * client.bottom);
+            for (size_t i = 0; i < words.size(); i++) {
+              BYTE *channels[] = {&decoded[i].rgbRed, &decoded[i].rgbGreen, &decoded[i].rgbBlue};
+              for (UINT c = 0; c < ARRAYSIZE(channels); c++) {
+                int q = (words[i] >> (c * colour_bits)) & colour_max;
+                float displayed =
+                    buffer_format == xr ? std::clamp((q - int(bias)) / scale, 0.f, 1.f) : float(q) / colour_max;
+                *channels[c] = BYTE(std::round(displayed * UINT8_MAX));
+              }
+            }
+            BITMAPINFO bitmap{{sizeof(BITMAPINFOHEADER), client.right, -client.bottom, 1,
+                               sizeof(RGBQUAD) * std::numeric_limits<BYTE>::digits, BI_RGB}};
+            void *pixels = nullptr;
+            HDC reference = CreateCompatibleDC(nullptr);
+            HBITMAP image =
+                reference ? CreateDIBSection(reference, &bitmap, DIB_RGB_COLORS, &pixels, nullptr, 0) : nullptr;
+            HGDIOBJ previous = image ? SelectObject(reference, image) : nullptr;
+            bitmap.bmiHeader.biWidth = width;
+            bitmap.bmiHeader.biHeight = -LONG(height);
+            bool ready = previous && previous != HGDI_ERROR && SetStretchBltMode(reference, COLORONCOLOR) &&
+                         StretchDIBits(reference, 0, 0, client.right, client.bottom, 0, 0, width, height,
+                                       decoded.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY) > 0 && GdiFlush();
+            DWORD error = GetLastError();
+            if (ready)
+              memcpy(expected.data(), pixels, expected.size() * sizeof(expected[0]));
+            if (previous && previous != HGDI_ERROR)
+              SelectObject(reference, previous);
+            if (image)
+              DeleteObject(image);
+            if (reference)
+              DeleteDC(reference);
+            if (!expect(ready, "GDI reference could not be drawn: %lu", error))
+              return verdict();
+            CHECK(chain->Present(0, 0));
             bool same = false;
             for (UINT attempt = 0; attempt < 250 && !same; attempt++) {
               MSG msg;
@@ -369,18 +419,14 @@ main() {
               Sleep(20);
               HDC dc = GetDC(window);
               same = true;
-              for (UINT x = 0; x < UINT(client.right); x++) {
-                UINT source_x = std::min(UINT((x + 0.5f) * width / client.right), width - 1);
-                auto got = GetPixel(dc, x, client.bottom / 2);
-                same &= got != CLR_INVALID;
-                const UINT channels[] = {GetRValue(got), GetGValue(got), GetBValue(got)};
-                for (UINT c = 0; c < ARRAYSIZE(channels); c++) {
-                  int q = (words[source_x] >> (c * colour_bits)) & colour_max;
-                  float displayed =
-                      buffer_format == xr ? std::clamp((q - int(bias)) / scale, 0.f, 1.f) : float(q) / colour_max;
-                  same &= std::fabs(channels[c] - displayed * UINT8_MAX) <= 1;
+              for (LONG y : {LONG(0), client.bottom / 2, client.bottom - 1})
+                for (LONG x = 0; x < client.right; x++) {
+                  auto got = GetPixel(dc, x, y);
+                  const auto &wanted_pixel = expected[y * client.right + x];
+                  same &= got != CLR_INVALID && std::abs(int(GetRValue(got)) - wanted_pixel.rgbRed) <= 1 &&
+                          std::abs(int(GetGValue(got)) - wanted_pixel.rgbGreen) <= 1 &&
+                          std::abs(int(GetBValue(got)) - wanted_pixel.rgbBlue) <= 1;
                 }
-              }
               ReleaseDC(window, dc);
             }
             expect(same, "presented pixels differ from XR decode and SDR clamp");

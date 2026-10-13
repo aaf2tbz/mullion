@@ -244,6 +244,7 @@ Presenter::drawToWindow(double after) {
   HDC dc;
   if (!GetClientRect(window_, &client) || !(dc = GetDCEx(window_, nullptr, DCX_CACHE)))
     return;
+  SetStretchBltMode(dc, COLORONCOLOR);
   StretchDIBits(
       dc, 0, 0, client.right, client.bottom, 0, 0, frame.width, frame.height, frame.pixels, &bitmap, DIB_RGB_COLORS,
       SRCCOPY
