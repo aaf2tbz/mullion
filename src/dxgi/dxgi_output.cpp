@@ -109,7 +109,7 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
   }
 
   // Filter by closest refresh rate
-  uint32_t minDiffRefreshRate = 0;
+  uint64_t minDiffRefreshRate = 0;
 
   if (TargetMode.RefreshRate.Numerator && TargetMode.RefreshRate.Denominator) {
     minDiffRefreshRate = std::accumulate(

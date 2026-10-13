@@ -87,6 +87,15 @@ main() {
                       mode.RefreshRate.Numerator / mode.RefreshRate.Denominator == current.dmDisplayFrequency,
                   "output %u's matching mode would change the display", index))
         return verdict();
+      // "Finds the display mode that most closely matches the requested display mode" (Microsoft Learn,
+      // IDXGIOutput::FindClosestMatchingMode): a rate below every mode's still has a closest mode, of the requested
+      // size and no faster than the current one.
+      DXGI_MODE_DESC slow = requested, slowest{};
+      slow.RefreshRate = {1, UINT_MAX};
+      expect(output->FindClosestMatchingMode(&slow, &slowest, device11.Get()) == S_OK &&
+                 slowest.Width == requested.Width && slowest.Height == requested.Height &&
+                 slowest.RefreshRate.Numerator <= UINT64(current.dmDisplayFrequency) * slowest.RefreshRate.Denominator,
+             "output %u has no mode closest to a rate below them all", index);
       MONITORINFO monitor{sizeof(monitor)};
       if (!expect(GetMonitorInfoW(output_desc.Monitor, &monitor), "could not query output %u's work area", index))
         return verdict();
