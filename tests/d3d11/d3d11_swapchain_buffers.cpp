@@ -18,6 +18,8 @@
 // presented pixels at the count boundaries use the existing GDI path. SRVs are created in different orders, so rotating
 // allocations must preserve each buffer's view mapping; SRGB decoding and UNORM rounding use D3D11.3 3.2.3's
 // named conversion and tolerance constants, rather than requiring an ideal result where the contract permits error.
+// a read-only back buffer's SRGB view is used only by a shader, then rotated in the same chunk as that draw.
+// no render attachment or presentation holds that view. its pixels must survive until the copy completes.
 #include "d3d11_test.hpp"
 #include <d3d10_1.h>
 #include <dxgi1_2.h>
@@ -281,6 +283,43 @@ main() {
         expect(resized.BufferCount == count, "ResizeBuffers(0) changed the count");
       }
     }
+  }
+  step("a shader-only view survives rotation before its chunk is submitted to Metal");
+  desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
+  desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
+  for (UINT count : {2u, 3u, UINT(DXGI_MAX_SWAP_CHAIN_BUFFERS)}) {
+    desc.BufferCount = count;
+    ComPtr<IDXGISwapChain> chain;
+    CHECK(factory->CreateSwapChain(device.Get(), &desc, &chain));
+    ComPtr<ID3D11Texture2D> front, source;
+    CHECK(chain->GetBuffer(0, IID_PPV_ARGS(&front)));
+    CHECK(chain->GetBuffer(count - 1, IID_PPV_ARGS(&source)));
+    ComPtr<ID3D11RenderTargetView> writable;
+    CHECK(device->CreateRenderTargetView(front.Get(), nullptr, &writable));
+    const BYTE value = std::numeric_limits<BYTE>::max() / 2;
+    const float colour[4] = {float(value) / std::numeric_limits<BYTE>::max(), 0, 0, 1};
+    context->ClearRenderTargetView(writable.Get(), colour);
+    CHECK(chain->Present(0, 0));
+    context->CopyResource(readback.Get(), source.Get());
+    bytes(readback.Get(), value);
+    D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{};
+    view_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    view_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    view_desc.Texture2D = {0, 1};
+    ComPtr<ID3D11ShaderResourceView> view;
+    CHECK(device->CreateShaderResourceView(source.Get(), &view_desc, &view));
+    context->VSSetShader(vs.Get(), nullptr, 0);
+    context->PSSetShader(ps.Get(), nullptr, 0);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D11_VIEWPORT viewport{0, 0, float(read_desc.Width), float(read_desc.Height), 0, 1};
+    context->RSSetViewports(1, &viewport);
+    context->OMSetRenderTargets(1, target_view.GetAddressOf(), nullptr);
+    context->PSSetShaderResources(0, 1, view.GetAddressOf());
+    context->Draw(3, 0);
+    context->CopyResource(before.Get(), target.Get());
+    CHECK(chain->Present(0, 0));
+    bytes(before.Get(), value, true);
+    context->ClearState();
   }
   desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
   desc.BufferCount = 3;

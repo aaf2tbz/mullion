@@ -198,7 +198,8 @@ main() {
                                   0,
                                   UINT64(client.right),
                                   dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1u : UINT(client.bottom),
-                                  2,
+                                  // D3D11.3 5.9.7.2: a tiled resource with a mip smaller than a tile is no array
+                                  UINT16(method >= 7 && !mips ? 1 : 2),
                                   mips,
                                   DXGI_FORMAT_R8G8B8A8_UNORM,
                                   {1, 0},

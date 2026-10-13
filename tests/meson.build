@@ -15,8 +15,26 @@ depth_config.set('DXGI_DEPTH_FORMATS', depth_formats[0])
 depth_config.set('DXGI_FORMATS', depth_formats[1])
 depth_formats_header = configure_file(output : 'depth_formats.hpp', configuration : depth_config)
 
+copy_formats_header = configure_file(output : 'copy_formats.hpp',
+                                     command : [find_program('python3', native : true), files('copy_formats.py')] + cpp.cmd_array(),
+                                     capture : true)
+configure_file(input : 'host/resource_cases.py', output : 'resource_cases.hpp',
+  command : [find_program('python3', native : true), '@INPUT@', '@OUTPUT@'] + cpp.cmd_array())
+
 subdir('dx11')
 if get_option('enable_d3d12')
+  levels = run_command(cpp.cmd_array() + ['-E', '-P', '-x', 'c++', '-include', 'd3dcommon.h', '/dev/null'],
+                       check: true).stdout().split('enum D3D_FEATURE_LEVEL')[1].split('{')[1].split('}')[0]
+  names = []
+  foreach level : levels.split(',')
+    name = level.strip().split('=')[0].strip()
+    if name != ''
+      names += name
+    endif
+  endforeach
+  data = configuration_data()
+  data.set('D3D12_TEST_FEATURE_LEVELS', ', '.join(names))
+  configure_file(output: 'feature_levels.hpp', configuration: data)
   subdir('d3d12')
   subdir('dxgi')
 endif

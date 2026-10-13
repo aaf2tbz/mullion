@@ -1,6 +1,7 @@
 #!/bin/sh
 # builds and runs each probe of Metal's own behaviour here and compares what it prints with <probe>.txt, which is
-# what an Apple10 GPU printed. these are not tests of the library: a difference on another GPU family is a finding
+# a recorded observation or a required result of the contract in the probe's header. these are not tests of the library:
+# a difference on another GPU family is a finding
 # about that family, and the constants that cite a probe have to be looked at again. run it under the GPU lock.
 cd "$(dirname "$0")" && out=$(mktemp -d) && code=0
 for probe in *.swift; do

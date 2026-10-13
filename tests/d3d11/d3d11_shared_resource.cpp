@@ -20,13 +20,32 @@
 // queued mutex work survives releasing the texture. an EVENT is signaled after earlier commands finish and
 // "the value of the BOOL is always TRUE" (D3D11.3 20.4.2); the D3D10_QUERY_EVENT contract is the same.
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d10/ne-d3d10-d3d10_query
+// the lifetime cases stop CPU encoding before the queued acquire or release can retain its event, drop the last
+// texture reference, then resume. completion returns TRUE; the runner also rejects any zombie message.
 #include "d3d11_test.hpp"
 #include <d3d11_1.h>
 #include <d3d10_1.h>
 #include <limits>
 
+static UINT64(__cdecl *command_buffer)(UINT64);
+static HANDLE encoding_stopped, encoding_resume;
+static volatile LONG stop_encoding;
+static DWORD issuing_thread;
+
+static UINT64 __cdecl
+paused_command_buffer(UINT64 queue) {
+  // uploads create command buffers on the issuing thread; only pause the asynchronous encoder
+  if (GetCurrentThreadId() != issuing_thread && InterlockedCompareExchange(&stop_encoding, 0, 1) == 1) {
+    SetEvent(encoding_stopped);
+    if (WaitForSingleObject(encoding_resume, 60000) != WAIT_OBJECT_0)
+      ExitProcess(1);
+  }
+  return command_buffer(queue);
+}
+
 // the key reaches the kernel through D3DKMTAcquireKeyedMutex, whose Key is a UINT64 on Windows; Wine's server keeps
-// 32 bits of it (server/protocol.def, d3dkmt_mutex_release, up to Wine 11.19). a key the host itself cannot tell
+// 32 bits of it (server/protocol.def, d3dkmt_mutex_acquire and d3dkmt_mutex_release in Wine-cx-26.2 and Rakia).
+// server/d3dkmt.c's d3dkmt_mutex.key_value is also unsigned int. a key the host itself cannot tell
 // from zero is the host's defect: it is measured on the host's own interface, named in the log and not exercised.
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmthk/ns-d3dkmthk-_d3dkmt_acquirekeyedmutex
 static UINT64
@@ -285,6 +304,81 @@ main() {
     peer.Reset();
     expect(imported.Reset() == 0, "keyed import retained an extra reference");
   }
+
+  step("stop encoding before the queued keyed event is consumed");
+  issuing_thread = GetCurrentThreadId();
+  encoding_stopped = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+  encoding_resume = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+  if (!expect(encoding_stopped && encoding_resume, "no encoding synchronization events"))
+    return verdict();
+  auto image = (BYTE *)GetModuleHandleA("d3d11.dll");
+  if (!expect(image != nullptr, "no d3d11 module"))
+    return verdict();
+  auto dos = (IMAGE_DOS_HEADER *)image;
+  auto headers = (IMAGE_NT_HEADERS *)(image + dos->e_lfanew);
+  auto imports = (IMAGE_IMPORT_DESCRIPTOR *)(
+      image + headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+  ULONG_PTR *hook = nullptr;
+  for (; imports->Name; imports++) {
+    auto names = (IMAGE_THUNK_DATA *)(image + imports->OriginalFirstThunk);
+    auto functions = (IMAGE_THUNK_DATA *)(image + imports->FirstThunk);
+    for (; names->u1.AddressOfData; names++, functions++) {
+      if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
+        continue;
+      auto name = (IMAGE_IMPORT_BY_NAME *)(image + names->u1.AddressOfData);
+      if (!strcmp((const char *)name->Name, "MTLCommandQueue_commandBuffer"))
+        hook = &functions->u1.Function;
+    }
+  }
+  if (!expect(hook != nullptr, "no command-buffer import to pause"))
+    return verdict();
+  DWORD protection;
+  if (!expect(VirtualProtect(hook, sizeof(*hook), PAGE_READWRITE, &protection), "cannot pause the encoder"))
+    return verdict();
+  command_buffer = reinterpret_cast<decltype(command_buffer)>(*hook);
+  *hook = ULONG_PTR(paused_command_buffer);
+  if (!expect(VirtualProtect(hook, sizeof(*hook), protection, &protection), "cannot restore import protection"))
+    return verdict();
+  for (bool nt : {false, true})
+    for (bool release : {false, true}) {
+      step("NT handle %d, queued acquire%s outlives its texture", nt, release ? " and release" : "");
+      ComPtr<ID3D11Device> device;
+      ComPtr<ID3D11DeviceContext> context;
+      const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+      CHECK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+                              &device, nullptr, &context));
+      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | (nt ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0);
+      ComPtr<ID3D11Texture2D> texture;
+      ComPtr<IDXGIKeyedMutex> mutex;
+      CHECK(device->CreateTexture2D(&desc, nullptr, &texture));
+      CHECK(texture.As(&mutex));
+      InterlockedExchange(&stop_encoding, 1);
+      CHECK(mutex->AcquireSync(0, 0));
+      if (!expect(WaitForSingleObject(encoding_stopped, 60000) == WAIT_OBJECT_0, "encoding did not stop"))
+        ExitProcess(1);
+      if (release)
+        CHECK(mutex->ReleaseSync(0));
+      mutex.Reset();
+      expect(texture.Reset() == 0, "queued mutex work retained the texture");
+      SetEvent(encoding_resume);
+      const D3D11_QUERY_DESC event_desc{D3D11_QUERY_EVENT};
+      ComPtr<ID3D11Query> completed;
+      CHECK(device->CreateQuery(&event_desc, &completed));
+      context->End(completed.Get());
+      context->Flush();
+      BOOL done = FALSE;
+      HRESULT hr;
+      while ((hr = context->GetData(completed.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
+        Sleep(0);
+      expect(hr == S_OK && done, "released texture's queued mutex work did not complete, hr %#lx", hr);
+    }
+  if (!expect(VirtualProtect(hook, sizeof(*hook), PAGE_READWRITE, &protection), "cannot restore the encoder"))
+    return verdict();
+  *hook = ULONG_PTR(command_buffer);
+  if (!expect(VirtualProtect(hook, sizeof(*hook), protection, &protection), "cannot restore import protection"))
+    return verdict();
+  CloseHandle(encoding_stopped);
+  CloseHandle(encoding_resume);
 
   auto module = LoadLibraryA("d3d10_1.dll");
   auto create = reinterpret_cast<decltype(&D3D10CreateDevice1)>((void *)GetProcAddress(module, "D3D10CreateDevice1"));

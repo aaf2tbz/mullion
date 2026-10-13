@@ -8,6 +8,9 @@
 // subsequent Stage." (4.4.3.2). the reordered pixel shader therefore reads EXTRA as DATA and DATA as EXTRA.x.
 // two vertex shaders with the same embedded signature and different bodies reuse the same pixel conversion:
 // the supplier's body changes no pixel conversion input (Microsoft Learn, Creating a Root Signature).
+// stream-output gaps leave bytes untouched: "the components specified by RegisterMask are skipped in
+// the output (and the output memory is unchanged)." (D3D11.3 14.3). changing a leading gap moves DATA while
+// keeping its stream, slot, component and stride fixed. the ordered declaration includes every gap component.
 #include "d3d12_test.hpp"
 #include <array>
 #include <fstream>
@@ -733,9 +736,9 @@ main(int argc, char **argv) {
     }
   }
   for (UINT topology = 0; topology < 4; topology++)
-    for (UINT variant = 0; variant < (topology < 2 ? 12u : 8u); variant++) {
+    for (UINT variant = 0; variant < (topology < 2 ? 14u : 8u); variant++) {
       if ((topology == 0 && variant != 0 && variant != 1 && variant != 2 && variant != 3 && variant != 4 &&
-           variant != 9 && variant != 10 && variant != 11) ||
+           variant != 9 && variant != 10 && variant != 11 && variant != 12 && variant != 13) ||
           (topology == 1 && variant != 0 && variant != 8) ||
           (topology == 2 && variant != 0 && variant != 6 && variant != 7) || (topology == 3 && variant != 0))
         continue;
@@ -745,7 +748,7 @@ main(int argc, char **argv) {
       const UINT cut_index = variant == 7 ? ~0u : 0xffff;
       const UINT stream = variant == 10;
       const UINT slot = variant == 1 ? D3D12_SO_BUFFER_SLOT_COUNT - 1 : 0;
-      const UINT component = variant == 2 ? 1 : 0, gap = variant == 3 ? 1 : 0;
+      const UINT component = variant == 2 ? 1 : 0, gap = variant >= 12 ? variant - 10 : variant == 3 ? 1 : 0;
       const UINT stride = (variant == 4 ? 5 : 4) * sizeof(UINT);
       D3D12_SO_DECLARATION_ENTRY entries[] = {
           {stream, nullptr, 0, 0, BYTE(gap), BYTE(slot)},
@@ -760,7 +763,8 @@ main(int argc, char **argv) {
       else if (topology == 1)
         desc.GS = bytecode(stream_gs);
       desc.StreamOutput = {
-          entries + !gap, gap + 1, strides.data(), UINT(strides.size()), rasterized ? 0u : D3D12_SO_NO_RASTERIZED_STREAM
+          entries + !gap, gap ? UINT(std::size(entries)) : 1u, strides.data(), UINT(strides.size()),
+          rasterized ? 0u : D3D12_SO_NO_RASTERIZED_STREAM
       };
       desc.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
       desc.SampleMask = ~0u;

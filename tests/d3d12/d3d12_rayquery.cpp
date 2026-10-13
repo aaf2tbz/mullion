@@ -30,6 +30,10 @@
 // positions of a format with an ignored fourth component packed at their own size up to their buffer's end
 // (VertexFormat), and at a stride of zero, which boxes may have and vertices are not denied, one element as many times
 // as the count says: boxes that are each a candidate of a ray through them, and a triangle of one point that nothing hits.
+// an acceleration structure view uses its Location: "the memory location comes as a GPUVA from the view
+// description" (DXR functional spec, "Additional SRV type"). that section requires a null resource parameter;
+// Windows also accepts a resource there (vkd3d-proton test_rayquery_root_table), and its contents do not select the
+// structure. the same rays are checked with a null, matching and unrelated resource, and with a null Location.
 #include "d3d12_rays.hpp"
 
 static const char hlsl[] = R"hlsl(
@@ -156,8 +160,8 @@ struct Case {
 int
 main(int argc, char **argv) {
   Compiler compiler;
-  if (!front_end(argc, argv, compiler)) {
-    printf("skipped: dxcompiler.dll not found\n");
+  if (!front_end(argc, argv, compiler) || !compiler.dxc) {
+    printf("skipped: RayQuery needs DXC\n");
     return 77;
   }
   RayScene scene;
@@ -194,10 +198,11 @@ main(int argc, char **argv) {
       "BOXES=" + std::to_string(std::size(scene.aabbs)), "BOX_LIST=" + box_list, "OWN_FLAGS=" + std::to_string(own_flags),
   };
   auto cs = compiler.compile(hlsl, "cs", "cs_6_5", defines), vs = compiler.compile(hlsl, "vs", "vs_6_5", defines),
-       ps = compiler.compile(hlsl, "ps", "ps_6_5", defines);
-  if (cs.empty() || vs.empty() || ps.empty()) {
-    printf("skipped: RayQuery is shader model 6.5\n");
-    return 77;
+       ps = compiler.compile(hlsl, "ps", "ps_6_5", defines),
+       count_cs = compiler.compile(count_hlsl, "cs", "cs_6_5", defines);
+  if (cs.empty() || vs.empty() || ps.empty() || count_cs.empty()) {
+    printf("failed: HLSL did not compile\n");
+    return 1;
   }
   ComPtr<ID3D12Device5> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
@@ -278,11 +283,11 @@ main(int argc, char **argv) {
 
   // traces every case through the structure at an address, from a compute shader or a pixel shader, and reads the
   // results back
-  auto trace_at = [&](D3D12_GPU_VIRTUAL_ADDRESS address, bool pixel) {
+  auto trace_at = [&](D3D12_GPU_VIRTUAL_ADDRESS address, bool pixel, ID3D12Resource *resource = nullptr) {
     D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_UNKNOWN, D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
                                          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     view.RaytracingAccelerationStructure.Location = address;
-    device->CreateShaderResourceView(nullptr, &view, views->GetCPUDescriptorHandleForHeapStart());
+    device->CreateShaderResourceView(resource, &view, views->GetCPUDescriptorHandleForHeapStart());
     ID3D12DescriptorHeap *heaps[] = {views.Get()};
     list->SetDescriptorHeaps(1, heaps);
     if (pixel) {
@@ -385,6 +390,15 @@ main(int argc, char **argv) {
   compare("built");
   CHECK(trace(scene.triangle_memory.Get(), scene.box_memory.Get(), true));
   compare("from a pixel shader");
+  for (bool pixel : {false, true})
+    for (auto resource : {scene.scene_memory.Get(), results.Get()}) {
+      step("acceleration structure SRV: %s, %s resource", pixel ? "pixel" : "compute",
+           resource == scene.scene_memory.Get() ? "matching" : "unrelated");
+      CHECK(trace_at(scene.scene_memory->GetGPUVirtualAddress(), pixel, resource));
+      compare("an acceleration structure view with a resource");
+      CHECK(trace_at(0, pixel, resource));
+      compare("a null acceleration structure view with a resource", true);
+    }
   UINT64 compacted_size, current_size;
   memcpy(&compacted_size, out + sizes_at, sizeof(UINT64));
   memcpy(&current_size, out + sizes_at + sizeof(UINT64), sizeof(UINT64));
@@ -806,7 +820,6 @@ main(int argc, char **argv) {
 
   // strides. three structures, each in its own corner of the rays' grid
   {
-    auto count_cs = compiler.compile(count_hlsl, "cs", "cs_6_5", defines);
     ComPtr<ID3D12PipelineState> count_pso;
     D3D12_COMPUTE_PIPELINE_STATE_DESC count_desc{rs.Get(), bytecode(count_cs)};
     CHECK(device->CreateComputePipelineState(&count_desc, IID_PPV_ARGS(&count_pso)));
@@ -954,10 +967,8 @@ main(int argc, char **argv) {
     printf("failed: a ray is %g from an edge\n", margin);
     return 1;
   }
-  if (failures) {
-    printf("failed: %u wrong rays\n", failures);
-    return 1;
-  }
+  if (!::expect(!failures, "%u wrong rays", failures))
+    return verdict();
   printf("passed: %u hits of %u rays\n", hits, traced);
-  return 0;
+  return verdict();
 }

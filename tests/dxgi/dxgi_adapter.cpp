@@ -17,6 +17,8 @@
 //   the configuration names another (dxgi.customVendorId), Apple's own included, and changes nothing else.
 // - a gamma ramp is an output's, a monitor's (IDXGIOutput::SetGammaControl, GetGammaControl): set through one object
 //   of the output, it is what another one gets.
+//   gamma capabilities are "only supported while in full-screen mode" (IDXGIOutput::GetGammaControlCapabilities).
+//   https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgioutput-getgammacontrolcapabilities
 #include "../d3d12/d3d12_test.hpp"
 #include <d3d10.h>
 #include <dxgi1_6.h>
@@ -86,9 +88,31 @@ main(int argc, char **argv) {
   // an output is its monitor, whichever object stands for it
   ComPtr<IDXGIOutput> one, twin;
   if (SUCCEEDED(adapter->EnumOutputs(0, &one)) && SUCCEEDED(adapter->EnumOutputs(0, &twin))) {
+    DXGI_OUTPUT_DESC output_desc{};
+    CHECK(one->GetDesc(&output_desc));
+    const auto &bounds = output_desc.DesktopCoordinates;
+    HWND window = CreateWindowW(L"static", L"gamma", 0, bounds.left, bounds.top, bounds.right - bounds.left,
+                                bounds.bottom - bounds.top, nullptr, nullptr, nullptr, nullptr);
+    if (!window)
+      return 1;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    ComPtr<ID3D12CommandQueue> queue;
+    CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
+    DXGI_SWAP_CHAIN_DESC swapchain_desc{};
+    swapchain_desc.BufferDesc = {UINT(bounds.right - bounds.left), UINT(bounds.bottom - bounds.top), {},
+                                 DXGI_FORMAT_R8G8B8A8_UNORM};
+    swapchain_desc.SampleDesc.Count = 1;
+    swapchain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapchain_desc.BufferCount = 2;
+    swapchain_desc.OutputWindow = window;
+    swapchain_desc.Windowed = TRUE;
+    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    ComPtr<IDXGISwapChain> swapchain;
+    CHECK(factory->CreateSwapChain(queue.Get(), &swapchain_desc, &swapchain));
+    CHECK(swapchain->SetFullscreenState(TRUE, one.Get()));
     DXGI_GAMMA_CONTROL_CAPABILITIES caps{};
     static DXGI_GAMMA_CONTROL set, got, identity;
-    CHECK(one->GetGammaControlCapabilities(&caps));
+    expect(one->GetGammaControlCapabilities(&caps) == S_OK, "fullscreen gamma capabilities");
     set.Scale = identity.Scale = {1, 1, 1};
     for (UINT i = 0; i < caps.NumGammaControlPoints; i++) {
       float at = caps.ControlPointPositions[i];
@@ -100,6 +124,9 @@ main(int argc, char **argv) {
       same = !memcmp(&set.GammaCurve[i], &got.GammaCurve[i], sizeof(DXGI_RGB));
     expect(same && caps.NumGammaControlPoints > 1, "a gamma ramp set on a monitor's output is not what another output of it has");
     one->SetGammaControl(&identity);
+    expect(swapchain->SetFullscreenState(FALSE, nullptr) == S_OK, "leave gamma fullscreen");
+    swapchain.Reset();
+    DestroyWindow(window);
   }
 
   DXGI_QUERY_VIDEO_MEMORY_INFO local, non_local, after;

@@ -4,7 +4,8 @@
 // NO_OVERWRITE changes a row no pending draw reads, before any full-buffer copies. CB ranges follow 5.3.4.3.2:
 // "FirstConstant must be a multiple of 16 constants." ordinary CBs use their whole binding, larger CBs also use a
 // nonzero range.
-// sizes cross BufferAllocation's minimum and DXMT_PAGE_SIZE; page / bytes + 3 updates cross each slot boundary.
+// sizes cross BufferAllocation's minimum and DXMT_PAGE_SIZE. fifteen page / bytes capacities (one above a page)
+// plus one update pass at least the first and last names of the first three doublings, including names above a page.
 // every generation draws distinct integer pixels. copies check every byte through staging Map, including bytes
 // outside partial writes. view, vertex, index, constant and argument offsets are nonzero independently of storage
 // offsets. immediate and deferred contexts use the same operations; output-bound controls must retain their bytes.
@@ -50,7 +51,7 @@ uint4 ps(V v) : SV_Target { return v.value; }
 )hlsl";
 
 int
-main() {
+main(int argc, char **argv) {
   step("compile every shader before creating a device");
   ComPtr<ID3DBlob> code[TypedOutput + 1];
   for (UINT kind = 0; kind < std::size(code); kind++) {
@@ -64,6 +65,8 @@ main() {
                                            "CONSTANTS=" + std::to_string(D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT)});
   if (!ps_code)
     return 1;
+  if (argc > 1 && !strcmp(argv[1], "shaders"))
+    return verdict();
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> immediate, deferred;
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_1;
@@ -88,7 +91,8 @@ main() {
   std::vector<UINT> sizes;
   for (UINT bytes = 4 * sizeof(Row); bytes < DXMT_PAGE_SIZE; bytes *= 2)
     sizes.push_back(bytes);
-  sizes.insert(sizes.end(), {DXMT_PAGE_SIZE - sizeof(Row), DXMT_PAGE_SIZE, DXMT_PAGE_SIZE + sizeof(Row)});
+  sizes.insert(sizes.end(), {DXMT_PAGE_SIZE - sizeof(Row), DXMT_PAGE_SIZE, DXMT_PAGE_SIZE + sizeof(Row),
+                              4 * DXMT_PAGE_SIZE});
   const char *names[] = {"vertex", "index", "constant", "typed", "structured", "raw", "indirect", "indexed indirect",
                          "vertex/output", "typed/output"};
   for (UINT bytes : sizes)
@@ -100,7 +104,8 @@ main() {
           immediate->ClearState();
           deferred->ClearState();
           auto context = recorded ? deferred1.Get() : immediate1.Get();
-          const UINT rows = bytes / sizeof(Row), generations = DXMT_PAGE_SIZE / bytes + 3;
+          const UINT rows = bytes / sizeof(Row);
+          const UINT generations = (1 + 2 + 4 + 8) * std::max(1u, DXMT_PAGE_SIZE / bytes) + 1;
           // D3D11.3 5.3.4.3.2 defines binding alignment in constants, distinct from a constant's byte size
           const UINT range_alignment = 16, first = kind == Constant && rows > range_alignment ? range_alignment : 0;
           const UINT probes[] = {first + 1, std::max(first + 1, rows / 2), rows - 1};

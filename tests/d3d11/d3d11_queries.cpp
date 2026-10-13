@@ -13,8 +13,13 @@
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-createpredicate
 // query types come from the contiguous D3D11_QUERY enumeration; the seed varies restart and reuse traces.
 // the restart draw covers a single-sample target with depth and stencil disabled: 20.4.6 counts width * height.
+// pipeline statistics count that draw too: "Number of vertices IA generated (not subtracting any caching)" and
+// "Number of times PS is executed" (20.4.7). The restarted range excludes its discarded draw on both contexts.
+// "The value of PSInvocations may include or exclude helper pixels for 2x2 stamps" (20.4.7). The triangle covers
+// the viewport's quad; clipping can split it into two triangles, each needing all lanes of its target's stamps.
 #include "d3d11_test.hpp"
 #include <d3d10.h>
+#include <d3d11_1.h>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -31,6 +36,7 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 }
 uint ps() : SV_Target { return 1; }
 )";
+  step("seed %u: compile VS and PS", seed);
   auto vs_code = compile(shader, "vs", "vs"), ps_code = compile(shader, "ps", "ps");
   if (!vs_code || !ps_code)
     return 1;
@@ -41,6 +47,12 @@ uint ps() : SV_Target { return 1; }
       nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr, &immediate
   ));
   CHECK(device->CreateDeferredContext(0, &deferred));
+  ComPtr<ID3D11Device1> device1;
+  ComPtr<ID3DDeviceContextState> state;
+  CHECK(device.As(&device1));
+  CHECK(device1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D10Device), nullptr, &state));
+  ComPtr<ID3D10Device> device10;
+  CHECK(device.As(&device10));
   alignas(D3D11_QUERY_DATA_PIPELINE_STATISTICS)
       std::array<unsigned char, sizeof(D3D11_QUERY_DATA_PIPELINE_STATISTICS) + sizeof(UINT64)> bytes;
   const unsigned char sentinel = 0xa5;
@@ -182,8 +194,6 @@ uint ps() : SV_Target { return 1; }
                "empty range returned nonzero data");
       }
     }
-    if (type == D3D11_QUERY_PIPELINE_STATISTICS)
-      continue;
     step("seed %u, query %u, deferred recording and replay", seed, kind);
     ComPtr<ID3D11Query> recorded;
     CHECK(device->CreateQuery(&desc, &recorded));
@@ -250,15 +260,22 @@ uint ps() : SV_Target { return 1; }
     context->VSSetShader(vertex.Get(), nullptr, 0);
     context->PSSetShader(pixel.Get(), nullptr, 0);
     D3D11_QUERY_DESC desc{D3D11_QUERY_OCCLUSION};
-    ComPtr<ID3D11Query> query;
+    ComPtr<ID3D11Query> query, statistics;
     CHECK(device->CreateQuery(&desc, &query));
+    D3D10_QUERY_DESC statistics_desc{D3D10_QUERY_PIPELINE_STATISTICS};
+    ComPtr<ID3D10Query> statistics10;
+    CHECK(device10->CreateQuery(&statistics_desc, &statistics10));
+    CHECK(statistics10.As(&statistics));
     context->Begin(query.Get());
+    context->Begin(statistics.Get());
     context->Draw(3, 0);
     context->Begin(query.Get());
+    context->Begin(statistics.Get());
     const UINT draws = 1 + next() % 3;
     for (UINT i = 0; i < draws; i++)
       context->Draw(3, 0);
     context->End(query.Get());
+    context->End(statistics.Get());
     if (context == deferred.Get()) {
       ComPtr<ID3D11CommandList> list;
       CHECK(deferred->FinishCommandList(FALSE, &list));
@@ -270,6 +287,36 @@ uint ps() : SV_Target { return 1; }
     CHECK(immediate->GetData(query.Get(), &count, sizeof(count), 0));
     const UINT64 expected = UINT64(width) * height * draws;
     expect(count == expected, "%u retained draws: count %llu, want %llu", draws, count, expected);
+    if (!ready(statistics.Get()))
+      return verdict();
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
+    if (!expect(immediate->GetData(statistics.Get(), &data, sizeof(data), 0) == S_OK, "pipeline data is not ready"))
+      return verdict();
+    expect(data.IAVertices == UINT64(3) * draws, "pipeline IA vertices %llu for %u retained draws",
+           data.IAVertices, draws);
+    expect(data.IAPrimitives == draws, "pipeline IA primitives %llu for %u retained draws", data.IAPrimitives, draws);
+    expect(data.VSInvocations == UINT64(3) * draws, "pipeline VS invocations %llu for %u retained draws",
+           data.VSInvocations, draws);
+    expect(data.CInvocations == draws && data.CPrimitives >= draws,
+           "pipeline clipping counts differ for %u retained draws", draws);
+    const UINT stamp_width = 2, stamp_height = 2, clipped_triangles = 2;
+    const UINT64 maximum_pixels = UINT64((width + stamp_width - 1) / stamp_width) *
+                                  ((height + stamp_height - 1) / stamp_height) * stamp_width * stamp_height *
+                                  clipped_triangles * draws;
+    expect(data.PSInvocations >= expected && data.PSInvocations <= maximum_pixels,
+           "pipeline PS count %llu, want [%llu, %llu]", data.PSInvocations, expected, maximum_pixels);
+    expect(!data.GSPrimitives && !data.HSInvocations && !data.DSInvocations && !data.CSInvocations,
+           "pipeline counted an unused stage");
+    struct {
+      D3D10_QUERY_DATA_PIPELINE_STATISTICS data;
+      UINT64 guard;
+    } ten{};
+    ten.guard = ~UINT64(0);
+    if (!expect(statistics10->GetData(&ten.data, sizeof(ten.data), D3D10_ASYNC_GETDATA_DONOTFLUSH) == S_OK,
+                "D3D10 pipeline data is not ready"))
+      return verdict();
+    expect(!memcmp(&ten.data, &data, sizeof(ten.data)) && ten.guard == ~UINT64(0),
+           "D3D10 pipeline statistics differ or changed bytes beyond their size");
     immediate->CopyResource(staging.Get(), target.Get());
     D3D11_MAPPED_SUBRESOURCE mapped;
     CHECK(immediate->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped));

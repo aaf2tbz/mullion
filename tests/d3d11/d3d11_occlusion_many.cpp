@@ -14,6 +14,8 @@
 // counts; later segments add to old contents, and from segment 16383 they return zero on Apple10. 64-bit chunks
 // allocate new Metal buffers, so zero-filled memory cannot distinguish a 4096 bound from an 8191 bound. the i386
 // backing allocation can be recycled after completion; stress and reuse use the same sizes.
+// the distinct-count frame draws a different nonzero area in every adjacent slot, past a whole visibility buffer.
+// equal or empty boundary draws cannot tell two slots sharing an offset from two independent results.
 #include "d3d11_test.hpp"
 #include <algorithm>
 #include <fstream>
@@ -124,7 +126,9 @@ main(int argc, char **) {
   UINT bias = 0;
 
   const D3D11_RECT marker{LONG(query_width), 0, LONG(width), LONG(height)};
-  auto rectangle = [&](UINT i, bool before_only_first, bool second_use) {
+  auto rectangle = [&](UINT i, bool before_only_first, bool second_use, bool distinct = false) {
+    if (distinct)
+      return D3D11_RECT{0, 0, LONG(i % query_width + 1), 1};
     const UINT n = i / 2;
     D3D11_RECT rect{0, 0, LONG(second_use ? query_width - n % (query_width + 1) : n % (query_width + 1)),
                     LONG(n / (query_width + 1) % height + 1)};
@@ -161,13 +165,13 @@ main(int argc, char **) {
   };
   const D3D11_QUERY_DESC counter_desc{D3D11_QUERY_OCCLUSION}, predicate_desc{D3D11_QUERY_OCCLUSION_PREDICATE};
   const float clear[4] = {};
-  enum { Control, Stress, Isolated, Reuse, Deferred, Flushed, ReuseFlushed, Frames };
+  enum { Control, Stress, Isolated, Reuse, Deferred, Flushed, ReuseFlushed, Distinct, Frames };
   const char *names[Frames] = {
       "control", "stress", "isolated immediate stress", "reuse after stress", "deferred stress", "stress with Flush",
-      "reuse after Flush"
+      "reuse after Flush", "distinct counting slots"
   };
   for (UINT frame = 0; frame < Frames; frame++) {
-    const UINT count = frame == Deferred ? stress_queries
+    const UINT count = frame == Deferred || frame == Distinct ? stress_queries
                        : frame == Stress || frame == Isolated || frame == Reuse ? 4 * window_segments + control_queries
                        : frame == Flushed ? 2 * window_segments + control_queries
                        : control_queries;
@@ -188,7 +192,7 @@ main(int argc, char **) {
       CHECK(device->CreatePredicate(&predicate_desc, &across_predicate[b]));
     }
     for (UINT i = 0; i < count; i++) {
-      if (i % 2) {
+      if (i % 2 && frame != Distinct) {
         ComPtr<ID3D11Predicate> predicate;
         CHECK(device->CreatePredicate(&predicate_desc, &predicate));
         queries[i] = predicate;
@@ -235,7 +239,7 @@ main(int argc, char **) {
       }
       if (frame == Flushed && i == window_segments)
         context->Flush();
-      const auto rect = rectangle(i, frame == Deferred, frame == Reuse);
+      const auto rect = rectangle(i, frame == Deferred, frame == Reuse, frame == Distinct);
       record->Begin(queries[i].Get());
       draw(rect);
       record->End(queries[i].Get());
@@ -280,11 +284,11 @@ main(int argc, char **) {
     };
     UINT wrong = 0;
     for (UINT i = 0; i < count; i++) {
-      const auto rect = rectangle(i, frame == Deferred, frame == Reuse);
+      const auto rect = rectangle(i, frame == Deferred, frame == Reuse, frame == Distinct);
       UINT64 expected = UINT64(rect.right - rect.left) * (rect.bottom - rect.top), got = ~UINT64(0);
       BOOL visible = -1;
       HRESULT hr;
-      if (i % 2) {
+      if (i % 2 && frame != Distinct) {
         hr = data(queries[i].Get(), &visible, sizeof(visible));
         got = visible;
         expected = expected != 0;
@@ -296,7 +300,8 @@ main(int argc, char **) {
                hr, (unsigned long long)got, (unsigned long long)expected);
       if ((hr != S_OK || got != expected) && wrong++ < report_limit)
         printf("%s query %u (%s): HRESULT %#lx, got %llu, want %llu\n", name, i,
-               i % 2 ? "predicate" : "counter", hr, (unsigned long long)got, (unsigned long long)expected);
+               i % 2 && frame != Distinct ? "predicate" : "counter", hr,
+               (unsigned long long)got, (unsigned long long)expected);
     }
     printf("%s: %u wrong of %u individual queries\n", name, wrong, count);
     expect(wrong == 0, "%s has %u wrong individual queries", name, wrong);

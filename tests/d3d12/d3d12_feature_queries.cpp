@@ -6,6 +6,7 @@
 // is rejected as Windows records in vkd3d-proton:test_check_feature_support. unsupported storage reports E_FAIL
 // with zero support bits, not E_INVALIDARG; the latter rejects a feature data size mismatch.
 // D16_UNORM depth/stencil and integer shader loads are required by D3D11.3 19.1.4.
+// NV12: "Hardware support required" (Microsoft Learn, Format support for Direct3D Feature Level 11.0 through 12.1).
 #include "d3d12_test.hpp"
 #include "../depth_formats.hpp"
 #include <limits>
@@ -57,9 +58,8 @@ main(int argc, char **argv) {
     step("format %#x: support and plane layout", format);
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format, D3D12_FORMAT_SUPPORT1(~0u), D3D12_FORMAT_SUPPORT2(~0u)};
     HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
-    if (format != DXGI_FORMAT_NV12)
-      expect(hr == S_OK || (hr == E_FAIL && !support.Support1 && !support.Support2),
-             "support hr %08lx, bits %#x, %#x", hr, support.Support1, support.Support2);
+    expect(hr == S_OK || (hr == E_FAIL && !support.Support1 && !support.Support2),
+           "support hr %08lx, bits %#x, %#x", hr, support.Support1, support.Support2);
     if (format == DXGI_FORMAT_UNKNOWN)
       expect(hr == S_OK && support.Support1 == D3D12_FORMAT_SUPPORT1_BUFFER && !support.Support2,
              "UNKNOWN is not a buffer-only format");
@@ -75,6 +75,22 @@ main(int argc, char **argv) {
     if (format == DXGI_FORMAT_R8G8B8A8_UNORM)
       expect(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
              "required normalized format has no shader sampling");
+    if (format == DXGI_FORMAT_NV12) {
+      const UINT required = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                            D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
+                            D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
+                            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+      // the video bits promise a decoder and a video processor: a device gives them with its video device or not at all
+      const GUID video_device{0x1f052807, 0x0b46, 0x4acc, {0x8a, 0x89, 0x36, 0x4f, 0x79, 0x37, 0x18, 0xa4}}; // ID3D12VideoDevice
+      ComPtr<IUnknown> video_unknown;
+      const UINT video = D3D12_FORMAT_SUPPORT1_DECODER_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT |
+                             D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT;
+      const UINT video_wanted = SUCCEEDED(device->QueryInterface(video_device, &video_unknown)) ? video : 0;
+      expect(hr == S_OK && (support.Support1 & required) == required &&
+                 (support.Support1 & video) == video_wanted &&
+                 support.Support2 == D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+             "NV12 required support hr %08lx, bits %#x, %#x", hr, support.Support1, support.Support2);
+    }
     UINT planes = 1;
     switch (format) {
     case DXGI_FORMAT_R32G8X24_TYPELESS:

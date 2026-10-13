@@ -55,7 +55,11 @@ main() {
       texture->GetDesc(&buffer_desc);
       expect(buffer_desc.Format == wanted, "back-buffer format %#x, expected %#x", buffer_desc.Format, wanted);
       ComPtr<ID3D11RenderTargetView> view;
-      if (!expect(device->CreateRenderTargetView(texture.Get(), nullptr, &view) == S_OK, "CreateRTV failed"))
+      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{wanted == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM
+                                               ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                               : wanted,
+                                           D3D11_RTV_DIMENSION_TEXTURE2D};
+      if (!expect(device->CreateRenderTargetView(texture.Get(), &rtv_desc, &view) == S_OK, "CreateRTV failed"))
         return;
       const float colour[] = {1, 0, 0, 1};
       context->ClearRenderTargetView(view.Get(), colour);
