@@ -183,7 +183,10 @@ public:
   }
 
   void
-  clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height) {
+  clear(
+      uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, uint32_t first_slice = 0,
+      uint32_t slice_count = 0
+  ) {
     meta_temp_.offset[0] = offset_x;
     meta_temp_.offset[1] = offset_y;
     meta_temp_.size[0] = width;
@@ -191,6 +194,8 @@ public:
 
     if (clearing_texture_) {
       ctx_.setComputeTexture(0, clearing_texture_, clearing_view_, ResourceAccess::Write);
+      if (clearing_texture_->textureType(clearing_view_) == WMTTextureType3D)
+        memcpy(ctx_.setComputeBytes(2, sizeof(first_slice)), &first_slice, sizeof(first_slice));
     } else if (clearing_buffer_) {
       if (clearing_view_) {
         auto &dst_ = clearing_buffer_->view_(clearing_view_);
@@ -211,7 +216,7 @@ public:
     void *temp = ctx_.setComputeBytes(1, sizeof(meta_temp_));
     memcpy(temp, &meta_temp_, sizeof(meta_temp_));
 
-    ctx_.dispatch({width, height, dispatch_depth_});
+    ctx_.dispatch({width, height, slice_count ? slice_count : dispatch_depth_});
   }
 
   void

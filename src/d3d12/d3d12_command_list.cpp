@@ -2270,9 +2270,12 @@ public:
       return;
     }
     D3D12_RECT full_rect;
+    UINT element_stride = 1, first_slice = 0, slice_count = 0;
     switch (Descriptor.type) {
     case ShaderVisibleDescriptorType::UAVBuffer: {
       allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+      element_stride = Descriptor.UAVBuffer.slice.byteLength /
+                       (Descriptor.UAVBuffer.slice.elementCount * sizeof(uint32_t));
       full_rect = {
           (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
           (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
@@ -2281,6 +2284,8 @@ public:
     }
     case ShaderVisibleDescriptorType::UAVTexture: {
       allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
+      first_slice = Descriptor.UAVTexture.first_slice;
+      slice_count = Descriptor.UAVTexture.slice_count;
       full_rect = {
           0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
           (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
@@ -2305,11 +2310,17 @@ public:
 
     for (unsigned i = 0; i < rect_count; i++) {
       auto &rect = rects[i];
-      auto width = rect.right - rect.left;
-      auto height = rect.bottom - rect.top;
-      if (width <= 0 || height <= 0)
+      auto left = RectCount ? std::max<int64_t>(rect.left, 0) : 0;
+      auto top = std::max<int64_t>(rect.top, 0);
+      auto right = RectCount ? std::min<int64_t>(rect.right, (full_rect.right - full_rect.left) / element_stride)
+                             : (full_rect.right - full_rect.left) / element_stride;
+      auto bottom = std::min<int64_t>(rect.bottom, full_rect.bottom);
+      if (right <= left || bottom <= top)
         continue;
-      allocator_->clear_uav_.clear(rect.left, rect.top, width, height);
+      allocator_->clear_uav_.clear(
+          full_rect.left + left * element_stride, top, (right - left) * element_stride, bottom - top,
+          first_slice, slice_count
+      );
     }
 
     allocator_->clear_uav_.end();
@@ -2331,9 +2342,12 @@ public:
       return;
     }
     D3D12_RECT full_rect;
+    UINT element_stride = 1, first_slice = 0, slice_count = 0;
     switch (Descriptor.type) {
     case ShaderVisibleDescriptorType::UAVBuffer: {
       allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+      element_stride = Descriptor.UAVBuffer.slice.byteLength /
+                       (Descriptor.UAVBuffer.slice.elementCount * sizeof(uint32_t));
       full_rect = {
           (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
           (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
@@ -2341,10 +2355,12 @@ public:
       break;
     }
     case ShaderVisibleDescriptorType::UAVTexture: {
-      allocator_->clear_uav_.begin(color, Descriptor.SRVTexture.texture, Descriptor.SRVTexture.view);
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
+      first_slice = Descriptor.UAVTexture.first_slice;
+      slice_count = Descriptor.UAVTexture.slice_count;
       full_rect = {
-          0, 0, (LONG)Descriptor.SRVTexture.texture->width(Descriptor.SRVTexture.view),
-          (LONG)Descriptor.SRVTexture.texture->height(Descriptor.SRVTexture.view)
+          0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
+          (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
       };
       break;
     }
@@ -2366,11 +2382,17 @@ public:
 
     for (unsigned i = 0; i < rect_count; i++) {
       auto &rect = rects[i];
-      auto width = rect.right - rect.left;
-      auto height = rect.bottom - rect.top;
-      if (width <= 0 || height <= 0)
+      auto left = RectCount ? std::max<int64_t>(rect.left, 0) : 0;
+      auto top = std::max<int64_t>(rect.top, 0);
+      auto right = RectCount ? std::min<int64_t>(rect.right, (full_rect.right - full_rect.left) / element_stride)
+                             : (full_rect.right - full_rect.left) / element_stride;
+      auto bottom = std::min<int64_t>(rect.bottom, full_rect.bottom);
+      if (right <= left || bottom <= top)
         continue;
-      allocator_->clear_uav_.clear(rect.left, rect.top, width, height);
+      allocator_->clear_uav_.clear(
+          full_rect.left + left * element_stride, top, (right - left) * element_stride, bottom - top,
+          first_slice, slice_count
+      );
     }
 
     allocator_->clear_uav_.end();

@@ -680,7 +680,10 @@ public:
             enc.emulated_cmd.ClearBufferUint(buffer_alloc->buffer(), slice.byteOffset + offset, slice.byteLength >> 2, value);
           } else {
             auto [view, element_offset] = enc.access(buffer, viewId, ResourceAccess::Write);
-            enc.emulated_cmd.ClearTextureBufferUint(view.texture, slice.firstElement + element_offset, slice.elementCount, value);
+            enc.emulated_cmd.ClearTextureBufferUint(
+                view.texture, slice.firstElement + element_offset, slice.elementCount,
+                ClearUAV<ArgumentEncodingContext>::clearColor(value, buffer->pixelFormat(viewId))
+            );
           }
         }
       });
@@ -831,10 +834,10 @@ public:
       });
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
-        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
-        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
-        int32_t rect_width = rect.right - rect_offset_x;
-        int32_t rect_height = rect.bottom - rect_offset_y;
+        auto rect_offset_x = std::max<int64_t>(rect.left, 0);
+        auto rect_offset_y = std::max<int64_t>(rect.top, 0);
+        auto rect_width = std::min<int64_t>(rect.right, rtv->description().Width) - rect_offset_x;
+        auto rect_height = std::min<int64_t>(rect.bottom, rtv->description().Height) - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
         EmitOP([=, array_length = rtv->description().RenderTargetArrayLength](ArgumentEncodingContext &enc) {
@@ -872,10 +875,10 @@ public:
       });
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
-        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
-        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
-        int32_t rect_width = rect.right - rect_offset_x;
-        int32_t rect_height = rect.bottom - rect_offset_y;
+        auto rect_offset_x = std::max<int64_t>(rect.left, 0);
+        auto rect_offset_y = std::max<int64_t>(rect.top, 0);
+        auto rect_width = std::min<int64_t>(rect.right, dsv->description().Width) - rect_offset_x;
+        auto rect_height = std::min<int64_t>(rect.bottom, dsv->description().Height) - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
         EmitOP([=, depth = color[0]](ArgumentEncodingContext &enc) {
@@ -889,35 +892,50 @@ public:
     }
 
     if (auto expected = com_cast<ID3D11UnorderedAccessView>(pView)) {
-      InvalidateCurrentPass(true);
       auto uav = static_cast<D3D11UnorderedAccessView *>(expected.ptr());
       D3D11_UNORDERED_ACCESS_VIEW_DESC1 desc;
       uav->GetDesc1(&desc);
+      if (desc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D)
+        return;
+      InvalidateCurrentPass(true);
+      UINT first_element = 0, element_stride = 1;
+      UINT width, height;
       if (desc.ViewDimension != D3D11_UAV_DIMENSION_BUFFER) {
+        width = uav->texture()->width(uav->viewId());
+        height = uav->texture()->height(uav->viewId());
         EmitST([=, texture = uav->texture(),
                 view = uav->viewId()](ArgumentEncodingContext &enc) {
           enc.clear_uav_cmd.begin(color, texture.ptr(), view);
         });
-      } else if (desc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) {
-        EmitST([=, buffer = uav->buffer(),
-                view = uav->viewId()](ArgumentEncodingContext &enc) {
-          enc.clear_uav_cmd.begin(color, buffer.ptr(), view);
-        });
       } else {
-        EmitST([=, buffer = uav->buffer()](ArgumentEncodingContext &enc) {
-          enc.clear_uav_cmd.begin(color, buffer.ptr());
-        });
+        auto slice = uav->bufferSlice();
+        width = desc.Buffer.NumElements;
+        height = 1;
+        if (desc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW || desc.Format == DXGI_FORMAT_UNKNOWN) {
+          first_element = slice.byteOffset / sizeof(uint32_t);
+          element_stride = slice.byteLength / (desc.Buffer.NumElements * sizeof(uint32_t));
+          EmitST([=, buffer = uav->buffer()](ArgumentEncodingContext &enc) {
+            enc.clear_uav_cmd.begin(color, buffer.ptr());
+          });
+        } else {
+          first_element = slice.firstElement;
+          EmitST([=, buffer = uav->buffer(), view = uav->viewId()](ArgumentEncodingContext &enc) {
+            enc.clear_uav_cmd.begin(color, buffer.ptr(), view);
+          });
+        }
       }
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
-        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
-        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
-        int32_t rect_width = rect.right - rect_offset_x;
-        int32_t rect_height = rect.bottom - rect_offset_y;
+        auto rect_offset_x = std::max<int64_t>(rect.left, 0);
+        auto rect_offset_y = std::max<int64_t>(rect.top, 0);
+        auto rect_width = std::min<int64_t>(rect.right, width) - rect_offset_x;
+        auto rect_height = std::min<int64_t>(rect.bottom, height) - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
         EmitOP([=](ArgumentEncodingContext &enc) {
-          enc.clear_uav_cmd.clear(rect_offset_x, rect_offset_y, rect_width, rect_height);
+          enc.clear_uav_cmd.clear(
+              first_element + rect_offset_x * element_stride, rect_offset_y, rect_width * element_stride, rect_height
+          );
         });
       }
       EmitST([](ArgumentEncodingContext &enc) { enc.clear_uav_cmd.end(); });

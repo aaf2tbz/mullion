@@ -221,6 +221,8 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexture;
     cpu_storage.UAVTexture.texture = Texture; // 
     cpu_storage.UAVTexture.view = View;
+    cpu_storage.UAVTexture.first_slice = FirstWSlice;
+    cpu_storage.UAVTexture.slice_count = WSize;
     if (mapped_argument_buffer_) {
       auto &texture_view = Texture->view(View);
       auto &gpu_storage = mapped_argument_buffer_[Index];

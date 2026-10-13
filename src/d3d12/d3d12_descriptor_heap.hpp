@@ -96,7 +96,12 @@ struct SRVTextureCPUStorage {
   TextureViewKey view{};
 };
 
-using UAVTextureCPUStorage = SRVTextureCPUStorage;
+struct UAVTextureCPUStorage {
+  Texture *texture = nullptr;
+  TextureViewKey view{};
+  UINT first_slice = 0;
+  UINT slice_count = 0;
+};
 
 struct UAVTexelBufferCPUStorage {
   Buffer *buffer = nullptr;
