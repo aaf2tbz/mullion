@@ -230,6 +230,8 @@ struct RenderEncoderData : EncoderData {
   bool use_visibility_result = 0;
   size_t visibility_result_window = 0;
   uint64_t visibility_result_count = 0;
+  // of WMT::kPassRectangles
+  uint32_t scissors = 0, viewports = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
   TileBarrierPSOKey tile_barrier_pso_key = {};

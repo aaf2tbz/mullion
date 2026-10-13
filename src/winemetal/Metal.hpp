@@ -390,6 +390,11 @@ public:
   }
 };
 
+// the scissors, and the viewports, a render pass of several viewports takes: the driver ends the process when the
+// pass's sets of scissors, each counted as many as it has viewports, come to 65,536, and when the viewports it was
+// set come to somewhat more (tests/native/pass_arrays.swift and .txt)
+constexpr uint32_t kPassRectangles = 65535;
+
 class RenderCommandEncoder : public CommandEncoder {
 public:
   void

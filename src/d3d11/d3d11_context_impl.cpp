@@ -4629,6 +4629,8 @@ public:
   bool promote_flush = false;
   unsigned active_visibility_queries_ = 0;
   uint64_t visibility_result_segments_ = 0;
+  // what the pass has of WMT::kPassRectangles
+  uint32_t pass_scissors_ = 0, pass_viewports_ = 0;
 
   void
   VisibilityQueryBoundary(bool counting) {
@@ -4667,6 +4669,7 @@ public:
       });
       allocated_encoder_argbuf_size_ = nullptr;
       visibility_result_segments_ = 0;
+      pass_scissors_ = pass_viewports_ = 0;
       break;
     }
     case CommandBufferState::ComputeEncoderActive:
@@ -5264,6 +5267,11 @@ public:
   template <bool IndexedDraw>
   DrawCallStatus
   PreDraw() {
+    // a draw whose scissors or viewports the pass has no room for starts the next pass
+    const UINT rectangles = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    if ((dirty_state.any(DirtyState::Scissors) && pass_scissors_ + rectangles > WMT::kPassRectangles) ||
+        (dirty_state.any(DirtyState::Viewport) && pass_viewports_ + rectangles > WMT::kPassRectangles))
+      InvalidateCurrentPass(true);
     DrawCallStatus status;
     if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
       return status;
@@ -5317,11 +5325,13 @@ public:
         viewports[i] = {d3dViewport.TopLeftX, d3dViewport.TopLeftY, d3dViewport.Width,
                         d3dViewport.Height,   d3dViewport.MinDepth, d3dViewport.MaxDepth};
       }
+      pass_viewports_ += viewport_count;
       EmitST([viewports = std::move(viewports)](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
         cmd.type = WMTRenderCommandSetViewports;
         cmd.viewports.set(viewports.data());
         cmd.viewport_count = viewports.size();
+        enc.currentRenderEncoder()->viewports += viewports.size();
       });
     }
     if (dirty_state.any(DirtyState::Scissors)) {
@@ -5346,11 +5356,13 @@ public:
           scissors[i] = {0, 0, render_target_width, render_target_height};
         }
       }
+      pass_scissors_ += viewport_count;
       EmitST([scissors = std::move(scissors)](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
         cmd.type = WMTRenderCommandSetScissorRects;
         cmd.scissor_rects.set(scissors.data());
         cmd.rect_count = scissors.size();
+        enc.currentRenderEncoder()->scissors += scissors.size();
       });
     }
     dirty_state.clrAll();

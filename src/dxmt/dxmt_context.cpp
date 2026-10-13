@@ -1548,6 +1548,7 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
 
     if (r0->visibility_result_count + r1->visibility_result_count <=
             VisibilityResultOffsetBumpState::kVisibilitySegments &&
+        r0->scissors + r1->scissors <= WMT::kPassRectangles && r0->viewports + r1->viewports <= WMT::kPassRectangles &&
         (!r0->use_visibility_result || !r1->use_visibility_result ||
          r0->visibility_result_window == r1->visibility_result_window) &&
         isEncoderSignatureMatched(r0, r1) &&
@@ -1608,6 +1609,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
         r1->visibility_result_window = r0->visibility_result_window;
       r1->use_visibility_result = r0->use_visibility_result || r1->use_visibility_result;
       r1->visibility_result_count += r0->visibility_result_count;
+      r1->scissors += r0->scissors;
+      r1->viewports += r0->viewports;
 
       r1->fence_update.merge(r0->fence_update);
       r1->fence_wait.merge(r0->fence_wait);

@@ -558,6 +558,13 @@ public:
   PreDraw(bool SkipResourceBinding = false) {
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
+    // a draw whose scissors or viewports the pass has no room for starts the next pass
+    const UINT count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    if (auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+        allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render &&
+        ((dirty_state_.test(DirtyState::ScissorRect) && pass->scissors + count > WMT::kPassRectangles) ||
+         (dirty_state_.test(DirtyState::Viewport) && pass->viewports + count > WMT::kPassRectangles)))
+      allocator_->InvalidateCurrentPass();
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
 
       allocator_->InvalidateCurrentPass();
@@ -736,7 +743,6 @@ public:
     // a primitive names one of the viewports and scissors there may be (D3D11.3 15.8.1). a viewport that is not set
     // is of no size and a scissor that is not set is empty (15.6, 15.7): nothing is drawn through either, which an
     // empty scissor says to Metal, whatever viewport it has there
-    const UINT count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     if (dirty_state_.test(DirtyState::Viewport) && num_viewports) {
       auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(count);
       for (auto i = 0u; i < count; i++) {
@@ -748,6 +754,7 @@ public:
       cmd.type = WMTRenderCommandSetViewports;
       cmd.viewports.set(metal_viewport);
       cmd.viewport_count = count;
+      static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
       dirty_state_.clr(DirtyState::Viewport);
     }
 
@@ -773,6 +780,7 @@ public:
       cmd.scissor_rects.set(metal_scissors);
       // Metal takes as many scissors as it has viewports, or one, and it has one viewport until some are set
       cmd.rect_count = num_viewports ? count : 1;
+      pass->scissors += cmd.rect_count;
       dirty_state_.clr(DirtyState::ScissorRect);
     }
 

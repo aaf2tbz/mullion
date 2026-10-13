@@ -110,6 +110,8 @@ struct RenderEncoderData : EncoderData {
   uint8_t render_target_count;
   bool use_visibility_result = 0;
   obj_handle_t visibility_buffer = 0; // where active occlusion queries count
+  // of WMT::kPassRectangles
+  uint32_t scissors = 0, viewports = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
 };
