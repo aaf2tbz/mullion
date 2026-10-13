@@ -23,6 +23,9 @@
 
 static constexpr UINT frames = 4, concurrent_frames = 12, width = 8, height = 4, turns = 4096, threads = 32;
 static constexpr UINT indices[] = {0, 1, 2}, instances[] = {1, 2};
+// how long the first frame's fence is kept from the queue that waits for it, which has that time to encode the
+// frame's two small lists: nothing tells an application that a list is encoded
+static constexpr DWORD held_ms = 200;
 static const char hlsl[] = R"hlsl(
 float4 vs(uint id : SV_VertexID) : SV_Position {
   float2 uv = float2((id << 1) & 2, id & 2);
@@ -260,11 +263,17 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   for (UINT frame = 0; frame < frames; frame++) {
     step("child frame %u: replay two pipelines, two kernels and timestamps", frame);
     ID3D12CommandList *submitted[] = {lists[0].Get(), lists[1].Get()};
-    if (!frame)
+    if (!frame) {
       CHECK(queues[0]->Wait(held.Get(), 1));
+      // a wait for a value the fence has had holds nothing more
+      CHECK(queues[0]->Wait(held.Get(), 0));
+    }
     queues[0]->ExecuteCommandLists(std::size(submitted), submitted);
-    if (!frame)
+    if (!frame) {
+      Sleep(held_ms);
+      facts << now() << '\n';
       CHECK(held->Signal(1));
+    }
     ComPtr<ID3D12Fence> fence;
     CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
     auto event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -463,8 +472,8 @@ main(int argc, char **argv) {
     for (auto &name : names)
       std::getline(facts, name);
     UINT pid = 0, capacity = 0;
-    UINT64 began = 0, ended = 0, query_start = 0, query_end = 0;
-    facts >> pid >> began >> capacity;
+    UINT64 began = 0, ended = 0, query_start = 0, query_end = 0, signaled = 0;
+    facts >> pid >> began >> capacity >> signaled;
     std::array<UINT64, 2> sampled_queries[frames]{};
     for (UINT frame = 0; frame < frames; frame++) {
       auto &query = sampled_queries[frame];
@@ -487,7 +496,7 @@ main(int argc, char **argv) {
     std::map<std::string, UINT> frame_counts;
     UINT files = 0, clocks = 0, spans = 0;
     std::map<UINT64, UINT> list_counts;
-    UINT64 last_frame = 0;
+    UINT64 last_frame = 0, held_began = ~UINT64(0), held_took = 0;
     for (auto &entry : std::filesystem::directory_iterator(directory)) {
       if (entry.path().extension() != ".diag")
         continue;
@@ -522,6 +531,8 @@ main(int argc, char **argv) {
           expect(number(row[3]) && number(row[5]) && began <= number(row[4]) &&
                      number(row[4]) + number(row[5]) <= ended,
                  "execute span outside run");
+          if (number(row[4]) < held_began)
+            held_began = number(row[4]), held_took = number(row[5]);
         } else if (row[0] == "buffer" && expect(row.size() == 4, "malformed buffer creation")) {
           expect(number(row[1]) && number(row[2]) && number(row[3]), "empty buffer creation");
         } else {
@@ -533,6 +544,13 @@ main(int argc, char **argv) {
     if (profiling) {
       expect(clocks == 2, "one clock pair per queue");
       expect(spans == frames + 1 && list_counts[2] == frames && list_counts[1] == 1, "execute spans lost list counts");
+      // ID3D12CommandQueue::Wait: "waits until the specified fence reaches or exceeds the specified value": the
+      // lists behind it run after the signal; their encoding does not wait for it, so the GPU has them at once
+      expect(held_began + held_took <= signaled, "lists behind a Wait were encoded %lld ns after the fence's signal",
+             (long long)(held_began + held_took - signaled));
+      for (auto &[key, row] : buffers)
+        expect(number(row[3]) < held_began || number(row[3]) >= signaled,
+               "command buffer committed ahead of a Wait's fence");
       expect(presents.size() == frames + 2 * concurrent_frames && frame_counts.size() == 2, "presents missing");
       if (!presents.empty()) {
         const auto queue = presents.front()[1];

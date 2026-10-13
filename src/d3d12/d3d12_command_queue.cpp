@@ -63,8 +63,42 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   dxmt::condition_variable held_changed_;
   std::deque<std::function<void()>> held_;
   bool holding_ = false, held_stop_ = false;
-  // the fence value the worker waits for
-  std::shared_ptr<std::atomic<bool>> awaited_;
+  // a Wait's fence has the queue's later command buffers until it is there: they are encoded ahead and committed
+  // in order by the signal that brings it. one gate is closed at a time, and is open only once its buffers are
+  // committed, so the order is the queue's. a queue that ends behind its Wait cancels: its buffers never run
+  struct Gate {
+    dxmt::mutex mutex;
+    std::atomic<bool> closed;
+    bool cancelled = false;
+    std::vector<std::pair<WMT::Reference<WMT::CommandBuffer>, uint64_t *>> buffers;
+
+    void
+    Commit(WMT::CommandBuffer buffer, uint64_t *committed) {
+      std::lock_guard<dxmt::mutex> lock(mutex);
+      closed ? (void)buffers.emplace_back(buffer, committed) : Run(buffer, committed);
+    }
+
+    void
+    Open(bool cancel = false) {
+      std::lock_guard<dxmt::mutex> lock(mutex);
+      cancelled |= cancel && closed;
+      for (auto &[buffer, committed] : std::exchange(buffers, {}))
+        Run(buffer, committed);
+      closed = false;
+      closed.notify_all();
+    }
+
+  private:
+    void
+    Run(WMT::CommandBuffer buffer, uint64_t *committed) {
+      if (cancelled)
+        return;
+      if (committed)
+        *committed = diag::Now();
+      buffer.commit();
+    }
+  };
+  std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
   dxmt::thread held_thread_;
 
   // what the queue does and where it waits, with DXMT_LOG_LEVEL=trace: the last lines of a hang name it
@@ -80,7 +114,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   bool
   Hold(Work &&work, bool begin = false) {
     std::unique_lock<dxmt::mutex> lock(held_mutex_);
-    if (!holding_ && !begin)
+    if (!holding_ && !begin && !gate_->closed)
       return false;
     if (!held_thread_.joinable())
       held_thread_ = dxmt::thread([this] { CommitHeld(); });
@@ -93,7 +127,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   bool
   Holding() {
     std::unique_lock<dxmt::mutex> lock(held_mutex_);
-    return holding_;
+    return holding_ || gate_->closed;
   }
 
   void
@@ -152,9 +186,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         mapping_queue_ = device_->GetMTLDevice().newMTL4CommandQueue();
         mapped_ = new Fence(device_->GetMTLDevice());
       }
-      auto before = scope.End();
       Trace("tile mappings: waits for the work before");
-      before.waitUntilCompleted();
+      if (!scope.Settle())
+        return;
       update(mapping_queue_);
       mapping_queue_.signalEvent(mapped_->sharedEvent(), ++mapping_value_);
       Trace("tile mappings: waits for mapping ", mapping_value_);
@@ -221,6 +255,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   struct InflightCommandBuffer {
     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
     WMT::Reference<WMT::Buffer> sparse_mappings{};
+    std::shared_ptr<Gate> gate{};
     std::shared_ptr<GPURecordChecks> records{};
     HANDLE semaphore{};
     std::function<void()> completed{};
@@ -321,6 +356,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         break;
       auto &inflight = inflight_cmdbuf_pool_[internal_seq % kCommandQueueSize];
 
+      inflight.gate->closed.wait(true);
+      // a cancelled gate's: it never runs, and nothing of the queue's follows it
+      if (inflight.cmdbuf.status() < WMTCommandBufferStatusCommitted) {
+        inflight = {};
+        inflight_cmdbuf_count_.fetch_sub(1, std::memory_order_release);
+        inflight_cmdbuf_count_.notify_one();
+        internal_seq++;
+        continue;
+      }
       Trace("waits for command buffer ", internal_seq);
       Watched(internal_seq);
       if (profile_ || inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
@@ -438,14 +482,27 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     WMT::Reference<WMT::CommandBuffer>
     End() {
       auto ended = inflight->cmdbuf;
-      if (queue->profile_)
-        queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].committed = diag::Now();
+      (inflight->gate = queue->gate_)->Commit(
+          ended, queue->profile_
+                     ? &queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].committed
+                     : nullptr);
       inflight = nullptr;
-      ended.commit();
       queue->inflight_cmdbuf_seq_.fetch_add(1, std::memory_order_release);
       queue->inflight_cmdbuf_seq_.notify_one();
       pool = nullptr;
       return ended;
+    }
+
+    // ends the command buffer and waits for it, past the fence a Wait before it names: what the work so far leaves
+    // in memory is then there. false when the queue ended behind that Wait
+    bool
+    Settle() {
+      auto ended = End();
+      queue->gate_->closed.wait(true);
+      if (ended.status() < WMTCommandBufferStatusCommitted)
+        return false;
+      ended.waitUntilCompleted();
+      return true;
     }
 
     ~CommittingScope() {
@@ -472,10 +529,7 @@ public:
         held_stop_ = true;
         held_changed_.notify_all();
         // a wait the queue will never see the end of
-        if (awaited_) {
-          *awaited_ = true;
-          awaited_->notify_all();
-        }
+        gate_->Open(true);
       }
       held_thread_.join();
     }
@@ -719,6 +773,11 @@ public:
     } keeps{scope, std::move(allocators)};
     WMT::Reference<WMT::Buffer> sparse_mappings;
     auto mappings = device_->SparseBufferMappings();
+    // another queue's mappings change the table, and a Wait may be for them: it is read past the Wait's fence
+    if (!mappings.empty() && gate_->closed) {
+      gate_->closed.wait(true);
+      mappings = device_->SparseBufferMappings();
+    }
     if (!mappings.empty()) {
       WMTBufferInfo info{mappings.size() * sizeof(mappings[0]), WMTResourceStorageModeShared};
       sparse_mappings = device_->GetMTLDevice().newBuffer(info);
@@ -740,8 +799,7 @@ public:
       std::shared_ptr<GPURecordChecks> checks;
       if (record_totals_)
         checks = scope.inflight->records;
-      auto ended = scope.End();
-      ended.waitUntilCompleted();
+      scope.Settle();
       if (record_totals_)
         CompareGPURecords(checks, record_totals_);
       scope.Start();
@@ -954,6 +1012,8 @@ public:
           break;
         }
         case EncoderType::AccelerationStructure: {
+          // which structures are built is the device's, and another queue's builds change it
+          gate_->closed.wait(true);
           auto data = static_cast<AccelerationStructureEncoderData *>(current);
           for (auto filled = data->filled; filled; filled = filled->next) {
             auto &structure = *filled->structure;
@@ -1008,9 +1068,9 @@ public:
           // copies them
           WMTBufferInfo info{data->count * sizeof(uint64_t), WMTResourceStorageModeShared};
           auto staging = device_->GetMTLDevice().newBuffer(info);
-          scope.End();
-          Trace("waits for the timestamps of command buffer ", inflight_cmdbuf_seq_ - 1);
-          retired_.Expect(inflight_cmdbuf_seq_ - 1)->wait(false);
+          Trace("waits for the timestamps of command buffer ", inflight_cmdbuf_seq_.load());
+          if (scope.Settle())
+            retired_.Expect(inflight_cmdbuf_seq_ - 1)->wait(false);
           memcpy(info.memory.ptr, &data->heap->timestamps[data->start], data->count * sizeof(uint64_t));
           scope.Start();
           cmdbuf = scope.inflight->cmdbuf;
@@ -1219,18 +1279,24 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   Wait(ID3D12Fence *pFence, UINT64 Value) {
-    auto reached = static_cast<MTLD3D12Fence *>(pFence)->Expect(Value);
-    auto work = [this, reached] {
+    auto gate = std::make_shared<Gate>();
+    gate->closed = true;
+    static_cast<MTLD3D12Fence *>(pFence)->Expect(Value, [gate] { gate->Open(); });
+    auto work = [this, gate] {
+      gate_->closed.wait(true);
       {
-        std::lock_guard<dxmt::mutex> lock(held_mutex_);
+        // after a submission another thread is in the middle of
+        std::scoped_lock lock(mutex_commit_, held_mutex_);
         if (held_stop_)
           return;
-        awaited_ = reached;
+        gate_ = gate;
       }
-      reached->wait(false);
+      // a Signal follows the last command buffer: an empty one is behind the gate for one with no work before it
+      if (gate->closed)
+        StartCommitting();
     };
-    Trace("Wait for fence ", pFence, " at ", Value, *reached ? ", which it has had" : ", which holds the queue");
-    if (!Hold(work) && !*reached)
+    Trace("Wait for fence ", pFence, " at ", Value, gate->closed ? ", which holds the queue" : ", which it has had");
+    if (gate->closed && !Hold(work))
       Hold(work, true);
     return S_OK;
   };
