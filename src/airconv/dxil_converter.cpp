@@ -1370,11 +1370,22 @@ convert_dxil(
     return make_error<UnsupportedFeature>(std::format("DXIL function {} not found", function));
   auto body = &F->getEntryBlock();
   auto &entry_bb = ctx.function->getEntryBlock();
-  // a ray tracing shader's function takes its payload and attributes, which the visible function has untyped
+  // a ray tracing shader's function takes its payload and attributes, which the visible function has untyped. another
+  // stage's keeps the parameters HLSL gave it when it reads one (DXC compiles a read of a mesh shader's output array
+  // so): nothing passes them, and they are memory of its own that nothing has written
   for (auto &argument : F->args())
-    argument.replaceAllUsesWith(new BitCastInst(
-        ctx.resource.ray_arguments[argument.getArgNo()], argument.getType(), "", &*entry_bb.getFirstInsertionPt()
-    ));
+    argument.replaceAllUsesWith(
+        ctx.resource.ray_context
+            ? (Value *)new BitCastInst(
+                  ctx.resource.ray_arguments[argument.getArgNo()], argument.getType(), "",
+                  &*entry_bb.getFirstInsertionPt()
+              )
+            : argument.getType()->isPointerTy()
+                  ? (Value *)new AllocaInst(
+                        argument.getType()->getNonOpaquePointerElementType(), 0, "", &*entry_bb.getFirstInsertionPt()
+                    )
+                  : UndefValue::get(argument.getType())
+    );
   for (auto &I : make_early_inc_range(*body))
     if (isa<AllocaInst>(I))
       I.moveBefore(&*entry_bb.getFirstInsertionPt());

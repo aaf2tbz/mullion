@@ -10,6 +10,11 @@
 // D3D12 pipeline state cache sample). "The pipeline stream description is matched against the library database"
 // (ID3D12PipelineLibrary1::LoadPipeline). the converter import counts conversion with the disk cache disabled;
 // named stream loads must preserve identity, reject AS/MS/depth bounds changes, and draw the same generated values.
+// a mesh shader's payload comes from DispatchMesh: "This parameter provides the same input values for the entire
+// Mesh shader thread group." (D3D12 mesh shader specification, Mesh Payload). its output arrays are another matter:
+// "Each array cannot be read from" (Shared Output Arrays), yet DXC compiles such a read, to one of a parameter the
+// function then keeps. the amplified shader has one, masked by a payload field that is 0: what it draws does not
+// depend on what the read gives, and it must still become a pipeline.
 #include "d3d12_test.hpp"
 #include <array>
 #include <random>
@@ -128,8 +133,8 @@ struct Stream {
 static const char mesh_hlsl[] = R"hlsl(
 cbuffer constants : register(b0) { uint number; };
 struct V { float4 pos : SV_Position; nointerpolation uint value : DATA; };
-struct Payload { uint value; };
-[numthreads(1, 1, 1)] void amplify() { Payload payload; payload.value = BIAS; DispatchMesh(1, 1, 1, payload); }
+struct Payload { uint value, none; };
+[numthreads(1, 1, 1)] void amplify() { Payload payload = {BIAS, 0}; DispatchMesh(1, 1, 1, payload); }
 [numthreads(1, 1, 1)] [outputtopology("triangle")]
 void mesh(
 #ifdef AMPLIFIED
@@ -141,7 +146,7 @@ void mesh(
     verticesOut[id].pos = float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
     verticesOut[id].value = BIAS;
 #ifdef AMPLIFIED
-    verticesOut[id].value += incoming.value;
+    verticesOut[id].value = BIAS + incoming.value + (verticesOut[id].value & incoming.none);
 #endif
   }
   indicesOut[0] = uint3(0, 1, 2);
@@ -576,7 +581,9 @@ main(int argc, char **argv) {
     auto &stored_stream = streams[i];
     D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stored_stream), &stored_stream};
     ComPtr<ID3D12PipelineState> made, loaded;
-    CHECK(device->CreatePipelineState(&desc, IID_PPV_ARGS(&made)));
+    hr = device->CreatePipelineState(&desc, IID_PPV_ARGS(&made));
+    if (!expect(hr == S_OK && made, "CreatePipelineState returned %08lx for %ls", hr, stream_names[i].c_str()))
+      return verdict();
     CHECK(library->StorePipeline(stream_names[i].c_str(), made.Get()));
     CHECK(library->LoadPipeline(stream_names[i].c_str(), &desc, IID_PPV_ARGS(&loaded)));
     expect(loaded.Get() == made.Get(), "a stream load returned another pipeline");
