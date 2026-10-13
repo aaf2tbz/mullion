@@ -630,7 +630,9 @@ public:
         });
         if ((clear->colors[0].attachment && color == render->colors.end()) ||
             (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
-            (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment))
+            (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment) ||
+            // a plane bound read-only may be sampled in the pass, and a load action clears only the tile's copy
+            (!clear->colors[0].attachment && render->dsv_readonly_flags))
           break;
         if (color != render->colors.end() && color->load_action == WMTLoadActionLoad) {
           color->load_action = WMTLoadActionClear;
@@ -1323,9 +1325,8 @@ public:
       WMTOrigin dst_origin, const D3D12_BOX &dst_extent
   ) {
     bool same = src->pixelFormat() == dst->pixelFormat();
-    bool viewed = DXGIFormatType(src_format.PlaneFormat) == DXGIFormatType(dst_format.PlaneFormat) &&
-                  !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat());
-    if (same || viewed) {
+    if (same || (DXGIFormatType(src_format.PlaneFormat) == DXGIFormatType(dst_format.PlaneFormat) &&
+                 !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat()))) {
       auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
       cmd.type = WMTBlitCommandCopyFromTextureToTexture;
       cmd.src = same ? src->current()->texture()
