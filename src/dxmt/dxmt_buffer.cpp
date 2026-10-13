@@ -90,7 +90,8 @@ BufferAllocation::BufferAllocation(
   sparse_tile_count = info_.length / sparse_tile_bytes;
   suballocation_size_ = info_.length;
   fenceTrackers.resize(suballocation_count_);
-  obj_ = device.newPlacementSparseBuffer(info_.length, info_.options, page_size, gpuAddress_);
+  // and a tile more, which stays mapped (MTLD3D12CommandQueue::Settle)
+  obj_ = device.newPlacementSparseBuffer(info_.length + sparse_tile_bytes, info_.options, page_size, gpuAddress_);
   if (diag::profile && obj_)
     diag::Write(diag::Line("buffer", diag::Now(), obj_.handle, info_.length));
   mappedMemory_ = nullptr;

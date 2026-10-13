@@ -168,13 +168,32 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       work();
   }
 
-  // Metal lets go of the memory a texture's unmapped tiles had when the texture next has a tile mapped: until then
-  // they read it, and take writes to it (seen where the texture can be written by shaders). a mapped tile, copied
-  // onto itself, is such a mapping and changes none; with none mapped, the first tile is mapped to a tile of the
-  // queue's own and unmapped again, which leaves that one tile reading the queue's
+  // Metal lets go of the memory a resource's unmapped tiles had when the resource next has a tile mapped: until then
+  // they read it, and take writes to it (seen of buffers, and of textures that shaders can write). a buffer has a tile
+  // past its end for this (BufferAllocation), mapped to a tile of the queue's own. a texture's mapped tile, copied
+  // onto itself, is such a mapping and changes none; with none mapped, its first tile is mapped to the queue's tile
+  // and unmapped again, which leaves that one tile reading the queue's
   WMT::Reference<WMT::Heap> spare_tile_;
+  WMT::Heap
+  SpareTile() {
+    if (!spare_tile_) {
+      WMTHeapInfo info{};
+      info.sparse_page_size = device_->GetSparsePageSize();
+      info.size = device_->GetMTLDevice().sparseTileSizeInBytes(info.sparse_page_size);
+      info.type = WMTHeapTypePlacement;
+      spare_tile_ = device_->GetMTLDevice().newHeap(info);
+      device_->RegisterResidency(spare_tile_);
+    }
+    return spare_tile_;
+  }
   std::function<void(WMT::MTL4CommandQueue)>
   Settle(const Tiling &tiling, MTLD3D12Resource *resource) {
+    if (!tiling.texture)
+      return [this, res = Com(resource)](WMT::MTL4CommandQueue queue) {
+        auto buffer = res->buffer->current();
+        queue.updateMappings(buffer->buffer(), false, SpareTile(), std::vector<WMTSparseBufferMapping>{
+            {WMTSparseMappingModeMap, buffer->sparse_tile_count, 1, 0}});
+      };
     auto &mapped = resource->mapped_tiles;
     auto bound = std::find(mapped.begin(), mapped.end(), true);
     auto at = tiling.place(bound == mapped.end() ? 0 : bound - mapped.begin());
@@ -185,17 +204,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             {at.origin, at.size, at.level, at.slice, at.origin, at.level, at.slice}});
       };
     return [this, res = Com(resource), at](WMT::MTL4CommandQueue queue) mutable {
-      if (!spare_tile_) {
-        WMTHeapInfo info{};
-        info.sparse_page_size = device_->GetSparsePageSize();
-        info.size = device_->GetMTLDevice().sparseTileSizeInBytes(info.sparse_page_size);
-        info.type = WMTHeapTypePlacement;
-        spare_tile_ = device_->GetMTLDevice().newHeap(info);
-        device_->RegisterResidency(spare_tile_);
-      }
       for (auto mode : {WMTSparseMappingModeMap, WMTSparseMappingModeUnmap}) {
         at.mode = mode;
-        queue.updateMappings(res->texture->current()->texture(), true, spare_tile_, std::vector{at});
+        queue.updateMappings(res->texture->current()->texture(), true, SpareTile(), std::vector{at});
       }
     };
   }
@@ -597,7 +608,7 @@ public:
     if (operations.empty())
       return;
     std::function<void(WMT::MTL4CommandQueue)> settle = [](auto) {};
-    if (tiling.texture && operations.back().mode == WMTSparseMappingModeUnmap)
+    if (operations.back().mode == WMTSparseMappingModeUnmap)
       settle = Settle(tiling, static_cast<MTLD3D12Resource *>(resource));
     Map([this, texture = tiling.texture, res = Com(static_cast<MTLD3D12Resource *>(resource)), settle = std::move(settle),
          heap = Com(static_cast<MTLD3D12Heap *>(heap)), operations = std::move(operations)](WMT::MTL4CommandQueue queue) {
@@ -612,6 +623,7 @@ public:
       for (auto &op : operations)
         ranges.push_back({op.mode, op.origin.x, op.size.width, op.heap_tile});
       queue.updateMappings(res->buffer->current()->buffer(), false, heap_handle, ranges);
+      settle(queue);
       device_->UpdateSparseBufferMappings(res->buffer->current(), ranges);
     });
   };
@@ -646,9 +658,9 @@ public:
         destination.index(*dst_region_start_coordinate, *region_size, 0) >
             source.index(*src_region_start_coordinate, *region_size, 0))
       std::reverse(operations.begin(), operations.end());
-    // a copy of a tile that is not mapped unmaps
+    // a copy of a tile that is not mapped unmaps; which of a buffer's are is not kept here
     std::function<void(WMT::MTL4CommandQueue)> settle = [](auto) {};
-    if (unmaps)
+    if (unmaps || !source.texture)
       settle = Settle(destination, dst);
     Map([this, texture = source.texture, src = Com(src), dst = Com(dst), settle = std::move(settle),
          operations = std::move(operations)](WMT::MTL4CommandQueue queue) {
@@ -661,6 +673,7 @@ public:
       for (auto &op : operations)
         ranges.push_back({op.origin.x, 1, op.destination_origin.x});
       queue.copyMappings(src->buffer->current()->buffer(), dst->buffer->current()->buffer(), false, ranges);
+      settle(queue);
       device_->CopySparseBufferMappings(src->buffer->current(), dst->buffer->current(), ranges);
     });
   };
