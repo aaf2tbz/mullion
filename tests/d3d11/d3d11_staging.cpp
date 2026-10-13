@@ -1,6 +1,7 @@
-// contract: staging resources take every copy and update that other resources take.
-// - UpdateSubresource writes a staging buffer and a box of a staging texture (it may not write only immutable and
-//   dynamic resources), in order with the copies around it: a copy out before the update sees the bytes before.
+// contract: staging resources take every copy, and a staging texture every update, that other resources take.
+// - UpdateSubresource writes a box of a staging texture, in order with the copies around it. it leaves a staging
+//   buffer as it was: Wine's test_staging_buffers (dlls/d3d11/tests/d3d11.c) records that of Windows, for a buffer
+//   of CPU write access made with data, updated whole and copied out.
 // - copies between a block-compressed format and an uncompressed one of the block's size ("CopySubresourceRegion",
 //   format conversion between BC1 and 64-bit formats, BC3 and 128-bit ones) carry a block as a texel, bit for bit,
 //   whichever side is a staging texture, a default one, or both are staging; a region of blocks lands at the
@@ -65,29 +66,26 @@ main() {
     return bytes;
   };
 
-  // updates: a staging buffer, part of it, then a staging texture's box
+  // updates: a staging buffer, whole and in part, then a staging texture's box
   {
     const UINT size = 64, from = 20, to = 44;
-    D3D11_BUFFER_DESC desc{size, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE};
-    ComPtr<ID3D11Buffer> staging, before;
-    CHECK(device->CreateBuffer(&desc, nullptr, &staging));
-    CHECK(device->CreateBuffer(&desc, nullptr, &before));
-    auto whole = content(1, size), part = content(2, to - from);
-    context->UpdateSubresource(staging.Get(), 0, nullptr, whole.data(), 0, 0);
-    // a copy out here holds the first update only
-    context->CopyResource(before.Get(), staging.Get());
+    D3D11_BUFFER_DESC desc{size, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_WRITE};
+    auto made = content(1, size), other = content(2, size);
+    D3D11_SUBRESOURCE_DATA data{made.data()};
+    ComPtr<ID3D11Buffer> staging, out;
+    CHECK(device->CreateBuffer(&desc, &data, &staging));
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    CHECK(device->CreateBuffer(&desc, nullptr, &out));
     const D3D11_BOX box{from, 0, 0, to, 1, 1};
-    context->UpdateSubresource(staging.Get(), 0, &box, part.data(), 0, 0);
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    CHECK(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped));
-    for (UINT i = 0; i < size; i++) {
-      uint8_t want = i >= from && i < to ? part[i - from] : whole[i];
-      expect(((const uint8_t *)mapped.pData)[i] == want, "an updated staging buffer's byte", ((const uint8_t *)mapped.pData)[i], want);
+    for (const D3D11_BOX *part : {(const D3D11_BOX *)nullptr, &box}) {
+      context->UpdateSubresource(staging.Get(), 0, part, other.data(), 0, 0);
+      context->CopyResource(out.Get(), staging.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      CHECK(context->Map(out.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+      for (UINT i = 0; i < size; i++)
+        expect(((const uint8_t *)mapped.pData)[i] == made[i], "a staging buffer's byte after an update", ((const uint8_t *)mapped.pData)[i], made[i]);
+      context->Unmap(out.Get(), 0);
     }
-    context->Unmap(staging.Get(), 0);
-    CHECK(context->Map(before.Get(), 0, D3D11_MAP_READ, 0, &mapped));
-    expect(!memcmp(mapped.pData, whole.data(), size), "the copy made before the second update", 0, 1);
-    context->Unmap(before.Get(), 0);
 
     const UINT width = 8, height = 6, texel = 4;
     auto target = texture(width, height, 1, DXGI_FORMAT_R8G8B8A8_UINT, D3D11_USAGE_STAGING);
