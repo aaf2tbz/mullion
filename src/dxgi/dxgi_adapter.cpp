@@ -202,10 +202,8 @@ public:
     pDesc->SubSysId = 0;
     pDesc->Revision = 0;
     // as much of it as a SIZE_T holds, which in a 32-bit process is less than there is
-    uint64_t memory = device_.recommendedMaxWorkingSetSize();
-    if (device_.hasUnifiedMemory())
-      memory /= 2; // FIXME: use a more appropriate value
-    pDesc->DedicatedVideoMemory = std::min<uint64_t>(memory, std::numeric_limits<SIZE_T>::max());
+    pDesc->DedicatedVideoMemory =
+        std::min<uint64_t>(device_.recommendedMaxWorkingSetSize(), std::numeric_limits<SIZE_T>::max());
     pDesc->DedicatedSystemMemory = 0;
     pDesc->SharedSystemMemory = 0;
     pDesc->AdapterLuid = adapter_luid_;
