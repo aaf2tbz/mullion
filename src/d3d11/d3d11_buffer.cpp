@@ -79,6 +79,35 @@ private:
     }
   };
 
+  class BufferRTV : public TResourceViewBase<tag_render_target_view<D3D11Buffer>> {
+    Rc<Texture> attachment_;
+
+  public:
+    BufferRTV(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
+              const MTL_DXGI_FORMAT_DESC &format) :
+        TResourceViewBase(pDesc, pResource, pDevice) {
+      WMTTextureInfo info{};
+      info.type = WMTTextureType2D;
+      info.pixel_format = format.PixelFormat;
+      info.width = pDesc->Buffer.NumElements;
+      info.height = info.depth = info.array_length = info.mipmap_level_count = info.sample_count = 1;
+      info.usage = WMTTextureUsageRenderTarget;
+      // Metal's linear-texture alignment cannot represent every D3D11.3 5.2.1 buffer view offset
+      attachment_ = new Texture(info, pDevice->GetMTLDevice());
+      Flags<TextureAllocationFlag> flags;
+      flags.set(TextureAllocationFlag::GpuPrivate);
+      attachment_->rename(attachment_->allocate(flags));
+      attachment_->render_buffer = pResource->buffer_;
+      attachment_->render_buffer_offset = pDesc->Buffer.FirstElement * format.BytesPerTexel;
+      texture_ = attachment_.ptr();
+      view_id_ = texture_->fullView;
+      format_ = format.PixelFormat;
+      pass_desc_ = {0, info.sample_count, 0, info.width, info.height};
+      subset_ =
+          ResourceSubsetState(attachment_->render_buffer_offset, pDesc->Buffer.NumElements * format.BytesPerTexel);
+    }
+  };
+
 public:
   D3D11Buffer(const tag_buffer::DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device) :
       TResourceBase<tag_buffer>(*pDesc, device) {
@@ -146,9 +175,43 @@ public:
 
   HRESULT
   STDMETHODCALLTYPE
+  CreateRenderTargetView(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc, ID3D11RenderTargetView1 **ppView) override {
+    D3D11_RENDER_TARGET_VIEW_DESC1 finalDesc;
+    if (FAILED(ExtractEntireResourceViewDescription(m_parent, &desc, pDesc, &finalDesc, dxgi_usage_)) ||
+        finalDesc.ViewDimension != D3D11_RTV_DIMENSION_BUFFER)
+      return E_INVALIDARG;
+    MTL_DXGI_FORMAT_DESC format;
+    UINT support = 0;
+    constexpr UINT required = D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+    if (FAILED(MTLQueryDXGIFormat(m_parent->GetMTLDevice(), finalDesc.Format, format)) || !format.BytesPerTexel ||
+        (format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
+        FAILED(m_parent->CheckFormatSupport(finalDesc.Format, &support)) ||
+        (support & required) != required)
+      return E_INVALIDARG;
+    const UINT elements = desc.ByteWidth / format.BytesPerTexel;
+    const UINT max_width = m_parent->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0 ? D3D11_REQ_TEXTURE1D_U_DIMENSION
+                                                                            : D3D10_REQ_TEXTURE1D_U_DIMENSION;
+    if (finalDesc.Buffer.FirstElement >= elements || !finalDesc.Buffer.NumElements ||
+        finalDesc.Buffer.NumElements > elements - finalDesc.Buffer.FirstElement ||
+        finalDesc.Buffer.NumElements > max_width)
+      return E_INVALIDARG;
+    if (!ppView)
+      return S_FALSE;
+    auto view = ref(new BufferRTV(&finalDesc, this, m_parent, format));
+    if (!view->texture()->current()->texture()) {
+      view->Release();
+      return E_OUTOFMEMORY;
+    }
+    *ppView = view;
+    return S_OK;
+  }
+
+  HRESULT
+  STDMETHODCALLTYPE
   CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView) override {
     D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
-    if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
+    if (FAILED(
+            ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
       return E_INVALIDARG;
     }
     if (finalDesc.ViewDimension != D3D11_SRV_DIMENSION_BUFFER &&
@@ -222,7 +285,8 @@ public:
   CreateUnorderedAccessView(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *pDesc, ID3D11UnorderedAccessView1 **ppView)
       override {
     D3D11_UNORDERED_ACCESS_VIEW_DESC1 finalDesc;
-    if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
+    if (FAILED(
+            ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
       return E_INVALIDARG;
     }
     if (finalDesc.ViewDimension != D3D11_UAV_DIMENSION_BUFFER) {

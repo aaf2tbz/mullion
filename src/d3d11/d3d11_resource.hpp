@@ -1,5 +1,6 @@
 #pragma once
 #include "dxmt_buffer.hpp"
+#include "dxmt_format.hpp"
 #include "dxmt_counter.hpp"
 #include "dxmt_dynamic.hpp"
 #include "dxmt_staging.hpp"
@@ -679,9 +680,9 @@ HRESULT ExtractEntireResourceViewDescription(const RESOURCE_DESC *pResourceDesc,
                                              VIEW_DESC *pViewDescOut);
 
 template <typename RESOURCE_DESC, typename VIEW_DESC>
-HRESULT ExtractEntireResourceViewDescription(const RESOURCE_DESC *pResourceDesc,
-                                             const VIEW_DESC *pViewDescIn,
-                                             VIEW_DESC *pViewDescOut) {
+HRESULT
+ExtractEntireResourceViewDescription(MTLD3D11Device *pDevice, const RESOURCE_DESC *pResourceDesc,
+                                    const VIEW_DESC *pViewDescIn, VIEW_DESC *pViewDescOut, DXGI_USAGE Usage) {
   if (pViewDescIn) {
     *pViewDescOut = *pViewDescIn;
     if constexpr (!std::is_same_v<RESOURCE_DESC, D3D11_BUFFER_DESC>) {
@@ -689,10 +690,67 @@ HRESULT ExtractEntireResourceViewDescription(const RESOURCE_DESC *pResourceDesc,
         pViewDescOut->Format = pResourceDesc->Format;
       }
     }
-    return S_OK;
   } else {
-    return ExtractEntireResourceViewDescription(pResourceDesc, pViewDescOut);
+    *pViewDescOut = {};
+    if (FAILED(ExtractEntireResourceViewDescription(pResourceDesc, pViewDescOut)))
+      return E_INVALIDARG;
   }
+  constexpr bool srv = std::is_same_v<VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC1>;
+  constexpr bool rtv = std::is_same_v<VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC1>;
+  constexpr bool dsv = std::is_same_v<VIEW_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC>;
+  constexpr UINT bind = srv   ? D3D11_BIND_SHADER_RESOURCE
+                        : rtv ? D3D11_BIND_RENDER_TARGET
+                        : dsv ? D3D11_BIND_DEPTH_STENCIL
+                              : D3D11_BIND_UNORDERED_ACCESS;
+  if (!(pResourceDesc->BindFlags & bind))
+    return E_INVALIDARG;
+  if constexpr (!std::is_same_v<RESOURCE_DESC, D3D11_BUFFER_DESC>) {
+    constexpr UINT one = dsv ? UINT(D3D11_DSV_DIMENSION_TEXTURE1D) : UINT(D3D11_SRV_DIMENSION_TEXTURE1D);
+    constexpr UINT one_array =
+        dsv ? UINT(D3D11_DSV_DIMENSION_TEXTURE1DARRAY) : UINT(D3D11_SRV_DIMENSION_TEXTURE1DARRAY);
+    constexpr UINT two = dsv ? UINT(D3D11_DSV_DIMENSION_TEXTURE2D) : UINT(D3D11_SRV_DIMENSION_TEXTURE2D);
+    constexpr UINT ms_array =
+        dsv ? UINT(D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY) : UINT(D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY);
+    UINT dimension = pViewDescOut->ViewDimension;
+    if constexpr (std::is_same_v<RESOURCE_DESC, D3D11_TEXTURE1D_DESC>) {
+      if (dimension != one && dimension != one_array)
+        return E_INVALIDARG;
+    } else if constexpr (std::is_same_v<RESOURCE_DESC, D3D11_TEXTURE2D_DESC1>) {
+      if (dimension < two || dimension > ms_array) {
+        if constexpr (srv) {
+          if ((dimension != D3D11_SRV_DIMENSION_TEXTURECUBE && dimension != D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) ||
+              !(pResourceDesc->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
+            return E_INVALIDARG;
+        } else {
+          return E_INVALIDARG;
+        }
+      }
+    } else {
+      if (dsv || dimension != D3D11_SRV_DIMENSION_TEXTURE3D)
+        return E_INVALIDARG;
+    }
+    // D3D11.3 5.1.6: typed resources keep their format; 5.2.1: views fully qualify typeless resources
+    MTL_DXGI_FORMAT_DESC resource_format, view_format;
+    if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), pResourceDesc->Format, resource_format)) ||
+        FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), pViewDescOut->Format, view_format)) ||
+        view_format.PixelFormat == WMTPixelFormatInvalid ||
+        // a family's parent qualifies no view; the formats of a depth stencil texture's planes carry the name and do
+        ((view_format.Flag & MTL_DXGI_FORMAT_TYPELESS) && DXGIFormatType(pViewDescOut->Format) == pViewDescOut->Format))
+      return E_INVALIDARG;
+    if (!(resource_format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) &&
+        (DXGIFormatType(pResourceDesc->Format) != DXGIFormatType(pViewDescOut->Format) ||
+         (pViewDescOut->Format != pResourceDesc->Format && !(resource_format.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+          !((srv || rtv) && (Usage & DXGI_USAGE_BACK_BUFFER)))))
+      return E_INVALIDARG;
+    UINT support = 0;
+    constexpr UINT required = srv   ? D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE
+                              : rtv ? D3D11_FORMAT_SUPPORT_RENDER_TARGET
+                              : dsv ? D3D11_FORMAT_SUPPORT_DEPTH_STENCIL
+                                    : D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+    if (FAILED(pDevice->CheckFormatSupport(pViewDescOut->Format, &support)) || !(support & required))
+      return E_INVALIDARG;
+  }
+  return S_OK;
 }
 
 template <typename TEXTURE_DESC>

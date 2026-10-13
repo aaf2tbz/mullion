@@ -549,6 +549,41 @@ ArgumentEncodingContext::clearColor(
   currentFrameStatistics().clear_pass_count++;
 
   endPass();
+  if (texture->render_buffer)
+    copyBufferRenderTarget(texture, false);
+}
+
+void
+ArgumentEncodingContext::copyBufferRenderTarget(const Rc<Texture> &texture, bool load) {
+  startBlitPass();
+  UINT bytes = texture->width() * MTLGetTexelSize(texture->pixelFormat());
+  auto [buffer, offset] = access(texture->render_buffer, texture->render_buffer_offset, bytes,
+                                load ? ResourceAccess::Read : ResourceAccess::Write);
+  auto image = access(texture, 0, 0, load ? ResourceAccess::Write : ResourceAccess::Read);
+  if (load) {
+    auto &cmd = encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+    cmd.type = WMTBlitCommandCopyFromBufferToTexture;
+    cmd.src = buffer->buffer();
+    cmd.src_offset = offset + texture->render_buffer_offset;
+    cmd.bytes_per_row = bytes;
+    cmd.bytes_per_image = bytes;
+    cmd.size = {texture->width(), 1, 1};
+    cmd.dst = image;
+    cmd.slice = cmd.level = 0;
+    cmd.origin = {};
+  } else {
+    auto &cmd = encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+    cmd.type = WMTBlitCommandCopyFromTextureToBuffer;
+    cmd.src = image;
+    cmd.slice = cmd.level = 0;
+    cmd.origin = {};
+    cmd.size = {texture->width(), 1, 1};
+    cmd.dst = buffer->buffer();
+    cmd.offset = offset + texture->render_buffer_offset;
+    cmd.bytes_per_row = bytes;
+    cmd.bytes_per_image = bytes;
+  }
+  endPass();
 }
 
 void
@@ -765,6 +800,7 @@ ArgumentEncodingContext::startBlitPass() {
 void
 ArgumentEncodingContext::endPass() {
   assert(encoder_current);
+  auto ended = encoder_current;
   encoder_last->next = encoder_current;
   encoder_last = encoder_current;
 
@@ -796,6 +832,15 @@ ArgumentEncodingContext::endPass() {
 
   encoder_current = nullptr;
   encoder_count_++;
+  if (ended->type == EncoderType::Render) {
+    for (auto &color : static_cast<RenderEncoderData *>(ended)->colors) {
+      if (!color.attachment)
+        continue;
+      auto texture = color.attachment->allocation->descriptor;
+      if (texture->render_buffer)
+        copyBufferRenderTarget(texture, false);
+    }
+  }
 }
 
 std::pair<WMT::Buffer, size_t>

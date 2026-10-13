@@ -587,9 +587,6 @@ public:
     if (!pResource)
       return E_INVALIDARG;
 
-    if (!ppDepthStencilView)
-      return S_FALSE;
-
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateDepthStencilView(pDesc, ppDepthStencilView);
   }
 

@@ -185,14 +185,9 @@ public:
   HRESULT STDMETHODCALLTYPE CreateRenderTargetView(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc,
                                  ID3D11RenderTargetView1 **ppView) override {
     D3D11_RENDER_TARGET_VIEW_DESC1 finalDesc;
-    if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
-                                                    &finalDesc))) {
+    if (FAILED(
+            ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
       return E_INVALIDARG;
-    }
-    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
-      if (finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS ||
-          finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY)
-        return E_INVALIDARG;
     }
     auto texture = viewTexture(finalDesc.Format);
     if (!texture)
@@ -223,14 +218,9 @@ public:
     if (this->texture_->chroma)
       return E_INVALIDARG;
     D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc;
-    if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
-                                                    &finalDesc))) {
+    if (FAILED(
+            ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
       return E_INVALIDARG;
-    }
-    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
-      if (finalDesc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMS ||
-          finalDesc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY)
-        return E_INVALIDARG;
     }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
@@ -258,19 +248,10 @@ public:
   CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc,
                            ID3D11ShaderResourceView1 **ppView) override {
     D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
-    if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
-                                                    &finalDesc))) {
+    if (FAILED(
+            ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
       ERR("DeviceTexture: Failed to create SRV descriptor");
       return E_INVALIDARG;
-    }
-    if ((finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE ||
-         finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) &&
-        !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
-      return E_INVALIDARG;
-    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
-      if (finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMS ||
-          finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY)
-        return E_INVALIDARG;
     }
     auto texture = viewTexture(finalDesc.Format);
     if (!texture)
@@ -301,8 +282,8 @@ public:
   CreateUnorderedAccessView(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *pDesc,
                             ID3D11UnorderedAccessView1 **ppView) override {
     D3D11_UNORDERED_ACCESS_VIEW_DESC1 finalDesc;
-    if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
-                                                    &finalDesc))) {
+    if (FAILED(
+            ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
       return E_INVALIDARG;
     }
     auto texture = viewTexture(finalDesc.Format);

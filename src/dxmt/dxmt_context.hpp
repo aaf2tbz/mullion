@@ -748,6 +748,7 @@ public:
   };
 
   void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata);
+  void copyBufferRenderTarget(const Rc<Texture> &texture, bool load);
 
   void upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);
 

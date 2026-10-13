@@ -829,7 +829,10 @@ public:
         return ClearRenderTargetView(rtv, Color);
       }
       InvalidateCurrentPass(true);
-      EmitST([texture = rtv->texture(), view = rtv->viewId(), plane = rtv->description().DepthPlane](ArgumentEncodingContext &enc) {
+      EmitST([texture = rtv->texture(), view = rtv->viewId(),
+              plane = rtv->description().DepthPlane](ArgumentEncodingContext &enc) {
+        if (texture->render_buffer)
+          enc.copyBufferRenderTarget(texture, true);
         enc.clear_rt_cmd.begin(texture, view, plane);
       });
       for (unsigned i = 0; i < NumRects; i++) {
@@ -4894,6 +4897,9 @@ public:
             render_target_array, encoder_argbuf_size = std::move(allocated_encoder_argbuf_size)](ArgumentEncodingContext &ctx) {
         auto pool = WMT::MakeAutoreleasePool();
         uint32_t dsv_planar_flags = DepthStencilPlanarFlags(dsv.PixelFormat);
+        for (auto &rtv : rtvs.span())
+          if (rtv.Texture && rtv.Texture->render_buffer)
+            ctx.copyBufferRenderTarget(rtv.Texture, true);
         auto& info = *ctx.startRenderPass(dsv_planar_flags, dsv.ReadOnlyFlags, rtvs.size(), *encoder_argbuf_size.get());
 
         for (auto &rtv : rtvs.span()) {

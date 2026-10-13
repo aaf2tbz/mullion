@@ -9,6 +9,12 @@
 namespace dxmt {
 
 template <>
+HRESULT
+ExtractEntireResourceViewDescription(const D3D11_BUFFER_DESC *, D3D11_RENDER_TARGET_VIEW_DESC1 *) {
+  return E_INVALIDARG;
+}
+
+template <>
 HRESULT ExtractEntireResourceViewDescription<D3D11_BUFFER_DESC,
                                              D3D11_SHADER_RESOURCE_VIEW_DESC1>(
     const D3D11_BUFFER_DESC *pResourceDesc,

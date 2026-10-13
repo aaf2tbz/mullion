@@ -22,6 +22,7 @@
 #include "dxmt_residency.hpp"
 #include "dxmt_allocation.hpp"
 #include "rc/util_rc_ptr.hpp"
+#include "dxmt_buffer.hpp"
 #include "thread.hpp"
 #include "util_flags.hpp"
 #include "util_svector.hpp"
@@ -281,6 +282,8 @@ public:
 
   TextureViewKey fullView;
   Rc<Texture> chroma;
+  Rc<Buffer> render_buffer;
+  uint32_t render_buffer_offset = 0;
 
   Texture *
   plane(unsigned index) {

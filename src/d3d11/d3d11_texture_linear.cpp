@@ -90,36 +90,18 @@ TDynamicLinearTexture(
 template<>
 HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView){
   D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
-  if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
+  if (FAILED(ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
     return E_INVALIDARG;
   }
-  if (finalDesc.ViewDimension != D3D10_SRV_DIMENSION_TEXTURE2D) {
-    ERR("Only 2d texture SRV can be created on dynamic texture");
-    return E_INVALIDARG;
-  }
-  if (~finalDesc.Texture2D.MipLevels == 0)
-    finalDesc.Texture2D.MipLevels = this->desc.MipLevels - finalDesc.Texture2D.MostDetailedMip;
-  if (finalDesc.Texture2D.MostDetailedMip != 0 || finalDesc.Texture2D.MipLevels != 1) {
-    ERR("2d texture SRV must be non-mipmapped on dynamic texture");
-    return E_INVALIDARG;
-  }
+  TextureViewDescriptor descriptor;
+  auto hr = InitializeAndNormalizeViewDescriptor(this->m_parent, this->desc.MipLevels, this->desc.ArraySize,
+                                                this->texture_.ptr(), finalDesc, descriptor);
+  if (FAILED(hr))
+    return hr;
   if (!ppView) {
     return S_FALSE;
   }
-  MTL_DXGI_FORMAT_DESC format;
-  if (FAILED(MTLQueryDXGIFormat(this->m_parent->GetMTLDevice(), finalDesc.Format, format))) {
-    return E_FAIL;
-  }
-
-  auto srv = ref(new SRV(
-      &finalDesc, this, this->m_parent,
-      {.format = format.PixelFormat,
-       .type = WMTTextureType2D,
-       .firstMiplevel = 0,
-       .miplevelCount = 1,
-       .firstArraySlice = 0,
-       .arraySize = 1}
-  ));
+  auto srv = ref(new SRV(&finalDesc, this, this->m_parent, descriptor));
 
   *ppView = srv;
   return S_OK;
@@ -128,36 +110,18 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
 template<>
 HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_1d>::CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView){
   D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
-  if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
+  if (FAILED(ExtractEntireResourceViewDescription(this->m_parent, &this->desc, pDesc, &finalDesc, this->dxgi_usage_))) {
     return E_INVALIDARG;
   }
-  if (finalDesc.ViewDimension != D3D10_SRV_DIMENSION_TEXTURE1D) {
-    ERR("Only 1d texture SRV can be created on dynamic texture");
-    return E_INVALIDARG;
-  }
-  if (~finalDesc.Texture1D.MipLevels == 0)
-    finalDesc.Texture1D.MipLevels = this->desc.MipLevels - finalDesc.Texture1D.MostDetailedMip;
-  if (finalDesc.Texture1D.MostDetailedMip != 0 || finalDesc.Texture1D.MipLevels != 1) {
-    ERR("1d texture SRV must be non-mipmapped on dynamic texture");
-    return E_INVALIDARG;
-  }
+  TextureViewDescriptor descriptor;
+  auto hr = InitializeAndNormalizeViewDescriptor(this->m_parent, this->desc.MipLevels, this->desc.ArraySize,
+                                                this->texture_.ptr(), finalDesc, descriptor);
+  if (FAILED(hr))
+    return hr;
   if (!ppView) {
     return S_FALSE;
   }
-  MTL_DXGI_FORMAT_DESC format;
-  if (FAILED(MTLQueryDXGIFormat(this->m_parent->GetMTLDevice(), finalDesc.Format, format))) {
-    return E_FAIL;
-  }
-
-  auto srv = ref(new SRV(
-      &finalDesc, this, this->m_parent,
-      {.format = format.PixelFormat,
-       .type = WMTTextureType2D, // since all 1d texture is implemented as 1-row 2d texture
-       .firstMiplevel = 0,
-       .miplevelCount = 1,
-       .firstArraySlice = 0,
-       .arraySize = 1}
-  ));
+  auto srv = ref(new SRV(&finalDesc, this, this->m_parent, descriptor));
 
   *ppView = srv;
   return S_OK;
