@@ -249,7 +249,6 @@ public:
   std::shared_ptr<void> memory;
 };
 
-// a value that signals move, and what waits for it
 struct Reached {
   std::atomic<uint64_t> value;
 
@@ -258,9 +257,12 @@ struct Reached {
   // test_cpu_signal_fence and test_fence_signal_availability have both from Windows)
   void
   Reach(uint64_t reached) {
+    decltype(waiting_) done; // ends after the lock: what a waiter kept alive may come back in here as it goes
     std::lock_guard<dxmt::mutex> lock(mutex_);
     value = reached;
-    std::erase_if(waiting_, [&](auto &wait) { return wait.first <= reached && (wait.second(), true); });
+    std::erase_if(waiting_, [&](auto &wait) {
+      return wait.first <= reached && (wait.second(), done.push_back(std::move(wait)), true);
+    });
   }
 
   void

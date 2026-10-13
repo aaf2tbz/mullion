@@ -38,7 +38,6 @@ enum class EncoderType {
 
 class MTLD3D12QueryHeap;
 
-// a timestamp query: the pass it is on samples the GPU clock for it as the pass ends
 struct Stamp {
   MTLD3D12QueryHeap *heap;
   uint32_t query;

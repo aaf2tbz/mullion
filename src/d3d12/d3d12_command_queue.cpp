@@ -53,7 +53,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   WMT::Reference<WMT::CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
-  // the last command buffer that has completed and left nothing for the CPU to do
+  // a Signal and a timestamp resolve wait here for a command buffer the completion thread is done with
   Reached retired_{};
 
   // Metal fails a command buffer that waits for an event for more than a few seconds, and ignores the queue's
@@ -182,9 +182,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     HANDLE semaphore{};
     std::function<void()> completed{};
     // the timestamp queries the command buffer samples: the device's counter sample buffer it holds until it
-    // completes, and the queries of each sample taken
+    // completes, and where each sample taken is with the queries it is for
     WMT::Reference<WMT::CounterSampleBuffer> samples{};
-    std::vector<std::vector<std::pair<Com<MTLD3D12QueryHeap>, uint32_t>>> sampled{};
+    std::vector<std::pair<uint64_t, std::vector<std::pair<Com<MTLD3D12QueryHeap>, uint32_t>>>> sampled{};
     // the resolves of timestamps into readback buffers, which the CPU does when the command buffer completes
     struct Resolve {
       Com<MTLD3D12QueryHeap> heap;
@@ -343,8 +343,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       size_t read = 0;
       auto sample = [&](size_t until) {
         for (; read < until; read++)
-          for (auto &[heap, query] : inflight.sampled[read])
-            heap->timestamps[query] = clock[read];
+          for (auto &[heap, query] : inflight.sampled[read].second)
+            heap->timestamps[query] = clock[inflight.sampled[read].first];
       };
       for (auto &resolve : inflight.resolves) {
         sample(resolve.after);
@@ -776,20 +776,17 @@ public:
                                    uint32_t(attachment.end_of_encoder_sample_index), diag::Now()});
           profiled = &buffer.passes.back();
         }
-        // a timestamp query has the clock when its pass ends
         if (current->stamps) {
           if (profile_)
             queries--;
           if (!scope.inflight->samples && !(scope.inflight->samples = pool.Take(device_->GetMTLDevice()))) {
             ERR("EndQuery: Metal has no counter sample buffer for a timestamp");
           } else {
-            // a profiled pass keeps the sample of its start, and its end is the query's
+            // the profile's sample of the pass's end is the queries' too
             if (!attachment.sample_buffer)
-              attachment = {scope.inflight->samples, ~0ull /* MTLCounterDontSample */};
-            attachment.end_of_encoder_sample_index = scope.inflight->sampled.size();
-            if (profiled)
-              profiled->count = WMTTimestampSamplesPerStage, profiled->last = attachment.end_of_encoder_sample_index;
-            auto &taken = scope.inflight->sampled.emplace_back();
+              attachment = {scope.inflight->samples, ~0ull /* MTLCounterDontSample */, scope.inflight->sampled.size()};
+            auto &[slot, taken] = scope.inflight->sampled.emplace_back();
+            slot = attachment.end_of_encoder_sample_index;
             for (auto stamp = current->stamps; stamp; stamp = stamp->next)
               taken.push_back({stamp->heap, stamp->query});
           }
@@ -945,13 +942,10 @@ public:
           // copies them
           WMTBufferInfo info{data->count * sizeof(uint64_t), WMTResourceStorageModeShared};
           auto staging = device_->GetMTLDevice().newBuffer(info);
-          scope.inflight->completed = [heap = Com(data->heap), staging, mapped = info.memory.ptr, first = data->start,
-                                       count = data->count] {
-            memcpy(mapped, &heap->timestamps[first], count * sizeof(uint64_t));
-          };
           scope.End();
           Trace("waits for the timestamps of command buffer ", inflight_cmdbuf_seq_ - 1);
           retired_.Expect(inflight_cmdbuf_seq_ - 1)->wait(false);
+          memcpy(info.memory.ptr, &data->heap->timestamps[data->start], data->count * sizeof(uint64_t));
           scope.Start();
           cmdbuf = scope.inflight->cmdbuf;
           auto encoder = cmdbuf.blitCommandEncoder();
@@ -1141,6 +1135,8 @@ public:
   Signal(ID3D12Fence *pFence, UINT64 Value) {
     // from the CPU, once the work before has completed and what it left for the CPU is done
     auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
+      // after a submission another thread is in the middle of
+      std::lock_guard<dxmt::mutex> lock(mutex_commit_);
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
         fence->Reach(Value);

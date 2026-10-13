@@ -2369,8 +2369,9 @@ public:
       return;
     }
     if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
-      // the clock when the work before is done, which the pass that work ends with samples as it ends: a render pass,
-      // or the pass of the query before. other work gets a blit encoder: Metal samples only encoders that do something
+      // the clock "at the instant that the GPU is finished with all the preceding workload" (D3D11.3 20.4.3): the
+      // pass that work ends with samples it as it ends, a render pass or the pass of the query before. other work
+      // gets a blit encoder: Metal samples only encoders that do something
       allocator_->InvalidateCurrentPass();
       auto pass = allocator_->encoder_last;
       if (!pass->stamps && pass->type != EncoderType::Render && pass->type != EncoderType::Clear) {
