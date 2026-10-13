@@ -335,6 +335,7 @@ CommandQueue::WaitForFinishThread() {
         lines += line + '\n' + pass.targets;
       }
       diag::Write(lines);
+      chunk.readback.timestamp.reset();
       for (auto &samples : buffer.samples)
         if (samples.buffer)
           timestamp_samples.Return(std::move(samples.buffer));

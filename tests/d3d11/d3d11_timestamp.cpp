@@ -144,7 +144,7 @@ RWBuffer<uint> result : register(u0);
   QueryPerformanceFrequency(&frequency);
   std::map<std::filesystem::path, std::streamoff> offsets;
   ComPtr<ID3D11Query> failed_query;
-  for (UINT variant = 0; variant < 9; variant++) {
+  for (UINT variant = 0; variant < 12; variant++) {
     if (variant == 5) {
       for (auto samples : held)
         release(samples);
@@ -158,8 +158,10 @@ RWBuffer<uint> result : register(u0);
           offsets[entry.path()] = std::filesystem::file_size(entry.path());
     next.seed(seed);
     next.discard(variant);
-    const bool many = variant == 2 || variant == 5, replay = variant == 3 || variant == 5 || variant == 6;
-    const UINT count = many ? capacity + 2 : 3;
+    const bool many = variant == 2 || variant == 5 || variant >= 9;
+    const bool replay = variant == 3 || variant == 5 || variant == 6 || variant == 11;
+    const UINT count = variant == 9 ? capacity - 1 : variant == 10 ? capacity
+                                  : variant == 11 ? 2 * capacity + 2 : many ? capacity + 2 : 3;
     const UINT work_count = many || variant >= 7 ? count - 1 : 1;
     ComPtr<ID3D11Texture2D> target, staging;
     if (variant == 7) {

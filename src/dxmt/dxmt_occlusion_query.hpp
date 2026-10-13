@@ -255,34 +255,28 @@ public:
       TimestampQueryList &&queries
   ) :
       queries_(std::move(queries)), pool_(pool), num_samples_(num_samples), cmdbuf_(cmdbuf) {
-    samples_ = pool_.Take(device, false);
-    if (!samples_)
+    samples_.push_back(pool_.Take(device, false));
+    if (!samples_.front())
       return;
-    results_info_.options = WMTResourceStorageModeShared;
-    results_info_.length = num_samples_ * sizeof(uint64_t);
-#ifdef __i386__
-    results_info_.length = (results_info_.length + DXMT_PAGE_SIZE - 1) / DXMT_PAGE_SIZE * DXMT_PAGE_SIZE;
-    results_info_.memory.set(wsi::aligned_malloc(results_info_.length, DXMT_PAGE_SIZE));
-    if (!results_info_.memory.get())
-      return;
-#endif
-    results_buffer_ = device.newBuffer(results_info_);
-    if (results_buffer_ && results_info_.memory.get())
-      std::fill_n(static_cast<uint64_t *>(results_info_.memory.get()), num_samples_,
-                  TimestampQuery::kCounterErrorValue);
+    for (auto remaining = num_samples_; remaining > pool_.limit; remaining -= pool_.limit)
+      samples_.push_back(pool_.Take(device, false));
   }
 
   ~TimestampReadback() {
-    auto results = results_buffer_ && cmdbuf_.status() == WMTCommandBufferStatusCompleted
-                       ? static_cast<const uint64_t *>(results_info_.memory.get()) : nullptr;
+    std::vector<uint64_t> results(num_samples_, TimestampQuery::kCounterErrorValue);
+    // CPU resolution follows GPU completion (Apple, Converting a GPU's counter data into a readable format).
+    if (cmdbuf_.status() == WMTCommandBufferStatusCompleted)
+      for (const auto &[index, source] : ranges_) {
+        auto count = source.end_of_encoder_sample_index - source.start_of_encoder_sample_index + 1;
+        WMT::CounterSampleBuffer{source.sample_buffer}.resolveCounterRange(
+            source.start_of_encoder_sample_index, count, results.data() + index, count * sizeof(uint64_t)
+        );
+      }
     for (const auto &[query, sample_index] : queries_)
-      query->issue(results ? results[sample_index] : TimestampQuery::kCounterErrorValue);
-    if (samples_)
-      pool_.Return(std::move(samples_));
-#ifdef __i386__
-    results_buffer_ = nullptr;
-    wsi::aligned_free(results_info_.memory.get());
-#endif
+      query->issue(results[sample_index]);
+    for (auto &samples : samples_)
+      if (samples)
+        pool_.Return(std::move(samples));
   }
 
   TimestampReadback(const TimestampReadback &) = delete;
@@ -290,30 +284,26 @@ public:
 
   WMTSampleBufferAttachmentInfo
   sampleBuffer(uint64_t index) {
-    return {results_buffer_ ? samples_.handle : 0, ~0ull /* MTLCounterDontSample */, index % pool_.limit};
+    return {samples_.front() ? samples_[index / pool_.limit].handle : 0,
+            ~0ull /* MTLCounterDontSample */, index % pool_.limit};
   }
 
   void
-  resolve(WMT::CommandBuffer cmdbuf, uint64_t index, WMTSampleBufferAttachmentInfo source, bool single) {
-    if (!source.sample_buffer || !results_buffer_)
+  resolve(uint64_t index, WMTSampleBufferAttachmentInfo source, bool single) {
+    if (!source.sample_buffer)
       return;
     auto count = single ? 1 : index % pool_.limit + 1;
     if (!single && count != pool_.limit && index + 1 != num_samples_)
       return;
-    auto encoder = cmdbuf.blitCommandEncoder();
-    // Metal's resolveCounters destination alignment is 4 bytes on Apple GPUs (Metal feature set tables, Resources).
-    encoder.resolveCounters(WMT::CounterSampleBuffer{source.sample_buffer},
-                            source.end_of_encoder_sample_index + 1 - count, count, results_buffer_,
-                            (index + 1 - count) * sizeof(uint64_t));
-    encoder.endEncoding();
+    source.start_of_encoder_sample_index = source.end_of_encoder_sample_index + 1 - count;
+    ranges_.push_back({index + 1 - count, source});
   }
 
 private:
   TimestampQueryList queries_;
   diag::TimestampSamples &pool_;
-  WMT::Reference<WMT::CounterSampleBuffer> samples_;
-  WMTBufferInfo results_info_{};
-  WMT::Reference<WMT::Buffer> results_buffer_;
+  std::vector<WMT::Reference<WMT::CounterSampleBuffer>> samples_;
+  std::vector<std::pair<uint64_t, WMTSampleBufferAttachmentInfo>> ranges_;
   uint64_t num_samples_;
   WMT::CommandBuffer cmdbuf_;
 };

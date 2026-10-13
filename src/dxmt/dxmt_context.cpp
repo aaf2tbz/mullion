@@ -1408,7 +1408,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           barrierOnQueue(cmdbuf);
         }
       }
-      readbacks.timestamp->resolve(cmdbuf, data->readback_index, timestamp_sample, Profile);
+      readbacks.timestamp->resolve(data->readback_index, timestamp_sample, Profile);
       timestamp_sample = {};
       data->~SampleTimestampData();
       break;
