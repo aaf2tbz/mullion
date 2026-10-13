@@ -1260,7 +1260,8 @@ convert_dxil(
   if (!module)
     return module.takeError();
   auto entry = read_entry(**module, function); // the signatures, which outlive the module
-  bool denorm = false;
+  // kDxilShaderFlagsTag, whose bit 1 is DisableMathRefactoring: every operation is precise, and none carries the mark
+  bool precise = [f = tag(entry.properties, 0)] { return f && (md_uint(*f) & (1u << 1)); }(), denorm = false;
   // a callee can have its own mode; preserve it before inlining (DXIL.rst, Functions; DXC, Denorm Mode)
   for (auto &F : (*module)->functions()) {
     if (F.getFnAttribute("fp32-denorm-mode").getValueAsString() == "preserve") {
@@ -3258,10 +3259,9 @@ convert_dxil(
       ret = air.CreateIntBinOp(llvm::air::AIRBuilder::min, a(1), a(2));
       break;
     case FMad:
-      ret = ir.CreateFAdd(ir.CreateFMul(a(1), a(2)), a(3));
-      break;
     case Fma:
-      ret = air.CreateFMA(a(1), a(2), a(3));
+      ret = op == FMad && (precise || call->getMetadata("dx.precise")) ? ir.CreateFAdd(ir.CreateFMul(a(1), a(2)), a(3))
+                                                                   : air.CreateFMA(a(1), a(2), a(3));
       break;
     case IMad:
     case UMad:
