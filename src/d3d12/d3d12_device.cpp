@@ -2040,8 +2040,8 @@ PipelineStateStream::Parse(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc) {
     }
     auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *>(stream_start);
 
-    if (defined_type & (1 << type)) {
-      ERR("CreatePipelineState: duplicated subobejct type ", type);
+    if (uint32_t(type) >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID || (defined_type & (1 << type))) {
+      ERR("CreatePipelineState: unknown or duplicated subobject type ", type);
       return E_INVALIDARG;
     }
     defined_type |= (1 << type);
