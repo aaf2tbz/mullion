@@ -168,6 +168,38 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       work();
   }
 
+  // Metal lets go of the memory a texture's unmapped tiles had when the texture next has a tile mapped: until then
+  // they read it, and take writes to it (seen where the texture can be written by shaders). a mapped tile, copied
+  // onto itself, is such a mapping and changes none; with none mapped, the first tile is mapped to a tile of the
+  // queue's own and unmapped again, which leaves that one tile reading the queue's
+  WMT::Reference<WMT::Heap> spare_tile_;
+  std::function<void(WMT::MTL4CommandQueue)>
+  Settle(const Tiling &tiling, MTLD3D12Resource *resource) {
+    auto &mapped = resource->mapped_tiles;
+    auto bound = std::find(mapped.begin(), mapped.end(), true);
+    auto at = tiling.place(bound == mapped.end() ? 0 : bound - mapped.begin());
+    if (bound != mapped.end())
+      return [res = Com(resource), at](WMT::MTL4CommandQueue queue) {
+        auto texture = res->texture->current()->texture();
+        queue.copyMappings(texture, texture, true, std::vector<WMTSparseTextureMappingCopy>{
+            {at.origin, at.size, at.level, at.slice, at.origin, at.level, at.slice}});
+      };
+    return [this, res = Com(resource), at](WMT::MTL4CommandQueue queue) mutable {
+      if (!spare_tile_) {
+        WMTHeapInfo info{};
+        info.sparse_page_size = device_->GetSparsePageSize();
+        info.size = device_->GetMTLDevice().sparseTileSizeInBytes(info.sparse_page_size);
+        info.type = WMTHeapTypePlacement;
+        spare_tile_ = device_->GetMTLDevice().newHeap(info);
+        device_->RegisterResidency(spare_tile_);
+      }
+      for (auto mode : {WMTSparseMappingModeMap, WMTSparseMappingModeUnmap}) {
+        at.mode = mode;
+        queue.updateMappings(res->texture->current()->texture(), true, spare_tile_, std::vector{at});
+      }
+    };
+  }
+
   std::atomic_uint64_t inflight_cmdbuf_seq_ = 1;
   std::atomic_uint64_t inflight_cmdbuf_count_ = 0;
   std::atomic_uint64_t inflight_cmdbuf_stop_ = 0;
@@ -528,6 +560,8 @@ public:
     D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
     UINT range_size = ~0u, range_offset = 0;
     std::vector<WMTSparseTextureMapping> operations;
+    auto &mapped = static_cast<MTLD3D12Resource *>(resource)->mapped_tiles;
+    mapped.resize(tiling.texture ? tiling.total : 0);
     for (UINT region = 0, region_tile = 0, range = 0, range_tile = 0; region < region_count && range < range_count;) {
       if (!range_tile) {
         range_flag = range_flags ? range_flags[range] : D3D12_TILE_RANGE_FLAG_NONE;
@@ -540,8 +574,11 @@ public:
         size = region_sizes ? region_sizes[region] : size;
       }
       if (range_flag != D3D12_TILE_RANGE_FLAG_SKIP) {
-        auto op = tiling.place(tiling.index(coordinate, size, region_tile));
+        auto tile = tiling.index(coordinate, size, region_tile);
+        auto op = tiling.place(tile);
         op.mode = range_flag == D3D12_TILE_RANGE_FLAG_NULL ? WMTSparseMappingModeUnmap : WMTSparseMappingModeMap;
+        if (tiling.texture)
+          mapped[tile] = op.mode == WMTSparseMappingModeMap;
         op.heap_tile = range_flag == D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE ? range_offset : range_offset + range_tile;
         auto *last = operations.empty() ? nullptr : &operations.back();
         if (last && last->mode == op.mode && last->level == op.level && last->slice == op.slice &&
@@ -559,11 +596,15 @@ public:
     }
     if (operations.empty())
       return;
-    Map([this, texture = tiling.texture, res = Com(static_cast<MTLD3D12Resource *>(resource)),
+    std::function<void(WMT::MTL4CommandQueue)> settle = [](auto) {};
+    if (tiling.texture && operations.back().mode == WMTSparseMappingModeUnmap)
+      settle = Settle(tiling, static_cast<MTLD3D12Resource *>(resource));
+    Map([this, texture = tiling.texture, res = Com(static_cast<MTLD3D12Resource *>(resource)), settle = std::move(settle),
          heap = Com(static_cast<MTLD3D12Heap *>(heap)), operations = std::move(operations)](WMT::MTL4CommandQueue queue) {
       WMT::Object heap_handle = heap != nullptr ? heap->heap : WMT::Heap{};
       if (texture) {
         queue.updateMappings(res->texture->current()->texture(), true, heap_handle, operations);
+        settle(queue);
         return;
       }
       // a buffer's tiles are its x
@@ -586,10 +627,18 @@ public:
       return;
     }
     std::vector<WMTSparseTextureMappingCopy> operations;
+    auto src = static_cast<MTLD3D12Resource *>(src_resource), dst = static_cast<MTLD3D12Resource *>(dst_resource);
+    src->mapped_tiles.resize(source.texture ? source.total : 0);
+    dst->mapped_tiles.resize(source.texture ? destination.total : 0);
+    const auto mapped = src->mapped_tiles;
+    bool unmaps = false;
     for (UINT n = 0; n < region_size->NumTiles; n++) {
-      auto from = source.place(source.index(*src_region_start_coordinate, *region_size, n));
-      auto to = destination.place(destination.index(*dst_region_start_coordinate, *region_size, n));
+      auto from_tile = source.index(*src_region_start_coordinate, *region_size, n);
+      auto to_tile = destination.index(*dst_region_start_coordinate, *region_size, n);
+      auto from = source.place(from_tile), to = destination.place(to_tile);
       operations.push_back({from.origin, from.size, from.level, from.slice, to.origin, to.level, to.slice});
+      if (source.texture)
+        unmaps |= !(dst->mapped_tiles[to_tile] = mapped[from_tile]);
     }
     // regions of one resource may overlap, with the result of a copy through a temporary one. Metal copies the tiles
     // in order, so a copy to later tiles goes from its last tile back, as memmove does
@@ -597,11 +646,15 @@ public:
         destination.index(*dst_region_start_coordinate, *region_size, 0) >
             source.index(*src_region_start_coordinate, *region_size, 0))
       std::reverse(operations.begin(), operations.end());
-    Map([this, texture = source.texture, src = Com(static_cast<MTLD3D12Resource *>(src_resource)),
-         dst = Com(static_cast<MTLD3D12Resource *>(dst_resource)),
+    // a copy of a tile that is not mapped unmaps
+    std::function<void(WMT::MTL4CommandQueue)> settle = [](auto) {};
+    if (unmaps)
+      settle = Settle(destination, dst);
+    Map([this, texture = source.texture, src = Com(src), dst = Com(dst), settle = std::move(settle),
          operations = std::move(operations)](WMT::MTL4CommandQueue queue) {
       if (texture) {
         queue.copyMappings(src->texture->current()->texture(), dst->texture->current()->texture(), true, operations);
+        settle(queue);
         return;
       }
       std::vector<WMTSparseBufferMappingCopy> ranges;

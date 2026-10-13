@@ -8,6 +8,8 @@
 // to use the standard tiling" (D3D11.3 5.9.7.2).
 // remapping precedes sampling: "tile mapping updates specified by this call must be completed before any
 // subsequent D3D command can proceed" without NO_OVERWRITE (D3D11.3 5.9.3.1).
+// the last phase leaves no tile mapped, and every read is of a NULL tile: "Reading from NULL-mapped tiles treat that
+// sampled value as zero" (D3D12_TILED_RESOURCES_TIER_2).
 // zero and nonzero texels share every tile; their values cannot stand in for its mapping status. R8G8B8A8_UNORM's
 // n / (2^8 - 1) conversion is undone before comparing bytes (D3D11.3 3.2.3.5).
 #include "d3d12_test.hpp"
@@ -174,13 +176,13 @@ main(int argc, char **argv) {
                         {{float(width), float(height)}, large, 0, 0},
                         {{float(width), float(height)}, large, 0, 1},
                         {{float(width), float(height)}, 0, 1, 0}};
-  for (UINT phase = 0; phase < 2; phase++) {
+  for (UINT phase = 0; phase < 3; phase++) {
     sampler.MinLOD = phase ? -D3D12_FLOAT32_MAX : -2 * large;
     sampler.MaxLOD = phase ? D3D12_FLOAT32_MAX : 2 * large;
     device->CreateSampler(&sampler, samplers->GetCPUDescriptorHandleForHeapStart());
     for (UINT tile = 0; tile < total; tile++) {
       const UINT mip = tile == first_mip_tiles, x = mip ? 0 : tile % tiles_wide, y = mip ? 0 : tile / tiles_wide;
-      const bool mapped = mip ? !phase : ((x == y) != bool(phase));
+      const bool mapped = phase < 2 && (mip ? !phase : ((x == y) != bool(phase)));
       D3D12_TILED_RESOURCE_COORDINATE coord{x, y, 0, mip};
       D3D12_TILE_RANGE_FLAGS flag = mapped ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
       queue->UpdateTileMappings(texture.Get(), 1, &coord, nullptr, heap.Get(), 1, &flag, &tile, nullptr,
@@ -216,7 +218,8 @@ main(int argc, char **argv) {
         UINT wrong = 0;
         for (UINT y = 0; y < height; y++)
           for (UINT x = 0; x < width; x++) {
-            const bool mapped = mip ? !phase : ((x / shape.WidthInTexels == y / shape.HeightInTexels) != bool(phase));
+            const bool mapped =
+                phase < 2 && (mip ? !phase : ((x / shape.WidthInTexels == y / shape.HeightInTexels) != bool(phase)));
             const UINT wanted = mapped && (((x >> mip) + (y >> mip)) & 1) ? mip + 1 : 0;
             const UINT *value = (const UINT *)(got + result.Offset + y * result.Footprint.RowPitch) + 2 * x;
             if ((value[0] != wanted || value[1] != UINT(mapped)) && wrong++ < 3)

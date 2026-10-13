@@ -143,6 +143,8 @@ public:
   virtual void ReleasePrivate() = 0;
   Rc<Texture> texture;
   Rc<Buffer> buffer;
+  // which of a reserved texture's tiles are mapped, as D3D12 numbers them (MTLD3D12CommandQueue::Settle)
+  std::vector<bool> mapped_tiles;
   // a sampler feedback map's description as its application gave it: `texture` has one R32_UINT texel per mip region
   // (TranscodeFeedback in dxmt_command_feedback.hpp)
   std::optional<D3D12_RESOURCE_DESC1> feedback;
