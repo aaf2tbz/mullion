@@ -514,8 +514,10 @@ main(int argc, char **argv) {
           expect(conversions - made_before == 1, "a different signature supplier converts only its own stage");
         if (variant == 4)
           expect(conversions == made_before, "sample count changes the Metal pipeline, not the conversion");
-        if (variant == 3 || (variant >= 5 && variant <= 13) || variant == 17 || variant == 18 || variant == 19 ||
-            variant == 21)
+        if (variant == 6)
+          expect(conversions == made_before, "a target format of the output's own type is not a conversion input");
+        if (variant == 3 || variant == 5 || (variant >= 7 && variant <= 13) || variant == 17 || variant == 18 ||
+            variant == 19 || variant == 21)
           expect(conversions - made_before == 1, "a new conversion input must have its own entry");
       }
       if (!strcmp(argv[2], "cold") && store_exists() && mesh && variant == 13)
