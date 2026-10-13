@@ -33,7 +33,7 @@ uint ps(float4 position : SV_Position) : SV_Target {
 )hlsl";
 
 int
-main(int argc, char **) {
+main(int argc, char **argv) {
   step("create a single-sample target and a scissored triangle");
   const UINT width = 8, height = 4, query_width = width / 2;
   const UINT window_segments = 4096; // counting segments stored per pass by the native probes cited above
@@ -42,6 +42,8 @@ main(int argc, char **) {
   const std::vector<std::string> defines{"WIDTH=" + std::to_string(width)};
   auto vs_code = compile(hlsl, "vs", "vs", defines), ps_code = compile(hlsl, "ps", "ps", defines);
   if (!expect(vs_code && ps_code, "HLSL did not compile"))
+    return verdict();
+  if (argc > 1 && !strcmp(argv[1], "shaders"))
     return verdict();
   char directory[MAX_PATH], exe[MAX_PATH];
   GetModuleFileNameA(nullptr, exe, sizeof(exe));
@@ -60,7 +62,12 @@ main(int argc, char **) {
       RemoveDirectoryA(path.c_str());
       return verdict();
     }
-    expect(WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0, "diagnostic child wait failed");
+    const auto waited = WaitForSingleObject(process.hProcess, 300000);
+    if (waited != WAIT_OBJECT_0) {
+      TerminateProcess(process.hProcess, 1);
+      expect(WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0, "diagnostic child did not terminate");
+    }
+    expect(waited == WAIT_OBJECT_0, "diagnostic child wait failed or timed out");
     DWORD code = 1;
     expect(GetExitCodeProcess(process.hProcess, &code), "diagnostic child exit code could not be read");
     CloseHandle(process.hThread);
@@ -164,6 +171,16 @@ main(int argc, char **) {
     return expect(device->GetDeviceRemovedReason() == S_OK, "device was removed during the pixel readback");
   };
   const D3D11_QUERY_DESC counter_desc{D3D11_QUERY_OCCLUSION}, predicate_desc{D3D11_QUERY_OCCLUSION_PREDICATE};
+  auto data = [&](ID3D11Query *query, void *out, UINT size) {
+    const auto deadline = GetTickCount64() + 60000;
+    HRESULT hr;
+    while ((hr = context->GetData(query, out, size, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE &&
+           GetTickCount64() < deadline)
+      Sleep(1);
+    if (!expect(hr != S_FALSE, "query data timed out"))
+      ExitProcess(verdict());
+    return hr;
+  };
   const float clear[4] = {};
   enum { Control, Stress, Isolated, Reuse, Deferred, Flushed, ReuseFlushed, Distinct, Frames };
   const char *names[Frames] = {
@@ -276,12 +293,6 @@ main(int argc, char **) {
       return verdict();
 
     step("%s: GetData for every query and the enclosing counter", name);
-    auto data = [&](ID3D11Query *query, void *out, UINT size) {
-      HRESULT hr;
-      while ((hr = context->GetData(query, out, size, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-        Sleep(0);
-      return hr;
-    };
     UINT wrong = 0;
     for (UINT i = 0; i < count; i++) {
       const auto rect = rectangle(i, frame == Deferred, frame == Reuse, frame == Distinct);
@@ -360,9 +371,7 @@ main(int argc, char **) {
     return verdict();
   for (auto query : {empty_query.Get(), long_query.Get()}) {
     UINT64 got = ~UINT64(0);
-    HRESULT hr;
-    while ((hr = context->GetData(query, &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-      Sleep(0);
+    const HRESULT hr = data(query, &got, sizeof(got));
     const UINT64 expected = query == empty_query.Get() ? 0 : UINT64(draws) * (marker.right - marker.left) * height;
     expect(hr == S_OK && got == expected, "long or empty query: HRESULT %#lx, got %llu, want %llu", hr,
            (unsigned long long)got, (unsigned long long)expected);
@@ -382,9 +391,7 @@ main(int argc, char **) {
   if (!picture())
     return verdict();
   UINT64 got = ~UINT64(0);
-  HRESULT hr;
-  while ((hr = context->GetData(long_query.Get(), &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-    Sleep(0);
+  HRESULT hr = data(long_query.Get(), &got, sizeof(got));
   const UINT64 expected = UINT64(marker.right - marker.left) * height;
   expect(hr == S_OK && got == expected, "query-free pass: HRESULT %#lx, got %llu, want %llu", hr,
          (unsigned long long)got, (unsigned long long)expected);
@@ -416,9 +423,7 @@ main(int argc, char **) {
              statistics().first - passes);
     for (UINT i = 0; i < overlapping.size(); i++) {
       got = ~UINT64(0);
-      while ((hr = context->GetData(overlapping[i].Get(), &got, sizeof(got),
-                                   D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-        Sleep(0);
+      hr = data(overlapping[i].Get(), &got, sizeof(got));
       const UINT64 wanted = expected * (separate_draws ? i + 1 : 1);
       expect(hr == S_OK && got == wanted, "overlapping query %u returned %#lx, %llu, want %llu", i, hr,
              (unsigned long long)got, (unsigned long long)wanted);
@@ -446,13 +451,11 @@ main(int argc, char **) {
     expect(statistics().first - passes == 1, "empty deferred brackets recorded %u passes, want 1",
            statistics().first - passes);
     UINT64 empty = ~UINT64(0);
-    while ((hr = context->GetData(empty_query.Get(), &empty, sizeof(empty), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-      Sleep(0);
+    hr = data(empty_query.Get(), &empty, sizeof(empty));
     expect(hr == S_OK && empty == 0, "empty deferred query returned %#lx, %llu", hr, (unsigned long long)empty);
     if (enclosed) {
       got = ~UINT64(0);
-      while ((hr = context->GetData(long_query.Get(), &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-        Sleep(0);
+      hr = data(long_query.Get(), &got, sizeof(got));
       expect(hr == S_OK && got == UINT64(draws) * expected, "enclosing empty brackets returned %#lx, %llu, want %llu",
              hr, (unsigned long long)got, (unsigned long long)(UINT64(draws) * expected));
     }
@@ -476,8 +479,7 @@ main(int argc, char **) {
   expect(statistics().first - counted_passes == 1, "empty brackets split one counting segment into %u passes",
          statistics().first - counted_passes);
   got = ~UINT64(0);
-  while ((hr = context->GetData(long_query.Get(), &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-    Sleep(0);
+  hr = data(long_query.Get(), &got, sizeof(got));
   expect(hr == S_OK && got == UINT64(draws) * expected, "deferred counting segment returned %#lx, %llu, want %llu",
          hr, (unsigned long long)got, (unsigned long long)(UINT64(draws) * expected));
   step("a deferred query counts the draws of a nested command list");
@@ -490,8 +492,7 @@ main(int argc, char **) {
   if (!picture())
     return verdict();
   got = ~UINT64(0);
-  while ((hr = context->GetData(long_query.Get(), &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-    Sleep(0);
+  hr = data(long_query.Get(), &got, sizeof(got));
   expect(hr == S_OK && got == UINT64(draws) * expected, "nested list returned %#lx, %llu, want %llu",
          hr, (unsigned long long)got, (unsigned long long)(UINT64(draws) * expected));
   step("compatible counting passes merge only when their combined segments fit");
@@ -519,8 +520,7 @@ main(int argc, char **) {
     expect(recorded - optimized == wanted, "%u + %u segments: %u passes, %u merged, want %u remaining",
            segments, segments, recorded, optimized, wanted);
     got = ~UINT64(0);
-    while ((hr = context->GetData(long_query.Get(), &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-      Sleep(0);
+    hr = data(long_query.Get(), &got, sizeof(got));
     expect(hr == S_OK && got == expected, "merged passes' final query returned %#lx, %llu, want %llu",
            hr, (unsigned long long)got, (unsigned long long)expected);
   }
@@ -574,8 +574,7 @@ main(int argc, char **) {
   if (!picture())
     return verdict();
   got = ~UINT64(0);
-  while ((hr = context->GetData(sparse_total.Get(), &got, sizeof(got), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-    Sleep(0);
+  hr = data(sparse_total.Get(), &got, sizeof(got));
   expect(hr == S_OK && got == sparse_sum, "sparse ranges returned %#lx, %llu, want %llu", hr,
          (unsigned long long)got, (unsigned long long)sparse_sum);
   return verdict();
