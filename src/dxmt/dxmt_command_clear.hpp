@@ -94,7 +94,8 @@ public:
       clearing_view_ = texture->checkViewUseFormat(clearing_view_, uint_format);
     }
 
-    setClearColor(color, view_format);
+    auto packed = clearColor(color, view_format);
+    memcpy(meta_temp_.color_u32, packed.data(), sizeof(meta_temp_.color_u32));
 
     bool is_array = false, is_3d = false;
     switch (texture->textureType(view)) {
@@ -154,7 +155,8 @@ public:
       clearing_view_ = buffer->createView(view);
     }
 
-    setClearColor(color, view_format);
+    auto packed = clearColor(color, view_format);
+    memcpy(meta_temp_.color_u32, packed.data(), sizeof(meta_temp_.color_u32));
     ctx_.setComputePSO(cs_clear_tbuffer_uint_, {32, 1, 1});
   }
 
@@ -176,7 +178,7 @@ public:
     clearing_view_ = 0;
 
     ctx_.startComputePass();
-    setClearColor(color, WMTPixelFormatInvalid);
+    memcpy(meta_temp_.color_u32, color.data(), sizeof(meta_temp_.color_u32));
     ctx_.setComputePSO(cs_clear_buffer_uint_, {32, 1, 1});
   }
 
@@ -231,11 +233,15 @@ private:
     meta_temp_.color_f32[2] = color[2];
     meta_temp_.color_f32[3] = color[3];
   };
-  void
-  setClearColor(const std::array<uint32_t, 4> &color, WMTPixelFormat source_format) {
+
+public:
+  // integer clears copy channel bits without conversion (D3D11.3 5.2.3.2).
+  static std::array<uint32_t, 4>
+  clearColor(const std::array<uint32_t, 4> &color, WMTPixelFormat source_format) {
+    std::array<uint32_t, 4> packed{};
     switch (source_format) {
     case WMTPixelFormatA8Unorm:
-      meta_temp_.color_u32[0] = color[3] & 0xff;
+      packed[0] = color[3] & 0xff;
       break;
     case WMTPixelFormatR8Unorm:
     case WMTPixelFormatR8Unorm_sRGB:
@@ -252,19 +258,19 @@ private:
     case WMTPixelFormatRGBA8Snorm:
     case WMTPixelFormatRGBA8Uint:
     case WMTPixelFormatRGBA8Sint:
-      meta_temp_.color_u32[0] = color[0] & 0xff;
-      meta_temp_.color_u32[1] = color[1] & 0xff;
-      meta_temp_.color_u32[2] = color[2] & 0xff;
-      meta_temp_.color_u32[3] = color[3] & 0xff;
+      packed[0] = color[0] & 0xff;
+      packed[1] = color[1] & 0xff;
+      packed[2] = color[2] & 0xff;
+      packed[3] = color[3] & 0xff;
       break;
     case WMTPixelFormatBGRA8Unorm:
     case WMTPixelFormatBGRA8Unorm_sRGB:
     case WMTPixelFormatBGRX8Unorm:
     case WMTPixelFormatBGRX8Unorm_sRGB:
-      meta_temp_.color_u32[0] = color[2] & 0xff;
-      meta_temp_.color_u32[1] = color[1] & 0xff;
-      meta_temp_.color_u32[2] = color[0] & 0xff;
-      meta_temp_.color_u32[3] = color[3] & 0xff;
+      packed[0] = color[2] & 0xff;
+      packed[1] = color[1] & 0xff;
+      packed[2] = color[0] & 0xff;
+      packed[3] = color[3] & 0xff;
       break;
     case WMTPixelFormatR16Unorm:
     case WMTPixelFormatR16Snorm:
@@ -281,50 +287,43 @@ private:
     case WMTPixelFormatRGBA16Uint:
     case WMTPixelFormatRGBA16Sint:
     case WMTPixelFormatRGBA16Float:
-      meta_temp_.color_u32[0] = color[0] & 0xffff;
-      meta_temp_.color_u32[1] = color[1] & 0xffff;
-      meta_temp_.color_u32[2] = color[2] & 0xffff;
-      meta_temp_.color_u32[3] = color[3] & 0xffff;
+      packed[0] = color[0] & 0xffff;
+      packed[1] = color[1] & 0xffff;
+      packed[2] = color[2] & 0xffff;
+      packed[3] = color[3] & 0xffff;
       break;
     case WMTPixelFormatRGB10A2Unorm:
     case WMTPixelFormatRGB10A2Uint:
-      meta_temp_.color_u32[0] = color[0] & 0x3ff;
-      meta_temp_.color_u32[1] = color[1] & 0x3ff;
-      meta_temp_.color_u32[2] = color[2] & 0x3ff;
-      meta_temp_.color_u32[3] = color[3] & 0x3;
+      packed[0] = color[0] & 0x3ff;
+      packed[1] = color[1] & 0x3ff;
+      packed[2] = color[2] & 0x3ff;
+      packed[3] = color[3] & 0x3;
       break;
     case WMTPixelFormatBGR10A2Unorm:
     case WMTPixelFormatBGR10_XR:
     case WMTPixelFormatBGR10_XR_sRGB:
-      meta_temp_.color_u32[0] = color[2] & 0x3ff;
-      meta_temp_.color_u32[1] = color[1] & 0x3ff;
-      meta_temp_.color_u32[2] = color[0] & 0x3ff;
-      meta_temp_.color_u32[3] = color[3] & 0x3;
+      packed[0] = color[2] & 0x3ff;
+      packed[1] = color[1] & 0x3ff;
+      packed[2] = color[0] & 0x3ff;
+      packed[3] = color[3] & 0x3;
       break;
     case WMTPixelFormatRG11B10Float:
       // interpreted as R32Uint
-      meta_temp_.color_u32[0] = ((color[0] & 0x7FF) << 0) | ((color[1] & 0x7FF) << 11) | ((color[2] & 0x3FF) << 22);
-      meta_temp_.color_u32[1] = 0;
-      meta_temp_.color_u32[2] = 0;
-      meta_temp_.color_u32[3] = 0;
+      packed[0] = ((color[0] & 0x7FF) << 0) | ((color[1] & 0x7FF) << 11) | ((color[2] & 0x3FF) << 22);
       break;
     case WMTPixelFormatRGB9E5Float:
       // interpreted as R32Uint
-      meta_temp_.color_u32[0] = ((color[0] & 0x1FF) << 0) | ((color[1] & 0x1FF) << 9) | ((color[2] & 0x1FF) << 18) |
-                                ((color[3] & 0b11111) << 27);
-      meta_temp_.color_u32[1] = 0;
-      meta_temp_.color_u32[2] = 0;
-      meta_temp_.color_u32[3] = 0;
+      packed[0] = ((color[0] & 0x1FF) << 0) | ((color[1] & 0x1FF) << 9) | ((color[2] & 0x1FF) << 18) |
+                  ((color[3] & 0b11111) << 27);
       break;
     default:
-      meta_temp_.color_u32[0] = color[0];
-      meta_temp_.color_u32[1] = color[1];
-      meta_temp_.color_u32[2] = color[2];
-      meta_temp_.color_u32[3] = color[3];
+      packed = color;
       break;
     }
+    return packed;
   };
 
+private:
   WMT::Device device_;
   SimpleCommandContext<Context> ctx_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_buffer_uint_;

@@ -88,6 +88,8 @@ run() {
   const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
   CHECK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, UINT(std::size(levels)),
                           D3D11_SDK_VERSION, &device, nullptr, &context));
+  ComPtr<ID3D11DeviceContext> deferred;
+  CHECK(device->CreateDeferredContext(0, &deferred));
   ComPtr<ID3D11Device3> device3;
   CHECK(device.As(&device3));
   step("NV12 required support");
@@ -339,10 +341,10 @@ run() {
         }
         return device->CreateShaderResourceView(resource, &v, &view);
       };
-      auto reads = [&](ID3D11Texture2D *resource) {
+      auto reads = [&](ID3D11Texture2D *resource, const char *variant = "") {
         context->ClearState();
         for (UINT layer = 0; layer < layers; layer++) {
-          step("seed %u, array %u: staging read", seed, layer);
+          step("seed %u, array %u: staging read %s", seed, layer, variant);
           D3D11_MAPPED_SUBRESOURCE poison;
           if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_WRITE, 0, &poison)))
             return false;
@@ -363,7 +365,7 @@ run() {
           for (UINT mode = 0; mode < std::size(reader[array]); mode++)
             for (UINT plane = 0; plane < 2; plane++) {
               UINT integer = mode == 3;
-              step("seed %u, array %u, plane %u, mode %u: shader read", seed, layer, plane, mode);
+              step("seed %u, array %u, plane %u, mode %u: shader read %s", seed, layer, plane, mode, variant);
               context->ClearState();
               ComPtr<ID3D11ShaderResourceView> view;
               if (FAILED(srv(resource, plane, integer, view)))
@@ -539,6 +541,43 @@ run() {
         if (operation == 0 && !reads(destination.Get()))
           return 1;
       }
+      for (UINT integer = 0; integer < std::size(formats); integer++)
+        for (UINT boundary : {UINT(UINT8_MAX), UINT(UINT8_MAX) + 1u})
+          for (UINT plane = 0; plane < std::size(formats[integer]); plane++)
+            for (bool listed : {false, true}) {
+              context->ClearState();
+              step("seed %u, plane %u, integer %u, value %u: uint clear boundary", seed, plane, integer, boundary);
+              D3D11_UNORDERED_ACCESS_VIEW_DESC v{formats[integer][plane], D3D11_UAV_DIMENSION_TEXTURE2DARRAY};
+              if (array)
+                v.Texture2DArray = {0, 0, layers};
+              else {
+                v.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+                v.Texture2D = {0};
+              }
+              ComPtr<ID3D11UnorderedAccessView> view;
+              CHECK(device->CreateUnorderedAccessView(destination.Get(), &v, &view));
+              const UINT values[] = {boundary - 1, boundary, boundary + 1, UINT_MAX};
+              auto recording = listed ? deferred.Get() : context.Get();
+              recording->ClearUnorderedAccessViewUint(view.Get(), values);
+              ComPtr<ID3D11CommandList> commands;
+              if (listed) {
+                CHECK(deferred->FinishCommandList(FALSE, &commands));
+              }
+              for (UINT layer = 0; layer < layers; layer++)
+                for (UINT y = 0; y < (desc.Height >> plane); y++)
+                  for (UINT x = 0; x < (width >> plane); x++)
+                    for (UINT c = 0; c <= plane; c++)
+                      expected[layer][plane * width * desc.Height + y * width + x * (plane + 1) + c] = UINT8(values[c]);
+              for (UINT repeat = 0; repeat < (listed ? 2u : 1u); repeat++) {
+                step("seed %u, plane %u, integer %u, value %u, listed %u, repeat %u: uint clear boundary",
+                     seed, plane, integer, boundary, listed, repeat);
+                if (listed)
+                  context->ExecuteCommandList(commands.Get(), FALSE);
+                auto variant = std::string(trace::doing);
+                if (!reads(destination.Get(), variant.c_str()))
+                  return 1;
+              }
+            }
       if (width == 8 && layers == 1 && sizeof(SIZE_T) > sizeof(UINT)) {
         SYSTEM_INFO system;
         GetSystemInfo(&system);

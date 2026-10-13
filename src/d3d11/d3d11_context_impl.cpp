@@ -688,19 +688,19 @@ public:
       EmitOP([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
             value = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]})](
                  ArgumentEncodingContext &enc
-             ) mutable {
+             ) {
         auto view_format = texture->pixelFormat(viewId);
         auto uint_format = MTLGetUnsignedIntegerFormat((WMTPixelFormat)view_format);
         /* RG11B10Float is a special case */
         if (view_format == WMTPixelFormatRG11B10Float) {
           uint_format = WMTPixelFormatR32Uint;
-          value[0] = ((value[0] & 0x7FF) << 0) | ((value[1] & 0x7FF) << 11) | ((value[2] & 0x3FF) << 22);
         }
 
         if (uint_format == WMTPixelFormatInvalid) {
           WARN("ClearUnorderedAccessViewUint: unhandled format ", view_format);
           return;
         }
+        auto clear_value = ClearUAV<ArgumentEncodingContext>::clearColor(value, view_format);
         auto viewChecked = texture->checkViewUseFormat(viewId, uint_format);
         WMT::Texture texture_handle = enc.access(texture, viewChecked, ResourceAccess::Write).texture;
         switch (desc.ViewDimension) {
@@ -708,14 +708,14 @@ public:
           break;
         case D3D11_UAV_DIMENSION_TEXTURE1D:
         case D3D11_UAV_DIMENSION_TEXTURE2D:
-          enc.emulated_cmd.ClearTexture2DUint(texture_handle, value);
+          enc.emulated_cmd.ClearTexture2DUint(texture_handle, clear_value);
           break;
         case D3D11_UAV_DIMENSION_TEXTURE1DARRAY:
         case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
-          enc.emulated_cmd.ClearTexture2DArrayUint(texture_handle, value);
+          enc.emulated_cmd.ClearTexture2DArrayUint(texture_handle, clear_value);
           break;
         case D3D11_UAV_DIMENSION_TEXTURE3D:
-          enc.emulated_cmd.ClearTexture3DUint(texture_handle, value, desc.Texture3D.FirstWSlice, desc.Texture3D.WSize);
+          enc.emulated_cmd.ClearTexture3DUint(texture_handle, clear_value, desc.Texture3D.FirstWSlice, desc.Texture3D.WSize);
           break;
         }
       });
