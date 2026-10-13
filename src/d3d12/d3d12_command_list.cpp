@@ -628,7 +628,8 @@ public:
           return clear->colors[0].attachment && rt.attachment == clear->colors[0].attachment &&
                  rt.depth_plane == clear->colors[0].depth_plane;
         });
-        if ((clear->colors[0].attachment && color == render->colors.end()) ||
+        // a timestamp query on the clear has the clock when the clear is done
+        if (clear->stamps || (clear->colors[0].attachment && color == render->colors.end()) ||
             (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
             (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment) ||
             // a plane bound read-only may be sampled in the pass, and a load action clears only the tile's copy
@@ -2368,21 +2369,23 @@ public:
       return;
     }
     if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
-      // the clock when the work before is done: a blit encoder of its own samples it as it starts. Metal samples only
-      // encoders that do something
+      // the clock when the work before is done, which the pass that work ends with samples as it ends: a render pass,
+      // or the pass of the query before. other work gets a blit encoder: Metal samples only encoders that do something
       allocator_->InvalidateCurrentPass();
-      PreBlit();
-      auto blit = static_cast<BlitEncoderData *>(allocator_->encoder_current);
-      blit->timestamps = heap;
-      blit->timestamp_query = Index;
-      auto [_, offset] = allocator_->AllocateGPUHeap(sizeof(uint32_t), sizeof(uint32_t));
-      auto &fill = allocator_->EncodeBlitCommand<wmtcmd_blit_fillbuffer>();
-      fill.type = WMTBlitCommandFillBuffer;
-      fill.buffer = allocator_->gpu_heap_buffer_;
-      fill.offset = offset;
-      fill.length = sizeof(uint32_t);
-      fill.value = 0;
-      allocator_->InvalidateCurrentPass();
+      auto pass = allocator_->encoder_last;
+      if (!pass->stamps && pass->type != EncoderType::Render && pass->type != EncoderType::Clear) {
+        PreBlit();
+        pass = allocator_->encoder_current;
+        auto [_, offset] = allocator_->AllocateGPUHeap(sizeof(uint32_t), sizeof(uint32_t));
+        auto &fill = allocator_->EncodeBlitCommand<wmtcmd_blit_fillbuffer>();
+        fill.type = WMTBlitCommandFillBuffer;
+        fill.buffer = allocator_->gpu_heap_buffer_;
+        fill.offset = offset;
+        fill.length = sizeof(uint32_t);
+        fill.value = 0;
+        allocator_->InvalidateCurrentPass();
+      }
+      pass->stamps = new (allocator_->AllocateCommandData<Stamp>(1)) Stamp{heap, Index, pass->stamps};
       return;
     }
     auto query = std::find_if(active_queries_.begin(), active_queries_.end(), [&](auto &q) {

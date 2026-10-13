@@ -36,10 +36,20 @@ enum class EncoderType {
   AccelerationStructure,
 };
 
+class MTLD3D12QueryHeap;
+
+// a timestamp query: the pass it is on samples the GPU clock for it as the pass ends
+struct Stamp {
+  MTLD3D12QueryHeap *heap;
+  uint32_t query;
+  Stamp *next;
+};
+
 struct EncoderData {
   EncoderType type;
   EncoderData *next = nullptr;
   uint64_t id;
+  Stamp *stamps = nullptr;
 };
 
 struct RenderEncoderColorAttachmentData {
@@ -105,14 +115,9 @@ struct RenderEncoderData : EncoderData {
   bool use_geometry = 0;
 };
 
-class MTLD3D12QueryHeap;
-
 struct BlitEncoderData : EncoderData {
   wmtcmd_blit_nop cmd_head;
   wmtcmd_base *cmd_tail;
-  // a timestamp query samples the GPU clock when the encoder starts
-  MTLD3D12QueryHeap *timestamps = nullptr;
-  uint32_t timestamp_query = 0;
 };
 
 struct ComputeEncoderData : EncoderData {

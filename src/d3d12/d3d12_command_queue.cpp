@@ -183,9 +183,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     HANDLE semaphore{};
     std::function<void()> completed{};
     // the timestamp queries the command buffer samples: the device's counter sample buffer it holds until it
-    // completes, and the query of each sample taken
+    // completes, and the queries of each sample taken
     WMT::Reference<WMT::CounterSampleBuffer> samples{};
-    std::vector<std::pair<Com<MTLD3D12QueryHeap>, uint32_t>> sampled{};
+    std::vector<std::vector<std::pair<Com<MTLD3D12QueryHeap>, uint32_t>>> sampled{};
     // the resolves of timestamps into readback buffers, which the CPU does when the command buffer completes
     struct Resolve {
       Com<MTLD3D12QueryHeap> heap;
@@ -344,7 +344,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       size_t read = 0;
       auto sample = [&](size_t until) {
         for (; read < until; read++)
-          inflight.sampled[read].first->timestamps[inflight.sampled[read].second] = clock[read];
+          for (auto &[heap, query] : inflight.sampled[read])
+            heap->timestamps[query] = clock[read];
       };
       for (auto &resolve : inflight.resolves) {
         sample(resolve.after);
@@ -668,7 +669,7 @@ public:
     if (profile_)
       for (auto list : recorded)
         for (auto pass = list; pass; pass = pass->next)
-          queries += pass->type == EncoderType::Blit && static_cast<BlitEncoderData *>(pass)->timestamps;
+          queries += !!pass->stamps;
     // ends the command buffer and waits for it: what the work so far leaves in memory is then there
     auto settle = [&] {
       std::shared_ptr<GPURecordChecks> checks;
@@ -748,17 +749,17 @@ public:
         scope.inflight->encoders[size_t(current->type)]++;
         WMTSampleBufferAttachmentInfo attachment{};
         ProfileBuffer::Pass *profiled = nullptr;
+        auto &pool = device_->timestamp_samples;
+        // a command buffer has one buffer of samples: when it is full the next begins
+        if (current->stamps && scope.inflight->samples && scope.inflight->sampled.size() == pool.limit) {
+          scope.End();
+          scope.Start();
+          cmdbuf = scope.inflight->cmdbuf;
+        }
         if (profile_ &&
             (current->type == EncoderType::Clear || current->type == EncoderType::Render ||
              current->type == EncoderType::Blit || current->type == EncoderType::Compute ||
              current->type == EncoderType::Resolve || current->type == EncoderType::AccelerationStructure)) {
-          auto &pool = device_->timestamp_samples;
-          if (current->type == EncoderType::Blit && static_cast<BlitEncoderData *>(current)->timestamps &&
-              scope.inflight->samples && scope.inflight->sampled.size() == pool.limit) {
-            scope.End();
-            scope.Start();
-            cmdbuf = scope.inflight->cmdbuf;
-          }
           auto &buffer = profile_->buffers[inflight_cmdbuf_seq_.load() % kCommandQueueSize];
           if (!scope.inflight->samples && buffer.passes.empty())
             scope.inflight->samples = pool.Take(device_->GetMTLDevice(), false);
@@ -775,6 +776,24 @@ public:
           buffer.passes.push_back({current, current->id, current->type, first, uint32_t(count),
                                    uint32_t(attachment.end_of_encoder_sample_index), diag::Now()});
           profiled = &buffer.passes.back();
+        }
+        // a timestamp query has the clock when its pass ends
+        if (current->stamps) {
+          if (profile_)
+            queries--;
+          if (!scope.inflight->samples && !(scope.inflight->samples = pool.Take(device_->GetMTLDevice()))) {
+            ERR("EndQuery: Metal has no counter sample buffer for a timestamp");
+          } else {
+            // a profiled pass keeps the sample of its start, and its end is the query's
+            if (!attachment.sample_buffer)
+              attachment = {scope.inflight->samples, ~0ull /* MTLCounterDontSample */};
+            attachment.end_of_encoder_sample_index = scope.inflight->sampled.size();
+            if (profiled)
+              profiled->count = WMTTimestampSamplesPerStage, profiled->last = attachment.end_of_encoder_sample_index;
+            auto &taken = scope.inflight->sampled.emplace_back();
+            for (auto stamp = current->stamps; stamp; stamp = stamp->next)
+              taken.push_back({stamp->heap, stamp->query});
+          }
         }
         switch (current->type) {
         case EncoderType::Null:
@@ -864,36 +883,8 @@ public:
         }
         case EncoderType::Blit: {
           auto data = static_cast<BlitEncoderData *>(current);
-          WMT::CounterSampleBuffer samples{};
-          uint32_t sample = 0;
-          if (data->timestamps) {
-            auto &pool = device_->timestamp_samples;
-            // a command buffer has one buffer of samples: when it is full the next begins
-            if (scope.inflight->samples && scope.inflight->sampled.size() == pool.limit) {
-              scope.End();
-              scope.Start();
-              cmdbuf = scope.inflight->cmdbuf;
-            }
-            if (!scope.inflight->samples)
-              scope.inflight->samples = pool.Take(device_->GetMTLDevice());
-            if (scope.inflight->samples) {
-              samples = scope.inflight->samples;
-              sample = scope.inflight->sampled.size();
-              scope.inflight->sampled.push_back({data->timestamps, data->timestamp_query});
-            } else {
-              ERR("EndQuery: Metal has no counter sample buffer for a timestamp");
-            }
-          }
-          WMTSampleBufferAttachmentInfo query{samples, sample, ~0ull /* MTLCounterDontSample */};
-          if (attachment.sample_buffer && samples) {
-            attachment.start_of_encoder_sample_index = sample;
-            profiled->first = sample;
-          }
-          auto &sampling = attachment.sample_buffer ? attachment : query;
-          auto encoder = sampling.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&sampling, 1)
-                                               : cmdbuf.blitCommandEncoder();
-          if (profile_ && data->timestamps)
-            queries--;
+          auto encoder = attachment.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1)
+                                                  : cmdbuf.blitCommandEncoder();
           encoder.waitForFence(fence_);
           encoder.encodeCommands(&data->cmd_head);
           encoder.updateFence(fence_);
