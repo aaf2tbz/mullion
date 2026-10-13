@@ -208,6 +208,19 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   index_buffer->Unmap(0, nullptr);
   D3D12_INDEX_BUFFER_VIEW index_view{index_buffer->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R32_UINT};
   list->IASetIndexBuffer(&index_view);
+  // a draw whose arguments the GPU reads is a call of its pipeline like the others
+  const D3D12_DRAW_ARGUMENTS indirect{std::size(indices), 1, 0, 0};
+  D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+  const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(indirect), 1, &argument};
+  ComPtr<ID3D12CommandSignature> signature;
+  CHECK(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)));
+  auto arguments = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(indirect), D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!expect(arguments != nullptr, "argument buffer allocation failed"))
+    return verdict();
+  void *argument_data;
+  CHECK(arguments->Map(0, nullptr, &argument_data));
+  memcpy(argument_data, &indirect, sizeof(indirect));
+  arguments->Unmap(0, nullptr);
   for (UINT i = 0; i < std::size(graphics); i++) {
     D3D12_RECT scissor{LONG(i * width / 2), 0, LONG((i + 1) * width / 2), height};
     list->RSSetScissorRects(1, &scissor);
@@ -216,6 +229,7 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
     for (auto count : instances)
       list->DrawInstanced(std::size(indices), count, 0, 0);
     list->DrawIndexedInstanced(std::size(indices), instances[i], 0, 0, 0);
+    list->ExecuteIndirect(signature.Get(), 1, arguments.Get(), 0, nullptr, 0);
   }
   list->SetComputeRootSignature(rs.Get());
   list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
@@ -462,7 +476,7 @@ main(int argc, char **argv) {
     facts.close();
     std::string render_runs[2], compute_runs[2];
     for (UINT i = 0; i < std::size(render_runs); i++) {
-      render_runs[i] = names[i] + '*' + std::to_string(std::size(instances) + 1) + '*' +
+      render_runs[i] = names[i] + '*' + std::to_string(std::size(instances) + 2) + '*' +
                        std::to_string(std::size(indices) * (instances[0] + instances[1])) + '*' +
                        std::to_string(std::size(indices) * instances[i]);
       compute_runs[i] = names[i + std::size(render_runs)] + '*' + std::to_string(std::size(instances)) + "*0*0";

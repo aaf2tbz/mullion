@@ -144,6 +144,7 @@ PipelineRuns(Head head, Name name) {
       case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
       case WMTRenderCommandDXMTTessellationMeshDrawIndirect:
       case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+      case WMTRenderCommandExecuteCommandsInBuffer:
         calls++;
         break;
       default:
