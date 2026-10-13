@@ -322,6 +322,14 @@ public:
     return *storage;
   }
 
+  // the dispatches of a pass run unordered: those after this see what those before it wrote
+  void
+  OrderDispatches() {
+    auto &barrier = EncodeComputeCommand<wmtcmd_compute_memory_barrier>();
+    barrier.type = WMTComputeCommandMemoryBarrier;
+    barrier.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
+  }
+
   template <typename cmd_struct>
   cmd_struct &
   EncodeAccelerationStructureCommand() {

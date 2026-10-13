@@ -846,7 +846,7 @@ public:
             render_pass_info.visibility_buffer = data->visibility_buffer;
           }
           if (data->before_head.next.get()) {
-            auto before = cmdbuf.computeCommandEncoder(false);
+            auto before = cmdbuf.computeCommandEncoder(true);
             before.waitForFence(fence_);
             before.encodeCommands(&data->before_head);
             before.updateFence(fence_);
@@ -910,7 +910,7 @@ public:
         case EncoderType::Compute: {
           auto data = static_cast<ComputeEncoderData *>(current);
           auto encoder =
-              attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment) : cmdbuf.computeCommandEncoder(false);
+              attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true) : cmdbuf.computeCommandEncoder(true);
           if (record_totals_) {
             auto label = "compute " + device_->PassName(current, !profile_);
             SnapshotGPURecords(records, current, label, scope.inflight->records);

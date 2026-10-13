@@ -356,6 +356,7 @@ MTLD3D12CommandAllocatorImpl::EncodeComputeResolver(MTLD3D12CommandSignature *pC
   auto &cmd_dispatch_res = EncodeComputeCommand<wmtcmd_compute_dispatch>();
   cmd_dispatch_res.type = WMTComputeCommandDispatch;
   cmd_dispatch_res.size = {1, 1, 1};
+  OrderDispatches();
   return data;
 }
 

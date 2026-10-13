@@ -1271,6 +1271,7 @@ public:
     part.type = WMTComputeCommandDispatchPart;
     part.origin = {origin[0], origin[1], origin[2]};
     part.size = {size[0], size[1], size[2]};
+    allocator_->OrderDispatches();
   }
 
   // with DXMT_D3D12_ISOLATE set a dispatch is a pass of its own, which the queue then waits for and times
@@ -1842,19 +1843,30 @@ public:
   };
 
   // passes are already ordered by the queue's fence (each waits for the one before), so a barrier matters only inside
-  // a render pass, where draws run unordered: one that orders writes a draw made (UAV, render target, depth, stream
-  // output) or aliases memory ends the pass, and the next draw opens one that loads what this one stored
+  // a pass, where draws and dispatches run unordered. one that orders writes a draw made (UAV, render target, depth,
+  // stream output) or aliases memory ends the render pass, and the next draw opens one that loads what this one
+  // stored. a dispatch writes through UAVs alone and keeps its pass: `dispatched` is a barrier on one, before or after.
+  // true when no later barrier of the call can matter
+  bool
+  Order(bool drew, bool dispatched) {
+    auto type = allocator_->encoder_current ? allocator_->encoder_current->type : EncoderType::Null;
+    if (type == EncoderType::Render && drew)
+      allocator_->InvalidateCurrentPass();
+    else if (type == EncoderType::Compute && dispatched)
+      allocator_->OrderDispatches();
+    else
+      return type != EncoderType::Render && type != EncoderType::Compute;
+    return true;
+  }
+
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
-    if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render)
-      return;
-    constexpr auto draw_writes =
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE |
-        D3D12_RESOURCE_STATE_STREAM_OUT;
+    constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
+                       D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
     for (auto &barrier : std::span(barriers, Count)) {
-      if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || (barrier.Transition.StateBefore & draw_writes)) {
-        allocator_->InvalidateCurrentPass();
+      bool other = barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      auto &states = barrier.Transition;
+      if (Order(other || (states.StateBefore & draw_writes), other || ((states.StateBefore | states.StateAfter) & uav)))
         return;
-      }
     }
   };
 
@@ -3498,26 +3510,25 @@ public:
     cmd.mesh_threadgroup_size = size(pso_graphics_->mesh_threads);
   }
 
-  // enhanced barriers order work as ResourceBarrier does: a draw's writes end the pass they were drawn in
+  // enhanced barriers order work as ResourceBarrier does
   void STDMETHODCALLTYPE
   Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups) {
-    if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render)
-      return;
-    constexpr auto draw_writes = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_RENDER_TARGET |
-                                 D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_STREAM_OUTPUT;
+    constexpr auto uav = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, draw_writes = uav | D3D12_BARRIER_ACCESS_RENDER_TARGET |
+                       D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_STREAM_OUTPUT;
     // common access is any access, writes included
-    auto writes = [&](D3D12_BARRIER_ACCESS access) {
-      return access == D3D12_BARRIER_ACCESS_COMMON || (access != D3D12_BARRIER_ACCESS_NO_ACCESS && (access & draw_writes));
+    auto any = [](D3D12_BARRIER_ACCESS access, D3D12_BARRIER_ACCESS of) {
+      return access == D3D12_BARRIER_ACCESS_COMMON || (access != D3D12_BARRIER_ACCESS_NO_ACCESS && (access & of));
     };
     for (auto &group : std::span(pBarrierGroups, NumBarrierGroups))
       for (UINT32 i = 0; i < group.NumBarriers; i++) {
-        auto access = group.Type == D3D12_BARRIER_TYPE_GLOBAL    ? group.pGlobalBarriers[i].AccessBefore
-                      : group.Type == D3D12_BARRIER_TYPE_TEXTURE ? group.pTextureBarriers[i].AccessBefore
-                                                                 : group.pBufferBarriers[i].AccessBefore;
-        if (writes(access)) {
-          allocator_->InvalidateCurrentPass();
+        auto [before, after] =
+            group.Type == D3D12_BARRIER_TYPE_GLOBAL
+                ? std::pair{group.pGlobalBarriers[i].AccessBefore, group.pGlobalBarriers[i].AccessAfter}
+                : group.Type == D3D12_BARRIER_TYPE_TEXTURE
+                      ? std::pair{group.pTextureBarriers[i].AccessBefore, group.pTextureBarriers[i].AccessAfter}
+                      : std::pair{group.pBufferBarriers[i].AccessBefore, group.pBufferBarriers[i].AccessAfter};
+        if (Order(any(before, draw_writes), any(before, uav) || any(after, uav)))
           return;
-        }
       }
   }
 };
