@@ -1120,8 +1120,9 @@ public:
     // a positive answer says the format and count can be created (ID3D11Device::CheckMultisampleQualityLevels),
     // which is what CheckFormatSupport says of the format and Metal of the count; Metal has one quality. no tiled
     // resource is multisampled
-    bool multisample = !(desc.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) &&
-                       any_bit_set(GetMTLPixelFormatCapability(desc.PixelFormat) & FormatCapability::MSAA);
+    UINT support = 0;
+    bool multisample = SUCCEEDED(CheckFormatSupport(Format, &support)) &&
+                       (support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET);
     if (SUCCEEDED(hr) && !Flags && (SampleCount == 1 || multisample) &&
         GetMTLDevice().supportsTextureSampleCount(SampleCount))
       *pNumQualityLevels = 1;

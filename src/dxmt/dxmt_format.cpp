@@ -1655,6 +1655,9 @@ MTLQueryDXGIFormatSupport(
   }
 
   auto Capability = GetMTLPixelFormatCapability(metal_format.PixelFormat);
+  // D3D11.3 19.1.4: shaders read the shared-exponent format and nothing renders to it, though Metal can
+  if (Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+    Capability = Capability & FormatCapability::Filter;
 
   // integer formats have shader loads, not shader samples (D3D11.3 19.1.4)
   if (metal_format.PixelFormat && !IsIntegerFormat(metal_format.PixelFormat) &&
@@ -1735,6 +1738,17 @@ MTLQueryDXGIFormatSupport(
     Support2 |= D3D11_FORMAT_SUPPORT2_TILED;
   }
 
+  // Microsoft Learn, "Format support for Direct3D Feature Level 11.0 hardware": a depth stencil format is a target no
+  // shader reads, and the format of one of its planes is read and is no target
+  if (metal_format.PixelFormat != ORIGINAL_FORMAT(metal_format.PixelFormat)) {
+    if (any_bit_set(Capability & FormatCapability::DepthStencil))
+      Support1 &= ~(D3D11_FORMAT_SUPPORT_DEPTH_STENCIL | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET);
+  } else if ((metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) &&
+             !(metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS)) {
+    Support1 &= ~(D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE |
+                  D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON | D3D11_FORMAT_SUPPORT_SHADER_GATHER |
+                  D3D11_FORMAT_SUPPORT_SHADER_GATHER_COMPARISON);
+  }
 
   return S_OK;
 }

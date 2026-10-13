@@ -95,13 +95,13 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
   }
   if (finalDesc.ViewDimension != D3D10_SRV_DIMENSION_TEXTURE2D) {
     ERR("Only 2d texture SRV can be created on dynamic texture");
-    return E_FAIL;
+    return E_INVALIDARG;
   }
   if (~finalDesc.Texture2D.MipLevels == 0)
     finalDesc.Texture2D.MipLevels = this->desc.MipLevels - finalDesc.Texture2D.MostDetailedMip;
   if (finalDesc.Texture2D.MostDetailedMip != 0 || finalDesc.Texture2D.MipLevels != 1) {
     ERR("2d texture SRV must be non-mipmapped on dynamic texture");
-    return E_FAIL;
+    return E_INVALIDARG;
   }
   if (!ppView) {
     return S_FALSE;
@@ -133,13 +133,13 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_1d>::CreateShaderRes
   }
   if (finalDesc.ViewDimension != D3D10_SRV_DIMENSION_TEXTURE1D) {
     ERR("Only 1d texture SRV can be created on dynamic texture");
-    return E_FAIL;
+    return E_INVALIDARG;
   }
   if (~finalDesc.Texture1D.MipLevels == 0)
     finalDesc.Texture1D.MipLevels = this->desc.MipLevels - finalDesc.Texture1D.MostDetailedMip;
   if (finalDesc.Texture1D.MostDetailedMip != 0 || finalDesc.Texture1D.MipLevels != 1) {
     ERR("1d texture SRV must be non-mipmapped on dynamic texture");
-    return E_FAIL;
+    return E_INVALIDARG;
   }
   if (!ppView) {
     return S_FALSE;

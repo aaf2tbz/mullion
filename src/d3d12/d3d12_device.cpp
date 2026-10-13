@@ -427,8 +427,12 @@ public:
       MTLQueryDXGIFormat(metal, out->Format, format_desc);
       if (!format_desc.PlanarCount && !IsSamplerFeedback(out->Format))
         return E_INVALIDARG;
-      bool multisample = !(format_desc.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) &&
-                         any_bit_set(GetMTLPixelFormatCapability(format_desc.PixelFormat) & FormatCapability::MSAA);
+      // a multisampled texture is a multisampled target: what the format's support says
+      uint32_t support1 = 0, support2 = 0;
+      MTLQueryDXGIFormatSupport(
+          metal, out->Format, [this](WMTPixelFormat f) { return GetMTLPixelFormatCapability(f); }, support1, support2
+      );
+      bool multisample = support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
       if (out->SampleCount == 1 || (!out->Flags && multisample && metal.supportsTextureSampleCount(out->SampleCount)))
         out->NumQualityLevels = 1;
       return S_OK;

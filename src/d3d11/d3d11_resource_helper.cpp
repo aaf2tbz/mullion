@@ -326,7 +326,7 @@ CreateMTLTextureDescriptorInternal(
 
   MTL_DXGI_FORMAT_DESC metal_format;
   if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), Format, metal_format)) ||
-      metal_format.PixelFormat == WMTPixelFormatInvalid || !metal_format.BytesPerTexel) {
+      metal_format.PixelFormat == WMTPixelFormatInvalid) {
     ERR("CreateMTLTextureDescriptorInternal: creating a texture of invalid "
         "format: ",
         Format);
@@ -360,10 +360,6 @@ CreateMTLTextureDescriptorInternal(
       break;
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
     case DXGI_FORMAT_D24_UNORM_S8_UINT:
-    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
     case DXGI_FORMAT_R32G8X24_TYPELESS:
     case DXGI_FORMAT_R24G8_TYPELESS:
       break;
@@ -382,8 +378,9 @@ CreateMTLTextureDescriptorInternal(
   if ((BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&
       ((BindFlags & D3D11_BIND_DEPTH_STENCIL) || !any_bit_set(capability & FormatCapability::Write)))
     return E_INVALIDARG;
+  // a plane's format is the one a shader reads the depth stencil texture in
   if ((BindFlags & D3D11_BIND_SHADER_RESOURCE) && any_bit_set(capability & FormatCapability::DepthStencil) &&
-      !(metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS))
+      !(metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) && metal_format.PixelFormat == pDescOut->pixel_format)
     return E_INVALIDARG;
   // D3D11.3 19.1.4 only permits shader reads of the shared-exponent format, even when Metal can render it
   if (Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && (BindFlags & ~D3D11_BIND_SHADER_RESOURCE))
