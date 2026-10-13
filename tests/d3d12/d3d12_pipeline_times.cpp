@@ -36,6 +36,10 @@ RWStructuredBuffer<uint> stored : register(u0);
 static const char ray_hlsl[] = R"hlsl(
 RWStructuredBuffer<uint> stored : register(u0);
 [shader("raygeneration")] void raygen() { stored[0] = VALUE; }
+// a pipeline stack size sets a call depth of its own only where a callable shader can recurse: without one the ray
+// recursion limit bounds every chain (DXR, "Ray recursion limit"), and a larger stack is the same pipeline
+struct Parameter { uint value; };
+[shader("callable")] void callable(inout Parameter parameter) { parameter.value = VALUE; }
 )hlsl";
 
 static const std::string made_prefix = "D3D12 pipeline made: ", totals_prefix = "D3D12 pipeline totals: ";
