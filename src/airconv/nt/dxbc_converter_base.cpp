@@ -1492,7 +1492,7 @@ Converter::TexelAddress(const TextureResourceHandle &Tex, llvm::Value *Coord, co
   if (Tex.Logical == llvm::air::Texture::texture_buffer) {
     OOB = ir.CreateICmpUGE(ir.CreateAdd(Address, OffsetValue), DecodeTextureBufferElement(Tex.Metadata));
     Address = ir.CreateAdd(Address, DecodeTextureBufferOffset(Tex.Metadata));
-  } else if (Level && Info.is_mipmaped) {
+  } else if (!Tex.IsUAV && Level && Info.is_mipmaped) {
     // the view keeps the mip that holds its min-LOD clamp and every smaller one
     auto MinLevel = air.CreateFPUnOp(llvm::air::AIRBuilder::floor, DecodeTextureMinLODClamp(Tex.Metadata));
     OOB = ir.CreateICmpULT(Level, air.CreateConvertToUnsigned(MinLevel));
