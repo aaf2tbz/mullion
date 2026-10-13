@@ -82,6 +82,8 @@ int32_t MTLQueryDXGIFormatSupport(
 
 uint32_t MTLGetTexelSize(WMTPixelFormat format);
 
+FormatCapability MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability capability);
+
 WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);
 
 bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);

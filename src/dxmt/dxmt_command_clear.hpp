@@ -311,6 +311,16 @@ public:
       // interpreted as R32Uint
       packed[0] = ((color[0] & 0x7FF) << 0) | ((color[1] & 0x7FF) << 11) | ((color[2] & 0x3FF) << 22);
       break;
+    // interpreted as R16Uint, in DXGI_FORMAT's order of fields from the low bit
+    case WMTPixelFormatB5G6R5Unorm:
+      packed[0] = (color[2] & 0x1f) | (color[1] & 0x3f) << 5 | (color[0] & 0x1f) << 11;
+      break;
+    case WMTPixelFormatBGR5A1Unorm:
+      packed[0] = (color[2] & 0x1f) | (color[1] & 0x1f) << 5 | (color[0] & 0x1f) << 10 | (color[3] & 1) << 15;
+      break;
+    case WMTPixelFormatBGRA4Unorm:
+      packed[0] = (color[2] & 0xf) | (color[1] & 0xf) << 4 | (color[0] & 0xf) << 8 | (color[3] & 0xf) << 12;
+      break;
     case WMTPixelFormatRGB9E5Float:
       // interpreted as R32Uint
       packed[0] = ((color[0] & 0x1FF) << 0) | ((color[1] & 0x1FF) << 9) | ((color[2] & 0x1FF) << 18) |

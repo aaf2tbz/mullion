@@ -381,7 +381,8 @@ CreateMTLTextureDescriptorInternal(
   if (pDescOut->pixel_format == WMTPixelFormatX32_Stencil8)
     pDescOut->pixel_format = WMTPixelFormatDepth32Float_Stencil8;
 
-  auto capability = pDevice->GetMTLPixelFormatCapability(pDescOut->pixel_format);
+  auto capability =
+      MTLGetDXGIFormatCapability(metal_format, pDevice->GetMTLPixelFormatCapability(pDescOut->pixel_format));
   if ((BindFlags & D3D11_BIND_RENDER_TARGET) && !any_bit_set(capability & FormatCapability::Color))
     return E_INVALIDARG;
   if ((BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&

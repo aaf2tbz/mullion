@@ -1345,8 +1345,9 @@ MTLGetUnsignedIntegerFormat(WMTPixelFormat format) {
   case WMTPixelFormatB5G6R5Unorm:
   case WMTPixelFormatA1BGR5Unorm:
   case WMTPixelFormatABGR4Unorm:
+  case WMTPixelFormatBGRA4Unorm:
   case WMTPixelFormatBGR5A1Unorm:
-    break;
+    return WMTPixelFormatR16Uint;
   case WMTPixelFormatR32Uint:
   case WMTPixelFormatR32Sint:
   case WMTPixelFormatR32Float:
@@ -1572,6 +1573,19 @@ BorderColorRange(const MTL_DXGI_FORMAT_DESC &description) {
 }
 
 
+/* what the capabilities of a format's Metal format are worth to the format: one of several Metal texels (the 96-bit
+   ones) is no texel of a view, and Microsoft's table of formats has no typed unordered access view of it */
+FormatCapability
+MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability capability) {
+  auto texel = MTLGetTexelSize(format.PixelFormat);
+  if (texel && format.BytesPerTexel > texel)
+    capability = capability & static_cast<FormatCapability>(
+                                  FormatCapability::Filter | FormatCapability::Color | FormatCapability::Blend |
+                                  FormatCapability::MSAA | FormatCapability::Sparse | FormatCapability::Resolve
+                              );
+  return capability;
+}
+
 /* D3D11_FORMAT_SUPPORT and D3D11_FORMAT_SUPPORT2 bits, derived from Metal; D3D12_FORMAT_SUPPORT1 and 2 share their
    values. `GetMTLPixelFormatCapability` is the device's own capability table */
 int32_t
@@ -1637,7 +1651,10 @@ MTLQueryDXGIFormatSupport(
                         D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
 
     if (!(metal_format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
-      Support1 |= D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
+      Support1 |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
+      // a buffer's view has no swizzle to put a format's channels in their places
+      if (metal_format.PixelFormat == ORIGINAL_FORMAT(metal_format.PixelFormat))
+        Support1 |= D3D11_FORMAT_SUPPORT_BUFFER;
     }
 
     if (metal_format.Flag & MTL_DXGI_FORMAT_BACKBUFFER) {
@@ -1654,7 +1671,7 @@ MTLQueryDXGIFormatSupport(
     Support1 |= D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER;
   }
 
-  auto Capability = GetMTLPixelFormatCapability(metal_format.PixelFormat);
+  auto Capability = MTLGetDXGIFormatCapability(metal_format, GetMTLPixelFormatCapability(metal_format.PixelFormat));
   // D3D11.3 19.1.4: shaders read the shared-exponent format and nothing renders to it, though Metal can
   if (Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
     Capability = Capability & FormatCapability::Filter;
