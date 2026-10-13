@@ -1745,8 +1745,6 @@ convert_dxil(
     auto &t = *h.texture;
     auto lod = sample ? ir.getInt32(0) : ir.CreateExtractElement(coord, 3);
     auto [address, array] = dxbc.TexelAddress(t, coord, offset, sample ? nullptr : lod);
-    if (t.Texture.memory_access == Texture::acesss_readwrite)
-      air.CreateTextureFence(t.Texture, t.Handle);
     return air.CreateRead(t.Texture, t.Handle, address, array, sample, lod, t.GlobalCoherent);
   };
   auto texel_write = [&](Handle &h, Value *coord, CallInst *call, unsigned first) {

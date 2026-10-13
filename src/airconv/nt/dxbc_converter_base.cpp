@@ -1445,9 +1445,6 @@ Converter::operator()(const InstLoadUAVTyped &load) {
   const int32_t NoOffset[3] = {};
   auto [Address, ArrayIndex] = TexelAddress(*Tex, LoadOperand(load.src_address, kMaskAll), NoOffset, nullptr);
 
-  if (Tex->Texture.memory_access == Texture::acesss_readwrite)
-    air.CreateTextureFence(Tex->Texture, Tex->Handle);
-
   auto [Value, Residency] =
       air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, nullptr, air.getInt(0), Tex->GlobalCoherent);
 

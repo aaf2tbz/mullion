@@ -794,7 +794,10 @@ AIRBuilder::CreateWrite(
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getVoidTy(), Tys, false), Attrs);
 
-  return builder.CreateCall(Fn, Ops);
+  auto Write = builder.CreateCall(Fn, Ops);
+  if (Texture.memory_access == Texture::acesss_readwrite) // a thread reads what it wrote only past a fence
+    CreateTextureFence(Texture, Handle);
+  return Write;
 }
 
 std::pair<Value *, Value *>
