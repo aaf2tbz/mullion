@@ -437,6 +437,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             // D3D11.3 19.1.4: shared-exponent data is for shader reads, even on Metal formats that render it
             if (format.value == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && bind && bind != D3D11_BIND_SHADER_RESOURCE)
               valid = false;
+            // the XR format has no views of its own: it is bound through the formats it casts to (its row: "Cast
+            // Within Bit Layout", "BackBuffer Castable Even Fully Typed"), which the row's other targets do not decide
+            if (format.value == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && bind && (support & needed))
+              continue;
             step("D3D%u dimension %u format %s bind %#x output %u", route, dimension, format.name, bind, output);
             check(
                 4, 4, 4, 1, 1, format.value, bind, 0, D3D11_USAGE_DEFAULT, {1, 0}, nullptr, output,

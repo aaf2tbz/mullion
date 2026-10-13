@@ -333,8 +333,17 @@ CreateMTLTextureDescriptorInternal(
     return E_FAIL;
   }
 
+  // a format makes the textures its row names (Microsoft Learn, "Format support for Direct3D Feature Level 11.0
+  // hardware": Texture1D, Texture2D, Texture3D)
+  UINT support = 0;
+  pDevice->CheckFormatSupport(Format, &support);
+  if (!(support & (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D   ? D3D11_FORMAT_SUPPORT_TEXTURE1D
+                   : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D ? D3D11_FORMAT_SUPPORT_TEXTURE2D
+                                                                     : D3D11_FORMAT_SUPPORT_TEXTURE3D)))
+    return E_INVALIDARG;
+
   if (metal_format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
-    if (Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || ((Width | Height) & 1) || MipLevels != 1 ||
+    if (((Width | Height) & 1) || MipLevels != 1 ||
         SampleCount != 1 || (MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) ||
         (BindFlags & D3D11_BIND_DEPTH_STENCIL) || (Usage == D3D11_USAGE_STAGING && ArraySize > 1))
       return E_INVALIDARG;

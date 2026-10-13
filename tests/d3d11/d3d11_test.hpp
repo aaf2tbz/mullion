@@ -59,6 +59,7 @@ read(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Buffer *source) {
   source->GetDesc(&desc);
   desc.Usage = D3D11_USAGE_STAGING;
   desc.BindFlags = 0;
+  desc.MiscFlags = 0; // the source's views are not the copy's
   desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
   ComPtr<ID3D11Buffer> staging;
   std::vector<uint32_t> words(desc.ByteWidth / 4);
