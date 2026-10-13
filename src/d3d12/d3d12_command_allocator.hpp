@@ -166,6 +166,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   std::vector<std::shared_ptr<const AccelerationStructureInputs>> acceleration_structure_inputs_;
 
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
+  std::vector<Rc<Buffer>> sparse_clear_texels_;
+  WMT::Reference<WMT::ComputePipelineState> sparse_clear_pso_;
   TranscodeFeedback<MTLD3D12CommandAllocatorImpl> transcode_feedback_;
   ClearRTV<MTLD3D12CommandAllocatorImpl> clear_rtv_;
 
@@ -173,6 +175,50 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   uint64_t copy_temp_version_;
 
 public:
+  template <typename T>
+  void
+  ClearSparseTexelBuffer(
+      const std::array<T, 4> &color, Buffer *buffer, BufferViewKey view, const BufferSlice &slice,
+      UINT RectCount, const D3D12_RECT *pRects
+  ) {
+    auto texel = Rc(new Buffer(sizeof(color), device_->GetMTLDevice()));
+    texel->rename(texel->allocate({}));
+    SimpleCommandContext<MTLD3D12CommandAllocatorImpl> ctx{*this};
+    if (!sparse_clear_pso_)
+      sparse_clear_pso_ = ctx.getComputePipeline("cs_clear_sparse_tbuffer");
+    if (!texel->current()->buffer() || !sparse_clear_pso_) {
+      exhausted_ = true;
+      return;
+    }
+    auto format = buffer->pixelFormat(view);
+    auto texel_view = texel->createView({format});
+    clear_uav_.begin(color, texel.ptr(), texel_view);
+    clear_uav_.clear(0, 0, 1, 1);
+    clear_uav_.end();
+    sparse_clear_texels_.push_back(texel);
+
+    ctx.startComputePass();
+    ctx.setComputePSO(sparse_clear_pso_, {sparse_clear_pso_.threadExecutionWidth(), 1, 1});
+    ctx.setComputeBuffer(0, Rc<Buffer>(buffer), 0, buffer->length(), ResourceAccess::Write);
+    ctx.setComputeBuffer(2, texel, 0, MTLGetTexelSize(format), ResourceAccess::Read);
+    for (UINT i = 0; i < (RectCount ? RectCount : 1); i++) {
+      uint64_t left = 0, right = slice.elementCount;
+      if (RectCount) {
+        auto rect = pRects[i];
+        left = std::max<int64_t>(rect.left, 0);
+        right = std::max<int64_t>(std::min<int64_t>(rect.right, slice.elementCount), 0);
+        if (rect.top >= 1 || rect.bottom <= 0)
+          continue;
+      }
+      if (right <= left)
+        continue;
+      SparseTexelClear meta{(slice.firstElement + left) * MTLGetTexelSize(format), MTLGetTexelSize(format)};
+      memcpy(ctx.setComputeBytes(1, sizeof(meta)), &meta, sizeof(meta));
+      ctx.dispatch({right - left, 1, 1});
+    }
+    ctx.endPass();
+  }
+
   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
 
   ~MTLD3D12CommandAllocatorImpl();

@@ -1870,6 +1870,16 @@ public:
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
                        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
+    // Metal orders nothing between passes that reach one memory through a reserved buffer and through another
+    // resource, in one command buffer or in two, until the earlier has completed (tests/native/alias_order)
+    if (std::ranges::any_of(std::span(barriers, Count), [](auto &barrier) {
+          return barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+        }) && !device_->SparseBufferMappings().empty()) {
+      allocator_->InvalidateCurrentPass();
+      allocator_->AllocatePass<EncoderData>()->type = EncoderType::Settle;
+      allocator_->InvalidateCurrentPass();
+      return;
+    }
     for (auto &barrier : std::span(barriers, Count)) {
       bool other = barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
       auto &states = barrier.Transition;
@@ -2253,6 +2263,12 @@ public:
       color = {};
       RectCount = 0;
     }
+    if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexelBuffer &&
+        Descriptor.UAVTexelBuffer.buffer->current()->sparse_tile_bytes) {
+      allocator_->ClearSparseTexelBuffer(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view,
+          Descriptor.UAVTexelBuffer.slice, RectCount, pRects);
+      return;
+    }
     D3D12_RECT full_rect;
     switch (Descriptor.type) {
     case ShaderVisibleDescriptorType::UAVBuffer: {
@@ -2308,6 +2324,12 @@ public:
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
     auto &Descriptor = Heap->GetDescriptor(Index);
     auto color = std::array<float, 4>({Values[0], Values[1], Values[2], Values[3]});
+    if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexelBuffer &&
+        Descriptor.UAVTexelBuffer.buffer->current()->sparse_tile_bytes) {
+      allocator_->ClearSparseTexelBuffer(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view,
+          Descriptor.UAVTexelBuffer.slice, RectCount, pRects);
+      return;
+    }
     D3D12_RECT full_rect;
     switch (Descriptor.type) {
     case ShaderVisibleDescriptorType::UAVBuffer: {

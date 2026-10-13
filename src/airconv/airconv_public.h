@@ -1,6 +1,7 @@
 #include "stddef.h"
 #include "stdint.h"
 #include "stdbool.h"
+#include "airconv_sparse.h"
 
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
@@ -36,13 +37,6 @@ enum SM50_BINDING_INDEX: uint32_t {
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
-};
-
-/* a count followed by these headers and one qword per tile (1 mapped, 0 NULL), captured at submission */
-struct SM50_SPARSE_BUFFER_MAPPING {
-  uint64_t address;
-  uint64_t tile_count;
-  uint64_t tile_bytes;
 };
 
 /* the bytes before the lock table of 64-bit atomics, which every root signature's arguments name, are the header of

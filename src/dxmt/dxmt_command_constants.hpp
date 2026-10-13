@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../airconv/airconv_sparse.h"
+
 #ifdef __METAL__
 #define CONSTANT constant
 #else
@@ -11,6 +13,11 @@ namespace dxmt {
 constexpr CONSTANT auto kCustomBufferArgumentIndex0 = 30;
 constexpr CONSTANT auto kCustomBufferArgumentIndex1 = 29;
 constexpr CONSTANT auto kSparseBufferArgumentIndex = kCustomBufferArgumentIndex1 - 1;
+
+struct SparseTexelClear {
+  sm50_sparse_qword byte_offset;
+  sm50_sparse_qword texel_size;
+};
 
 constexpr CONSTANT auto kPresentFCIndex_BackbufferSizeMatched = 0x100;
 constexpr CONSTANT auto kPresentFCIndex_BackbufferIsSRGB = 0x103;

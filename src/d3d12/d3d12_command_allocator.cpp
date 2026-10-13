@@ -185,6 +185,7 @@ MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
     case EncoderType::Null:
     case EncoderType::Predicate:
     case EncoderType::Later:
+    case EncoderType::Settle:
       break;
     case EncoderType::Clear:
     case EncoderType::Render:
@@ -290,6 +291,7 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   encoder_count_ = 0;
 
   icb_.clear();
+  sparse_clear_texels_.clear();
   visibility_.clear();
   visibility_used_ = kVisibilityWindow;
   acceleration_structures_.clear();

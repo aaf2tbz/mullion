@@ -33,6 +33,8 @@ enum class EncoderType {
   ResolveTimestamps,
   Predicate,
   Later,
+  // the work so far completes before what follows starts
+  Settle,
   AccelerationStructure,
 };
 

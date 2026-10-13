@@ -1021,6 +1021,9 @@ public:
           encoder.endEncoding();
           break;
         }
+        case EncoderType::Settle:
+          settle();
+          break;
         case EncoderType::Predicate: {
           // what its region's kernel decided is in memory once the command buffer with the kernel has completed
           auto data = static_cast<PredicateEncoderData *>(current);

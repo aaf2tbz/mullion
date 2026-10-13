@@ -804,6 +804,30 @@ struct DXMTClearUintMetadata {
   buffer[meta.offset.x + pos] = meta.value.x;
 }
 
+[[kernel]] void cs_clear_sparse_tbuffer(
+    device uchar *buffer [[buffer(0)]],
+    constant SparseTexelClear &meta [[buffer(1)]],
+    device const uchar *texel [[buffer(2)]],
+    constant ulong *mappings [[buffer(kSparseBufferArgumentIndex)]],
+    uint pos [[thread_position_in_grid]]
+) {
+  ulong offset = meta.byte_offset + ulong(pos) * meta.texel_size;
+  ulong address = (ulong)buffer + offset;
+  auto entry = mappings + 1;
+  for (ulong i = 0; i < mappings[0]; i++) {
+    auto header = (constant SM50_SPARSE_BUFFER_MAPPING *)entry;
+    auto tiles = entry + sizeof(*header) / sizeof(*entry);
+    ulong relative = address - header->address;
+    if (relative < header->tile_count * header->tile_bytes) {
+      for (ulong byte = 0; byte < meta.texel_size; byte++)
+        if (tiles[(relative + byte) / header->tile_bytes])
+          buffer[offset + byte] = texel[byte];
+      return;
+    }
+    entry = tiles + header->tile_count;
+  }
+}
+
 [[kernel]] void cs_downscale_dilated_mv(
   uint2 pos [[thread_position_in_grid]],
   constant float2& mv_scale [[buffer(0)]],
