@@ -32,6 +32,8 @@ struct SRVTextureGPUStorage {
   uint64_t padding[2];
 };
 
+static_assert(D3D12_REQ_MIP_LEVELS <= (1u << SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS));
+
 using UAVTextureGPUStorage = SRVTextureGPUStorage;
 
 struct UAVTexelBufferGPUStorage {
@@ -192,6 +194,8 @@ public:
       // resource has, a byte each, then 16 bits each for the first slice and the resource's width and height
       gpu_storage.SRVTexture.padding[1] = View.mip_start | Texture->miplevelCount() << 8 | View.array_start << 16 |
                                           (uint64_t)Texture->width() << 32 | (uint64_t)Texture->height() << 48;
+      if (Texture->isSparse() && (Texture->usage() & WMTTextureUsageShaderWrite))
+        gpu_storage.SRVTexture.padding[1] |= SM50_TEXTURE_VIEW_METADATA_SPARSE_WRITE;
     }
     return S_OK;
   }

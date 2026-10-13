@@ -214,6 +214,11 @@ public:
     return info_.usage;
   }
 
+  bool
+  isSparse() const {
+    return info_.placement_sparse_page_size != 0;
+  }
+
   unsigned
   sampleCount() const {
     return info_.sample_count;

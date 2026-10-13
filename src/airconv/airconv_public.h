@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 37
+#define AIRCONV_VERSION 38
 
 #ifdef __cplusplus
 #include <string>
@@ -333,6 +333,12 @@ enum SM50_SAMPLER_METADATA {
   SM50_SAMPLER_METADATA_MAX_LOD = 44,
   SM50_SAMPLER_METADATA_COMPARE = 56,
   SM50_SAMPLER_METADATA_ADDRESS = 59,
+};
+
+/* the view location qword after its format range: bit 7 of the first mip byte is spare (D3D12_REQ_MIP_LEVELS) */
+enum SM50_TEXTURE_VIEW_METADATA : uint64_t {
+  SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS = 7,
+  SM50_TEXTURE_VIEW_METADATA_SPARSE_WRITE = 1ull << SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS,
 };
 
 /* WMTSamplerAddressMode, with one border */

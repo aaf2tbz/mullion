@@ -487,7 +487,17 @@ public:
   // unbiased, replaces Metal's where it has no derivatives
   std::pair<llvm::Value *, llvm::Value *> CalculateLOD(
       const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
-      llvm::Value *Level = nullptr
+      llvm::Value *Level = nullptr, bool Conservative = false
+  );
+
+  // a sample's texels and status, where Metal's own are wrong: a reserved texture a shader can write reports no
+  // texel mapped, and filters as if magnified, when the level is past its last mip (D3D11.3 7.18.10: the level is
+  // "clamped to available miplevels"). `Read` reads again, `Level` or the gradients say how the sample chose its level
+  std::pair<llvm::Value *, llvm::Value *> SamplingResidency(
+      const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
+      llvm::Value *ArrayIndex, const int32_t Offset[3], std::pair<llvm::Value *, llvm::Value *> Sample,
+      llvm::function_ref<std::pair<llvm::Value *, llvm::Value *>(llvm::Value *)> Read, llvm::Value *Level,
+      llvm::Value *Bias = nullptr, llvm::Value *MinLOD = nullptr, llvm::Value *DDX = nullptr, llvm::Value *DDY = nullptr
   );
 
   // D3D's gather, with `Reference` its comparison (D3D11.3 22.4.2-22.4.5). an offset is the low 6 bits of each

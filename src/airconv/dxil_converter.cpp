@@ -2568,6 +2568,8 @@ convert_dxil(
       auto reference = op == SampleCmp || op == SampleCmpLevelZero ? a(10) : nullptr;
       // compute shaders have no derivatives: they sample with their quads' gradients, or compare at their LOD
       bool compute = ctx.shader_type == D3D11_SB_COMPUTE_SHADER;
+      Value *residency_level = nullptr, *residency_bias = bias, *residency_clamp = nullptr;
+      Value *residency_dx = nullptr, *residency_dy = nullptr;
       std::function<std::pair<Value *, Value *>(Value *, Value *)> read;
       if (compute && (op == Sample || op == SampleBias)) {
         auto [dx, dy] = quad_gradients(coord);
@@ -2575,6 +2577,7 @@ convert_dxil(
           bias = ir.CreateFAdd(a(10), bias);
         auto gx = dxbc.BiasGradient(dx, bias), gy = dxbc.BiasGradient(dy, bias);
         auto clamp = min_lod(tex, a(op == Sample ? 10 : 11));
+        residency_dx = gx, residency_dy = gy, residency_clamp = clamp, residency_bias = nullptr;
         read = [&, gx, gy, clamp](Value *s, Value *) {
           return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
         };
@@ -2583,6 +2586,7 @@ convert_dxil(
         auto lod = llvm::air::sample_level{air.CreateFPBinOp(
             llvm::air::AIRBuilder::fmax, min_lod(tex, a(11)), ir.CreateFAdd(quad_lod(*tex.texture, coord, is_cube), bias)
         )};
+        residency_level = lod.lod;
         read = [&, lod](Value *s, Value *ref) {
           return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, lod)
                      : air.CreateSample(texture, handle, s, coord, array, offset, lod);
@@ -2591,6 +2595,7 @@ convert_dxil(
         switch (op) {
         case Sample: {
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(10))}};
+          residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *) {
             return air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
           };
@@ -2600,6 +2605,7 @@ convert_dxil(
           auto options = std::pair{
               llvm::air::sample_bias{ir.CreateFAdd(a(10), bias)}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(11))}
           };
+          residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *) {
             return air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
           };
@@ -2607,6 +2613,7 @@ convert_dxil(
         }
         case SampleLevel: {
           auto lod = llvm::air::sample_level{min_lod(tex, ir.CreateFAdd(a(10), bias))};
+          residency_level = lod.lod;
           read = [&, lod](Value *s, Value *) {
             return air.CreateSample(texture, handle, s, coord, array, offset, lod);
           };
@@ -2616,6 +2623,7 @@ convert_dxil(
           auto gx = dxbc.BiasGradient(vec(call, 10, logical, coord_ty), bias);
           auto gy = dxbc.BiasGradient(vec(call, 13, logical, coord_ty), bias);
           auto clamp = min_lod(tex, a(16));
+          residency_dx = gx, residency_dy = gy, residency_clamp = clamp, residency_bias = nullptr;
           read = [&, gx, gy, clamp](Value *s, Value *) {
             return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
           };
@@ -2623,6 +2631,7 @@ convert_dxil(
         }
         case SampleCmp: {
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(11))}};
+          residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *ref) {
             return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, options.first, options.second)
                        : air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
@@ -2631,6 +2640,7 @@ convert_dxil(
         }
         default: {
           auto lod = llvm::air::sample_level{min_lod(tex, bias)};
+          residency_level = lod.lod;
           read = [&, lod](Value *s, Value *ref) {
             return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, lod)
                        : air.CreateSample(texture, handle, s, coord, array, offset, lod);
@@ -2640,6 +2650,15 @@ convert_dxil(
         }
       }
       auto [value, residency] = read(sampler, reference);
+      bool feedback = llvm::any_of(call->users(), [](User *user) {
+        auto extract = dyn_cast<ExtractValueInst>(user);
+        return !extract || extract->getIndices().front() == 4;
+      });
+      if (feedback)
+        std::tie(value, residency) = dxbc.SamplingResidency(
+            *tex.texture, sampler, smp.sampler->Metadata, coord, array, offset, {value, residency},
+            [&](Value *s) { return read(s, reference); }, residency_level, residency_bias, residency_clamp,
+            residency_dx, residency_dy);
       value = dxbc.CustomBorder(
           *tex.texture, sampler, smp.sampler->Border, smp.sampler->Metadata, value,
           [&](Value *s) { return read(s, nullptr).first; }, reference
@@ -2828,7 +2847,7 @@ convert_dxil(
         auto part = [&](unsigned shift, unsigned bits) {
           return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(place, shift), i32), ir.getInt32((1u << bits) - 1));
         };
-        first_mip = part(0, 8);
+        first_mip = part(0, SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS);
         resource_mips = part(8, 8);
         first_slice = part(16, 16);
         resource_size[0] = part(32, 16);

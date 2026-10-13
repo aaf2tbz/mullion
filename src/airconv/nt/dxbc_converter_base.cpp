@@ -19,6 +19,7 @@
 #include "dxbc_converter_base.hpp"
 #include "../dxbc_converter.hpp"
 #include "air_builder.hpp"
+#include <limits>
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -1628,6 +1629,10 @@ Converter::operator()(const InstSample &sample) {
     );
   };
   auto [Value, Residency] = Read(SamplerHandle);
+  if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
+    std::tie(Value, Residency) =
+        SamplingResidency(*Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
+                          {Value, Residency}, Read, nullptr, Sampler->Bias, MinLODClamp);
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
@@ -1698,6 +1703,9 @@ Converter::operator()(const InstSampleLOD &sample) {
     return air.CreateSample(Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, sample.offsets, sample_level{LOD});
   };
   auto [Value, Residency] = Read(SamplerHandle);
+  if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
+    std::tie(Value, Residency) = SamplingResidency(*Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex,
+                                                   sample.offsets, {Value, Residency}, Read, LOD);
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
@@ -1776,6 +1784,10 @@ Converter::operator()(const InstSampleBias &sample) {
     );
   };
   auto [Value, Residency] = Read(SamplerHandle);
+  if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
+    std::tie(Value, Residency) =
+        SamplingResidency(*Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
+                          {Value, Residency}, Read, nullptr, Bias, MinLODClamp);
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
@@ -1872,6 +1884,10 @@ Converter::operator()(const InstSampleDerivative &sample) {
     );
   };
   auto [Value, Residency] = Read(SamplerHandle);
+  if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
+    std::tie(Value, Residency) = SamplingResidency(
+        *Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, {Value, Residency}, Read, nullptr,
+        nullptr, MinLODClamp, BiasGradient(DDX, Sampler->Bias), BiasGradient(DDY, Sampler->Bias));
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
@@ -1929,16 +1945,21 @@ Converter::operator()(const InstSampleCompare &sample) {
     return;
   }
 
-  auto [Value, Residency] = //
-      sample.level_zero     //
-          ? air.CreateSampleCmp(
-                Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Reference, sample.offsets,
-                sample_level{ClampMinLOD(Tex->Metadata, Sampler->Bias)}
-            )
-          : air.CreateSampleCmp(
-                Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Reference, sample.offsets,
-                sample_bias{Sampler->Bias}, sample_min_lod_clamp{MinLODClamp}
-            );
+  auto Read = [&](llvm::Value *S) {
+    return sample.level_zero ? air.CreateSampleCmp(
+                                   Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, Reference, sample.offsets,
+                                   sample_level{ClampMinLOD(Tex->Metadata, Sampler->Bias)}
+                               )
+                             : air.CreateSampleCmp(
+                                   Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, Reference, sample.offsets,
+                                   sample_bias{Sampler->Bias}, sample_min_lod_clamp{MinLODClamp}
+                               );
+  };
+  auto [Value, Residency] = Read(SamplerHandle);
+  if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
+    std::tie(Value, Residency) = SamplingResidency(
+        *Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, {Value, Residency}, Read,
+        sample.level_zero ? ClampMinLOD(Tex->Metadata, Sampler->Bias) : nullptr, Sampler->Bias, MinLODClamp);
   Value = CustomBorder(
       *Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value,
       [&](llvm::Value *S) {
@@ -2130,7 +2151,7 @@ Converter::operator()(const InstCalcLOD &lod) {
 std::pair<llvm::Value *, llvm::Value *>
 Converter::CalculateLOD(
     const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
-    llvm::Value *Level
+    llvm::Value *Level, bool Conservative
 ) {
   using namespace llvm::air;
   if (!Level)
@@ -2142,10 +2163,14 @@ Converter::CalculateLOD(
     return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(SamplerMetadata, Shift), air.getIntTy()), FieldMax);
   };
   auto LOD = [&](llvm::Value *Field) {
-    return ir.CreateFMul(
+    auto Value = ir.CreateFMul(
         air.CreateConvertToFloat(Field),
-        llvm::ConstantFP::get(air.getFloatTy(), std::ldexp(1.0, -SM50_SAMPLER_METADATA_LOD_FRACTION_BITS))
-    );
+        llvm::ConstantFP::get(air.getFloatTy(), std::ldexp(1.0, -SM50_SAMPLER_METADATA_LOD_FRACTION_BITS)));
+    // nearest encoding can raise a clamp by one fractional LOD step (D3D11.3 7.18.16.1); a bound rounds down.
+    return Conservative
+               ? ir.CreateFSub(Value, llvm::ConstantFP::get(air.getFloatTy(),
+                                                            std::ldexp(1.0, -SM50_SAMPLER_METADATA_LOD_FRACTION_BITS)))
+               : Value;
   };
   auto Mips = air.CreateTextureQuery(Tex.Texture, Tex.Handle, Texture::num_mip_levels, ir.getInt32(0));
   auto Last = air.CreateConvertToFloat(ir.CreateSub(Mips, ir.getInt32(1)), Signedness::Unsigned);
@@ -2166,6 +2191,112 @@ Converter::CalculateLOD(
   );
   auto Empty = ir.CreateFCmpOGT(DecodeTextureMinLODClamp(Tex.Metadata), Last);
   return {ir.CreateSelect(Empty, llvm::ConstantFP::get(air.getFloatTy(), 0.0), Clamped), Unclamped};
+}
+
+std::pair<llvm::Value *, llvm::Value *>
+Converter::SamplingResidency(
+    const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
+    llvm::Value *ArrayIndex, const int32_t Offset[3], std::pair<llvm::Value *, llvm::Value *> Sample,
+    llvm::function_ref<std::pair<llvm::Value *, llvm::Value *>(llvm::Value *)> Read, llvm::Value *Level,
+    llvm::Value *Bias, llvm::Value *MinLOD, llvm::Value *DDX, llvm::Value *DDY
+) {
+  using namespace llvm;
+  using namespace llvm::air;
+  auto Residency = Sample.second;
+  if (!Tex.Range || !Residency)
+    return Sample;
+  bool Explicit = Level != nullptr, Implicit = !Explicit && !DDX;
+  if (Implicit) {
+    // derivatives must precede the lane-dependent residency branch (D3D11.3 16.8).
+    DDX = air.CreateDerivative(Coord, false);
+    DDY = air.CreateDerivative(Coord, true);
+  }
+  auto Head = ir.GetInsertBlock();
+  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
+  if (auto Branch = Head->getTerminator())
+    Branch->eraseFromParent();
+  auto Check = llvm::BasicBlock::Create(ctx.llvm, "sample_residency", Head->getParent(), Tail);
+  ir.SetInsertPoint(Head);
+  auto Metadata = ir.CreateLoad(ir.getInt64Ty(), ir.CreateConstGEP1_32(ir.getInt64Ty(), Tex.Range, 1));
+  auto Writable = ir.CreateICmpNE(ir.CreateAnd(Metadata, SM50_TEXTURE_VIEW_METADATA_SPARSE_WRITE), ir.getInt64(0));
+  ir.CreateCondBr(
+      ir.CreateAnd(Writable, ir.CreateICmpNE(ir.CreateAnd(Residency, 1), ConstantInt::get(Residency->getType(), 0))),
+      Check, Tail);
+
+  ir.SetInsertPoint(Check);
+  // what such a texture reports wrongly it also filters wrongly, when its status is asked for: with one mip, a
+  // minified read gets the magnification filter (tests/d3d12/d3d12_sample_residency). a read that asks for no
+  // status has the right texels; one that takes its derivatives itself has none in this branch
+  auto Again = Implicit ? Sample.first : Read(Sampler).first;
+  auto Last = air.CreateConvertToFloat(
+      ir.CreateSub(air.CreateTextureQuery(Tex.Texture, Tex.Handle, Texture::num_mip_levels, ir.getInt32(0)),
+                   ir.getInt32(1)),
+      Signedness::Unsigned);
+  Value *Safe = ir.CreateFCmpOLE(DecodeTextureMinLODClamp(Tex.Metadata), Last);
+  if (!Explicit) {
+    // a component bounds the isotropic footprint from below (D3D11.3 7.18.11). its binary exponent avoids log
+    // approximation; one exponent lower also bounds upward rounding when gradients are scaled to texels.
+    Level = ConstantFP::get(air.getFloatTy(), -std::numeric_limits<float>::infinity());
+    auto &Info = AIRBuilder::getTextureInfo(Tex.Logical);
+    if (!Info.is_cube) {
+      auto Size = air.CreateConvertToFloat(TextureDimensions(Tex, ir.getInt32(0)), Signedness::Unsigned);
+      Value *Largest = ConstantFP::get(air.getFloatTy(), 0);
+      for (unsigned i = 0; i < cast<FixedVectorType>(DDX->getType())->getNumElements(); i++)
+        for (auto D : {DDX, DDY})
+          Largest =
+              air.CreateFPBinOp(AIRBuilder::fmax, Largest,
+                                air.CreateFPUnOp(AIRBuilder::fabs, ir.CreateFMul(ir.CreateExtractElement(D, i),
+                                                                                 ir.CreateExtractElement(Size, i))));
+      auto &Semantics = Largest->getType()->getFltSemantics();
+      unsigned Fraction = APFloat::semanticsPrecision(Semantics) - 1;
+      unsigned Exponent = Largest->getType()->getScalarSizeInBits() - Fraction - 1;
+      auto Bits = ir.CreateBitCast(Largest, ir.getIntNTy(Largest->getType()->getScalarSizeInBits()));
+      auto Field = ir.CreateAnd(ir.CreateLShr(Bits, Fraction), llvm::maskTrailingOnes<uint64_t>(Exponent));
+      auto ExponentBias = 1 - APFloat::semanticsMinExponent(Semantics);
+      Level = ir.CreateSelect(
+          ir.CreateICmpEQ(Field, ConstantInt::get(Field->getType(), 0)), Level,
+          air.CreateConvertToFloat(ir.CreateSub(Field, ConstantInt::get(Field->getType(), ExponentBias + 1))));
+      Safe = ir.CreateAnd(
+          Safe, ir.CreateFCmpOLT(Largest, ConstantFP::get(air.getFloatTy(), std::numeric_limits<float>::infinity())));
+    }
+    if (Bias)
+      Level = ir.CreateFAdd(Level, Bias);
+    Level = CalculateLOD(Tex, Sampler, SamplerMetadata, Coord, ir.CreateFSub(Level, DecodeSamplerBias(SamplerMetadata)),
+                         true)
+                .first;
+    if (MinLOD) {
+      Level = air.CreateFPBinOp(AIRBuilder::fmax, Level, MinLOD);
+      Safe = ir.CreateAnd(Safe, ir.CreateFCmpOLE(MinLOD, Last));
+    }
+    // an anisotropic footprint cannot be replaced by a single isotropic sample without losing texels.
+    auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
+                                   (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
+    Safe =
+        ir.CreateAnd(Safe, ir.CreateAnd(ir.CreateICmpULE(Anisotropy, ir.getInt64(1)), ir.CreateFCmpOGE(Level, Last)));
+    Safe = ir.CreateAnd(Safe, ir.CreateFCmpOGT(Last, ConstantFP::get(air.getFloatTy(), 0)));
+  }
+  // the probe of a texture of one mip is a magnified read: where the filters differ its texels are other ones
+  auto Filter = [&](unsigned Shift) { return ir.CreateAnd(ir.CreateLShr(SamplerMetadata, Shift), 1); };
+  Safe = ir.CreateAnd(
+      Safe, ir.CreateOr(ir.CreateFCmpOGT(Last, ConstantFP::get(air.getFloatTy(), 0)),
+                        ir.CreateICmpEQ(Filter(SM50_SAMPLER_METADATA_MIN_LINEAR), Filter(SM50_SAMPLER_METADATA_MAG_LINEAR))));
+  auto Probe = llvm::BasicBlock::Create(ctx.llvm, "sample_last_mip", Head->getParent(), Tail);
+  ir.CreateCondBr(Safe, Probe, Tail);
+  ir.SetInsertPoint(Probe);
+  auto Fixed = air.CreateSample(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Offset,
+                                sample_level{air.CreateFPBinOp(AIRBuilder::fmin, Level, Last)})
+                   .second;
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Tail, Tail->begin());
+  auto Value = ir.CreatePHI(Sample.first->getType(), 3);
+  auto Result = ir.CreatePHI(Residency->getType(), 3);
+  for (auto [Block, Texels, Status] : {std::tuple{Head, Sample.first, Residency},
+                                       std::tuple{Check, Again, Residency}, std::tuple{Probe, Again, Fixed}}) {
+    Value->addIncoming(Texels, Block);
+    Result->addIncoming(Status, Block);
+  }
+  return {Value, Result};
 }
 
 std::pair<llvm::Value *, llvm::Value *>
