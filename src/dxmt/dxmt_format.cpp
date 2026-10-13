@@ -1658,6 +1658,12 @@ MTLQueryDXGIFormatSupport(
   // D3D11.3 19.1.4: shaders read the shared-exponent format and nothing renders to it, though Metal can
   if (Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
     Capability = Capability & FormatCapability::Filter;
+  // the same table gives a depth stencil format, its planes and their parent no 3D texture, and a block compressed
+  // format no 1D texture
+  if (any_bit_set(Capability & FormatCapability::DepthStencil))
+    Support1 &= ~D3D11_FORMAT_SUPPORT_TEXTURE3D;
+  if (metal_format.Flag & MTL_DXGI_FORMAT_BC)
+    Support1 &= ~D3D11_FORMAT_SUPPORT_TEXTURE1D;
 
   // integer formats have shader loads, not shader samples (D3D11.3 19.1.4)
   if (metal_format.PixelFormat && !IsIntegerFormat(metal_format.PixelFormat) &&
