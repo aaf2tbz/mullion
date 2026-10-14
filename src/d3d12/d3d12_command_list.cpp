@@ -937,14 +937,14 @@ public:
     if (!increment)
       return;
     uint32_t warps = (Count - 1) / increment + 1;
-    if (uint64_t(warps) * Args.InstanceCount >
+    auto parts = geometry_draw_parts(
+        warps, Args.InstanceCount,
         get_gs_max_object_threadgroups(
-            topology_, pso_graphics_->vertex_registers, pso_graphics_->mesh_instances, -1ull,
-            device_->mesh_bytes_per_draw
-        )) {
-      WARN("Omitted mesh draw (GS) because of too many object threadgroups (", warps, "x", Args.InstanceCount, ")");
+            topology_, pso_graphics_->vertex_registers, pso_graphics_->mesh_instances, -1ull, device_->mesh_bytes_per_draw
+        )
+    );
+    if (!parts)
       return;
-    }
     auto [Mapped, Offset] = allocator_->AllocateGPUHeap(sizeof(View) + sizeof(Args), 16);
     if (allocator_->records_)
       allocator_->RecordGPUHeap(Mapped, sizeof(View) + sizeof(Args), "geometry inputs", sizeof(View),
@@ -963,6 +963,7 @@ public:
       cmd.warp_count = warps;
       cmd.instance_count = Args.InstanceCount;
       cmd.vertex_per_warp = vertex_per_warp;
+      cmd.max_object_threadgroups = *parts;
     };
     if (!pso_graphics_->stream_output)
       return draw();
@@ -2716,6 +2717,12 @@ public:
     } else if (cmd->threads_per_patch) {
       object = {cmd->threads_per_patch, 32 / cmd->threads_per_patch, 1};
       mesh = {32, 1, 1};
+    }
+    // a geometry draw's object stage adds its origin (SM50_BINDING_INDEX_DRAW_ORIGIN), none here
+    if (!dispatch_mesh && !cmd->threads_per_patch) {
+      auto [origin, origin_offset] = allocator_->AllocateGPUHeap(2 * sizeof(uint32_t), 8);
+      memset(origin, 0, 2 * sizeof(uint32_t));
+      EncodeBuffer(WMTRenderCommandSetObjectBuffer, origin_offset, SM50_BINDING_INDEX_DRAW_ORIGIN);
     }
     for (UINT i = 0; i < MaxCommandCount; i++) {
       auto at = cmd->draws - heap + i * sizeof(IndirectMeshDraw);

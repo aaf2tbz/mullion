@@ -1603,14 +1603,15 @@ public:
         return;
       auto warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
 
-      if (uint64_t(warp_count) * InstanceCount >
+      auto parts = geometry_draw_parts(
+          warp_count, InstanceCount,
           get_gs_max_object_threadgroups(
               topo, vertex_registers, enc.currentRenderEncoder()->geometry_mesh_instances, max_object_threadgroups,
               mesh_budget
-          )) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
+          )
+      );
+      if (!parts)
         return;
-      }
 
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
@@ -1621,6 +1622,7 @@ public:
         cmd.instance_count = InstanceCount;
         cmd.warp_count = warp_count;
         cmd.vertex_per_warp = vertex_per_warp;
+        cmd.max_object_threadgroups = *parts;
       };
       auto encoder = enc.currentRenderEncoder();
       if (encoder->so_count_pso)
@@ -1655,14 +1657,15 @@ public:
         return;
       auto warp_count = (IndexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
 
-      if (uint64_t(warp_count) * InstanceCount >
+      auto parts = geometry_draw_parts(
+          warp_count, InstanceCount,
           get_gs_max_object_threadgroups(
               topo, vertex_registers, enc.currentRenderEncoder()->geometry_mesh_instances, max_object_threadgroups,
               mesh_budget
-          )) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
+          )
+      );
+      if (!parts)
         return;
-      }
 
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
@@ -1673,6 +1676,7 @@ public:
         cmd.instance_count = InstanceCount;
         cmd.warp_count = warp_count;
         cmd.vertex_per_warp = vertex_per_warp;
+        cmd.max_object_threadgroups = *parts;
         cmd.index_buffer = index_buffer;
         cmd.index_buffer_offset = index_buffer_offset;
       };

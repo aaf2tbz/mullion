@@ -1,6 +1,6 @@
 // contract: a draw the device cannot run does not take the draws around it with it. a geometry shader of 32 instances
 // over 96000 points is 3000 object threadgroups of 1024 mesh threadgroups, more than an Apple7 GPU runs in one draw
-// (2^21), which fails its whole render pass there; Mullion leaves that draw out on such a GPU. the small draws before
+// (2^21), which fails its whole render pass there; Mullion draws it in parts on such a GPU. the small draws before
 // and after it, in the same pass, still draw their points. the big draw's points are all clipped, so a GPU without the
 // limit leaves the same pixels.
 #include "d3d11_test.hpp"

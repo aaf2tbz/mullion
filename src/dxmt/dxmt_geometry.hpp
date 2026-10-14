@@ -2,8 +2,10 @@
 
 #include "airconv_public.h"
 #include "d3dcommon.h"
+#include "log/log.hpp"
 #include <cstdint>
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 namespace dxmt {
@@ -62,6 +64,17 @@ get_gs_max_object_threadgroups(
   if (!per_object)
     return max_object_threadgroups;
   return std::min(max_object_threadgroups, mesh_budget / per_object / 2048);
+}
+
+// the most object threadgroups each Metal draw of a geometry draw of `warps` x `instances` may have, when it has more
+// than `max` (wmtcmd_render_dxmt_geometry_draw: 0 is one draw), or nothing when not one object threadgroup fits
+inline std::optional<uint32_t>
+geometry_draw_parts(uint32_t warps, uint32_t instances, uint64_t max) {
+  if (!max) {
+    WARN("Omitted mesh draw (GS): not one object threadgroup fits the mesh memory of a draw (", warps, "x", instances, ")");
+    return std::nullopt;
+  }
+  return uint64_t(warps) * instances <= max ? 0 : uint32_t(std::min<uint64_t>(max, UINT32_MAX));
 }
 
 } // namespace dxmt
