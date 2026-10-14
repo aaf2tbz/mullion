@@ -201,7 +201,6 @@ FormatCapabilityInspector::Inspect(WMT::Device device) {
     // Apple 8: M2
 
     APPEND_CAP(WMTPixelFormatRG32Uint, FormatCapability::Atomic)
-    APPEND_CAP(WMTPixelFormatRG32Sint, FormatCapability::Atomic)
 
     APPEND_CAP(WMTPixelFormatDepth16Unorm, FormatCapability::Sparse)
     APPEND_CAP(WMTPixelFormatStencil8, FormatCapability::Sparse)
