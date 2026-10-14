@@ -141,6 +141,9 @@ struct MTL_SHADER_REFLECTION {
   /* a compute shader whose threadgroups wait for one another (a loop reads globally coherent memory): its dispatch
      may be made in parts, each with the stage-in region's origin at the part's first group */
   uint32_t GroupsWorkTogether;
+  /* a compute shader with 64-bit atomics on resources, whose emulation's locks wait for the threadgroups that hold
+     them: on a GPU without native 64-bit min and max its dispatch is made in parts as GroupsWorkTogether's */
+  uint32_t DeviceAtomics64;
 };
 
 #if defined(__LP64__) || defined(_WIN64)

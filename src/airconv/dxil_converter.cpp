@@ -1056,7 +1056,8 @@ read_dxil(
     auto [opcode, type, row, name, id, interpolation, phase] = key;
     declare(opcode, type, row, mask, name, interpolation, phase);
   }
-  // groupshared 64-bit atomics hash their locks with the threadgroup's position (`locked`)
+  // groupshared 64-bit atomics hash their locks with the threadgroup's position (`locked`); those on resources share
+  // their locks among threadgroups
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
@@ -1064,6 +1065,9 @@ read_dxil(
           used_ops.insert(GroupId);
         else if (auto cx = dyn_cast<AtomicCmpXchgInst>(&I); cx && cx->getCompareOperand()->getType()->isIntegerTy(64))
           used_ops.insert(GroupId);
+        else if (auto call = dyn_cast<CallInst>(&I); call && is_dx_op(call) && call->getType()->isIntegerTy(64) &&
+                 (opcode(call) == AtomicBinOp || opcode(call) == AtomicCompareExchange))
+          shader->device_atomics64 = true;
   // threadgroups work together when one waits for what another does: a loop that reads globally coherent memory
   auto coherent = [&](Value *handle) {
     auto made = dyn_cast<CallInst>(handle);
