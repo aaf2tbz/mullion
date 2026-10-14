@@ -359,6 +359,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight.gate->closed.wait(true);
       // a cancelled gate's: it never runs, and nothing of the queue's follows it
       if (inflight.cmdbuf.status() < WMTCommandBufferStatusCommitted) {
+        for (auto &allocator : inflight.allocators)
+          if (allocator)
+            allocator->pending--;
         inflight = {};
         inflight_cmdbuf_count_.fetch_sub(1, std::memory_order_release);
         inflight_cmdbuf_count_.notify_one();
