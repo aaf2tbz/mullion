@@ -106,8 +106,8 @@ child(int argc, char **argv) {
     }
   }
   char directory[MAX_PATH], setting[MAX_PATH];
-  GetEnvironmentVariableA("DXMT_LOG_PATH", directory, sizeof(directory));
-  const bool enabled = GetEnvironmentVariableA("DXMT_D3D12_GPU_ERRORS", setting, sizeof(setting)) != 0;
+  GetEnvironmentVariableA("MULLION_LOG_PATH", directory, sizeof(directory));
+  const bool enabled = GetEnvironmentVariableA("MULLION_D3D12_GPU_ERRORS", setting, sizeof(setting)) != 0;
   const bool presents = strcmp(argv[3], "never") != 0;
   std::multiset<std::string> expected;
   auto checkpoint = [&] {
@@ -390,16 +390,16 @@ main(int argc, char **argv) {
     return verdict();
   for (const char *mode : {"never", "first", "second"})
     for (const char *setting : {static_cast<const char *>(nullptr), "0", "2"}) {
-      step("%s child, DXMT_D3D12_GPU_ERRORS=%s", mode, setting ? setting : "unset");
+      step("%s child, MULLION_D3D12_GPU_ERRORS=%s", mode, setting ? setting : "unset");
       if (!expect(GetTempFileNameA(temporary, "pso", 0, directory), "temporary name found"))
         return verdict();
       DeleteFileA(directory);
       if (!expect(CreateDirectoryA(directory, nullptr), "log directory created"))
         return verdict();
-      SetEnvironmentVariableA("DXMT_LOG_PATH", directory);
-      SetEnvironmentVariableA("DXMT_LOG_LEVEL", "info");
-      SetEnvironmentVariableA("DXMT_D3D12_GPU_ERRORS", setting);
-      SetEnvironmentVariableA("DXMT_D3D12_ISOLATE", nullptr);
+      SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
+      SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");
+      SetEnvironmentVariableA("MULLION_D3D12_GPU_ERRORS", setting);
+      SetEnvironmentVariableA("MULLION_D3D12_ISOLATE", nullptr);
       std::string command = std::string("\"") + exe + "\" " + (argc > 1 ? argv[1] : "dxil") + " child " + mode;
       STARTUPINFOA startup{sizeof(startup)};
       PROCESS_INFORMATION process{};

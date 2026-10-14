@@ -19,7 +19,7 @@ main() {
     if (!ok && wrong++ < 16)
       printf("%s\n", what);
   };
-  SetEnvironmentVariableA("DXMT_CONFIG", "dxgi.presentThroughGDI=True");
+  SetEnvironmentVariableA("MULLION_CONFIG", "dxgi.presentThroughGDI=True");
   const UINT client = 192, buffers = 2;
   const DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
   WNDCLASSA wc{0, DefWindowProcA, 0, 0, GetModuleHandleA(nullptr), nullptr, nullptr, nullptr, nullptr, "d3d11_swapchain"};

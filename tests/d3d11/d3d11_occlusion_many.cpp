@@ -52,8 +52,8 @@ main(int argc, char **argv) {
     const std::string path = std::string(directory) + "d3d11_occlusion_many-" + std::to_string(GetCurrentProcessId());
     if (!expect(CreateDirectoryA(path.c_str(), nullptr), "diagnostic directory could not be created"))
       return verdict();
-    SetEnvironmentVariableA("DXMT_LOG_PATH", path.c_str());
-    SetEnvironmentVariableA("DXMT_LOG_LEVEL", "trace");
+    SetEnvironmentVariableA("MULLION_LOG_PATH", path.c_str());
+    SetEnvironmentVariableA("MULLION_LOG_LEVEL", "trace");
     std::string command = std::string("\"") + exe + "\" diagnostics";
     STARTUPINFOA startup{sizeof(startup)};
     PROCESS_INFORMATION process{};
@@ -117,7 +117,7 @@ main(int argc, char **argv) {
   CHECK(device->CreateBuffer(&params_desc, nullptr, &params));
   for (auto *record : {context.Get(), deferred.Get()})
     record->PSSetConstantBuffers(0, 1, params.GetAddressOf());
-  GetEnvironmentVariableA("DXMT_LOG_PATH", directory, sizeof(directory));
+  GetEnvironmentVariableA("MULLION_LOG_PATH", directory, sizeof(directory));
   const auto base = std::string(exe).substr(std::string(exe).find_last_of("\\/") + 1);
   const auto log = std::string(directory) + "/" + base.substr(0, base.find_last_of('.')) + "_d3d11.log";
   auto statistics = [&]() {

@@ -71,7 +71,7 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
   }
 
   if (FAILED(hr = dxgi_adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter_mtl)))) {
-    ERR("D3D12CreateDevice: Not a DXMT adapter");
+    ERR("D3D12CreateDevice: Not a Mullion adapter");
     return hr;
   }
 

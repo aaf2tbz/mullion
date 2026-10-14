@@ -2,7 +2,7 @@
 // is its SV_GroupID times the threadgroup's size plus its SV_GroupThreadID ("the sum of SV_GroupID * numthreads and
 // GroupThreadID", HLSL SV_DispatchThreadID), in a dispatch whose arguments come from a buffer as well. a translator
 // may hand a dispatch to the GPU in parts (this library does for a shader in which a loop reads globally coherent
-// memory, whose threadgroups may wait for one another; DXMT_D3D12_THREADS_AT_ONCE gives a part's threads): the
+// memory, whose threadgroups may wait for one another; MULLION_D3D12_THREADS_AT_ONCE gives a part's threads): the
 // threads must not see them. every thread marks the cell of its SV_DispatchThreadID in a grid of the dispatch's
 // threads, in a loop of as many turns as a word of the buffer says (one); then one group dispatched through
 // ExecuteIndirect marks its cells again
@@ -31,7 +31,7 @@ main(int argc, char **argv) {
   }
   const UINT groups[3] = {37, 5, 3}, threads[3] = {4, 2, 2};
   // parts of at most 8 groups: the grid is cut along each of its sides
-  SetEnvironmentVariableA("DXMT_D3D12_THREADS_AT_ONCE", std::to_string(8 * threads[0] * threads[1] * threads[2]).c_str());
+  SetEnvironmentVariableA("MULLION_D3D12_THREADS_AT_ONCE", std::to_string(8 * threads[0] * threads[1] * threads[2]).c_str());
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   const UINT cells[3] = {groups[0] * threads[0], groups[1] * threads[1], groups[2] * threads[2]};

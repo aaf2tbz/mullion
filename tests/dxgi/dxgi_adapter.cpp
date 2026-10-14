@@ -29,7 +29,7 @@ main(int argc, char **argv) {
   UINT vendor = 0x1002;
   if (argc > 2) {
     vendor = strtoul(argv[2], nullptr, 16);
-    SetEnvironmentVariableA("DXMT_CONFIG", (std::string("dxgi.customVendorId=") + argv[2]).c_str());
+    SetEnvironmentVariableA("MULLION_CONFIG", (std::string("dxgi.customVendorId=") + argv[2]).c_str());
   }
   unsigned failures = 0, checks = 0;
   auto expect = [&](bool ok, const char *what) {

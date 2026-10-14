@@ -43,7 +43,7 @@ GetVersionDescriptionText(uint32_t ApiVersion, uint32_t FeatureLevel) {
 
 WMTMetalVersion
 ShaderMetalVersion(WMT::Device device) {
-  int asked = Config::getInstance().getOption<int>("dxmt.shaderMetalVersion", 0);
+  int asked = Config::getInstance().getOption<int>("mullion.shaderMetalVersion", Config::getInstance().getOption<int>("dxmt.shaderMetalVersion", 0));
   auto version = asked == WMTMetal310 || asked == WMTMetal320 ? WMTMetalVersion(asked) : WMTMetalVersionMax;
   uint64_t macos_major_version = 0;
   WMTGetOSVersion(&macos_major_version, nullptr, nullptr);

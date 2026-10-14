@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """reads Mullion's profile records and says where a frame's time goes.
 
-the libraries write a record when DXMT_DIAG=profile and DXMT_DIAG_PATH names a directory:
+the libraries write a record when MULLION_DIAG=profile and MULLION_DIAG_PATH names a directory:
 
-  DXMT_DIAG=profile DXMT_DIAG_PATH=/some/dir <the program>
+  MULLION_DIAG=profile MULLION_DIAG_PATH=/some/dir <the program>
   mullion-diag report /some/dir
   mullion-diag frames /some/dir
 
-DXMT_DIAG_PATH is a path of macOS, not of the Wine prefix. each process writes mullion-<process id>.diag there.
+MULLION_DIAG_PATH is a path of macOS, not of the Wine prefix. each process writes mullion-<process id>.diag there.
 calculations return nanoseconds; printing converts them to milliseconds. a CPU span belongs to the frame of its
 start time. D3D11 command buffers append the caller submission time, pass count, present count and timestamp-command
 count; an event-only buffer has no encoder and may have zero GPU clocks. the submission time decides its frame;

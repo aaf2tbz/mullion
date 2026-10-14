@@ -80,7 +80,7 @@ main() {
     if (!expect(SUCCEEDED(hr) && shaders[i], "%s did not compile: %#lx", entries[i], hr))
       return verdict();
   }
-  SetEnvironmentVariableA("DXMT_CONFIG", "dxgi.presentThroughGDI=True");
+  SetEnvironmentVariableA("MULLION_CONFIG", "dxgi.presentThroughGDI=True");
   const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
                                       D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
   ComPtr<ID3D11Device> probe;

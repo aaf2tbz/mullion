@@ -97,7 +97,7 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   auto write = (UINT (*)(const char *, const char *, UINT64))GetProcAddress(bridge, "WMTDiagWrite");
   const UINT pid = write ? write(nullptr, nullptr, 0) : 0;
   char setting[32]{};
-  GetEnvironmentVariableA("DXMT_DIAG", setting, sizeof(setting));
+  GetEnvironmentVariableA("MULLION_DIAG", setting, sizeof(setting));
   const bool profiling = !strcmp(setting, "profile");
   if (profiling && pid)
     std::ofstream(std::string(argv[3]) + "\\mullion-" + std::to_string(pid) + ".diag") << "stale\n";
@@ -424,7 +424,7 @@ main(int argc, char **argv) {
   for (UINT run = 0; run < std::size(settings); run++) {
     auto setting = settings[run];
     const bool profiling = setting && !strcmp(setting, "profile");
-    step("child DXMT_DIAG=%s, run %u", setting ? setting : "unset", run);
+    step("child MULLION_DIAG=%s, run %u", setting ? setting : "unset", run);
     if (!expect(GetTempFileNameA(temporary, "prf", 0, directory), "no temporary name"))
       return verdict();
     DeleteFileA(directory);
@@ -435,12 +435,12 @@ main(int argc, char **argv) {
     char *path = unix_name(wide);
     if (!expect(path != nullptr, "Wine path conversion failed"))
       return verdict();
-    SetEnvironmentVariableA("DXMT_DIAG_PATH", path);
+    SetEnvironmentVariableA("MULLION_DIAG_PATH", path);
     HeapFree(GetProcessHeap(), 0, path);
-    SetEnvironmentVariableA("DXMT_DIAG", setting);
-    SetEnvironmentVariableA("DXMT_LOG_PATH", "none");
-    SetEnvironmentVariableA("DXMT_D3D12_GPU_ERRORS", run == std::size(settings) - 1 ? "1" : nullptr);
-    SetEnvironmentVariableA("DXMT_D3D12_ISOLATE", nullptr);
+    SetEnvironmentVariableA("MULLION_DIAG", setting);
+    SetEnvironmentVariableA("MULLION_LOG_PATH", "none");
+    SetEnvironmentVariableA("MULLION_D3D12_GPU_ERRORS", run == std::size(settings) - 1 ? "1" : nullptr);
+    SetEnvironmentVariableA("MULLION_D3D12_ISOLATE", nullptr);
     std::string command =
         std::string("\"") + exe + "\" " + (argc > 1 ? argv[1] : "dxil") + " child \"" + directory + "\"";
     STARTUPINFOA startup{};

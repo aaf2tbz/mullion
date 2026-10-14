@@ -100,7 +100,7 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
 }
 
 std::string Logger::getFileName(const std::string &base) {
-  std::string path = env::getEnvVar("DXMT_LOG_PATH");
+  std::string path = env::getEnvVar("MULLION_LOG_PATH");
 
   if (path == "none")
     return std::string();
@@ -127,7 +127,7 @@ LogLevel Logger::getMinLogLevel() {
       {"none", LogLevel::None},
   }};
 
-  const std::string logLevelStr = env::getEnvVar("DXMT_LOG_LEVEL");
+  const std::string logLevelStr = env::getEnvVar("MULLION_LOG_LEVEL");
 
   for (const auto &pair : logLevels) {
     if (logLevelStr == pair.first)

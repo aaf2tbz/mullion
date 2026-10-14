@@ -102,7 +102,7 @@ struct IndirectRenderCommandData {
   uint32_t vertex_slots;
   // the bound index buffer view's size in bytes: a command draws no indices past it
   uint32_t index_buffer_size;
-  // DXMT_D3D12_GPU_ERRORS: where the resolver keeps the largest numbers its commands ask for (kMostWords words)
+  // MULLION_D3D12_GPU_ERRORS: where the resolver keeps the largest numbers its commands ask for (kMostWords words)
   uint64_t most;
   // the commands' IndirectMeshDraws, where the resolver writes those instead of commands; zero otherwise
   uint64_t draws;

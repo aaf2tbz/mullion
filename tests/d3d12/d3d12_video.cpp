@@ -58,7 +58,7 @@ main(int argc, char **argv) {
     printf("skipped: dxcompiler.dll not found\n");
     return 77;
   }
-  SetEnvironmentVariableA("DXMT_CONFIG", "dxgi.presentThroughGDI=True");
+  SetEnvironmentVariableA("MULLION_CONFIG", "dxgi.presentThroughGDI=True");
   auto vs = compiler.compile(hlsl, "vs", "vs"), ps = compiler.compile(hlsl, "ps", "ps");
   if (vs.empty() || ps.empty()) {
     printf("failed: HLSL did not compile\n");

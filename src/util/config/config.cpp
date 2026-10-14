@@ -350,15 +350,18 @@ namespace dxmt {
   Config Config::getUserConfig() {
     Config config;
 
-    // Load either $DXMT_CONFIG_FILE or $PWD/dxmt.conf
-    std::string filePath = env::getEnvVar("DXMT_CONFIG_FILE");
-    std::string confLine = env::getEnvVar("DXMT_CONFIG");
+    // Load either $MULLION_CONFIG_FILE or $PWD/mullion.conf (dxmt.conf, the name it had, when there is none)
+    std::string filePath = env::getEnvVar("MULLION_CONFIG_FILE");
+    std::string confLine = env::getEnvVar("MULLION_CONFIG");
 
-    if (filePath == "")
-      filePath = "dxmt.conf";
+    bool named = filePath != "";
+    if (!named)
+      filePath = "mullion.conf";
 
     // Open the file if it exists
     std::ifstream stream(str::topath(filePath.c_str()).c_str());
+    if (!stream && !named)
+      stream.open(str::topath((filePath = "dxmt.conf").c_str()).c_str());
 
     if (!stream && confLine.empty())
       return config;

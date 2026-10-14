@@ -3,7 +3,7 @@
 +++ b/src/winemetal/unix/cache.c
 @@ -203,7 +203,7 @@
    [key appendBytes:params->key.ptr length:params->key_length];
-   const char *skip = getenv("DXMT_AIRCONV_SKIP");
+   const char *skip = (getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP"));
    if (skip)
 -    [key appendBytes:skip length:strlen(skip)];
 +    [key appendBytes:skip length:0];
@@ -12,7 +12,7 @@
    [key release];
 @@ -227,7 +227,7 @@
    [key appendBytes:params->key.ptr length:params->key_length];
-   const char *skip = getenv("DXMT_AIRCONV_SKIP");
+   const char *skip = (getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP"));
    if (skip)
 -    [key appendBytes:skip length:strlen(skip)];
 +    [key appendBytes:skip length:0];

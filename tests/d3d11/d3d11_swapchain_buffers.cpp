@@ -40,7 +40,7 @@ main() {
   auto vs_code = compile(hlsl, "vs", "vs"), ps_code = compile(hlsl, "ps", "ps");
   if (!vs_code || !ps_code)
     return 1;
-  SetEnvironmentVariableA("DXMT_CONFIG", "dxgi.presentThroughGDI=True");
+  SetEnvironmentVariableA("MULLION_CONFIG", "dxgi.presentThroughGDI=True");
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> context, deferred;
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;

@@ -48,8 +48,8 @@ struct TimestampSamples {
   }
 };
 
-inline const bool profile = env::getEnvVar("DXMT_DIAG") == "profile";
-inline const bool errors = !env::getEnvVar("DXMT_D3D12_GPU_ERRORS").empty();
+inline const bool profile = env::getEnvVar("MULLION_DIAG") == "profile";
+inline const bool errors = !env::getEnvVar("MULLION_D3D12_GPU_ERRORS").empty();
 
 inline uint64_t
 Nanoseconds(uint64_t ticks) {
@@ -76,7 +76,7 @@ Line(const char *kind, const Fields &...fields) {
 
 inline void
 Write(const std::string &lines) {
-  static const auto directory = env::getEnvVar("DXMT_DIAG_PATH");
+  static const auto directory = env::getEnvVar("MULLION_DIAG_PATH");
   if (!WMTDiagWrite(directory.c_str(), lines.data(), lines.size()))
     ERR("Mullion profile: record could not be written");
 }

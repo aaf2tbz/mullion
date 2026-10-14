@@ -19,10 +19,10 @@ ShaderCache::getInstance(WMTMetalVersion version) {
 }
 
 ShaderCache::ShaderCache(WMTMetalVersion metal_version) {
-  if (env::getEnvVar("DXMT_SHADER_CACHE") == "0")
+  if (env::getEnvVar("MULLION_SHADER_CACHE") == "0")
     return;
   std::string path;
-  if (path = env::getEnvVar("DXMT_SHADER_CACHE_PATH"); !path.empty() && path.starts_with("/")) {
+  if (path = env::getEnvVar("MULLION_SHADER_CACHE_PATH"); !path.empty() && path.starts_with("/")) {
     if (!path.ends_with('/'))
       path += "/";
   } else {

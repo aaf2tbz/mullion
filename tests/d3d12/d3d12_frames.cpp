@@ -29,12 +29,12 @@ child(const char *directory_mode) {
   if (directory_mode) {
     ComPtr<IUnknown> debug;
     D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
-    SetEnvironmentVariableA("DXMT_LOG_PATH", !strcmp(directory_mode, "none") ? "none" : nullptr);
+    SetEnvironmentVariableA("MULLION_LOG_PATH", !strcmp(directory_mode, "none") ? "none" : nullptr);
   }
   char setting[MAX_PATH];
-  const bool enabled = GetEnvironmentVariableA("DXMT_D3D12_DUMP_FRAMES", setting, sizeof(setting));
+  const bool enabled = GetEnvironmentVariableA("MULLION_D3D12_DUMP_FRAMES", setting, sizeof(setting));
   const std::string changed = "0:" + std::to_string(frames);
-  SetEnvironmentVariableA("DXMT_D3D12_DUMP_FRAMES", enabled ? nullptr : changed.c_str());
+  SetEnvironmentVariableA("MULLION_D3D12_DUMP_FRAMES", enabled ? nullptr : changed.c_str());
   ComPtr<ID3D12CommandQueue> queue;
   D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
   CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
@@ -148,15 +148,15 @@ main(int argc, char **argv) {
       {"0:1", "unset"}, {"0:1", "none"},
   };
   for (auto [range, directory_mode] : cases) {
-    step("child with DXMT_D3D12_DUMP_FRAMES=%s", range ? range : "unset");
+    step("child with MULLION_D3D12_DUMP_FRAMES=%s", range ? range : "unset");
     if (!expect(GetTempFileNameA(temporary, "frm", 0, directory), "no temporary name"))
       return verdict();
     DeleteFileA(directory);
     if (!expect(CreateDirectoryA(directory, nullptr), "no temporary directory"))
       return verdict();
-    SetEnvironmentVariableA("DXMT_LOG_PATH", directory);
-    SetEnvironmentVariableA("DXMT_LOG_LEVEL", "info");
-    SetEnvironmentVariableA("DXMT_D3D12_DUMP_FRAMES", range);
+    SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
+    SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");
+    SetEnvironmentVariableA("MULLION_D3D12_DUMP_FRAMES", range);
     std::string command = std::string("\"") + exe + "\" dxbc child";
     if (directory_mode)
       command += std::string(" ") + directory_mode;

@@ -58,9 +58,9 @@ RWBuffer<uint> result : register(u0);
       char *path = unix_name(wide);
       if (!expect(path != nullptr, "Wine path conversion failed"))
         return verdict();
-      SetEnvironmentVariableA("DXMT_DIAG_PATH", path);
+      SetEnvironmentVariableA("MULLION_DIAG_PATH", path);
       HeapFree(GetProcessHeap(), 0, path);
-      SetEnvironmentVariableA("DXMT_DIAG", strstr(mode, "profile") ? "profile" : nullptr);
+      SetEnvironmentVariableA("MULLION_DIAG", strstr(mode, "profile") ? "profile" : nullptr);
       std::string command =
           std::string("\"") + exe + "\" " + std::to_string(seed) + " " + mode + " \"" + directory + "\"";
       STARTUPINFOA startup{sizeof(startup)};

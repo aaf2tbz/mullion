@@ -70,7 +70,7 @@ NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERS
 
 NVAPI_INTERFACE
 NvAPI_GetInterfaceVersionString(NvAPI_ShortString szDesc) {
-  std::string version_str = "NVAPI Open Source Interface (DXMT-NVAPI)";
+  std::string version_str = "NVAPI Open Source Interface (Mullion-NVAPI)";
 
   if (!szDesc)
     return NVAPI_INVALID_ARGUMENT;

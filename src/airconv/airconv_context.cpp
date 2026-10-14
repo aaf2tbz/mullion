@@ -150,8 +150,8 @@ runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
     GlobalCleanupPM.addPass(SimplifyCFGPass(SimplifyCFGOptions().convertSwitchRangeToICmp(true)));
 
     GlobalCleanupPM.addPass(air::Lower16BitTexReadPass());
-    // DXMT_AIRCONV_SKIP names what the converter leaves out, to find the one a shader goes wrong with
-    if (auto skip = getenv("DXMT_AIRCONV_SKIP"); !skip || !strstr(skip, "simdgroup-barrier"))
+    // MULLION_AIRCONV_SKIP names what the converter leaves out, to find the one a shader goes wrong with
+    if (auto skip = (getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP")); !skip || !strstr(skip, "simdgroup-barrier"))
       GlobalCleanupPM.addPass(air::SimdgroupImplicitMemBarrierPass());
 
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(GlobalCleanupPM), true /* ? */));

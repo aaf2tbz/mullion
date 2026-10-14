@@ -11,9 +11,9 @@ namespace dxmt {
 CaptureState::CaptureState() {
   if (env::getEnvVar("MTL_CAPTURE_ENABLED") != "1")
     return;
-  if (env::getExeBaseName() != env::getEnvVar("DXMT_CAPTURE_EXECUTABLE"))
+  if (env::getExeBaseName() != env::getEnvVar("MULLION_CAPTURE_EXECUTABLE"))
     return;
-  WARN("DXMT capture enabled");
+  WARN("Mullion capture enabled");
   state = State::Idle;
 }
 

@@ -1,4 +1,4 @@
-// contract: DXMT_DIAG=profile records the final Metal passes, their targets, pipeline runs and CPU/GPU times,
+// contract: MULLION_DIAG=profile records the final Metal passes, their targets, pipeline runs and CPU/GPU times,
 // and real presents; unset or any other value writes nothing and leaves rendered results unchanged.
 // "When the GPU starts or finishes a stage, it samples the counters" (Apple, Sampling GPU data into counter
 // sample buffers, Sample counters at stage boundaries, https://developer.apple.com/documentation/metal/
@@ -271,7 +271,7 @@ int main(int argc, char **argv) {
   std::string baseline;
   const char *settings[] = {nullptr, "profiles", "profile"};
   for (const char *setting : settings) {
-    step("DXMT_DIAG=%s", setting ? setting : "unset");
+    step("MULLION_DIAG=%s", setting ? setting : "unset");
     if (!expect(GetTempFileNameA(temporary, "prf", 0, directory), "temporary name unavailable"))
       return verdict();
     DeleteFileA(directory);
@@ -282,9 +282,9 @@ int main(int argc, char **argv) {
     char *path = unix_name(wide);
     if (!expect(path != nullptr, "Wine path conversion failed"))
       return verdict();
-    SetEnvironmentVariableA("DXMT_DIAG_PATH", path);
+    SetEnvironmentVariableA("MULLION_DIAG_PATH", path);
     HeapFree(GetProcessHeap(), 0, path);
-    SetEnvironmentVariableA("DXMT_DIAG", setting);
+    SetEnvironmentVariableA("MULLION_DIAG", setting);
     std::string command = std::string("\"") + exe + "\" child \"" + directory + "\"";
     STARTUPINFOA startup{sizeof(startup)};
     PROCESS_INFORMATION process{};

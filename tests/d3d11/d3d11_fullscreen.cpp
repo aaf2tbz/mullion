@@ -273,7 +273,7 @@ main(int argc, char **argv) {
               desc.Windowed = !created_fullscreen;
               desc.SwapEffect = version == 12 ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_DISCARD;
               desc.Flags = mode_switch ? DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH : 0;
-              SetEnvironmentVariableA("DXMT_METALFX_SPATIAL_SWAPCHAIN", created_fullscreen ? "1" : "0");
+              SetEnvironmentVariableA("MULLION_METALFX_SPATIAL_SWAPCHAIN", created_fullscreen ? "1" : "0");
               ComPtr<IDXGISwapChain> swapchain;
               hr = factory->CreateSwapChain(device.Get(), &desc, &swapchain);
               if (expect(hr == S_OK, "CreateSwapChain returned %#lx", hr)) {

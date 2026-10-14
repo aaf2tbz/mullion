@@ -1138,7 +1138,7 @@ CreateSwapChain(
     return DXGI_ERROR_INVALID_CALL;
   }
   Com<IDXGISwapChain1> swapchain;
-  if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
+  if (env::getEnvVar("MULLION_METALFX_SPATIAL_SWAPCHAIN") == "1") {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
       swapchain = Com<IDXGISwapChain1>::transfer(new MTLD3D11SwapChain<true>(
           pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc

@@ -1282,10 +1282,10 @@ public:
     allocator_->OrderDispatches();
   }
 
-  // with DXMT_D3D12_ISOLATE set a dispatch is a pass of its own, which the queue then waits for and times
+  // with MULLION_D3D12_ISOLATE set a dispatch is a pass of its own, which the queue then waits for and times
   void
   Isolate(UINT X, UINT Y, UINT Z) {
-    static const bool isolate = !env::getEnvVar("DXMT_D3D12_ISOLATE").empty();
+    static const bool isolate = !env::getEnvVar("MULLION_D3D12_ISOLATE").empty();
     if (!isolate || !allocator_->encoder_current)
       return;
     TRACE("pass ", allocator_->encoder_current->id, ": dispatch of ", X, " by ", Y, " by ", Z, " groups");

@@ -56,9 +56,9 @@ main(int argc, char **argv) {
     MultiByteToWideChar(CP_ACP, 0, directory, -1, wide, std::size(wide));
     char *path = unix_name(wide);
     CHECK(path ? S_OK : E_FAIL);
-    SetEnvironmentVariableA("DXMT_DIAG_PATH", path);
+    SetEnvironmentVariableA("MULLION_DIAG_PATH", path);
     HeapFree(GetProcessHeap(), 0, path);
-    SetEnvironmentVariableA("DXMT_DIAG", "profile");
+    SetEnvironmentVariableA("MULLION_DIAG", "profile");
     std::string command = std::string("\"") + exe + "\" child \"" + directory + "\"";
     STARTUPINFOA startup{sizeof(startup)};
     PROCESS_INFORMATION process{};

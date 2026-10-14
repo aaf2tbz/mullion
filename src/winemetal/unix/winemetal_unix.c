@@ -109,8 +109,8 @@ _NSAutoreleasePool_alloc_init(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_commandBuffer(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  // DXMT_D3D12_GPU_ERRORS: the error of a command buffer the GPU failed lists its encoders and what became of each
-  if (getenv("DXMT_D3D12_GPU_ERRORS")) {
+  // MULLION_D3D12_GPU_ERRORS: the error of a command buffer the GPU failed lists its encoders and what became of each
+  if (getenv("MULLION_D3D12_GPU_ERRORS") ?: getenv("DXMT_D3D12_GPU_ERRORS")) {
     MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
     descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
     params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBufferWithDescriptor:descriptor];
@@ -1396,13 +1396,13 @@ _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   return STATUS_SUCCESS;
 }
 
-// the Apple GPU family the bridge answers as, to test on a newer GPU what an older one takes: DXMT_GPU_FAMILY=7 is
+// the Apple GPU family the bridge answers as, to test on a newer GPU what an older one takes: MULLION_GPU_FAMILY=7 is
 // Apple7. 0: the GPU's own
 static unsigned
 emulated_family(void) {
   static int family = -1;
   if (family < 0) {
-    const char *value = getenv("DXMT_GPU_FAMILY");
+    const char *value = (getenv("MULLION_GPU_FAMILY") ?: getenv("DXMT_GPU_FAMILY"));
     family = value ? atoi(value) : 0;
   }
   return family;
@@ -3088,8 +3088,8 @@ _MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(void *obj) {
   static const uint64_t limits[] = {[7] = 1024, [8] = 1024, [9] = 1048575};
   unsigned family = emulated_family();
   uint64_t limit = family < sizeof(limits) / sizeof(*limits) ? limits[family] : 0;
-  // or a limit to test with, which no family has: DXMT_MESH_GRID_LIMIT
-  const char *given = getenv("DXMT_MESH_GRID_LIMIT");
+  // or a limit to test with, which no family has: MULLION_MESH_GRID_LIMIT
+  const char *given = (getenv("MULLION_MESH_GRID_LIMIT") ?: getenv("DXMT_MESH_GRID_LIMIT"));
   if (given)
     limit = strtoull(given, NULL, 10);
   if (limit && limit < params->ret)

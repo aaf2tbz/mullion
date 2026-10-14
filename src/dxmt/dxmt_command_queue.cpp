@@ -152,7 +152,7 @@ CommandQueue::CommandQueue(WMT::Device device) :
   };
   event = device.newSharedEvent();
 
-  std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
+  std::string env = env::getEnvVar("MULLION_CAPTURE_FRAME");
 
   if (!env.empty()) {
     try {
@@ -276,7 +276,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
 uint32_t
 CommandQueue::EncodingThread() {
 #if ASYNC_ENCODING
-  env::setThreadName("dxmt-encode-thread");
+  env::setThreadName("mullion-encode-thread");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
@@ -295,7 +295,7 @@ CommandQueue::EncodingThread() {
 
 uint32_t
 CommandQueue::WaitForFinishThread() {
-  env::setThreadName("dxmt-finish-thread");
+  env::setThreadName("mullion-finish-thread");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {

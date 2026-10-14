@@ -65,7 +65,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
 
   // Try to find the corresponding Metal device for the DXGI adapter
   if (FAILED(pAdapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
-    ERR("Not a DXMT adapter");
+    ERR("Not a Mullion adapter");
     return E_INVALIDARG;
   }
 

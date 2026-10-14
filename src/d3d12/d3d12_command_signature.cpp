@@ -247,7 +247,7 @@ public:
              << ".instance_count, patches ? command_data.tessellation_parts : 0);\n";
       source << "} else\n";
     };
-    // DXMT_D3D12_GPU_ERRORS: the largest numbers the commands ask for, which the report of a failed command buffer
+    // MULLION_D3D12_GPU_ERRORS: the largest numbers the commands ask for, which the report of a failed command buffer
     // gives with the pass: instances, vertices or indices, their start, the base vertex as written, start instance
     auto most = [&](const char *args, const char *count, const char *start, const char *base) {
       if (!diag::errors)

@@ -3,7 +3,7 @@
 
 the tests are the build's own (meson's intro-tests.json: what tests/*/meson.build declares), run in a Wine the
 build's libraries are installed into. a family other than the GPU's own lowers what the Metal bridge answers
-(DXMT_GPU_FAMILY: src/winemetal/unix), so the paths an older GPU takes run here. a test passes when it says so on
+(MULLION_GPU_FAMILY: src/winemetal/unix), so the paths an older GPU takes run here. a test passes when it says so on
 every repeat: one that fails once, ends without a result or outlives its time has failed.
 """
 import argparse
@@ -242,8 +242,8 @@ def environment(args):
     wine = args.wine.resolve()
     prefix = (args.prefix or builds[0] / "tests-prefix").resolve()
     unix, pe = libraries(builds)
-    base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), DXMT_SHADER_CACHE="0", **ZOMBIES)
-    base.pop("DXMT_GPU_FAMILY", None)
+    base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), MULLION_SHADER_CACHE="0", **ZOMBIES)
+    base.pop("MULLION_GPU_FAMILY", None)
     # the build's libraries in place of the Wine's own, the shader compiler the prefix has, and no installer or
     # debugger that asks in a dialog
     own = sorted(path.stem for path in pe.values() if builtin(path))
@@ -317,7 +317,7 @@ def own(args, tests, builds, binary, base):
     families = args.family.split(",")
     verdicts = {}
     for family in families:
-        env = dict(base) if family == "native" else dict(base, DXMT_GPU_FAMILY=family)
+        env = dict(base) if family == "native" else dict(base, MULLION_GPU_FAMILY=family)
         for test in tests:
             native = not test["cmd"][0].endswith(".exe")
             # a test of the host's own does not meet the GPU

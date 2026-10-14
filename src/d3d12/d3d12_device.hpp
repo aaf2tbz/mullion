@@ -375,10 +375,10 @@ public:
   static HRESULT
   InitializeShader(D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl);
 
-  // writes shaders that failed to compile to DXMT_SHADER_DUMP_PATH, when set, as <sha1>.dxbc for airconv's CLI
+  // writes shaders that failed to compile to MULLION_SHADER_DUMP_PATH, when set, as <sha1>.dxbc for airconv's CLI
   static void DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
 
-  // the SHA-1 of each of its shaders, which is what logs call the pipeline. with DXMT_LOG_LEVEL=trace every shader
+  // the SHA-1 of each of its shaders, which is what logs call the pipeline. with MULLION_LOG_LEVEL=trace every shader
   // is also written as DumpShaders writes them, so that a pass a log names can be looked at
   std::string name;
   void Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
@@ -479,7 +479,7 @@ public:
   virtual HRESULT GetAdapter(REFIID riid, void **ppAdapter) = 0;
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
-  // DXMT_D3D12_GPU_ERRORS: passes carry the names of their pipelines to Metal, whose report of a command buffer
+  // MULLION_D3D12_GPU_ERRORS: passes carry the names of their pipelines to Metal, whose report of a command buffer
   // the GPU failed then says which pass it was. `NamePass` adds a pipeline to a pass's name, `PassName` takes it
   virtual bool NamesPasses() = 0;
   virtual void NamePass(const EncoderData *pass, const std::string &pipeline, obj_handle_t metal) = 0;

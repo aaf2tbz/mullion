@@ -31,7 +31,7 @@ main(int argc, char **argv) {
     printf("skipped: dxcompiler.dll not found\n");
     return 77;
   }
-  SetEnvironmentVariableA("DXMT_CONFIG", "dxgi.presentThroughGDI=True");
+  SetEnvironmentVariableA("MULLION_CONFIG", "dxgi.presentThroughGDI=True");
   // the window's client area, and the smaller buffer of the swap chain that is not stretched
   const UINT client = 256, small = client / 2, buffers = 2;
   const float blue = 0.5f;

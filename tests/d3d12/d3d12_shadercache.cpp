@@ -946,7 +946,7 @@ processes(int argc, char **argv) {
   auto path = unix_name(wide.c_str());
   if (!expect(path != nullptr, "the store's Unix path is unavailable"))
     return verdict();
-  std::string store = std::string("DXMT_SHADER_CACHE_PATH=") + path;
+  std::string store = std::string("MULLION_SHADER_CACHE_PATH=") + path;
   HeapFree(GetProcessHeap(), 0, path);
   auto spawn = reinterpret_cast<LONG(WINAPI *)(char *const *, int)>(
       GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_unix_spawnvp")
@@ -963,17 +963,17 @@ processes(int argc, char **argv) {
   if (!expect(loader_path != nullptr, "the loader's Unix path is unavailable"))
     return verdict();
   std::string reference;
-  auto run = [&](const char *mode, bool disabled, const char *option = "DXMT_AIRCONV_SKIP=") {
+  auto run = [&](const char *mode, bool disabled, const char *option = "MULLION_AIRCONV_SKIP=") {
     step("process %s, store %s", mode, directory);
     std::string output = std::string(directory) + "\\" + mode + ".bin";
     const char *args[] = {
         "env",
         "-u",
-        "DXMT_AIRCONV_SKIP",
+        "MULLION_AIRCONV_SKIP",
         "-u",
-        "DXMT_MESH_GRID_LIMIT",
+        "MULLION_MESH_GRID_LIMIT",
         store.c_str(),
-        disabled ? "DXMT_SHADER_CACHE=0" : "DXMT_SHADER_CACHE=1",
+        disabled ? "MULLION_SHADER_CACHE=0" : "MULLION_SHADER_CACHE=1",
         option,
         loader_path,
         exe,
@@ -1015,7 +1015,7 @@ processes(int argc, char **argv) {
     run("disabled", true);
     run("disabled", true);
     const char *options[] = {
-        "DXMT_AIRCONV_SKIP=simdgroup-barrier", "DXMT_AIRCONV_SKIP=simdgroup-barrier,simdgroup-barrier"
+        "MULLION_AIRCONV_SKIP=simdgroup-barrier", "MULLION_AIRCONV_SKIP=simdgroup-barrier,simdgroup-barrier"
     };
     LONG statuses[std::size(options)];
     std::thread writers[std::size(options)];
@@ -1024,7 +1024,7 @@ processes(int argc, char **argv) {
       writers[i] = std::thread([&, i] {
         std::string output = std::string(directory) + "\\writers_" + std::to_string(i) + ".bin";
         const char *args[] = {
-            "env", "-u", "DXMT_AIRCONV_SKIP", "-u", "DXMT_MESH_GRID_LIMIT", store.c_str(), "DXMT_SHADER_CACHE=1",
+            "env", "-u", "MULLION_AIRCONV_SKIP", "-u", "MULLION_MESH_GRID_LIMIT", store.c_str(), "MULLION_SHADER_CACHE=1",
             options[i], loader_path, exe, argc > 1 ? argv[1] : "dxil", "writers", output.c_str(), nullptr
         };
         statuses[i] = spawn(const_cast<char *const *>(args), TRUE);
@@ -1038,8 +1038,8 @@ processes(int argc, char **argv) {
       expect(bytes == reference, "writer %zu pixels or buffers differ", i);
       run("warm", false, options[i]);
     }
-    run("grid", false, "DXMT_MESH_GRID_LIMIT=2");
-    run("warm", false, "DXMT_MESH_GRID_LIMIT=2");
+    run("grid", false, "MULLION_MESH_GRID_LIMIT=2");
+    run("warm", false, "MULLION_MESH_GRID_LIMIT=2");
   }
   HeapFree(GetProcessHeap(), 0, loader_path);
   auto find = FindFirstFileA((std::string(directory) + "\\*").c_str(), &found);

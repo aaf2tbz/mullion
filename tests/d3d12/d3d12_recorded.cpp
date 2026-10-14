@@ -407,7 +407,7 @@ child(int argc, char **argv) {
       printf("skipped: predicated indirect rays require DXIL and ray tracing tier 1.1\n");
     } else {
       char log_path[MAX_PATH];
-      GetEnvironmentVariableA("DXMT_LOG_PATH", log_path, sizeof(log_path));
+      GetEnvironmentVariableA("MULLION_LOG_PATH", log_path, sizeof(log_path));
       std::ofstream(std::filesystem::path(log_path) / "rays.txt");
       step("predicated indirect rays register roots and static samplers after the resolver");
       D3D12_DXIL_LIBRARY_DESC dxil{bytecode(library)};
@@ -490,16 +490,16 @@ main(int argc, char **argv) {
     return verdict();
   for (const char *mode : {"empty", "work"}) {
     for (const char *setting : {static_cast<const char *>(nullptr), "1", "2"}) {
-      step("%s child, DXMT_D3D12_GPU_ERRORS=%s", mode, setting ? setting : "unset");
+      step("%s child, MULLION_D3D12_GPU_ERRORS=%s", mode, setting ? setting : "unset");
       if (!expect(GetTempFileNameA(temporary, "rec", 0, directory), "temporary name found"))
         return verdict();
       DeleteFileA(directory);
       if (!expect(CreateDirectoryA(directory, nullptr), "log directory created"))
         return verdict();
-      SetEnvironmentVariableA("DXMT_LOG_PATH", directory);
-      SetEnvironmentVariableA("DXMT_LOG_LEVEL", "info");
-      SetEnvironmentVariableA("DXMT_D3D12_GPU_ERRORS", setting);
-      SetEnvironmentVariableA("DXMT_D3D12_ISOLATE", nullptr);
+      SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
+      SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");
+      SetEnvironmentVariableA("MULLION_D3D12_GPU_ERRORS", setting);
+      SetEnvironmentVariableA("MULLION_D3D12_ISOLATE", nullptr);
       std::string command = std::string("\"") + exe + "\" " + (argc > 1 ? argv[1] : "dxil") + " child " + mode;
       STARTUPINFOA startup{sizeof(startup)};
       PROCESS_INFORMATION process{};

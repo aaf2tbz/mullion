@@ -41,7 +41,7 @@
 namespace dxmt {
 
 constexpr auto kCommandQueueSize = 32u;
-const auto dump_frames = env::getEnvVar("DXMT_D3D12_DUMP_FRAMES");
+const auto dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES");
 
 const GUID kD3D12CommandQueueDownlevelUUID = {
     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
@@ -101,7 +101,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
   dxmt::thread held_thread_;
 
-  // what the queue does and where it waits, with DXMT_LOG_LEVEL=trace: the last lines of a hang name it
+  // what the queue does and where it waits, with MULLION_LOG_LEVEL=trace: the last lines of a hang name it
   template <typename... Args>
   void
   Trace(const Args &...args) {
@@ -132,7 +132,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   void
   CommitHeld() {
-    env::setThreadName("dxmt-held-work-thread");
+    env::setThreadName("mullion-held-work-thread");
     std::unique_lock<dxmt::mutex> lock(held_mutex_);
     for (;;) {
       held_changed_.wait(lock, [&] { return held_stop_ || !held_.empty(); });
@@ -275,7 +275,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::vector<Resolve> resolves{};
     // the allocators of the lists the command buffer is the last of
     std::vector<Com<MTLD3D12CommandAllocator>> allocators{};
-    // DXMT_D3D12_GPU_ERRORS: the passes with indirect commands and where their resolvers keep their largest numbers
+    // MULLION_D3D12_GPU_ERRORS: the passes with indirect commands and where their resolvers keep their largest numbers
     std::vector<std::pair<std::string, const RenderEncoderData::Most *>> most{};
     // how many encoders of each kind it has, and whether it presents: what a report of one that does not complete says
     std::array<uint16_t, size_t(EncoderType::AccelerationStructure) + 1> encoders{};
@@ -316,7 +316,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   void
   Watch() {
-    env::setThreadName("dxmt-cmdbuf-watch-thread");
+    env::setThreadName("mullion-cmdbuf-watch-thread");
     std::unique_lock<dxmt::mutex> lock(watch_mutex_);
     while (!watch_stop_) {
       auto seq = watched_seq_;
@@ -346,7 +346,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   void
   CommandBufferWaitingThread() {
-    env::setThreadName("dxmt-cmdbuf-waiting-thread");
+    env::setThreadName("mullion-cmdbuf-waiting-thread");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     uint64_t internal_seq = 1;
@@ -790,7 +790,7 @@ public:
       }
       sparse_mappings.updateContents(0, mappings.data(), info.length);
     }
-    static const bool isolate = !env::getEnvVar("DXMT_D3D12_ISOLATE").empty();
+    static const bool isolate = !env::getEnvVar("MULLION_D3D12_ISOLATE").empty();
     WMT::CommandBuffer cmdbuf = scope.inflight->cmdbuf;
     uint64_t queries = 0;
     if (profile_)
@@ -864,7 +864,7 @@ public:
       };
       const uint32_t *decided = nullptr;
       while (current) {
-        // with DXMT_D3D12_ISOLATE set every pass is a command buffer that is waited for, and the trace names each:
+        // with MULLION_D3D12_ISOLATE set every pass is a command buffer that is waited for, and the trace names each:
         // the last one named is the one the GPU does not finish
         if (isolate) {
           settle();
@@ -1377,9 +1377,9 @@ public:
     if (number < range[0] || number - range[0] >= range[1])
       return;
     static const auto directory = [] {
-      auto path = env::getEnvVar("DXMT_LOG_PATH");
+      auto path = env::getEnvVar("MULLION_LOG_PATH");
       if (path.empty() || path == "none") {
-        WARN("D3D12 frame directory missing: DXMT_LOG_PATH must name a directory");
+        WARN("D3D12 frame directory missing: MULLION_LOG_PATH must name a directory");
         return std::string();
       }
       return path + (path.back() == '/' ? "" : "/");

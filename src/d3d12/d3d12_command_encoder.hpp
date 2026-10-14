@@ -101,7 +101,7 @@ struct RenderEncoderData : EncoderData {
   // compute commands that run before the pass: the resolvers of its indirect commands, whose commands it then runs
   wmtcmd_compute_nop before_head{WMTComputeCommandNop};
   wmtcmd_base *before_tail = (wmtcmd_base *)&before_head;
-  // DXMT_D3D12_GPU_ERRORS: where each of the pass's indirect commands' resolvers keeps its largest numbers
+  // MULLION_D3D12_GPU_ERRORS: where each of the pass's indirect commands' resolvers keeps its largest numbers
   struct Most {
     const uint32_t *words;
     const struct IndirectRenderCommandData *call;

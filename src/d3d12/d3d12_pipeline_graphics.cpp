@@ -241,7 +241,7 @@ ExtractMTLInputLayoutElements(
 
 void
 MTLD3D12PipelineState::DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders) {
-  static const auto dir = env::getEnvVar("DXMT_SHADER_DUMP_PATH");
+  static const auto dir = env::getEnvVar("MULLION_SHADER_DUMP_PATH");
   if (dir.empty())
     return;
   for (auto &Shader : Shaders) {
