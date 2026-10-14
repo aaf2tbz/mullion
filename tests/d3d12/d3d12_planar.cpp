@@ -10,6 +10,7 @@
 // its top-left texel in w (D3D11.3 22.4.2); point sampling at texel centres reads that texel. uint clears copy the
 // lower bits without conversion: "This works on any UAV with no format conversion." (D3D11.3 5.2.3.2).
 #include "d3d12_test.hpp"
+#include <algorithm>
 #include <array>
 
 static const char hlsl[] = R"hlsl(
