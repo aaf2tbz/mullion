@@ -62,6 +62,8 @@ GPUShaderFlags(WMT::Device device) {
   uint32_t flags = 0;
   if (!device.supportsFamily(WMTGPUFamilyApple8))
     flags |= SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64;
+  if (!device.supportsFamily(WMTGPUFamilyApple9))
+    flags |= SM50_SHADER_FLAG_COHERENT_GROUP_SYNC;
   return SM50_SHADER_FLAG(flags);
 }
 
