@@ -3841,6 +3841,7 @@ convert_dxil_mesh_stage(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .wideHalfSinCos = bool(shader_flags & SM50_SHADER_FLAG_WIDE_HALF_SINCOS),
       },
       builder, nulldbg
   );
@@ -3962,6 +3963,7 @@ convert_dxil_ray_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .wideHalfSinCos = bool(shader_flags & SM50_SHADER_FLAG_WIDE_HALF_SINCOS),
       },
       builder, nulldbg
   );
