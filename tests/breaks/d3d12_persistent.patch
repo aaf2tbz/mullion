@@ -1,12 +1,13 @@
 # a globally coherent buffer uses an ordinary load (DXIL)
---- a/src/airconv/dxil_converter.cpp
-+++ b/src/airconv/dxil_converter.cpp
-@@ -2618,7 +2618,7 @@
-               ir.CreateStore(piece, ptr);
-             continue;
-           }
--          Value *piece = b.GlobalCoherent ? (Value *)air.CreateDeviceCoherentLoad(unit, ptr) : ir.CreateLoad(unit, ptr);
-+          Value *piece = ir.CreateLoad(unit, ptr);
-           loaded = ir.CreateOr(loaded, ir.CreateShl(ir.CreateZExt(piece, element), shift));
-         }
-         if (!store)
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -3196,8 +3196,7 @@
+ llvm::Value *
+ Converter::LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr, bool Inside) {
+   auto Load = [&]() -> llvm::Value * {
+-    return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(Type, Ptr)
+-                                 : ir.CreateLoad(Type, Ptr, Ptr->getType()->getPointerAddressSpace() == 3);
++    return ir.CreateLoad(Type, Ptr, Ptr->getType()->getPointerAddressSpace() == 3);
+   };
+   if (!Buffer.Metadata || Inside)
+     return Load();

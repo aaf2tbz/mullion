@@ -1,9 +1,9 @@
 --- a/src/d3d11/d3d11_device.cpp
 +++ b/src/d3d11/d3d11_device.cpp
-@@ -709,7 +709,7 @@
-     // which is what CheckFormatSupport says of the format and Metal of the count; Metal has one quality. no tiled
-     // resource is multisampled
-     bool multisample = any_bit_set(GetMTLPixelFormatCapability(desc.PixelFormat) & FormatCapability::MSAA);
+@@ -1120,7 +1120,7 @@
+     UINT support = 0;
+     bool multisample = SUCCEEDED(CheckFormatSupport(Format, &support)) &&
+                        (support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET);
 -    if (SUCCEEDED(hr) && !Flags && (SampleCount == 1 || multisample) &&
 +    if (!Flags && (SampleCount == 1 || multisample) &&
          GetMTLDevice().supportsTextureSampleCount(SampleCount))
