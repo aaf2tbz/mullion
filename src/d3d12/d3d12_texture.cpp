@@ -128,8 +128,12 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
                               ? WMTTextureUsagePixelFormatView : WMTTextureUsageUnknown;
   if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     Usage |= WMTTextureUsageRenderTarget;
-  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
+    // Metal runs a shader's atomic functions only on a texture made for them
+    if (any_bit_set(Device->GetMTLPixelFormatCapability(InfoOut.pixel_format) & FormatCapability::Atomic))
+      Usage |= WMTTextureUsageShaderAtomic;
+  }
   // a resolve reads its source's samples in a shader, whatever the resource allows the application's
   if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || InfoOut.sample_count > 1)
     Usage |= WMTTextureUsageShaderRead;
