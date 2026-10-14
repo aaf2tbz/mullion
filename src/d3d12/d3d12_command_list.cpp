@@ -2645,7 +2645,9 @@ public:
     SumOcclusion();
     D3D12_HEAP_PROPERTIES placed{};
     pDstBuffer->GetHeapProperties(&placed, nullptr);
-    bool readback = placed.Type == D3D12_HEAP_TYPE_READBACK;
+    // a custom heap the CPU reads back through its cache is a readback heap (GetCustomHeapProperties)
+    bool readback = placed.Type == D3D12_HEAP_TYPE_READBACK ||
+                    (placed.Type == D3D12_HEAP_TYPE_CUSTOM && placed.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
     // pipeline statistics into a readback buffer are written by the CPU too, unless they count indirect dispatches,
     // whose arguments the GPU may write later in the command buffer. those the CPU writes are not written to the heap
     auto resolved = [&](auto &sum) { return sum.first == heap && sum.second.query - StartIndex < QueryCount; };
