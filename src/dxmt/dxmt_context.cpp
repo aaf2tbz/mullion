@@ -1206,6 +1206,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint64_t so_overflow;
           uint32_t so_invocations;
           uint64_t omitted;
+          uint64_t origins;
+          uint32_t parts;
         };
         auto [mapped_task_data, task_data_buffer, task_data_buffer_offset] =
             queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
@@ -1228,6 +1230,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           tasks_data[i].so_overflow = so_scratch_overflow_va_;
           tasks_data[i].so_invocations = task.so_invocations;
           tasks_data[i].omitted = so_scratch_overflow_va_ + sizeof(uint64_t);
+          tasks_data[i].origins = task.origins_va;
+          tasks_data[i].parts = task.parts;
           encoder.useResource(task.draw_arguments, WMTResourceUsageRead, WMTRenderStageVertex);
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
           if (task.so_targets_va)
