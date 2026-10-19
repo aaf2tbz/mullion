@@ -1030,7 +1030,16 @@ Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
   // NaN (D3D11.3 22.10.20), and a tangent made of them is 0 / 0. the precise ones are right for every other value:
   // sine and tangent of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3
   // 22.10.20; DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
-  auto Result = air.CreateFPUnOp(Op, Value, false);
+  auto Type = Value->getType();
+  llvm::Value *Result;
+  if (Type->getScalarType()->isHalfTy()) {
+    // a half one is computed as a float and rounded, as precise as D3D asks
+    auto Wide = Type->isVectorTy()
+                    ? llvm::VectorType::get(ir.getFloatTy(), llvm::cast<llvm::VectorType>(Type)->getElementCount())
+                    : ir.getFloatTy();
+    Result = ir.CreateFPTrunc(air.CreateFPUnOp(Op, ir.CreateFPExt(Value, Wide), false), Type);
+  } else
+    Result = air.CreateFPUnOp(Op, Value, false);
   if (Op == llvm::air::AIRBuilder::cos)
     return Result;
   auto Scalar = Value->getType()->getScalarType();

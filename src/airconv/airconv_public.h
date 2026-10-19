@@ -371,6 +371,8 @@ enum SM50_SHADER_FLAG {
   SM50_SHADER_FLAG_DEFUSE_FMA = 1 << 1,
   /* the device has no 64-bit atomics (before Apple8): its 64-bit minimum and maximum take locks as the others do */
   SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64 = 1 << 2,
+  /* the precise sine and cosine of a half are less precise than D3D asks (before Apple9): they are computed as floats */
+  SM50_SHADER_FLAG_WIDE_HALF_SINCOS = 1 << 4,
 };
 
 struct SM50_SHADER_COMMON_DATA {
