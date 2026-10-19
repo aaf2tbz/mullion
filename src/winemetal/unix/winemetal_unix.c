@@ -1,4 +1,5 @@
 #include <stdatomic.h>
+#include <errno.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -19,6 +20,30 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+
+static int64_t test_late_ns;
+static dispatch_queue_t test_late_commits;
+static dispatch_semaphore_t test_late_timer;
+static pthread_mutex_t test_late_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+__attribute__((constructor)) static void
+init_test_late(void) {
+  const char *value = getenv("MULLION_TEST_LATE");
+  if (!value)
+    return;
+  char *end;
+  errno = 0;
+  long long ms = strtoll(value, &end, 10);
+  if (errno || end == value || *end || ms < 0 || ms > INT64_MAX / (int64_t)NSEC_PER_MSEC) {
+    fprintf(stderr, "winemetal: invalid MULLION_TEST_LATE: %s\n", value);
+    abort();
+  }
+  test_late_ns = ms * NSEC_PER_MSEC;
+  if (test_late_ns) {
+    test_late_commits = dispatch_queue_create("mullion-test-late", DISPATCH_QUEUE_SERIAL);
+    test_late_timer = dispatch_semaphore_create(0);
+  }
+}
 
 void
 execute_on_main(dispatch_block_t block) {
@@ -123,13 +148,31 @@ _MTLCommandQueue_commandBuffer(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_commit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
-  [(id<MTLCommandBuffer>)params->handle commit];
+  id<MTLCommandBuffer> buffer = (id<MTLCommandBuffer>)params->handle;
+  if (test_late_ns) {
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, test_late_ns);
+    pthread_mutex_lock(&test_late_mutex);
+    // MTLCommandBuffer.enqueue reserves queue order before the delayed commit (Apple, enqueue discussion).
+    [buffer enqueue];
+    dispatch_async(test_late_commits, ^{
+      dispatch_semaphore_wait(test_late_timer, deadline);
+      @autoreleasepool {
+        [buffer commit];
+      }
+    });
+    pthread_mutex_unlock(&test_late_mutex);
+  } else {
+    [buffer commit];
+  }
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLCommandBuffer_waitUntilCompleted(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
+  // Metal's wait must follow commit; the commit worker never waits for GPU work.
+  if (test_late_ns)
+    dispatch_sync(test_late_commits, ^{});
   [(id<MTLCommandBuffer>)params->handle waitUntilCompleted];
   return STATUS_SUCCESS;
 }
@@ -138,6 +181,9 @@ static NTSTATUS
 _MTLCommandBuffer_status(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLCommandBuffer>)params->handle status];
+  // callers must not mistake a delayed commit for a cancelled buffer and free its allocations.
+  if (test_late_ns && params->ret == MTLCommandBufferStatusEnqueued)
+    params->ret = MTLCommandBufferStatusCommitted;
   return STATUS_SUCCESS;
 }
 

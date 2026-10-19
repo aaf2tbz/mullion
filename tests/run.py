@@ -288,6 +288,7 @@ def options(parser):
     parser.add_argument("--family", default="native,9,8,7",
                         help="the Apple GPU families to run as, 'native' for the GPU's own (default: %(default)s)")
     parser.add_argument("--repeat", type=int, default=1, help="how many times each test runs")
+    parser.add_argument("--late", type=int, help="delay each Metal command buffer's commit by this many milliseconds")
     parser.add_argument("--suite", action="append", default=[], help="only tests of this suite (may repeat)")
     parser.add_argument("--exact", action="store_true", help="match whole test names instead of prefixes")
     parser.add_argument("tests", nargs="*", help="test name prefixes, or whole names with --exact")
@@ -312,6 +313,8 @@ def chosen(args):
 
 def own(args, tests, builds, binary, base):
     """runs the build's tests as each family; how many failed"""
+    if args.late is not None and args.late < 0:
+        sys.exit("--late must be nonnegative milliseconds")
     logs = builds[0] / "meson-logs" / "tests"
     logs.mkdir(parents=True, exist_ok=True)
     families = args.family.split(",")
@@ -324,15 +327,21 @@ def own(args, tests, builds, binary, base):
             if native and family != families[0]:
                 continue
             command = test["cmd"] if native else [binary] + test["cmd"]
+            test_env = dict(env, **test["env"])
+            if args.late is not None:
+                test_env["MULLION_TEST_LATE"] = str(args.late)
+            late = test_env.get("MULLION_TEST_LATE")
+            mode = f".late{late}" if late is not None else ""
             verdict, said, seconds = "passed", "", 0.0
             for attempt in range(args.repeat):
-                log = logs / f"{test['name']}.{family}.{attempt}.txt"
-                verdict, said, taken = run(command, dict(env, **test["env"]), test["timeout"], log)
+                log = logs / f"{test['name']}.{family}{mode}.{attempt}.txt"
+                verdict, said, taken = run(command, test_env, test["timeout"], log)
                 seconds += taken
                 if verdict == "failed":
                     break
             verdicts[test["name"], family] = verdict
-            print(f"{family:>6}  {verdict:7}  {test['name']:32} {seconds:6.1f} s  {said}", flush=True)
+            print(f"{family:>6}  {verdict:7}  {test['name']:32} {seconds:6.1f} s  "
+                  f"{f'late={late}ms ' if late is not None else ''}{said}", flush=True)
             if verdict == "failed":
                 for line in explain(log.read_text(errors="replace").splitlines()) + [f"log: {log}"]:
                     print(f"{'':17}{line}", flush=True)
