@@ -867,12 +867,17 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTComputeCommandDispatch: {
       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
+      // a grid with no groups runs nothing in Direct3D (D3D11.3 18.6.2), and Metal rejects it
+      if (!body->size.width || !body->size.height || !body->size.depth)
+        break;
       [encoder dispatchThreadgroups:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
               threadsPerThreadgroup:threadgroup_size];
       break;
     }
     case WMTComputeCommandDispatchPart: {
       struct wmtcmd_compute_dispatch_part *body = (struct wmtcmd_compute_dispatch_part *)next;
+      if (!body->size.width || !body->size.height || !body->size.depth)
+        break;
       MTLSize size = MTLSizeMake(body->size.width, body->size.height, body->size.depth);
       [encoder setStageInRegion:MTLRegionMake3D(
                                     body->origin.x, body->origin.y, body->origin.z, size.width, size.height, size.depth

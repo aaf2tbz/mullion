@@ -2,7 +2,7 @@
 // exchanges values through group shared memory across a group barrier, and writes a structured buffer; every
 // element equals the same expression evaluated on the CPU from the same input. the CBV views only the first part of
 // its buffer, and rows past the view read 0 (D3D11.3 7.5). the table is the last descriptor of a heap of 2,000,000,
-// the heap Unreal Engine 5 makes.
+// the heap Unreal Engine 5 makes. grids with no groups along one side, dispatched after it, write nothing.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <bit>
@@ -101,6 +101,12 @@ main(int argc, char **argv) {
   list->SetComputeRootUnorderedAccessView(1, dst->GetGPUVirtualAddress());
   list->SetComputeRootDescriptorTable(2, table_gpu);
   list->Dispatch(groups, 1, 1);
+  // a grid with no groups along one side runs nothing (D3D11.3 18.6.2)
+  for (int side = 0; side < 3; side++) {
+    UINT none[3] = {groups, 1, 1};
+    none[side] = 0;
+    list->Dispatch(none[0], none[1], none[2]);
+  }
   transition(list.Get(), dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->CopyResource(readback.Get(), dst.Get());
   CHECK(submit(device.Get(), queue.Get(), list.Get()));

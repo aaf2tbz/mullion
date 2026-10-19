@@ -5,7 +5,7 @@
 // memory, whose threadgroups may wait for one another; MULLION_D3D12_THREADS_AT_ONCE gives a part's threads): the
 // threads must not see them. every thread marks the cell of its SV_DispatchThreadID in a grid of the dispatch's
 // threads, in a loop of as many turns as a word of the buffer says (one); then one group dispatched through
-// ExecuteIndirect marks its cells again
+// ExecuteIndirect marks its cells again, and grids with no groups along one side mark none
 #include "d3d12_test.hpp"
 #include <cstdint>
 
@@ -83,6 +83,12 @@ main(int argc, char **argv) {
   list->SetComputeRootSignature(rs.Get());
   list->SetComputeRootUnorderedAccessView(0, marks->GetGPUVirtualAddress());
   list->Dispatch(groups[0], groups[1], groups[2]);
+  // a grid with no groups along one side runs nothing (D3D11.3 18.6.2)
+  for (int side = 0; side < 3; side++) {
+    UINT none[3] = {groups[0], groups[1], groups[2]};
+    none[side] = 0;
+    list->Dispatch(none[0], none[1], none[2]);
+  }
   list->ExecuteIndirect(sig.Get(), 1, args.Get(), 0, nullptr, 0);
   transition(list.Get(), marks.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->CopyBufferRegion(readback.Get(), 0, marks.Get(), 0, bytes);
