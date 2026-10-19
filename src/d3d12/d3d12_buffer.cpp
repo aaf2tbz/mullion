@@ -207,9 +207,10 @@ public:
       ERR("D3D12Buffer::CreateShaderResourceView: not an ordinary or packed format: ", ViewDesc.Format);
       return E_FAIL;
     }
-    BufferViewDescriptor view_descriptor{Format.PixelFormat};
-    Slice.firstElement = ViewDesc.Buffer.FirstElement;
-    Slice.elementCount = ViewDesc.Buffer.NumElements;
+    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
+    Slice.firstElement = ViewDesc.Buffer.FirstElement * (Format.BytesPerTexel / MTLGetTexelSize(Format.BufferPixelFormat));
+    Slice.elementCount = ViewDesc.Buffer.NumElements |
+                         (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? SM50_TEXEL_BUFFER_METADATA_RGB32 : 0);
     Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;
     Slice.byteLength = Format.BytesPerTexel * ViewDesc.Buffer.NumElements;
 
@@ -258,7 +259,10 @@ public:
       ERR("D3D12Buffer::CreateUnorderedAccessView: not an ordinary or packed format: ", ViewDesc.Format);
       return E_FAIL;
     }
-    BufferViewDescriptor view_descriptor{Format.PixelFormat};
+    // R32G32B32 has no typed unordered access (Format support for Direct3D Feature Level 11.0 hardware)
+    if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+      return E_INVALIDARG;
+    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
     Slice.firstElement = ViewDesc.Buffer.FirstElement;
     Slice.elementCount = ViewDesc.Buffer.NumElements;
     Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;

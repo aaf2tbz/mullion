@@ -919,6 +919,7 @@ public:
   AllocatedTempBufferSlice draw_auto_arguments;
 
   InternalCommandLibrary &lib;
+  RGB32Copy<ArgumentEncodingContext> rgb32_copy_cmd{*this};
   EmulatedCommandContext emulated_cmd;
   ClearRTV<ArgumentEncodingContext> clear_rt_cmd;
   DepthStencilBlitContext blit_depth_stencil_cmd;

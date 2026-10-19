@@ -279,8 +279,18 @@ ResourceInitializer::initWithData(
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
     ALLOC_GPU(temp, total_bytes_needed);
 
+    std::vector<uint8_t> rgba;
+    if (format_flags & MTL_DXGI_FORMAT_EMULATED_RGB32)
+      rgba.resize(bytes_per_row_needed);
     for (auto depth = 0u; depth < depth_sub; depth++) {
-      if (bytes_per_row_increment != bytes_per_row_needed) {
+      if (format_flags & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+        for (auto row = 0u; row < height_sub; row++) {
+          auto src = ptr_add(data, depth * depth_pitch + row * row_pitch);
+          CopyRGB32(rgba.data(), src, width_sub, true);
+          temp.updateContents(temp_offset + depth * bytes_per_image_needed + row * bytes_per_row_needed,
+                              rgba.data(), bytes_per_row_needed);
+        }
+      } else if (bytes_per_row_increment != bytes_per_row_needed) {
         for (auto row = 0u; row < (align(height_sub, block_size) / block_size); row++) {
           auto offset = temp_offset + depth * bytes_per_image_needed + row * bytes_per_row_needed;
           auto length = bytes_per_row_valid;

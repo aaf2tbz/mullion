@@ -165,6 +165,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   // and the inputs they kept, which a rebuilt structure replaces
   std::vector<std::shared_ptr<const AccelerationStructureInputs>> acceleration_structure_inputs_;
 
+  RGB32Copy<MTLD3D12CommandAllocatorImpl> rgb32_copy_{*this};
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
   std::vector<Rc<Buffer>> sparse_clear_texels_;
   WMT::Reference<WMT::ComputePipelineState> sparse_clear_pso_;

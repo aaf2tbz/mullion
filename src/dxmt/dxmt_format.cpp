@@ -508,6 +508,7 @@ uint32_t DXGIFormatType(uint32_t format) {
 int32_t
 MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description, uint32_t plane) {
   description.PixelFormat = WMTPixelFormatInvalid;
+  description.BufferPixelFormat = WMTPixelFormatInvalid;
   description.AttributeFormat = WMTAttributeFormatInvalid;
   description.BytesPerTexel = 0;
   description.PlanarCount = 1;
@@ -541,27 +542,34 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     break;
   }
   case DXGI_FORMAT_R32G32B32_TYPELESS: {
-    description.PixelFormat = WMTPixelFormatR32Uint;
+    description.PixelFormat = WMTPixelFormat(WMTPixelFormatRGBA32Uint | WMTPixelFormatRGB1Swizzle);
+    description.BufferPixelFormat = WMTPixelFormatR32Uint;
     description.BytesPerTexel = 12;
-    description.Flag = MTL_DXGI_FORMAT_TYPELESS;
+    description.Flag = MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_EMULATED_RGB32;
     break;
   }
   case DXGI_FORMAT_R32G32B32_UINT: {
-    description.PixelFormat = WMTPixelFormatR32Uint;
+    description.PixelFormat = WMTPixelFormat(WMTPixelFormatRGBA32Uint | WMTPixelFormatRGB1Swizzle);
+    description.BufferPixelFormat = WMTPixelFormatR32Uint;
     description.AttributeFormat = WMTAttributeFormatUInt3;
     description.BytesPerTexel = 12;
+    description.Flag = MTL_DXGI_FORMAT_EMULATED_RGB32;
     break;
   }
   case DXGI_FORMAT_R32G32B32_SINT: {
-    description.PixelFormat = WMTPixelFormatR32Sint;
+    description.PixelFormat = WMTPixelFormat(WMTPixelFormatRGBA32Sint | WMTPixelFormatRGB1Swizzle);
+    description.BufferPixelFormat = WMTPixelFormatR32Sint;
     description.AttributeFormat = WMTAttributeFormatInt3;
     description.BytesPerTexel = 12;
+    description.Flag = MTL_DXGI_FORMAT_EMULATED_RGB32;
     break;
   }
   case DXGI_FORMAT_R32G32B32_FLOAT: {
-    description.PixelFormat = WMTPixelFormatR32Float;
+    description.PixelFormat = WMTPixelFormat(WMTPixelFormatRGBA32Float | WMTPixelFormatRGB1Swizzle);
+    description.BufferPixelFormat = WMTPixelFormatR32Float;
     description.AttributeFormat = WMTAttributeFormatFloat3;
     description.BytesPerTexel = 12;
+    description.Flag = MTL_DXGI_FORMAT_EMULATED_RGB32;
     break;
   }
   case DXGI_FORMAT_R16G16B16A16_TYPELESS: {
@@ -1165,7 +1173,23 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     return E_FAIL;
   }
 
+  if (!description.BufferPixelFormat)
+    description.BufferPixelFormat = description.PixelFormat;
+
   return S_OK;
+}
+
+void
+CopyRGB32(void *dst, const void *src, size_t count, bool expand) {
+  using RGB = std::array<uint32_t, 3>;
+  using RGBA = std::array<uint32_t, 4>;
+  const size_t src_stride = expand ? sizeof(RGB) : sizeof(RGBA), dst_stride = expand ? sizeof(RGBA) : sizeof(RGB);
+  for (size_t x = 0; x < count; x++) {
+    auto output = static_cast<char *>(dst) + x * dst_stride;
+    memcpy(output, static_cast<const char *>(src) + x * src_stride, sizeof(RGB));
+    if (expand)
+      memset(output + sizeof(RGB), 0, sizeof(RGBA) - sizeof(RGB));
+  }
 }
 
 uint32_t
@@ -1572,16 +1596,11 @@ BorderColorRange(const MTL_DXGI_FORMAT_DESC &description) {
 }
 
 
-/* what the capabilities of a format's Metal format are worth to the format: one of several Metal texels (the 96-bit
-   ones) is no texel of a view, and Microsoft's table of formats has no typed unordered access view of it */
+// the storage format does not grant operations excluded by the DXGI format table
 FormatCapability
 MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability capability) {
-  auto texel = MTLGetTexelSize(format.PixelFormat);
-  if (texel && format.BytesPerTexel > texel)
-    capability = capability & static_cast<FormatCapability>(
-                                  FormatCapability::Filter | FormatCapability::Color | FormatCapability::Blend |
-                                  FormatCapability::MSAA | FormatCapability::Sparse | FormatCapability::Resolve
-                              );
+  if (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+    return FormatCapability::None;
   return capability;
 }
 
@@ -1606,6 +1625,20 @@ MTLQueryDXGIFormatSupport(
   MTL_DXGI_FORMAT_DESC metal_format;
   if (FAILED(MTLQueryDXGIFormat(device, Format, metal_format))) {
     return E_FAIL;
+  }
+
+  // Microsoft Learn, Format support for Direct3D Feature Level 10.0/11.0 hardware, RGB32 rows.
+  if (DXGIFormatType(Format) == DXGI_FORMAT_R32G32B32_TYPELESS) {
+    Support1 = D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURE3D |
+               D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE |
+               D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
+    if (!(metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS)) {
+      Support1 |= D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER | D3D11_FORMAT_SUPPORT_SO_BUFFER |
+                  D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
+      if (Format == DXGI_FORMAT_R32G32B32_FLOAT)
+        Support1 |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;
+    }
+    return S_OK;
   }
 
   if (Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) {

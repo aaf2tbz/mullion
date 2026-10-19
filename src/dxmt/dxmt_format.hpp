@@ -55,10 +55,12 @@ enum MTL_DXGI_FORMAT_FLAG {
   MTL_DXGI_FORMAT_EMULATED_D24 = 256,
   MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL = 512,
   MTL_DXGI_FORMAT_VIDEO_PLANAR = 1024,
+  MTL_DXGI_FORMAT_EMULATED_RGB32 = 2048,
 };
 
 struct MTL_DXGI_FORMAT_DESC {
   WMTPixelFormat PixelFormat;
+  WMTPixelFormat BufferPixelFormat;
   WMTAttributeFormat AttributeFormat;
   union {
     uint32_t BytesPerTexel;
@@ -79,6 +81,8 @@ int32_t MTLQueryDXGIFormatSupport(
     WMT::Device device, uint32_t format, const std::function<FormatCapability(WMTPixelFormat)> &GetMTLPixelFormatCapability,
     uint32_t &support1, uint32_t &support2
 );
+
+void CopyRGB32(void *dst, const void *src, size_t count, bool expand);
 
 uint32_t MTLGetTexelSize(WMTPixelFormat format);
 

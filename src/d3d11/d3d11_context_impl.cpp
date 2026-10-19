@@ -4285,6 +4285,15 @@ public:
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
           auto offset = unit_offset(dst_, cmd.DstFormat, dst_unit, cmd.DstOrigin, cmd.Plane, cmd.Dst.Height);
+          auto buffer = dst->buffer();
+          uint64_t buffer_offset = offset + dst_offset, row_pitch = dst_->bytesPerRow,
+                   image_pitch = dst_->bytesPerImage;
+          bool rgb32 = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32;
+          if (rgb32) {
+            row_pitch = cmd.SrcSize.width * MTLGetTexelSize(src_->pixelFormat());
+            image_pitch = row_pitch * cmd.SrcSize.height;
+            std::tie(buffer, buffer_offset) = enc.allocateTempBuffer(image_pitch * cmd.SrcSize.depth, 256);
+          }
           auto &cmd_cpbuf = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
           cmd_cpbuf.type = WMTBlitCommandCopyFromTextureToBuffer;
           cmd_cpbuf.src = src;
@@ -4292,10 +4301,15 @@ public:
           cmd_cpbuf.level = cmd.Src.MipLevel;
           cmd_cpbuf.origin = cmd.SrcOrigin;
           cmd_cpbuf.size = cmd.SrcSize;
-          cmd_cpbuf.dst = dst->buffer();
-          cmd_cpbuf.offset = offset + dst_offset;
-          cmd_cpbuf.bytes_per_row = dst_->bytesPerRow;
-          cmd_cpbuf.bytes_per_image = dst_->bytesPerImage;
+          cmd_cpbuf.dst = buffer;
+          cmd_cpbuf.offset = buffer_offset;
+          cmd_cpbuf.bytes_per_row = row_pitch;
+          cmd_cpbuf.bytes_per_image = image_pitch;
+          if (rgb32) {
+            enc.rgb32_copy_cmd.run(false, buffer, buffer_offset, dst->buffer(), offset + dst_offset,
+                                   {row_pitch, image_pitch, dst_->bytesPerRow, dst_->bytesPerImage}, cmd.SrcSize);
+            enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          }
         });
         promote_flush = true;
       } else {
@@ -4323,12 +4337,24 @@ public:
           auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
           auto offset = unit_offset(src_, cmd.SrcFormat, src_unit, cmd.SrcOrigin, cmd.Plane, cmd.Src.Height);
+          auto buffer = src->buffer();
+          uint64_t buffer_offset = offset + src_offset, row_pitch = src_->bytesPerRow,
+                   image_pitch = src_->bytesPerImage;
+          if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+            row_pitch = cmd.SrcSize.width * MTLGetTexelSize(dst_->pixelFormat());
+            image_pitch = row_pitch * cmd.SrcSize.height;
+            std::tie(buffer, buffer_offset) = enc.allocateTempBuffer(image_pitch * cmd.SrcSize.depth, 256);
+            enc.rgb32_copy_cmd.run(true, src->buffer(), offset + src_offset, buffer, buffer_offset,
+                                   {src_->bytesPerRow, src_->bytesPerImage, row_pitch, image_pitch}, cmd.SrcSize);
+            enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+            dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+          }
           auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
           cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
-          cmd_cptex.src = src->buffer();
-          cmd_cptex.src_offset = offset + src_offset;
-          cmd_cptex.bytes_per_row =  src_->bytesPerRow;
-          cmd_cptex.bytes_per_image = src_->bytesPerImage;
+          cmd_cptex.src = buffer;
+          cmd_cptex.src_offset = buffer_offset;
+          cmd_cptex.bytes_per_row = row_pitch;
+          cmd_cptex.bytes_per_image = image_pitch;
           // the units in the destination's texels, which a mip smaller than a block does not have all of
           cmd_cptex.size = {std::min<uint64_t>(units_wide * dst_unit, cmd.Dst.Width - cmd.DstOrigin.x),
                             std::min<uint64_t>(units_high * dst_unit, cmd.Dst.Height - cmd.DstOrigin.y),
@@ -4354,7 +4380,8 @@ public:
               bytes_per_row = (align(cmd.SrcSize.width, 4u) >> 2) * cmd.SrcFormat.BytesPerTexel;
               bytes_per_image = bytes_per_row * (align(cmd.SrcSize.height, 4u) >> 2);
             } else {
-              bytes_per_row = cmd.SrcSize.width * cmd.SrcFormat.BytesPerTexel;
+              bytes_per_row = cmd.SrcSize.width * ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+                                                         ? MTLGetTexelSize(src_format) : cmd.SrcFormat.BytesPerTexel);
               bytes_per_image = bytes_per_row * cmd.SrcSize.height;
             }
             bytes_total = bytes_per_image * cmd.SrcSize.depth;
@@ -4578,12 +4605,23 @@ public:
       EmitOP([staging_buffer, offset, dst = std::move(dst), cmd = std::move(cmd),
             bytes_per_depth_slice](ArgumentEncodingContext &enc) {
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+        auto upload = staging_buffer;
+        uint64_t upload_offset = offset, row_pitch = cmd.EffectiveBytesPerRow, image_pitch = bytes_per_depth_slice;
+        if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+          row_pitch = cmd.DstSize.width * MTLGetTexelSize(dst->pixelFormat());
+          image_pitch = row_pitch * cmd.DstSize.height;
+          std::tie(upload, upload_offset) = enc.allocateTempBuffer(image_pitch * cmd.DstSize.depth, 256);
+          enc.rgb32_copy_cmd.run(true, staging_buffer, offset, upload, upload_offset,
+                                 {cmd.EffectiveBytesPerRow, bytes_per_depth_slice, row_pitch, image_pitch},
+                                 cmd.DstSize);
+          texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+        }
         auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
         cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
-        cmd_cptex.src = staging_buffer;
-        cmd_cptex.src_offset = offset;
-        cmd_cptex.bytes_per_row = cmd.EffectiveBytesPerRow;
-        cmd_cptex.bytes_per_image = bytes_per_depth_slice;
+        cmd_cptex.src = upload;
+        cmd_cptex.src_offset = upload_offset;
+        cmd_cptex.bytes_per_row = row_pitch;
+        cmd_cptex.bytes_per_image = image_pitch;
         cmd_cptex.size = cmd.DstSize;
         cmd_cptex.dst = texture;
         cmd_cptex.slice = cmd.Dst.ArraySlice;
@@ -4628,12 +4666,24 @@ public:
       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
         auto [src_buffer, src_offset] = enc.access(src, 0, src->length(), ResourceAccess::Read);
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+        auto upload = src_buffer->buffer();
+        uint64_t upload_offset = src_offset + cmd.Plane * cmd.Dst.Height * SrcRowPitch;
+        uint64_t row_pitch = SrcRowPitch, image_pitch = SrcDepthPitch;
+        if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+          row_pitch = cmd.DstSize.width * MTLGetTexelSize(dst->pixelFormat());
+          image_pitch = row_pitch * cmd.DstSize.height;
+          std::tie(upload, upload_offset) = enc.allocateTempBuffer(image_pitch * cmd.DstSize.depth, 256);
+          enc.rgb32_copy_cmd.run(true, src_buffer->buffer(), src_offset, upload, upload_offset,
+                                 {SrcRowPitch, SrcDepthPitch, row_pitch, image_pitch}, cmd.DstSize);
+          enc.access(src, 0, src->length(), ResourceAccess::Read);
+          texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+        }
         auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
         cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
-        cmd_cptex.src = src_buffer->buffer();
-        cmd_cptex.src_offset = src_offset + cmd.Plane * cmd.Dst.Height * SrcRowPitch;
-        cmd_cptex.bytes_per_row = SrcRowPitch;
-        cmd_cptex.bytes_per_image = SrcDepthPitch;
+        cmd_cptex.src = upload;
+        cmd_cptex.src_offset = upload_offset;
+        cmd_cptex.bytes_per_row = row_pitch;
+        cmd_cptex.bytes_per_image = image_pitch;
         cmd_cptex.size = cmd.DstSize;
         cmd_cptex.dst = texture;
         cmd_cptex.slice = cmd.Dst.ArraySlice;

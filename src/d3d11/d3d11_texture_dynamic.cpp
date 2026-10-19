@@ -179,7 +179,17 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
   }
   if (pInitialData) {
     auto default_allocation = texture->allocate(flags);
-    InitializeTextureData(pDevice, default_allocation->texture(), finalDesc, pInitialData);
+    if (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+      for (auto sub : EnumerateSubresources(finalDesc)) {
+        auto &data = pInitialData[sub.SubresourceId];
+        pDevice->GetDXMTDevice().queue().initializer.initWithData(
+            texture.ptr(), default_allocation.ptr(), sub.ArraySlice, sub.MipLevel, data.pSysMem,
+            data.SysMemPitch, data.SysMemSlicePitch, format.Flag
+        );
+      }
+    } else {
+      InitializeTextureData(pDevice, default_allocation->texture(), finalDesc, pInitialData);
+    }
     texture->rename(std::move(default_allocation));
     *ppTexture =
         reinterpret_cast<typename tag::COM_IMPL *>(

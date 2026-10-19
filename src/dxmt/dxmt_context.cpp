@@ -1858,6 +1858,23 @@ SimpleCommandContext<ArgumentEncodingContext>::endPass() {
 
 template <>
 void
+SimpleCommandContext<ArgumentEncodingContext>::startBlitPass() {
+  ctx.startBlitPass()->fence_wait.set(ctx.encoder_last->id);
+}
+
+template <>
+void
+SimpleCommandContext<ArgumentEncodingContext>::setComputeBuffer(uint32_t index, WMT::Buffer buffer, uint64_t offset) {
+  ctx.encoder_current->fence_wait.set(ctx.encoder_last->id);
+  auto &cmd = ctx.encodeComputeCommand<wmtcmd_compute_setbuffer>();
+  cmd.type = WMTComputeCommandSetBuffer;
+  cmd.buffer = buffer;
+  cmd.offset = offset;
+  cmd.index = index;
+}
+
+template <>
+void
 SimpleCommandContext<ArgumentEncodingContext>::setComputePSO(WMT::ComputePipelineState pso, WMTSize tgsize) {
   auto &setpso = ctx.encodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;

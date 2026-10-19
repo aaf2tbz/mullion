@@ -253,11 +253,12 @@ public:
         return E_FAIL;
       }
 
-      view_format = format.PixelFormat;
+      view_format = format.BufferPixelFormat;
       offset = finalDesc.Buffer.FirstElement * format.BytesPerTexel;
       size = finalDesc.Buffer.NumElements * format.BytesPerTexel;
-      viewElementOffset = finalDesc.Buffer.FirstElement;
-      viewElementWidth = finalDesc.Buffer.NumElements;
+      viewElementOffset = finalDesc.Buffer.FirstElement * (format.BytesPerTexel / MTLGetTexelSize(view_format));
+      viewElementWidth = finalDesc.Buffer.NumElements |
+                         (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? SM50_TEXEL_BUFFER_METADATA_RGB32 : 0);
     }
 
     if (!ppView) {
@@ -331,8 +332,11 @@ public:
         ERR("D3D11Buffer::CreateUnorderedAccessView: not an ordinary or packed format: ", finalDesc.Format);
         return E_FAIL;
       }
+      // R32G32B32 has no typed unordered access (Format support for Direct3D Feature Level 11.0 hardware)
+      if (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+        return E_INVALIDARG;
 
-      view_format = format.PixelFormat;
+      view_format = format.BufferPixelFormat;
       offset = finalDesc.Buffer.FirstElement * format.BytesPerTexel;
       size = finalDesc.Buffer.NumElements * format.BytesPerTexel;
       viewElementOffset = finalDesc.Buffer.FirstElement;

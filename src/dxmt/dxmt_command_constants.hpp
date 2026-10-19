@@ -14,6 +14,10 @@ constexpr CONSTANT auto kCustomBufferArgumentIndex0 = 30;
 constexpr CONSTANT auto kCustomBufferArgumentIndex1 = 29;
 constexpr CONSTANT auto kSparseBufferArgumentIndex = kCustomBufferArgumentIndex1 - 1;
 
+struct RGB32CopyLayout {
+  sm50_sparse_qword src_row, src_image, dst_row, dst_image;
+};
+
 struct SparseTexelClear {
   sm50_sparse_qword byte_offset;
   sm50_sparse_qword texel_size;

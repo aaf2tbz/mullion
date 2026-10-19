@@ -542,6 +542,10 @@ public:
 
   llvm::Value *FirstBit(IntegerUnaryOp Op, llvm::Value *Value);
   llvm::Value *SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value);
+  std::pair<llvm::Value *, llvm::Value *> ReadTexel(
+      const TextureResourceHandle &Tex, llvm::Value *Address, llvm::Value *ArrayIndex, llvm::Value *SampleIndex,
+      llvm::Value *Level
+  );
   llvm::Value *ExtractBits(llvm::Value *Width, llvm::Value *Offset, llvm::Value *Src, bool Signed);
   llvm::Value *InsertBits(llvm::Value *Width, llvm::Value *Offset, llvm::Value *Src, llvm::Value *Dst);
   llvm::Value *MaskedSumOfAbsDiff(llvm::Value *Ref, llvm::Value *Src, llvm::Value *Accum);
@@ -611,7 +615,12 @@ public:
 
   llvm::Value *
   DecodeTextureBufferElement(llvm::Value *Metadata) {
-    return ir.CreateTrunc(ir.CreateLShr(Metadata, 32uLL), air.getIntTy());
+    return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(Metadata, 32uLL), air.getIntTy()), ~SM50_TEXEL_BUFFER_METADATA_RGB32);
+  }
+
+  llvm::Value *
+  DecodeTextureBufferRGB32(llvm::Value *Metadata) {
+    return ir.CreateICmpNE(ir.CreateAnd(Metadata, uint64_t(SM50_TEXEL_BUFFER_METADATA_RGB32) << 32), ir.getInt64(0));
   }
 
   llvm::Value *ClampArrayIndex(llvm::Value *ShaderValue, llvm::Value *Metadata);

@@ -1442,12 +1442,48 @@ Converter::operator()(const InstLoad &load) {
   auto LOD = ir.CreateExtractElement(Coord, 3);
   auto [Address, ArrayIndex] = TexelAddress(*Tex, Coord, load.offsets, SampleIndex ? nullptr : LOD);
 
-  auto [Value, Residency] =
-      air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD, Tex->GlobalCoherent);
+  auto [Value, Residency] = ReadTexel(*Tex, Address, ArrayIndex, SampleIndex, LOD);
 
   StoreOperand(load.dst, MaskSwizzle(Value, GetMask(load.dst), Tex->Swizzle));
   StoreFeedback(load.feedback, Residency);
 }
+
+std::pair<llvm::Value *, llvm::Value *>
+Converter::ReadTexel(
+    const TextureResourceHandle &Tex, llvm::Value *Address, llvm::Value *ArrayIndex, llvm::Value *SampleIndex,
+    llvm::Value *Level
+) {
+  auto [Value, Residency] =
+      air.CreateRead(Tex.Texture, Tex.Handle, Address, ArrayIndex, SampleIndex, Level, Tex.GlobalCoherent);
+  if (Tex.Logical != llvm::air::Texture::texture_buffer || Tex.IsUAV)
+    return {Value, Residency};
+  // an R32G32B32 element's green and blue are the next two R32 texels; its alpha is R32's 1, the default of a
+  // missing A (D3D11.3 19.1.3.3). an address past the view stays past it
+  auto From = ir.GetInsertBlock();
+  auto Done = ir.GetInsertPoint() == From->end() ? llvm::BasicBlock::Create(ctx.llvm, "", From->getParent())
+                                                 : llvm::SplitBlock(From, &*ir.GetInsertPoint());
+  if (auto Branch = From->getTerminator())
+    Branch->eraseFromParent();
+  auto Three = llvm::BasicBlock::Create(ctx.llvm, "", From->getParent(), Done);
+  ir.SetInsertPoint(From);
+  ir.CreateCondBr(DecodeTextureBufferRGB32(Tex.Metadata), Three, Done);
+  ir.SetInsertPoint(Three);
+  auto Past = ir.CreateICmpEQ(Address, llvm::ConstantInt::getAllOnesValue(Address->getType()));
+  auto Wide = Value;
+  for (unsigned i = 1; i < 3; i++) {
+    auto At = ir.CreateSelect(Past, Address, ir.CreateAdd(Address, air.getInt(i)));
+    auto Texel = air.CreateRead(Tex.Texture, Tex.Handle, At, ArrayIndex, SampleIndex, Level, Tex.GlobalCoherent).first;
+    Wide = ir.CreateInsertElement(Wide, ir.CreateExtractElement(Texel, uint64_t(0)), i);
+  }
+  ir.CreateBr(Done);
+  auto Read = ir.GetInsertBlock();
+  ir.SetInsertPoint(Done, Done->begin());
+  auto Merged = ir.CreatePHI(Value->getType(), 2);
+  Merged->addIncoming(Value, From);
+  Merged->addIncoming(Wide, Read);
+  return {Merged, Residency};
+}
+
 void
 Converter::operator()(const InstLoadUAVTyped &load) {
   using namespace llvm::air;
@@ -1501,7 +1537,8 @@ Converter::TexelAddress(const TextureResourceHandle &Tex, llvm::Value *Coord, co
   llvm::Value *OOB = nullptr;
   if (Tex.Logical == llvm::air::Texture::texture_buffer) {
     OOB = ir.CreateICmpUGE(ir.CreateAdd(Address, OffsetValue), DecodeTextureBufferElement(Tex.Metadata));
-    Address = ir.CreateAdd(Address, DecodeTextureBufferOffset(Tex.Metadata));
+    auto Texels = ir.CreateSelect(DecodeTextureBufferRGB32(Tex.Metadata), air.getInt(3), air.getInt(1));
+    Address = ir.CreateAdd(ir.CreateMul(Address, Texels), DecodeTextureBufferOffset(Tex.Metadata));
   } else if (!Tex.IsUAV && Level && Info.is_mipmaped) {
     // the view keeps the mip that holds its min-LOD clamp and every smaller one
     auto MinLevel = air.CreateFPUnOp(llvm::air::AIRBuilder::floor, DecodeTextureMinLODClamp(Tex.Metadata));

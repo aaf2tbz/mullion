@@ -142,7 +142,7 @@ CreateDynamicLinearTexture2D(
     return E_FAIL;
   MTL_DXGI_FORMAT_DESC format;
   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), pDesc->Format, format);
-  if (format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_VIDEO_PLANAR)) {
+  if (format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_VIDEO_PLANAR | MTL_DXGI_FORMAT_EMULATED_RGB32)) {
     return E_FAIL;
   }
   if (format.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
@@ -179,7 +179,7 @@ CreateDynamicLinearTexture1D(
     return E_FAIL;
   MTL_DXGI_FORMAT_DESC format;
   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), pDesc->Format, format);
-  if (format.Flag & MTL_DXGI_FORMAT_BC) {
+  if (format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_EMULATED_RGB32)) {
     return E_FAIL;
   }
   if (format.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {

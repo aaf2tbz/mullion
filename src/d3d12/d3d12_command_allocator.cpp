@@ -584,6 +584,28 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::endPass() {
 
 template <>
 void
+SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startBlitPass() {
+  auto blit = ctx.AllocatePass<BlitEncoderData>();
+  blit->type = EncoderType::Blit;
+  blit->cmd_head.type = WMTBlitCommandNop;
+  blit->cmd_head.next.set(0);
+  blit->cmd_tail = (wmtcmd_base *)&blit->cmd_head;
+}
+
+template <>
+void
+SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeBuffer(
+    uint32_t index, WMT::Buffer buffer, uint64_t offset
+) {
+  auto &cmd = ctx.EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+  cmd.type = WMTComputeCommandSetBuffer;
+  cmd.buffer = buffer;
+  cmd.offset = offset;
+  cmd.index = index;
+}
+
+template <>
+void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputePSO(WMT::ComputePipelineState pso, WMTSize tgsize) {
   auto &setpso = ctx.EncodeComputeCommand<wmtcmd_compute_setpso>();
   setpso.type = WMTComputeCommandSetPSO;

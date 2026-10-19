@@ -424,7 +424,9 @@ CreateMTLTextureDescriptorInternal(
     // decoder not supported: D3D11_BIND_DECODER, D3D11_BIND_VIDEO_ENCODER
   }
 
-  if (metal_format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_VIDEO_PLANAR)) {
+  // a copy into a staging depth stencil reads the stencil through an X32_Stencil8 view, as D3D12 does
+  if ((metal_format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
+      pDescOut->pixel_format == WMTPixelFormatDepth32Float_Stencil8) {
     // well this is necessary for passing validation layer
     metal_usage |= WMTTextureUsagePixelFormatView;
   }

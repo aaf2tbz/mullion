@@ -1296,3 +1296,19 @@ enum {
     c.index[i] = index[i];
   ray_shader(c, record, record->function[0], nullptr, nullptr);
 }
+
+[[kernel]] void cs_expand_rgb32(
+    device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+    constant RGB32CopyLayout &layout [[buffer(2)]], uint3 pos [[thread_position_in_grid]]) {
+  auto rgb = *(device const packed_uint3 *)(src + pos.z * layout.src_image + pos.y * layout.src_row +
+                                           pos.x * sizeof(packed_uint3));
+  *(device uint4 *)(dst + pos.z * layout.dst_image + pos.y * layout.dst_row + pos.x * sizeof(uint4)) = uint4(rgb, 0);
+}
+
+[[kernel]] void cs_pack_rgb32(
+    device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+    constant RGB32CopyLayout &layout [[buffer(2)]], uint3 pos [[thread_position_in_grid]]) {
+  auto rgba = *(device const uint4 *)(src + pos.z * layout.src_image + pos.y * layout.src_row + pos.x * sizeof(uint4));
+  *(device packed_uint3 *)(dst + pos.z * layout.dst_image + pos.y * layout.dst_row +
+                          pos.x * sizeof(packed_uint3)) = packed_uint3(rgba.xyz);
+}

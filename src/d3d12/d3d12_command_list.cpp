@@ -1461,13 +1461,29 @@ public:
                                    ? (pSrc->PlacedFootprint.Footprint.Height / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch
                                    : 0;
 
+        auto upload = src->current()->buffer();
+        const uint64_t src_offset = pSrc->PlacedFootprint.Offset +
+                                    (src_box.left / block_width) * src_format.BytesPerTexel +
+                                    (src_box.top / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch +
+                                    src_box.front * src_depth_pitch;
+        uint64_t upload_offset = src_offset;
+        uint64_t row_pitch = pSrc->PlacedFootprint.Footprint.RowPitch, image_pitch = src_depth_pitch;
+        if (dst_format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+          WMTSize size{src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
+          row_pitch = size.width * MTLGetTexelSize(dst->pixelFormat());
+          image_pitch = row_pitch * size.height;
+          std::tie(upload, upload_offset) = allocator_->AllocateTempBuffer(image_pitch * size.depth, 256);
+          allocator_->rgb32_copy_.run(
+              true, src->current()->buffer(), src_offset, upload, upload_offset,
+              {pSrc->PlacedFootprint.Footprint.RowPitch, src_depth_pitch, row_pitch, image_pitch}, size
+          );
+        }
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
-        cmd_cp.src = src->current()->buffer();
-        cmd_cp.src_offset = pSrc->PlacedFootprint.Offset + (src_box.left / block_width) * src_format.BytesPerTexel +
-                            (src_box.top / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch + src_box.front * src_depth_pitch;
-        cmd_cp.bytes_per_row = pSrc->PlacedFootprint.Footprint.RowPitch;
-        cmd_cp.bytes_per_image = src_depth_pitch;
+        cmd_cp.src = upload;
+        cmd_cp.src_offset = upload_offset;
+        cmd_cp.bytes_per_row = row_pitch;
+        cmd_cp.bytes_per_image = image_pitch;
         // D3D10.1 reinterpret copies carry one source unit into one destination unit (CopyResource, Remarks)
         cmd_cp.size = {
             std::min<uint64_t>(align(src_box.right - src_box.left, block_width) / block_width * dst_block_width,
@@ -1579,6 +1595,19 @@ public:
                                    ? (pDst->PlacedFootprint.Footprint.Height / block_width) * pDst->PlacedFootprint.Footprint.RowPitch
                                    : 0;
 
+        auto download = dst->current()->buffer();
+        const uint64_t dst_offset = pDst->PlacedFootprint.Offset + (DstX / block_width) * dst_format.BytesPerTexel +
+                                    (DstY / block_width) * pDst->PlacedFootprint.Footprint.RowPitch +
+                                    DstZ * dst_depth_pitch;
+        uint64_t download_offset = dst_offset, row_pitch = pDst->PlacedFootprint.Footprint.RowPitch,
+                 image_pitch = dst_depth_pitch;
+        WMTSize size{src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
+        bool rgb32 = src_format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32;
+        if (rgb32) {
+          row_pitch = size.width * MTLGetTexelSize(src->pixelFormat());
+          image_pitch = row_pitch * size.height;
+          std::tie(download, download_offset) = allocator_->AllocateTempBuffer(image_pitch * size.depth, 256);
+        }
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
         cmd_cp.src = src->current()->texture();
@@ -1586,14 +1615,18 @@ public:
         cmd_cp.slice = src_slice;
         cmd_cp.origin = {src_box.left, src_box.top, src_box.front};
         cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
-        cmd_cp.dst = dst->current()->buffer();
-        cmd_cp.offset = pDst->PlacedFootprint.Offset + (DstX / block_width) * dst_format.BytesPerTexel +
-                        (DstY / block_width) * pDst->PlacedFootprint.Footprint.RowPitch + DstZ * dst_depth_pitch;
-        cmd_cp.bytes_per_row = pDst->PlacedFootprint.Footprint.RowPitch;
-        cmd_cp.bytes_per_image = dst_depth_pitch;
+        cmd_cp.dst = download;
+        cmd_cp.offset = download_offset;
+        cmd_cp.bytes_per_row = row_pitch;
+        cmd_cp.bytes_per_image = image_pitch;
         cmd_cp.options = (src_planar_count > 1)
                              ? (src_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
                              : WMTBlitOptionNone;
+        if (rgb32)
+          allocator_->rgb32_copy_.run(
+              false, download, download_offset, dst->current()->buffer(), dst_offset,
+              {row_pitch, image_pitch, pDst->PlacedFootprint.Footprint.RowPitch, dst_depth_pitch}, size
+          );
       } else {
         // between buffers there is CopyBufferRegion: one end of this copy is a texture
         ERR("CopyTextureRegion: both the source and the destination are footprints in buffers");

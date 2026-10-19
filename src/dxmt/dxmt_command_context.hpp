@@ -19,8 +19,12 @@
 #pragma once
 
 #include "Metal.hpp"
+#include <cstdlib>
+#include <cstring>
 #include "dxmt_buffer.hpp"
+#include "dxmt_command_constants.hpp"
 #include "dxmt_texture.hpp"
+#include "log/log.hpp"
 
 namespace dxmt {
 
@@ -30,6 +34,8 @@ template <typename Context> struct SimpleCommandContext {
   WMT::Reference<WMT::ComputePipelineState> getComputePipeline(std::string name);
   void startComputePass();
   void endPass();
+  void startBlitPass();
+  void setComputeBuffer(uint32_t index, WMT::Buffer buffer, uint64_t offset);
   void setComputePSO(WMT::ComputePipelineState pso, WMTSize tgsize);
   void dispatch(WMTSize size);
   void setComputeTexture(uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags);
@@ -57,6 +63,36 @@ template <typename Context> struct SimpleCommandContext {
       WMTPrimitiveType primitive, uint32_t vertex_start, uint32_t vertex_count, int32_t base_instance,
       uint32_t instance_count
   );
+};
+
+template <typename Context> class RGB32Copy {
+public:
+  RGB32Copy(Context &ctx) : ctx_(ctx) {}
+
+  void run(bool expand, WMT::Buffer src, uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset,
+           RGB32CopyLayout layout, WMTSize size) {
+    auto &pso = pipelines_[expand];
+    if (!pso) {
+      pso = ctx_.getComputePipeline(expand ? "cs_expand_rgb32" : "cs_pack_rgb32");
+      if (!pso) {
+        ERR("Failed to create RGB32 transfer pipeline");
+        abort();
+      }
+    }
+    ctx_.endPass();
+    ctx_.startComputePass();
+    ctx_.setComputePSO(pso, {pso.threadExecutionWidth(), 1, 1});
+    ctx_.setComputeBuffer(0, src, src_offset);
+    ctx_.setComputeBuffer(1, dst, dst_offset);
+    memcpy(ctx_.setComputeBytes(2, sizeof(layout)), &layout, sizeof(layout));
+    ctx_.dispatch(size);
+    ctx_.endPass();
+    ctx_.startBlitPass();
+  }
+
+private:
+  SimpleCommandContext<Context> ctx_;
+  WMT::Reference<WMT::ComputePipelineState> pipelines_[2];
 };
 
 } // namespace dxmt

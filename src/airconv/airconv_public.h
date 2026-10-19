@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 39
+#define AIRCONV_VERSION 40
 
 #ifdef __cplusplus
 #include <string>
@@ -315,6 +315,11 @@ enum SM50_SHADER_METAL_VERSION {
   SM50_SHADER_METAL_320 = 320,
   SM50_SHADER_METAL_MAX = 0xffffffff,
 };
+
+/* a texel buffer's metadata qword is its first element, in the view's Metal texels, then its element count. Metal has
+   no 96-bit pixel format, so an R32G32B32 view is one of R32 texels, three to an element, marked by the count's top
+   bit: a view has at most 2^27 elements (D3D11_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP) */
+#define SM50_TEXEL_BUFFER_METADATA_RGB32 (1u << 31)
 
 /* the sampler metadata qword that shaders read next to the sampler states: MipLODBias as a signed 16-bit LOD in
    bits 0-15, then whether the minification, magnification and mip filters are linear and MaxAnisotropy (1 unless the

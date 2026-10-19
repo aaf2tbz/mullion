@@ -39,7 +39,12 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
     if (Plane != ~0u && FAILED(MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, Format, Plane)))
       return E_INVALIDARG;
   }
-  InfoOut.pixel_format = Format.PixelFormat;
+  InfoOut.pixel_format = Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32
+                             ? WMTPixelFormat(ORIGINAL_FORMAT(Format.PixelFormat)) : Format.PixelFormat;
+  if ((Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) &&
+      (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+    return E_INVALIDARG;
 
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
     switch (Format.PixelFormat) {
@@ -126,6 +131,8 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
 
   WMTTextureUsage Usage = ORIGINAL_FORMAT(InfoOut.pixel_format) == WMTPixelFormatDepth32Float_Stencil8
                               ? WMTTextureUsagePixelFormatView : WMTTextureUsageUnknown;
+  if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+    Usage |= WMTTextureUsagePixelFormatView;
   if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
@@ -398,6 +405,19 @@ public:
         return E_INVALIDARG;
     }
 
+    if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+      const size_t width = box.right - box.left, height = box.bottom - box.top, depth = box.back - box.front;
+      const size_t row_bytes = width * MTLGetTexelSize(storage->pixelFormat()), image_bytes = row_bytes * height;
+      std::vector<uint8_t> rgba(image_bytes * depth);
+      for (size_t z = 0; z < depth; z++)
+        for (size_t y = 0; y < height; y++)
+          CopyRGB32(rgba.data() + z * image_bytes + y * row_bytes,
+                    static_cast<const char *>(pSrcData) + z * SrcSlicePitch + y * SrcRowPitch, width, true);
+      storage->current()->texture().replaceRegion(
+          {box.left, box.top, box.front}, {width, height, depth}, Level, Slice, rgba.data(), row_bytes, image_bytes);
+      return S_OK;
+    }
+
     storage->current()->texture().replaceRegion(
         {box.left, box.top, box.front}, {box.right - box.left, box.bottom - box.top, box.back - box.front}, Level,
         Slice, pSrcData, SrcRowPitch, SrcSlicePitch
@@ -436,6 +456,19 @@ public:
     if (Format.Flag & MTL_DXGI_FORMAT_BC) {
       if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
         return E_INVALIDARG;
+    }
+
+    if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
+      const size_t width = box.right - box.left, height = box.bottom - box.top, depth = box.back - box.front;
+      const size_t row_bytes = width * MTLGetTexelSize(storage->pixelFormat()), image_bytes = row_bytes * height;
+      std::vector<uint8_t> rgba(image_bytes * depth);
+      storage->current()->texture().getBytes(
+          {box.left, box.top, box.front}, {width, height, depth}, Level, Slice, rgba.data(), row_bytes, image_bytes);
+      for (size_t z = 0; z < depth; z++)
+        for (size_t y = 0; y < height; y++)
+          CopyRGB32(static_cast<char *>(pDstData) + z * DstSlicePitch + y * DstRowPitch,
+                    rgba.data() + z * image_bytes + y * row_bytes, width, false);
+      return S_OK;
     }
 
     storage->current()->texture().getBytes(
