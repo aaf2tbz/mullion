@@ -1566,6 +1566,8 @@ struct wmtcmd_render_dxmt_geometry_draw {
   uint32_t warp_count;
   uint32_t instance_count;
   uint32_t vertex_per_warp;
+  // the most object threadgroups one Metal draw may have: more are drawn in parts (0: one draw)
+  uint32_t max_object_threadgroups;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw_indexed {
@@ -1578,6 +1580,8 @@ struct wmtcmd_render_dxmt_geometry_draw_indexed {
   uint32_t warp_count;
   uint32_t instance_count;
   uint32_t vertex_per_warp;
+  // the most object threadgroups one Metal draw may have: more are drawn in parts (0: one draw)
+  uint32_t max_object_threadgroups;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw_indirect {

@@ -142,7 +142,9 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   FormatCapabilityInspector format_inspector_;
 
 public:
-  MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter) : adapter_(adapter), command_library(adapter_->GetMTLDevice()) {}
+  MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter) : adapter_(adapter), command_library(adapter_->GetMTLDevice()) {
+    mesh_bytes_per_draw = MeshBytesPerDraw(adapter_->GetMTLDevice());
+  }
 
   ~MTLD3D12DeviceImpl() {}
 

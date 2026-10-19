@@ -80,4 +80,16 @@ GPUShaderFlags(WMT::Device device) {
   return SM50_SHADER_FLAG(flags);
 }
 
+uint64_t
+MeshBytesPerDraw(WMT::Device device) {
+  auto limit = env::getEnvVar("MULLION_MAX_MESH_THREADGROUPS");
+  if (!limit.empty()) {
+    uint64_t value = std::strtoull(limit.c_str(), nullptr, 0);
+    return value ? value * 2048 : -1ull;
+  }
+  // "up to 4 GB of payload and mesh geometry per draw for devices in the Apple7 and Apple8 GPU families" (Metal
+  // Feature Set Tables): 2^32 bytes, which 2^21 mesh threadgroups of 2 KB fill (measured on an M1 Pro)
+  return device.supportsFamily(WMTGPUFamilyApple7) && !device.supportsFamily(WMTGPUFamilyApple9) ? 1ull << 32 : -1ull;
+}
+
 } // namespace dxmt
