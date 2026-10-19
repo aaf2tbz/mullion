@@ -1108,6 +1108,7 @@ struct wmtcmd_compute_dispatch_part {
   struct WMTMemoryPointer next;
   struct WMTOrigin origin;
   struct WMTSize size;
+  struct WMTSize threadgroup_size;
 };
 
 struct wmtcmd_compute_dispatch_indirect {

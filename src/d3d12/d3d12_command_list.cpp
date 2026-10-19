@@ -1314,16 +1314,18 @@ public:
   }
 
   // a new compute pass, where the next dispatch binds its state again
-  void
-  StartComputePass() {
+  ComputeEncoderData *
+  StartComputePass(bool Parts = false) {
     allocator_->InvalidateCurrentPass();
-    auto compute = allocator_->AllocatePass<ComputeEncoderData>();
+    ComputeEncoderData *compute = Parts ? allocator_->AllocatePass<ComputePartsEncoderData>()
+                                       : allocator_->AllocatePass<ComputeEncoderData>();
     compute->type = EncoderType::Compute;
     compute->cmd_head.type = WMTComputeCommandNop;
     compute->cmd_head.next.set(0);
     compute->cmd_tail = (wmtcmd_base *)&compute->cmd_head;
     dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::ComputeRootSignature);
     dirty_state_.set(DirtyState::ComputePipelineState);
+    return compute;
   }
 
   bool
@@ -1381,6 +1383,19 @@ public:
   Dispatch(UINT X, UINT Y, UINT Z) {
     if (Record([=](auto *l) { l->Dispatch(X, Y, Z); }))
       return;
+    if (pso_compute_ && pso_compute_->groups_work_together) {
+      PredicatedPasses predicated(this);
+      auto parts = static_cast<ComputePartsEncoderData *>(StartComputePass(true));
+      if (!PreDispatch())
+        return;
+      auto &group = pso_compute_->threadgroup_size;
+      parts->at_once = std::max<uint64_t>(device_->ThreadsAtOnce() / (group.width * group.height * group.depth), 1);
+      parts->size = {X, Y, Z};
+      parts->type = EncoderType::ComputeParts;
+      Isolate(X, Y, Z);
+      allocator_->InvalidateCurrentPass();
+      return;
+    }
     if (!PreDispatch())
       return;
     auto &group = pso_compute_->threadgroup_size;
@@ -1401,41 +1416,11 @@ public:
       cmd.indirect_args_offset = *offset;
       return;
     }
-    if (auto at_once = pso_compute_->groups_work_together ? device_->ThreadsAtOnce(pso_compute_->part_scale) : 0) {
-      auto &group = pso_compute_->threadgroup_size;
-      DispatchParts({}, {X, Y, Z}, std::max<uint64_t>(at_once / (group.width * group.height * group.depth), 1));
-      Isolate(X, Y, Z);
-      return;
-    }
     auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     cmd_dispatch.type = WMTComputeCommandDispatch;
     cmd_dispatch.size = {X, Y, Z};
     Isolate(X, Y, Z);
   };
-
-  // threadgroups that hand each other work wait for the one group that owns it. an Apple GPU starts every group of
-  // a dispatch and, after a few milliseconds, takes turns among those it does not keep running (a few hundred groups
-  // of a kernel with state of its own), so that each handover waits a whole round: seconds a dispatch, where a
-  // desktop GPU runs the first groups to their end. such a dispatch goes in boxes of at most `at_once` groups, as
-  // many as the GPU runs at once and well under what it keeps, one after another, each halved along its longest
-  // side until it is one
-  void
-  DispatchParts(std::array<uint64_t, 3> origin, std::array<uint64_t, 3> size, uint64_t at_once) {
-    if (size[0] * size[1] * size[2] > at_once) {
-      auto axis = std::max_element(size.begin(), size.end()) - size.begin();
-      auto half = size;
-      half[axis] /= 2;
-      DispatchParts(origin, half, at_once);
-      origin[axis] += half[axis];
-      size[axis] -= half[axis];
-      return DispatchParts(origin, size, at_once);
-    }
-    auto &part = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_part>();
-    part.type = WMTComputeCommandDispatchPart;
-    part.origin = {origin[0], origin[1], origin[2]};
-    part.size = {size[0], size[1], size[2]};
-    allocator_->OrderDispatches();
-  }
 
   // with MULLION_D3D12_ISOLATE set a dispatch is a pass of its own, which the queue then waits for and times
   void
@@ -2799,6 +2784,7 @@ public:
     bool rays = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
     if (rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
       IndirectComputeCommandData *cmd;
+      bool parts = !rays && pso_compute_ && pso_compute_->groups_work_together;
       uint32_t ray_flags = 0;
       if (rays) {
         // the resolver runs first, in the pass of the dispatches; without a pipeline it has no commands
@@ -2812,7 +2798,8 @@ public:
       } else {
         if (!PreDispatch(sig->UpdateRootArguments))
           return;
-        cmd = allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
+        cmd = parts ? allocator_->EncodeComputeResolver(sig, MaxCommandCount)
+                    : allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
         if (!active_statistics_.empty()) {
           // the resolver's threads write a command each
           size_t size = std::max<size_t>(MaxCommandCount, 1) * sizeof(uint64_t);
@@ -2838,7 +2825,32 @@ public:
         ResetIndirectState(sig, rootarg_compute_staging_);
         dirty_state_.set(DirtyState::ComputeRootArguments);
       }
-      if (rays) {
+      if (parts) {
+        auto [mapped, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(D3D12_DISPATCH_ARGUMENTS),
+                                                       alignof(D3D12_DISPATCH_ARGUMENTS));
+        cmd->dispatches = allocator_->gpu_heap_buffer_address_ + at;
+        auto &group = pso_compute_->threadgroup_size;
+        for (UINT i = 0; i < MaxCommandCount; i++) {
+          auto pass = static_cast<ComputePartsEncoderData *>(StartComputePass(true));
+          PreDispatch(sig->UpdateRootArguments);
+          if (sig->UpdateRootArguments) {
+            const std::pair<uint64_t, uint8_t> bindings[] = {
+                {root_arguments + i * rootsig_compute_->UploadQwords * sizeof(uint64_t), SM50_BINDING_INDEX_ROOT_ARGUMENTS},
+                {cmd->static_samplers - allocator_->gpu_heap_buffer_address_, SM50_BINDING_INDEX_STATIC_SAMPLERS}};
+            for (auto [offset, index] : bindings) {
+              auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+              binding.type = WMTComputeCommandSetBuffer;
+              binding.buffer = allocator_->gpu_heap_buffer_;
+              binding.offset = offset;
+              binding.index = index;
+            }
+          }
+          pass->at_once = std::max<uint64_t>(device_->ThreadsAtOnce() / (group.width * group.height * group.depth), 1);
+          pass->indirect = static_cast<const D3D12_DISPATCH_ARGUMENTS *>(mapped) + i;
+          pass->type = EncoderType::ComputeParts;
+        }
+        allocator_->InvalidateCurrentPass();
+      } else if (rays) {
         // each command is a dispatch of the kernel, of the threadgroups the resolver counts for it
         auto [_, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(IndirectRays), alignof(IndirectRays));
         cmd->rays = allocator_->gpu_heap_buffer_address_ + at;

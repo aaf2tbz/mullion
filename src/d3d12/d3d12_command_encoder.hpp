@@ -35,6 +35,7 @@ enum class EncoderType {
   Later,
   // the work so far completes before what follows starts
   Settle,
+  ComputeParts,
   AccelerationStructure,
 };
 
@@ -126,6 +127,13 @@ struct BlitEncoderData : EncoderData {
 struct ComputeEncoderData : EncoderData {
   wmtcmd_compute_nop cmd_head;
   wmtcmd_base *cmd_tail;
+};
+
+// bindings recorded once; the queue submits each part before making the next
+struct ComputePartsEncoderData : ComputeEncoderData {
+  WMTSize size;
+  const D3D12_DISPATCH_ARGUMENTS *indirect = nullptr;
+  uint64_t at_once;
 };
 struct AccelerationStructure;
 struct AccelerationStructureInputs;

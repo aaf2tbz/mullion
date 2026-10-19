@@ -925,10 +925,12 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       if (!body->size.width || !body->size.height || !body->size.depth)
         break;
       MTLSize size = MTLSizeMake(body->size.width, body->size.height, body->size.depth);
+      MTLSize group = MTLSizeMake(body->threadgroup_size.width, body->threadgroup_size.height,
+                                  body->threadgroup_size.depth);
       [encoder setStageInRegion:MTLRegionMake3D(
                                     body->origin.x, body->origin.y, body->origin.z, size.width, size.height, size.depth
                                 )];
-      [encoder dispatchThreadgroups:size threadsPerThreadgroup:threadgroup_size];
+      [encoder dispatchThreadgroups:size threadsPerThreadgroup:group];
       // the origin is the encoder's: a dispatch that is not a part starts at none
       [encoder setStageInRegion:MTLRegionMake3D(0, 0, 0, size.width, size.height, size.depth)];
       break;

@@ -411,7 +411,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           const char *kind = pass.type == EncoderType::Clear     ? "Clear"
                              : pass.type == EncoderType::Render  ? "Render"
                              : pass.type == EncoderType::Blit    ? "Blit"
-                             : pass.type == EncoderType::Compute ? "Compute"
+                             : pass.type == EncoderType::Compute || pass.type == EncoderType::ComputeParts ? "Compute"
                              : pass.type == EncoderType::Resolve ? "Resolve"
                                                                  : "AccelerationStructure";
           std::string runs;
@@ -421,7 +421,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           };
           if (pass.type == EncoderType::Render)
             runs = diag::PipelineRuns(static_cast<const RenderEncoderData *>(pass.pass)->cmd_head, name);
-          else if (pass.type == EncoderType::Compute)
+          else if (pass.type == EncoderType::Compute || pass.type == EncoderType::ComputeParts)
             runs = diag::PipelineRuns(static_cast<const ComputeEncoderData *>(pass.pass)->cmd_head, name);
           auto line = diag::Line("pass", profile_->id, internal_seq, pass.id, kind, pass.encoding, runs);
           line.pop_back();
@@ -888,6 +888,9 @@ public:
           settle();
           Trace("pass ", current->id, " of kind ", uint32_t(current->type), " starts");
         }
+        // indirect dimensions and bindings are read only after their resolver has finished
+        if (current->type == EncoderType::ComputeParts && static_cast<ComputePartsEncoderData *>(current)->indirect)
+          settle();
         if (record_totals_ && current->type != EncoderType::Render && current->type != EncoderType::Compute)
           SnapshotGPURecords(records, current, "unlabelled", scope.inflight->records);
         scope.inflight->encoders[size_t(current->type)]++;
@@ -903,6 +906,7 @@ public:
         if (profile_ &&
             (current->type == EncoderType::Clear || current->type == EncoderType::Render ||
              current->type == EncoderType::Blit || current->type == EncoderType::Compute ||
+             current->type == EncoderType::ComputeParts ||
              current->type == EncoderType::Resolve || current->type == EncoderType::AccelerationStructure)) {
           auto &buffer = profile_->buffers[inflight_cmdbuf_seq_.load() % kCommandQueueSize];
           if (!scope.inflight->samples && buffer.passes.empty())
@@ -1073,6 +1077,51 @@ public:
             encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
           }
           encoder.encodeCommands(&data->cmd_head);
+          encoder.updateFence(fence_);
+          encoder.endEncoding();
+          break;
+        }
+        case EncoderType::ComputeParts: {
+          auto data = static_cast<ComputePartsEncoderData *>(current);
+          auto size = data->indirect ? WMTSize{data->indirect->ThreadGroupCountX, data->indirect->ThreadGroupCountY,
+                                             data->indirect->ThreadGroupCountZ} : data->size;
+          const std::array<uint64_t, 3> extent{size.width, size.height, size.depth};
+          auto pipeline = reinterpret_cast<const wmtcmd_compute_setpso *>(data->cmd_head.next.ptr);
+          assert(pipeline->type == WMTComputeCommandSetPSO);
+          auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true)
+                                                  : cmdbuf.computeCommandEncoder(true);
+          encoder.waitForFence(fence_);
+          if (sparse_mappings) {
+            scope.inflight->sparse_mappings = sparse_mappings;
+            wmtcmd_compute_setbuffer binding{};
+            binding.type = WMTComputeCommandSetBuffer;
+            binding.buffer = sparse_mappings;
+            binding.index = kSparseBufferArgumentIndex;
+            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
+          }
+          encoder.encodeCommands(&data->cmd_head);
+          auto parts = [&](auto &parts, std::array<uint64_t, 3> origin, std::array<uint64_t, 3> size) -> void {
+            if (size[0] * size[1] * size[2] > data->at_once) {
+              auto axis = std::max_element(size.begin(), size.end()) - size.begin();
+              auto half = size;
+              half[axis] /= 2;
+              parts(parts, origin, half);
+              origin[axis] += half[axis];
+              size[axis] -= half[axis];
+              return parts(parts, origin, size);
+            }
+            wmtcmd_compute_dispatch_part part{};
+            part.type = WMTComputeCommandDispatchPart;
+            part.origin = {origin[0], origin[1], origin[2]};
+            part.size = {size[0], size[1], size[2]};
+            part.threadgroup_size = pipeline->threadgroup_size;
+            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&part));
+            wmtcmd_compute_memory_barrier barrier{};
+            barrier.type = WMTComputeCommandMemoryBarrier;
+            barrier.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
+            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&barrier));
+          };
+          parts(parts, {}, extent);
           encoder.updateFence(fence_);
           encoder.endEncoding();
           break;

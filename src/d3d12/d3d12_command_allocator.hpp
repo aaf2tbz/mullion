@@ -54,6 +54,7 @@ struct IndirectComputeCommandData {
   uint32_t ray_flags;
   uint64_t statistics;
   WMTIndirectCommandBufferExecutionRange execution_range;
+  uint64_t dispatches;
 };
 
 // what a command signature's resolver makes of an indirect DispatchRays command: the arguments of the pipeline's

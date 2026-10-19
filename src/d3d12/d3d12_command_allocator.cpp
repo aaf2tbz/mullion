@@ -195,6 +195,7 @@ MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
       reinterpret_cast<BlitEncoderData *>(pass)->~BlitEncoderData();
       break;
     case EncoderType::Compute:
+    case EncoderType::ComputeParts:
       reinterpret_cast<ComputeEncoderData *>(pass)->~ComputeEncoderData();
       break;
     case EncoderType::AccelerationStructure:

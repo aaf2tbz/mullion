@@ -42,6 +42,7 @@ struct dxmt_compute_command_data {
   uint ray_flags;
   device ulong *statistics;
   packed_uint2 execution_range;
+  device packed_uint3 * dispatches;
 };
 
 struct d3d12_draw_arguments {
@@ -282,7 +283,8 @@ public:
     if (is_compute && !rays)
       source << "if (command_data.statistics) command_data.statistics[i] = 0;\n";
     if (!rays)
-      source << (is_compute ? "if (i >= count) return;\n" : "if (i >= count && !command_data.draws) return;\n");
+      source << (is_compute ? "if (i >= count && !command_data.dispatches) return;\n"
+                              : "if (i >= count && !command_data.draws) return;\n");
     source << "{\n";
     source << "device d3d12_arguments& arg = reinterpret_cast<device d3d12_arguments *>("
               "command_data.argument_buffer + i * "
@@ -292,15 +294,17 @@ public:
       source << "device packed_uint3 &threadgroups = *reinterpret_cast<device packed_uint3 *>(ray + "
              << offsetof(IndirectRays, threadgroups) << ");\n";
       source << "threadgroups = uint3(0);\n";
+    } else if (is_compute) {
+      source << "if (command_data.dispatches) command_data.dispatches[i] = uint3(0);\n"
+                "else { compute_command cmd(command_data.cmd_buf, i); cmd.reset(); }\n";
     } else {
       // an indexed draw's indices past their view are a second command, `rest`, which draws zeros (command_data.zeros)
-      source << (is_compute ? "compute_command" : "render_command") << " cmd(command_data.cmd_buf, "
+      source << "render_command cmd(command_data.cmd_buf, "
              << (indexed ? "command_data.zeros ? 2 * i : i" : "i") << ");\n";
       if (indexed)
         source << "render_command rest(command_data.cmd_buf, 2 * i + 1);\n";
       // no command to write where each command's draw is left in an IndirectMeshDraw, with no threadgroups so far
-      source << (is_compute ? "cmd.reset();\n"
-                            : "if (command_data.draws) command_data.draws[i].threadgroups = uint3(0); else cmd.reset();\n");
+      source << "if (command_data.draws) command_data.draws[i].threadgroups = uint3(0); else cmd.reset();\n";
       if (indexed)
         source << "if (command_data.zeros) rest.reset();\n";
     }
@@ -333,9 +337,6 @@ public:
         }
         if (indexed)
           source << "}\n";
-      } else if (!rays) {
-        source << "cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
-        source << "cmd.set_kernel_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
       }
     }
     if (!is_compute)
@@ -402,7 +403,15 @@ public:
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
         source << "if (command_data.statistics) command_data.statistics[i] = ulong(arg.dispatch.x) * arg.dispatch.y * "
                   "arg.dispatch.z * command_data.tgsize.x * command_data.tgsize.y * command_data.tgsize.z;\n";
+        source << "if (command_data.dispatches) command_data.dispatches[i] = arg.dispatch;\n"
+                  "else {\n"
+                  "compute_command cmd(command_data.cmd_buf, i);\n";
+        if (UpdateRootArguments) {
+          source << "cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
+          source << "cmd.set_kernel_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
+        }
         source << "cmd.concurrent_dispatch_threadgroups(arg.dispatch, command_data.tgsize);\n";
+        source << "}\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS: {
