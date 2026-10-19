@@ -1868,16 +1868,17 @@ public:
         auto max_part = get_gs_max_object_threadgroups(
             topo, vertex_registers, encoder->geometry_mesh_instances, max_object_threadgroups, mesh_budget
         );
+        auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo, vertex_registers);
+        uint32_t invocations = vertex_per_warp * encoder->so_geometry_instances;
         // each part's origin (8 bytes), then each part's grid
-        auto parts = indirect_geometry_parts(max_part, 0);
+        auto parts = indirect_geometry_parts(max_part, enc.indirectGeometryBound(encoder->so_count_pso ? invocations : 0));
         auto dispatch_arg = enc.allocateTempBuffer1(parts * (8 + sizeof(DXMT_DISPATCH_ARGUMENTS)), 8);
         auto grids = dispatch_arg.offset + parts * 8;
 
-        auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo, vertex_registers);
         // not one primitive fits an object threadgroup's payload
         if (!vertex_increment_per_wrap)
           return;
-  
+
         if (enc.pipelineStatisticsActive())
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(topo), 0, 0, 0,
                                      buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
@@ -1896,7 +1897,6 @@ public:
           cmd.imm_draw_arguments = enc.getFinalArgumentBuffer();
         };
         // with stream output, the marshal sizes the draw's scratch from the arguments it reads
-        uint32_t invocations = vertex_per_warp * encoder->so_geometry_instances;
         uint64_t targets = 0;
         if (encoder->so_count_pso)
           targets = enc.encodeStreamOutputDraw(0, 0, invocations, draw);
@@ -1929,17 +1929,18 @@ public:
         auto max_part = get_gs_max_object_threadgroups(
             topo, vertex_registers, encoder->geometry_mesh_instances, max_object_threadgroups, mesh_budget
         );
+        auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo, vertex_registers);
+        uint32_t invocations = vertex_per_warp * encoder->so_geometry_instances;
         // each part's origin (8 bytes), then each part's grid
-        auto parts = indirect_geometry_parts(max_part, 0);
+        auto parts = indirect_geometry_parts(max_part, enc.indirectGeometryBound(encoder->so_count_pso ? invocations : 0));
         auto dispatch_arg = enc.allocateTempBuffer1(parts * (8 + sizeof(DXMT_DISPATCH_ARGUMENTS)), 8);
         auto grids = dispatch_arg.offset + parts * 8;
 
-        auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo, vertex_registers);
         // not one primitive fits an object threadgroup's payload
         if (!vertex_increment_per_wrap)
           return;
         auto [index_buffer, index_buffer_offset, index_stride] = IndexBuffer(enc);
-  
+
         if (enc.pipelineStatisticsActive())
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(topo), index_stride, index_buffer_offset, 0,
                                      buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
@@ -1960,7 +1961,6 @@ public:
           cmd.imm_draw_arguments = enc.getFinalArgumentBuffer();
         };
         // with stream output, the marshal sizes the draw's scratch from the arguments it reads
-        uint32_t invocations = vertex_per_warp * encoder->so_geometry_instances;
         uint64_t targets = 0;
         if (encoder->so_count_pso)
           targets = enc.encodeStreamOutputDraw(0, 0, invocations, draw);
@@ -2121,7 +2121,7 @@ public:
           return;
         // the buffer bounds the vertices, and the marshal tells the targets the object threadgroups there are
         uint32_t max_vertices = offset < vertices->length() ? (vertices->length() - offset) / stride : 0;
-        uint32_t max_warps = (max_vertices + vertex_increment_per_warp - 1) / vertex_increment_per_warp;
+        uint32_t max_warps = max_vertices / vertex_increment_per_warp + (max_vertices % vertex_increment_per_warp != 0);
         auto max_part = get_gs_max_object_threadgroups(
             topo, vertex_registers, encoder->geometry_mesh_instances, max_object_threadgroups, mesh_budget
         );

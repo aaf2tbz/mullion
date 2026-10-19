@@ -650,7 +650,7 @@ struct DXMTGSDispatchMarshal {
     ulong cap = max(task.max_object_threadgroups, 1ul);
     uint width = x <= cap ? x : (uint)cap;
     uint height = x <= cap ? (uint)min(cap / max(x, 1u), (ulong)max(y, 1u)) : 1;
-    ulong columns = width ? (x + width - 1) / width : 0, rows = (y + height - 1) / height;
+    ulong columns = width ? ((ulong)x + width - 1) / width : 0, rows = ((ulong)y + height - 1) / height;
     bool runs = x && y && columns * rows <= task.parts;
     if (x && y && !runs)
       *task.omitted = max(*task.omitted, object_groups);
@@ -664,7 +664,7 @@ struct DXMTGSDispatchMarshal {
       task.origins_out[part] = origin;
     }
     // the whole draw's grid, which stream output's scratch and targets describe
-    uint2 output = runs ? uint2(x, y) : uint2(0);
+    uint2 output = uint2(x, y);
 
     // stream output's scratch area (SM50_STREAM_OUTPUT_TARGETS, SM50StreamOutputScratch): the filled sizes, then per
     // stream a total per object threadgroup and per block of 1 << 10 of them, and a count per invocation. the counts
@@ -680,7 +680,7 @@ struct DXMTGSDispatchMarshal {
           task.dispatch_arguments_out[part].y = 0;
           task.dispatch_arguments_out[part].z = 0;
         }
-      } else {
+      } else if (runs) {
         device uint* scratch = task.so_scratch_area + so_used / 4;
         for (ulong i = 0; i < zeroed / 4; i++)
           scratch[i] = 0;

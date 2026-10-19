@@ -34,6 +34,7 @@
 #include "log/log.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "../airconv/airconv_public.h"
+#include <atomic>
 #include <cassert>
 
 #define DXMT_IMPLEMENT_ME __builtin_unreachable();
@@ -688,6 +689,9 @@ public:
     storage->next.set(nullptr);
     return *storage;
   }
+
+  std::atomic_uint64_t indirect_geometry_bound{1};
+  uint64_t indirectGeometryBound(uint32_t invocations);
 
   void
   encodeGSDispatchArgumentsMarshal(

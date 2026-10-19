@@ -2,7 +2,7 @@
 // of them does (D3D11.3 functional spec, 8.7 and 14.5), and the statistics query counts them (20.4). Mullion gives an
 // indirect draw's stream output its scratch from an area the encoder's indirect draws share, sized on the GPU from the
 // arguments; the area starts at 32 MB. a geometry shader of 32 instances needs about 16 KB a 32-point object
-// threadgroup, so 96000 points need about 49 MB. a draw the area has no room for draws nothing (Mullion's limit, not
+// threadgroup, so 192000 points need about 98 MB. a draw the area has no room for draws nothing (Mullion's limit, not
 // D3D11's rule), the encoder's other draws still stream out whole, and the area grows so the same draw, once the GPU
 // has finished the first, streams out whole.
 #include "d3d11_test.hpp"
@@ -45,7 +45,7 @@ main() {
   ));
 
   // a small draw, the big one, and the small one again; then the big one once more
-  const UINT small = 1000, big = 96000;
+  const UINT small = 1000, big = 192000;
   const UINT argument_words[] = {small, 1, 0, 0, big, 1, 0, 0};
   D3D11_BUFFER_DESC arguments_desc{sizeof(argument_words), D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS};
   D3D11_SUBRESOURCE_DATA arguments_data{argument_words};

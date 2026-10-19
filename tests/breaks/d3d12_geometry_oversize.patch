@@ -2,12 +2,12 @@
 # family 7
 --- a/src/dxmt/dxmt_geometry.hpp
 +++ b/src/dxmt/dxmt_geometry.hpp
-@@ -74,7 +74,7 @@
+@@ -75,7 +75,7 @@
      WARN("Omitted mesh draw (GS): not one object threadgroup fits the mesh memory of a draw (", warps, "x", instances, ")");
      return std::nullopt;
    }
 -  return uint64_t(warps) * instances <= max ? 0 : uint32_t(std::min<uint64_t>(max, UINT32_MAX));
 +  return uint64_t(warps) * instances <= max ? std::optional<uint32_t>(0) : std::nullopt;
  }
- 
- } // namespace dxmt
+
+ // rectangular parts can leave nearly half their capacity unused at instance boundaries

@@ -3,11 +3,11 @@ diff --git a/src/dxmt/dxmt_command.metal b/src/dxmt/dxmt_command.metal
 index 25d41ae..cc690ab 100644
 --- a/src/dxmt/dxmt_command.metal
 +++ b/src/dxmt/dxmt_command.metal
-@@ -592,7 +592,6 @@ struct DXMTGSDispatchMarshal {
+@@ -616,7 +616,6 @@
        ulong groups = (ulong)output.x * output.y, zeroed = 32 + 16 * (groups + ((groups + 1023) >> 10));
        ulong need = (zeroed + 16 * groups * task.so_invocations + 15) & ~15ul;
        if (so_used + need > task.so_scratch_size) {
 -        *task.so_overflow = max(*task.so_overflow, so_used + need);
-         output.x = 0;
-         output.y = 0;
-         output.z = 0;
+         for (uint part = 0; part < task.parts; part++) {
+           task.dispatch_arguments_out[part].x = 0;
+           task.dispatch_arguments_out[part].y = 0;
