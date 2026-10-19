@@ -5,7 +5,6 @@
 #include "dxmt_command.hpp"
 #include "rc/util_rc.hpp"
 #include "thread.hpp"
-#include "util_cpu_fence.hpp"
 #include "winemetal.h"
 #include <atomic>
 #include <deque>
@@ -69,25 +68,10 @@ public:
   class PresentState {
   public:
     DXMTPresentMetadata metadata;
-    uint64_t frame_id;
-    Presenter *presenter;
-    PresentState(DXMTPresentMetadata metadata, uint64_t frame_id, Presenter *presenter) :
-        metadata(metadata),
-        frame_id(frame_id),
-        presenter(presenter) {}
-    PresentState(const PresentState &copy) = delete;
-    PresentState(PresentState &&move)  {
-      metadata = move.metadata;
-      frame_id = move.frame_id;
-      presenter = move.presenter;
-      move.presenter = nullptr;
-    };
-    ~PresentState() {
-      if (presenter) {
-        presenter->frame_presented_.signal(frame_id);
-        presenter = nullptr;
-      }
-    };
+    WMTLayerProps layer_props;
+    WMTColorSpace colorspace;
+    WMT::Reference<WMT::Texture> gamma_lut;
+    WMT::Reference<WMT::RenderPipelineState> blit, scale;
   };
 
   PresentState synchronizeLayerProperties();
@@ -99,7 +83,7 @@ public:
   }
 
   WMT::MetalDrawable encodeCommands(
-      WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
+      WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
       std::function<void(WMT::RenderCommandEncoder)> &&update_fences
   );
@@ -131,8 +115,6 @@ private:
   WMT::Reference<WMT::RenderPipelineState> present_blit_;
   WMT::Reference<WMT::RenderPipelineState> present_scale_;
   std::atomic_flag pso_valid = 0;
-  uint64_t frame_requested_ = 0;
-  CpuFence frame_presented_ = 0;
   HWND window_;
   WMT::Reference<WMT::Texture> window_target_;
   struct WindowFrame {

@@ -285,7 +285,7 @@ struct PresentData : EncoderData {
   WMT::Reference<WMT::Texture> backbuffer;
   Rc<Presenter> presenter;
   double after;
-  DXMTPresentMetadata metadata;
+  Presenter::PresentState state;
 };
 
 struct SpatialUpscaleData : EncoderData {
@@ -747,7 +747,7 @@ public:
     return (new (allocate_cpu_heap(sizeof(T), alignof(T))) T());
   };
 
-  void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, DXMTPresentMetadata metadata);
+  void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, Presenter::PresentState state);
   void copyBufferRenderTarget(const Rc<Texture> &texture, bool load);
 
   void upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);

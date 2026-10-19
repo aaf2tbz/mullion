@@ -1,0 +1,12 @@
+# a held Present reads the later frame's settings
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -1470,7 +1470,7 @@
+     auto &view = g->texture->view(g->texture->fullView);
+ 
+     auto drawable = presenter->encodeCommands(
+-        cmdbuf, view.texture, state,
++        cmdbuf, view.texture, presenter->synchronizeLayerProperties(),
+         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
+         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
+     );

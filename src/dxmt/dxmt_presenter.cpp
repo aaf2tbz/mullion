@@ -20,19 +20,6 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   layer_props_.display_sync_enabled = false;
   layer_props_.framebuffer_only = false; // how strangely setting it true results in worse performance
   layer_props_.contents_scale = layer_props_.contents_scale * scale_factor;
-
-  WMTTextureInfo texture_info{};
-  texture_info.type = WMTTextureType2D;
-  texture_info.pixel_format = WMTPixelFormatRGBA32Float;
-  texture_info.usage = WMTTextureUsageShaderRead;
-  texture_info.options = WMTResourceStorageModeShared;
-  texture_info.width = DXMT_GAMMA_CP_COUNT;
-  texture_info.height = 1;
-  texture_info.depth = 1;
-  texture_info.mipmap_level_count = 1;
-  texture_info.sample_count = 1;
-  texture_info.array_length = 1;
-  gamma_lut_texture_ = device.newTexture(texture_info);
 }
 
 bool
@@ -51,8 +38,6 @@ Presenter::changeLayerProperties(
   colorspace_ = colorspace;
   if (should_invalidated)
     pso_valid.clear(); // defer changes
-  else
-    layer_.setProps(layer_props_);
   return should_invalidated;
 }
 
@@ -94,6 +79,18 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
       gamma_lut_rgba_[i * 4 + 2] = std::clamp(gamma_ramp->blue[i], 0.f, 1.f);
       gamma_lut_rgba_[i * 4 + 3] = 1.0f;
     }
+    WMTTextureInfo texture_info{};
+    texture_info.type = WMTTextureType2D;
+    texture_info.pixel_format = WMTPixelFormatRGBA32Float;
+    texture_info.usage = WMTTextureUsageShaderRead;
+    texture_info.options = WMTResourceStorageModeShared;
+    texture_info.width = DXMT_GAMMA_CP_COUNT;
+    texture_info.height = 1;
+    texture_info.depth = 1;
+    texture_info.mipmap_level_count = 1;
+    texture_info.sample_count = 1;
+    texture_info.array_length = 1;
+    gamma_lut_texture_ = device_.newTexture(texture_info);
     gamma_lut_texture_.replaceRegion(
           {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0,
           gamma_lut_rgba_.data(),
@@ -121,12 +118,11 @@ Presenter::synchronizeLayerProperties() {
   auto hdr_metadata = display_setting_version_ > 0 ? &display_hdr_metadata_
                       : has_hdr_metadata_          ? &hdr_metadata_
                                                    : nullptr;
-  if (unlikely(!pso_valid.test_and_set())) {
-    frame_presented_.wait(frame_requested_);
-    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_version_ != 0);
-    layer_.setProps(layer_props_);
-    layer_.setColorSpace(final_colorspace);
-  }
+  if (unlikely(!pso_valid.test_and_set()))
+    buildRenderPipelineState(
+        final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1,
+        gamma_version_ != 0
+    );
 
   DXMTPresentMetadata metadata;
 
@@ -150,23 +146,26 @@ Presenter::synchronizeLayerProperties() {
   if (final_colorspace == WMTColorSpaceHDR_scRGB)
     metadata.edr_scale *= 0.8;
 
-  return {metadata, ++frame_requested_, this};
+  return {metadata, layer_props_, final_colorspace, gamma_lut_texture_, present_blit_, present_scale_};
 }
 
 WMT::MetalDrawable
 Presenter::encodeCommands(
-    WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
+    WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
     std::function<void(WMT::RenderCommandEncoder)> &&update_fences
 ) {
-  double width = layer_props_.drawable_width;
-  double height = layer_props_.drawable_height;
+  const auto &metadata = state.metadata;
+  double width = state.layer_props.drawable_width;
+  double height = state.layer_props.drawable_height;
+  layer_.setProps(state.layer_props);
+  layer_.setColorSpace(state.colorspace);
 
   auto drawable = layer_ ? layer_.nextDrawable() : WMT::MetalDrawable{};
   if (!drawable && (!window_target_ || window_target_.width() != width || window_target_.height() != height)) {
     WMTTextureInfo texture_info{};
     texture_info.type = WMTTextureType2D;
-    texture_info.pixel_format = layer_props_.pixel_format;
+    texture_info.pixel_format = state.layer_props.pixel_format;
     texture_info.usage = WMTTextureUsageRenderTarget;
     texture_info.options = WMTResourceStorageModePrivate;
     texture_info.width = width;
@@ -187,14 +186,14 @@ Presenter::encodeCommands(
   auto encoder = cmdbuf.renderCommandEncoder(info);
   wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);
-  encoder.setFragmentTexture(gamma_lut_texture_, 1);
+  encoder.setFragmentTexture(state.gamma_lut, 1);
 
   encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
   // a back buffer as large as the target is read texel for texel, when all of it is presented as it is
   if (backbuffer.width() == (uint64_t)width && backbuffer.height() == (uint64_t)height && metadata.presentation.plain()) {
-    encoder.setRenderPipelineState(present_blit_);
+    encoder.setRenderPipelineState(state.blit);
   } else {
-    encoder.setRenderPipelineState(present_scale_);
+    encoder.setRenderPipelineState(state.scale);
   }
   encoder.setViewport({0, 0, width, height, 0, 1});
   encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);

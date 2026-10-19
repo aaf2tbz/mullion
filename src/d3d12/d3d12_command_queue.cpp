@@ -100,6 +100,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   };
   std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
   dxmt::thread held_thread_;
+  std::atomic<DWORD> held_thread_id_{0};
 
   // what the queue does and where it waits, with MULLION_LOG_LEVEL=trace: the last lines of a hang name it
   template <typename... Args>
@@ -133,6 +134,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   void
   CommitHeld() {
     env::setThreadName("mullion-held-work-thread");
+    held_thread_id_ = GetCurrentThreadId();
     std::unique_lock<dxmt::mutex> lock(held_mutex_);
     for (;;) {
       held_changed_.wait(lock, [&] { return held_stop_ || !held_.empty(); });
@@ -143,6 +145,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       lock.unlock();
       Trace("held work starts");
       work();
+      work = {};
       lock.lock();
       held_.pop_front();
       Trace("held work done, ", held_.size(), " left");
@@ -521,6 +524,19 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   }
 
 public:
+  ULONG STDMETHODCALLTYPE
+  Release() override {
+    auto refs = --m_refCount;
+    if (!refs) {
+      // a queued Present can release the queue's last reference on the thread its destructor joins
+      if (held_thread_id_ == GetCurrentThreadId())
+        dxmt::thread([this] { ReleasePrivate(); }).detach();
+      else
+        ReleasePrivate();
+    }
+    return refs;
+  }
+
   MTLD3D12CommandQueueImpl(MTLD3D12Device *pDevice) :
       MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice),
       inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }),
@@ -1356,11 +1372,12 @@ public:
       std::chrono::steady_clock::time_point unset;
       device_->first_present.compare_exchange_strong(unset, std::chrono::steady_clock::now());
     }
+    auto state = presenter->synchronizeLayerProperties();
     if (Holding() &&
         Hold([this, swapchain = Com(swapchain), presenter, backbuffer = Com(backbuffer), hLantecyWaitable, after, id,
-              number] { Commit(presenter, backbuffer.ptr(), hLantecyWaitable, after, id, number); }))
+              number, state] { Commit(presenter, backbuffer.ptr(), state, hLantecyWaitable, after, id, number); }))
       return S_OK;
-    return Commit(presenter, backbuffer, hLantecyWaitable, after, id, number);
+    return Commit(presenter, backbuffer, state, hLantecyWaitable, after, id, number);
   }
 
   void
@@ -1440,8 +1457,8 @@ public:
 
   HRESULT
   Commit(
-      Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after, uint64_t id,
-      uint64_t number
+      Presenter *presenter, ID3D12Resource *backbuffer, const Presenter::PresentState &state, HANDLE hLantecyWaitable,
+      double after, uint64_t id, uint64_t number
   ) {
     Trace("Present");
     auto scope = StartCommitting();
@@ -1452,9 +1469,8 @@ public:
     auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
     auto &view = g->texture->view(g->texture->fullView);
 
-    auto state = presenter->synchronizeLayerProperties();
     auto drawable = presenter->encodeCommands(
-        cmdbuf, view.texture, state.metadata,
+        cmdbuf, view.texture, state,
         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
     );

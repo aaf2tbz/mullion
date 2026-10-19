@@ -29,6 +29,7 @@
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "wsi_window.hpp"
+#include "util_cpu_fence.hpp"
 #include "util_hotpatch.h"
 #include "config/config.hpp"
 #include <cfloat>
