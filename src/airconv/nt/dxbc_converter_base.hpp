@@ -214,9 +214,10 @@ public:
     std::visit(
         [=, this](auto &DstOp) {
           auto Value_ = Value;
-          // sat(NaN) is 0 (D3D11.3 22.19.1), which Metal's fast variant leaves undefined
+          // sat(NaN) is 0 (D3D11.3 22.19.1). MSL leaves Metal's fast variant undefined for a NaN, and d3d12_minmax
+          // checks that the GPU gives it
           if (DstOp._.write_type == OperandDataType::Float && Saturate)
-            Value_ = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, Value, false);
+            Value_ = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, Value);
           this->StoreOperand(DstOp, Value_);
         },
         DstOp
@@ -231,7 +232,7 @@ public:
         [=, this](auto &DstOp) {
           auto Value_ = ValueVec4;
           if (DstOp._.write_type == OperandDataType::Float && Saturate)
-            Value_ = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, ValueVec4, false);
+            Value_ = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, ValueVec4);
           this->StoreOperand(DstOp, this->MaskSwizzle(Value_, DstOp._.mask));
         },
         DstOp

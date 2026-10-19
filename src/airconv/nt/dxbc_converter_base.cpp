@@ -955,13 +955,14 @@ Converter::operator()(const InstFloatBinaryOp &bin) {
   case FloatBinaryOp::Div:
     Result = ir.CreateFDiv(LHS, RHS);
     break;
-  // the operand that is not NaN (D3D11.3 22.10.10), which Metal's fast variants leave undefined
+  // the operand that is not NaN (D3D11.3 22.10.10). MSL leaves Metal's fast variants undefined for a NaN, and
+  // d3d12_minmax checks that the GPU gives it
   case FloatBinaryOp::Min: {
-    Result = air.CreateFPBinOp(AIRBuilder::fmin, LHS, RHS, false);
+    Result = air.CreateFPBinOp(AIRBuilder::fmin, LHS, RHS);
     break;
   }
   case FloatBinaryOp::Max: {
-    Result = air.CreateFPBinOp(AIRBuilder::fmax, LHS, RHS, false);
+    Result = air.CreateFPBinOp(AIRBuilder::fmax, LHS, RHS);
     break;
   }
   }

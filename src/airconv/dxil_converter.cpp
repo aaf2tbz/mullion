@@ -3223,10 +3223,10 @@ convert_dxil(
     case FAbs:
       ret = fp_unary(llvm::air::AIRBuilder::fabs, a(1));
       break;
-    // a NaN saturates to 0, and FMax and FMin give the operand that is not one (DXIL.rst), which Metal's fast
-    // variants leave undefined
+    // a NaN saturates to 0, and FMax and FMin give the operand that is not one (DXIL.rst). MSL leaves Metal's fast
+    // variants undefined for a NaN, and d3d12_minmax checks that the GPU gives these
     case Saturate:
-      ret = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, a(1), false);
+      ret = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, a(1));
       break;
     case Cos:
       ret = dxbc.SinCos(llvm::air::AIRBuilder::cos, a(1));
@@ -3293,10 +3293,10 @@ convert_dxil(
       ret = ir.CreateZExtOrTrunc(air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, a(1)), ty);
       break;
     case FMax:
-      ret = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, a(1), a(2), false);
+      ret = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, a(1), a(2));
       break;
     case FMin:
-      ret = air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, a(1), a(2), false);
+      ret = air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, a(1), a(2));
       break;
     case IMax:
       ret = air.CreateIntBinOp(llvm::air::AIRBuilder::max, a(1), a(2), true);
