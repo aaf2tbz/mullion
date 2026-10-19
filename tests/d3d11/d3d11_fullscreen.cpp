@@ -38,6 +38,7 @@
 #include <dxgi1_6.h>
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <random>
 
 static bool test_nested = true, destroy_on_style = false;
@@ -242,9 +243,18 @@ main(int argc, char **argv) {
                 return verdict();
               LONG width = output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left;
               LONG height = output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top;
+              // stock Wine's win32u asserts (make_ratio, dlls/win32u/sysparams.c) when the DPI times the physical size
+              // over the mode's does not reduce below 65536 on an axis, and the process never ends: no such mode
+              auto held = [dpi = UINT64(GetDpiForSystem()), &registry](const DXGI_MODE_DESC &mode) {
+                auto reduces = [&](UINT64 physical, UINT64 size) {
+                  return dpi * physical / std::gcd(dpi * physical, size) < 65536;
+                };
+                return reduces(registry.dmPelsWidth, mode.Width) && reduces(registry.dmPelsHeight, mode.Height);
+              };
               auto available = modes;
               available.erase(std::remove_if(available.begin(), available.end(), [&](const auto &mode) {
-                                return mode.Width == desktop.dmPelsWidth && mode.Height == desktop.dmPelsHeight;
+                                return (mode.Width == desktop.dmPelsWidth && mode.Height == desktop.dmPelsHeight) ||
+                                       !held(mode);
                               }),
                               available.end());
               if (!expect(!available.empty(), "no enumerated mode differs from the desktop"))
