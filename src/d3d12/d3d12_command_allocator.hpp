@@ -53,6 +53,7 @@ struct IndirectComputeCommandData {
   uint64_t rays;
   uint32_t ray_flags;
   uint64_t statistics;
+  WMTIndirectCommandBufferExecutionRange execution_range;
 };
 
 // what a command signature's resolver makes of an indirect DispatchRays command: the arguments of the pipeline's
@@ -111,6 +112,7 @@ struct IndirectRenderCommandData {
   // past it, as many of these zero indices of 16 bits (D3D11.3 8.19.2: "the return is 0"), `zero_count` at most
   uint64_t zeros;
   uint32_t zero_count;
+  WMTIndirectCommandBufferExecutionRange execution_range;
 };
 
 // the words of IndirectRenderCommandData::most: five numbers of the commands and how many commands there were

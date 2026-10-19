@@ -1077,6 +1077,7 @@ enum WMTComputeCommandType : uint16_t {
   WMTComputeCommandExecuteCommandsInBuffer,
   WMTComputeCommandSetVisibleFunctionTable,
   WMTComputeCommandDispatchPart,
+  WMTComputeCommandExecuteCommandsInBufferIndirect,
 };
 
 struct wmtcmd_compute_setvisiblefunctiontable {
@@ -1202,6 +1203,20 @@ struct wmtcmd_compute_executecommands {
   uint32_t length;
 };
 
+struct WMTIndirectCommandBufferExecutionRange {
+  uint32_t location;
+  uint32_t length;
+};
+
+struct wmtcmd_compute_executecommands_indirect {
+  enum WMTComputeCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t indirect_command_buffer;
+  obj_handle_t indirect_buffer;
+  uint64_t indirect_buffer_offset;
+};
+
 WINEMETAL_API void MTLComputeCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 enum WMTRenderCommandType : uint16_t {
@@ -1255,6 +1270,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetStencilRef,
   WMTRenderCommandSetDepthStencilState,
   WMTRenderCommandSetDepthTestBounds,
+  WMTRenderCommandExecuteCommandsInBufferIndirect,
 };
 
 struct wmtcmd_render_nop {
@@ -1668,6 +1684,15 @@ struct wmtcmd_render_executecommands {
   uint32_t length;
 };
 
+struct wmtcmd_render_executecommands_indirect {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t indirect_command_buffer;
+  obj_handle_t indirect_buffer;
+  uint64_t indirect_buffer_offset;
+};
+
 WINEMETAL_API void MTLRenderCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 WINEMETAL_API enum WMTPixelFormat MTLTexture_pixelFormat(obj_handle_t texture);
@@ -2058,6 +2083,8 @@ WINEMETAL_API uint64_t MTLDevice_registryID(obj_handle_t device);
 
 WINEMETAL_API uint64_t MTLComputePipelineState_threadExecutionWidth(obj_handle_t pipeline);
 
+WINEMETAL_API uint64_t MTLComputePipelineState_maxTotalThreadsPerThreadgroup(obj_handle_t pipeline);
+
 WINEMETAL_API uint64_t MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(obj_handle_t pipeline);
 
 WINEMETAL_API uint64_t MTLDevice_gpuCoreCount(obj_handle_t device);
@@ -2408,7 +2435,8 @@ enum WMTSampledEncoder {
   WMTSampledCompute, WMTSampledAccelerationStructure, WMTSampledRender, WMTSampledConcurrentCompute
 };
 // appended calls keep the preceding bridge ABI indices
-enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixCallCount };
+enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixComputeMaxThreadsPerThreadgroup,
+       WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);

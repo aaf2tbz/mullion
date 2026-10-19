@@ -369,6 +369,11 @@ public:
 class ComputePipelineState : public Object {
 public:
   uint64_t
+  maxTotalThreadsPerThreadgroup() const {
+    return MTLComputePipelineState_maxTotalThreadsPerThreadgroup(handle);
+  }
+
+  uint64_t
   threadExecutionWidth() const {
     return MTLComputePipelineState_threadExecutionWidth(handle);
   }

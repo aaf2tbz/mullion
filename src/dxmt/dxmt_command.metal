@@ -884,6 +884,11 @@ struct PipelineStatisticsSum {
   uint predicated_count;
 };
 
+struct IndirectInvocations {
+  device const ulong *counts;
+  ulong length;
+};
+
 struct PredicatedStatistics {
   ulong vertices, primitives, threads;
   device const uint *skips;
@@ -893,7 +898,7 @@ struct PredicatedStatistics {
     constant PipelineStatisticsSum *sums [[buffer(0)]],
     constant VisibilitySlot *slots [[buffer(1)]],
     constant uint *slot_shades [[buffer(2)]],
-    constant VisibilitySlot *dispatches [[buffer(3)]],
+    constant IndirectInvocations *dispatches [[buffer(3)]],
     device ulong *results [[buffer(4)]],
     constant PredicatedStatistics *predicated [[buffer(5)]],
     uint i [[thread_position_in_grid]]
@@ -906,7 +911,8 @@ struct PredicatedStatistics {
     if (slot_shades[k])
       result[7] += *slots[k].count;
   for (uint k = sum.first_dispatch; k < sum.first_dispatch + sum.dispatch_count; k++)
-    result[10] += *dispatches[k].count;
+    for (ulong c = 0; c < dispatches[k].length; c++)
+      result[10] += dispatches[k].counts[c];
   for (uint k = sum.first_predicated; k < sum.first_predicated + sum.predicated_count; k++) {
     constant PredicatedStatistics &count = predicated[k];
     if (*count.skips)

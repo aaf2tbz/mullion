@@ -335,22 +335,19 @@ MTLD3D12CommandAllocatorImpl::Reset() {
   return Initialize();
 };
 
-// threads per threadgroup of a signature's resolver, which runs one thread per command
-constexpr size_t kResolverThreadgroupSize = 64;
-
 // runs the signature's resolver over the commands; the caller fills in what it reads
 IndirectComputeCommandData *
 MTLD3D12CommandAllocatorImpl::EncodeComputeResolver(MTLD3D12CommandSignature *pCmdSig, size_t MaxCount) {
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectComputeCommandData), 16);
   if (records_)
-    RecordGPUHeap(Ptr, sizeof(IndirectComputeCommandData), "indirect dispatch");
+    RecordGPUHeap(Ptr, offsetof(IndirectComputeCommandData, execution_range), "indirect dispatch");
   auto data = new (Ptr) IndirectComputeCommandData{};
   data->max_count = MaxCount;
 
   auto &cmd_setpso_res = EncodeComputeCommand<wmtcmd_compute_setpso>();
   cmd_setpso_res.type = WMTComputeCommandSetPSO;
   cmd_setpso_res.pso = pCmdSig->compute_resolver;
-  cmd_setpso_res.threadgroup_size = {kResolverThreadgroupSize, 1, 1};
+  cmd_setpso_res.threadgroup_size = {pCmdSig->compute_resolver.maxTotalThreadsPerThreadgroup(), 1, 1};
 
   auto &cmd_argbuf_res = EncodeComputeCommand<wmtcmd_compute_setbuffer>();
   cmd_argbuf_res.type = WMTComputeCommandSetBuffer;
@@ -407,11 +404,12 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
   cmd_setpso.pso = pPSO->pso;
   cmd_setpso.threadgroup_size = pPSO->threadgroup_size; // not really used
 
-  auto &cmd = EncodeComputeCommand<wmtcmd_compute_executecommands>();
-  cmd.type = WMTComputeCommandExecuteCommandsInBuffer;
+  auto &cmd = EncodeComputeCommand<wmtcmd_compute_executecommands_indirect>();
+  cmd.type = WMTComputeCommandExecuteCommandsInBufferIndirect;
   cmd.indirect_command_buffer = icb;
-  cmd.location = 0;
-  cmd.length = MaxCount;
+  cmd.indirect_buffer = gpu_heap_buffer_;
+  cmd.indirect_buffer_offset = reinterpret_cast<char *>(data) - static_cast<char *>(gpu_heap_) +
+                               offsetof(IndirectComputeCommandData, execution_range);
 
   icb_.push_back(std::move(icb));
 
@@ -457,7 +455,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
   if (records_)
-    RecordGPUHeap(Ptr, sizeof(IndirectRenderCommandData), "indirect draw");
+    RecordGPUHeap(Ptr, offsetof(IndirectRenderCommandData, execution_range), "indirect draw");
 
   auto data = reinterpret_cast<IndirectRenderCommandData *>(Ptr);
 
@@ -514,7 +512,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   auto &cmd_setpso_res = EncodeBeforeRender<wmtcmd_compute_setpso>();
   cmd_setpso_res.type = WMTComputeCommandSetPSO;
   cmd_setpso_res.pso = pCmdSig->render_resolver;
-  cmd_setpso_res.threadgroup_size = {kResolverThreadgroupSize, 1, 1};
+  cmd_setpso_res.threadgroup_size = {pCmdSig->render_resolver.maxTotalThreadsPerThreadgroup(), 1, 1};
 
   auto &cmd_argbuf_res = EncodeBeforeRender<wmtcmd_compute_setbuffer>();
   cmd_argbuf_res.type = WMTComputeCommandSetBuffer;
@@ -542,11 +540,11 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   cmd_use_icb.usage = WMTResourceUsageRead;
   cmd_use_icb.resource = icb;
 
-  auto &cmd = EncodeRenderCommand<wmtcmd_render_executecommands>();
-  cmd.type = WMTRenderCommandExecuteCommandsInBuffer;
+  auto &cmd = EncodeRenderCommand<wmtcmd_render_executecommands_indirect>();
+  cmd.type = WMTRenderCommandExecuteCommandsInBufferIndirect;
   cmd.indirect_command_buffer = icb;
-  cmd.location = 0;
-  cmd.length = MaxCount * each;
+  cmd.indirect_buffer = gpu_heap_buffer_;
+  cmd.indirect_buffer_offset = Offset + offsetof(IndirectRenderCommandData, execution_range);
 
   icb_.push_back(std::move(icb));
 

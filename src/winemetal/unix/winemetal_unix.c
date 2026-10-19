@@ -1005,6 +1005,13 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
                              withRange:NSMakeRange(body->location, body->length)];
       break;
     }
+    case WMTComputeCommandExecuteCommandsInBufferIndirect: {
+      struct wmtcmd_compute_executecommands_indirect *body = (struct wmtcmd_compute_executecommands_indirect *)next;
+      [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                        indirectBuffer:(id<MTLBuffer>)body->indirect_buffer
+                  indirectBufferOffset:body->indirect_buffer_offset];
+      break;
+    }
     }
 
     next = next->next.ptr;
@@ -1023,7 +1030,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     enum WMTRenderCommandType type = next->type;
     if (!pipeline && ((type >= WMTRenderCommandDraw && type <= WMTRenderCommandDrawMeshThreadgroupsIndirect) ||
                       (type >= WMTRenderCommandDXMTGeometryDraw && type <= WMTRenderCommandDXMTGeometryDrawIndexedIndirect) ||
-                      (type >= WMTRenderCommandDXMTTessellationMeshDraw && type <= WMTRenderCommandExecuteCommandsInBuffer))) {
+                      (type >= WMTRenderCommandDXMTTessellationMeshDraw &&
+                       type <= WMTRenderCommandExecuteCommandsInBuffer) ||
+                      type == WMTRenderCommandExecuteCommandsInBufferIndirect)) {
       next = next->next.ptr;
       continue;
     }
@@ -1372,6 +1381,13 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_executecommands *body = (struct wmtcmd_render_executecommands *)next;
       [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
                              withRange:NSMakeRange(body->location, body->length)];
+      break;
+    }
+    case WMTRenderCommandExecuteCommandsInBufferIndirect: {
+      struct wmtcmd_render_executecommands_indirect *body = (struct wmtcmd_render_executecommands_indirect *)next;
+      [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                        indirectBuffer:(id<MTLBuffer>)body->indirect_buffer
+                  indirectBufferOffset:body->indirect_buffer_offset];
       break;
     }
     }
@@ -3144,6 +3160,13 @@ _MTLComputePipelineState_threadExecutionWidth(void *obj) {
 }
 
 static NTSTATUS
+_MTLComputePipelineState_maxTotalThreadsPerThreadgroup(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLComputePipelineState>)params->handle maxTotalThreadsPerThreadgroup];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLRenderPipelineState>)params->handle maxTotalThreadgroupsPerMeshGrid];
@@ -4097,6 +4120,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_sampledCommandEncoder,
     &_WMTDiagWrite,
     &_DispatchData_getBytes,
+    &_MTLComputePipelineState_maxTotalThreadsPerThreadgroup,
 };
 
 #ifndef DXMT_NATIVE
@@ -4271,6 +4295,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_sampledCommandEncoder,
     &_WMTDiagWrite,
     &_DispatchData_getBytes,
+    &_MTLComputePipelineState_maxTotalThreadsPerThreadgroup,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

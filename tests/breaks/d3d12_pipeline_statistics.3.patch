@@ -1,19 +1,19 @@
 # statistics re-read a simple indirect dispatch's arguments and count at resolve time
 --- a/src/d3d12/d3d12_command_list.cpp
 +++ b/src/d3d12/d3d12_command_list.cpp
-@@ -2772,7 +2772,8 @@
+@@ -2812,7 +2812,8 @@
            if (allocator_->records_)
-             allocator_->RecordGPUHeap(mapped, sizeof(uint64_t), "indirect invocations", 0, sizeof(uint64_t));
+             allocator_->RecordGPUHeap(mapped, size, "indirect invocations", 0, size);
            cmd->statistics = allocator_->gpu_heap_buffer_address_ + offset;
--          indirect_dispatches_.push_back(cmd->statistics);
-+          indirect_dispatches_.push_back(allocator_->gpu_heap_buffer_address_ +
-+              (reinterpret_cast<char *>(cmd) - static_cast<char *>(allocator_->gpu_heap_)));
+-          indirect_dispatches_.push_back({cmd->statistics, MaxCommandCount});
++          indirect_dispatches_.push_back({allocator_->gpu_heap_buffer_address_ +
++              (reinterpret_cast<char *>(cmd) - static_cast<char *>(allocator_->gpu_heap_)), MaxCommandCount});
          }
        }
        cmd->max_count_buffer = CountBufferAddress;
 --- a/src/dxmt/dxmt_command.metal
 +++ b/src/dxmt/dxmt_command.metal
-@@ -889,6 +889,15 @@
+@@ -894,6 +894,15 @@
    device const uint *skips;
  };
  
@@ -29,14 +29,15 @@
  [[kernel]] void sum_pipeline_statistics(
      constant PipelineStatisticsSum *sums [[buffer(0)]],
      constant VisibilitySlot *slots [[buffer(1)]],
-@@ -905,8 +914,13 @@
+@@ -910,9 +919,13 @@
    for (uint k = sum.first_slot; k < sum.first_slot + sum.slot_count; k++)
      if (slot_shades[k])
        result[7] += *slots[k].count;
 -  for (uint k = sum.first_dispatch; k < sum.first_dispatch + sum.dispatch_count; k++)
--    result[10] += *dispatches[k].count;
+-    for (ulong c = 0; c < dispatches[k].length; c++)
+-      result[10] += dispatches[k].counts[c];
 +  for (uint k = sum.first_dispatch; k < sum.first_dispatch + sum.dispatch_count; k++) {
-+    device const DeferredDispatch &dispatch = *reinterpret_cast<device const DeferredDispatch *>(dispatches[k].count);
++    device const DeferredDispatch &dispatch = *reinterpret_cast<device const DeferredDispatch *>(dispatches[k].counts);
 +    uint commands = dispatch.count ? min(ulong(*dispatch.count), dispatch.max_count) : dispatch.max_count;
 +    if (commands)
 +      result[10] += ulong(dispatch.arguments[0]) * dispatch.arguments[1] * dispatch.arguments[2] *

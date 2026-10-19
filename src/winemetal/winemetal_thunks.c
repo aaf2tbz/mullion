@@ -1131,6 +1131,15 @@ MTLComputePipelineState_threadExecutionWidth(obj_handle_t pipeline) {
 }
 
 WINEMETAL_API uint64_t
+MTLComputePipelineState_maxTotalThreadsPerThreadgroup(obj_handle_t pipeline) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = pipeline;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixComputeMaxThreadsPerThreadgroup, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
 MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(obj_handle_t pipeline) {
   struct unixcall_generic_obj_uint64_ret params;
   params.handle = pipeline;

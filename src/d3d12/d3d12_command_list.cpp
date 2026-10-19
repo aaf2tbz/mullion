@@ -223,7 +223,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     uint64_t vertices, primitives, threads, skips;
   };
   std::vector<std::pair<MTLD3D12QueryHeap *, StatisticsSum>> active_statistics_, statistics_sums_;
-  std::vector<uint64_t> indirect_dispatches_;
+  // each indirect dispatch's threads, a word per command (IndirectInvocations)
+  struct IndirectInvocations {
+    uint64_t counts, length;
+  };
+  std::vector<IndirectInvocations> indirect_dispatches_;
   std::vector<PredicatedStatistics> predicated_statistics_;
   std::vector<uint32_t> visibility_shades_;
 
@@ -460,7 +464,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     auto slots = upload(visibility_slots_.data(), visibility_slots_.size() * sizeof(uint64_t), "statistics slots");
     auto shades = upload(visibility_shades_.data(), visibility_shades_.size() * sizeof(uint32_t), "statistics shades");
     auto dispatches = upload(
-        indirect_dispatches_.data(), indirect_dispatches_.size() * sizeof(uint64_t), "statistics dispatches"
+        indirect_dispatches_.data(), indirect_dispatches_.size() * sizeof(IndirectInvocations), "statistics dispatches"
     );
     auto predicated = upload(
         predicated_statistics_.data(), predicated_statistics_.size() * sizeof(PredicatedStatistics),
@@ -2810,11 +2814,13 @@ public:
           return;
         cmd = allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
         if (!active_statistics_.empty()) {
-          auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t), alignof(uint64_t));
+          // the resolver's threads write a command each
+          size_t size = std::max<size_t>(MaxCommandCount, 1) * sizeof(uint64_t);
+          auto [mapped, offset] = allocator_->AllocateGPUHeap(size, alignof(uint64_t));
           if (allocator_->records_)
-            allocator_->RecordGPUHeap(mapped, sizeof(uint64_t), "indirect invocations", 0, sizeof(uint64_t));
+            allocator_->RecordGPUHeap(mapped, size, "indirect invocations", 0, size);
           cmd->statistics = allocator_->gpu_heap_buffer_address_ + offset;
-          indirect_dispatches_.push_back(cmd->statistics);
+          indirect_dispatches_.push_back({cmd->statistics, MaxCommandCount});
         }
       }
       cmd->max_count_buffer = CountBufferAddress;
