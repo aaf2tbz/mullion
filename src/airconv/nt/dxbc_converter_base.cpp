@@ -3340,4 +3340,9 @@ Converter::SupportsNonExecutionBarrier() const {
   return ctx.metal_version >= SM50_SHADER_METAL_320;
 }
 
+bool
+Converter::CoherentGroupSync() const {
+  return ctx.coherent_group_sync;
+}
+
 } // namespace dxmt::dxbc

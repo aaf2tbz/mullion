@@ -3912,6 +3912,7 @@ convert_dxil_mesh_stage(
       .shader_type = pShaderInternal->shader_type,
       .metal_version = metal_version,
       .simd_width = sm50_common ? sm50_common->simd_width : 0,
+      .coherent_group_sync = pShaderInternal->groups_work_together && (shader_flags & SM50_SHADER_FLAG_COHERENT_GROUP_SYNC),
   };
 
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
@@ -4042,6 +4043,7 @@ convert_dxil_ray_shader(
       .shader_type = pShaderInternal->shader_type,
       .metal_version = metal_version,
       .simd_width = sm50_common ? sm50_common->simd_width : 0,
+      .coherent_group_sync = pShaderInternal->groups_work_together && (shader_flags & SM50_SHADER_FLAG_COHERENT_GROUP_SYNC),
   };
   auto body = convert_dxil(pShaderInternal, ctx, ray->name, epilogue_bb, std::move(*linked), shader_info);
   if (auto err = body.takeError())

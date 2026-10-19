@@ -374,6 +374,9 @@ enum SM50_SHADER_FLAG {
   SM50_SHADER_FLAG_DEFUSE_FMA = 1 << 1,
   /* the device has no 64-bit atomics (before Apple8): its 64-bit minimum and maximum take locks as the others do */
   SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64 = 1 << 2,
+  /* a group sync does not make globallycoherent memory visible to other groups (before Apple9): in shaders whose
+     groups work together, each group sync takes a device-scope fence */
+  SM50_SHADER_FLAG_COHERENT_GROUP_SYNC = 1 << 5,
 };
 
 struct SM50_SHADER_COMMON_DATA {
