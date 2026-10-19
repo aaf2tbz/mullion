@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 49
+#define AIRCONV_VERSION 50
 
 #ifdef __cplusplus
 #include <string>
@@ -374,6 +374,8 @@ enum SM50_SHADER_FLAG {
   SM50_SHADER_FLAG_DEFUSE_FMA = 1 << 1,
   /* the device has no 64-bit atomics (before Apple8): its 64-bit minimum and maximum take locks as the others do */
   SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64 = 1 << 2,
+  /* culling a line of a mesh line strip culls the next one too (before Apple9): a culled line collapses instead */
+  SM50_SHADER_FLAG_COLLAPSE_CULLED_LINES = 1 << 3,
   /* a group sync does not make globallycoherent memory visible to other groups (before Apple9): in shaders whose
      groups work together, each group sync takes a device-scope fence */
   SM50_SHADER_FLAG_COHERENT_GROUP_SYNC = 1 << 5,

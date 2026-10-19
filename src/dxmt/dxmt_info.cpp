@@ -65,7 +65,8 @@ GPUShaderFlags(WMT::Device device) {
     errno = 0;
     auto flags = std::strtoul(given.c_str(), &end, 0);
     constexpr auto known = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO | SM50_SHADER_FLAG_DEFUSE_FMA |
-                           SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64 | SM50_SHADER_FLAG_COHERENT_GROUP_SYNC;
+                           SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64 | SM50_SHADER_FLAG_COLLAPSE_CULLED_LINES |
+                           SM50_SHADER_FLAG_COHERENT_GROUP_SYNC;
     if (end != given.c_str() && !*end && errno != ERANGE &&
         !(flags & ~static_cast<unsigned long>(known)) && given.find('-') == std::string::npos)
       return SM50_SHADER_FLAG(flags);
@@ -75,7 +76,7 @@ GPUShaderFlags(WMT::Device device) {
   if (!device.supportsFamily(WMTGPUFamilyApple8))
     flags |= SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64;
   if (!device.supportsFamily(WMTGPUFamilyApple9))
-    flags |= SM50_SHADER_FLAG_COHERENT_GROUP_SYNC;
+    flags |= SM50_SHADER_FLAG_COLLAPSE_CULLED_LINES | SM50_SHADER_FLAG_COHERENT_GROUP_SYNC;
   return SM50_SHADER_FLAG(flags);
 }
 
