@@ -913,11 +913,19 @@ Converter::operator()(const InstFloatUnaryOp &unary) {
   case FloatUnaryOp::Sqrt:
     Value = air.CreateFPUnOp(AIRBuilder::sqrt, Value);
     break;
-  // the fraction of an infinity is NaN (D3D11.3 22.10.10), which Metal's fract is not: x - x adds 0 to a finite
-  // fraction and NaN to an infinity's
-  case FloatUnaryOp::Fraction:
-    Value = ir.CreateFAdd(air.CreateFPUnOp(AIRBuilder::fract, Value), ir.CreateFSub(Value, Value));
+  // D3D11.3 22.10.7 requires NaN for infinities and NaNs; integer selection survives fast math's cancellation
+  case FloatUnaryOp::Fraction: {
+    auto Scalar = Value->getType()->getScalarType();
+    auto Bits = ir.CreateBitCast(Value, Value->getType()->getWithNewType(ir.getIntNTy(Scalar->getScalarSizeInBits())));
+    auto Inf = llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt();
+    auto NonFinite = ir.CreateICmpEQ(ir.CreateAnd(Bits, Inf), llvm::ConstantInt::get(Bits->getType(), Inf));
+    auto Fraction = ir.CreateBitCast(air.CreateFPUnOp(AIRBuilder::fract, Value), Bits->getType());
+    auto NaN = llvm::APFloat::getQNaN(Scalar->getFltSemantics()).bitcastToAPInt();
+    Value = ir.CreateBitCast(
+        ir.CreateSelect(NonFinite, llvm::ConstantInt::get(Bits->getType(), NaN), Fraction), Value->getType()
+    );
     break;
+  }
   case FloatUnaryOp::RoundNearestEven:
     Value = air.CreateFPUnOp(AIRBuilder::rint, Value);
     break;
