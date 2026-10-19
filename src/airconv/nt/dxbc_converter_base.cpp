@@ -1167,8 +1167,9 @@ Converter::operator()(const InstFloatMAD &mad) {
   auto B = LoadOperand(mad.src1, Mask);
   auto C = LoadOperand(mad.src2, Mask);
 
-  // D3D11.3 3.1.3.2 permits rounded intermediates; Metal fma can flush before rounding back into the normal range
-  StoreOperand(mad.dst, ir.CreateFAdd(ir.CreateFMul(A, B), C), mad._.saturate);
+  // precise mad keeps rounded intermediates for consistent results across shaders (HLSL mad function)
+  auto Result = mad._.precise_mask ? ir.CreateFAdd(ir.CreateFMul(A, B), C) : air.CreateFMA(A, B, C);
+  StoreOperand(mad.dst, Result, mad._.saturate);
 }
 
 void
