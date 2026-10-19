@@ -3,6 +3,9 @@
 // subsequent primitive." and "the PrimitiveID resets to its starting value whenever a new instance begins"
 // (D3D11.3 functional spec, 8.17). every point of the large direct draw owns a pixel whose value is PrimitiveID + 1,
 // including both sides of every part boundary; separate rows hold separate instances. small draws bracket it.
+// line strips exercise the payload's primitive carry across parts, both without indices and with a 32-bit cut
+// in a later part (8.12). each consecutive pair of non-cut indices is one primitive, whose first vertex owns its
+// pixel; IDs count across the cut, independently of the pixel's position.
 // the indirect case keeps the large draw clipped: it checks the surrounding draws survive its rejection on
 // Apple7/8, where the indirect resolver cannot split it. MULLION_MAX_MESH_THREADGROUPS lowers the budget for this
 // test on every family. each rejected submission must warn after completion: "the GPU finished running"
@@ -33,6 +36,16 @@ void gs(point V v[1], uint primitive : SV_PrimitiveID, uint i : SV_GSInstanceID,
   s.Append(o);
 }
 uint ps(P p) : SV_Target { return p.value; }
+[maxvertexcount(1)] [instance(32)]
+void gs_strip(line V v[2], uint primitive : SV_PrimitiveID, uint i : SV_GSInstanceID, inout PointStream<P> s) {
+  if (i != v[0].id % 32)
+    return;
+  P o;
+  o.pos = float4((v[0].id % WIDTH + 0.5) / WIDTH * 2 - 1,
+                 1 - (v[0].id / WIDTH + 0.5) / HEIGHT * 2, 0.5, 1);
+  o.value = primitive + 1;
+  s.Append(o);
+}
 )hlsl";
 
 int
@@ -45,8 +58,9 @@ main(int argc, char **argv) {
   const std::vector<std::string> defines = {"WIDTH=" + std::to_string(width), "ROWS=" + std::to_string(rows),
                                              "HEIGHT=" + std::to_string(height)};
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), gs = compiler.compile(hlsl, "gs", "gs", defines),
+       gs_strip = compiler.compile(hlsl, "gs_strip", "gs", defines),
        ps = compiler.compile(hlsl, "ps", "ps", defines);
-  if (!expect(!vs.empty() && !gs.empty() && !ps.empty(), "HLSL did not compile"))
+  if (!expect(!vs.empty() && !gs.empty() && !gs_strip.empty() && !ps.empty(), "HLSL did not compile"))
     return verdict();
   char temporary[MAX_PATH], directory[MAX_PATH];
   auto length = GetTempPathA(sizeof(temporary), temporary);
@@ -72,8 +86,12 @@ main(int argc, char **argv) {
   desc.NumRenderTargets = 1;
   desc.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
   desc.SampleDesc = {1, 0};
-  ComPtr<ID3D12PipelineState> pso;
+  ComPtr<ID3D12PipelineState> pso, strip_pso;
   CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)));
+  desc.GS = bytecode(gs_strip);
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+  desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+  CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&strip_pso)));
 
   const UINT64 row = (width * sizeof(UINT) + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
                      D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
@@ -102,6 +120,18 @@ main(int argc, char **argv) {
   ComPtr<ID3D12CommandSignature> sig;
   CHECK(device->CreateCommandSignature(&sig_desc, nullptr, IID_PPV_ARGS(&sig)));
 
+  std::vector<UINT> indices(big);
+  for (UINT i = 0; i < indices.size(); i++)
+    indices[i] = i;
+  indices[indices.size() / 2] = UINT32_MAX;
+  auto index_buffer = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, indices.size() * sizeof(UINT),
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+  CHECK(index_buffer->Map(0, nullptr, &mapped));
+  memcpy(mapped, indices.data(), indices.size() * sizeof(UINT));
+  index_buffer->Unmap(0, nullptr);
+  D3D12_INDEX_BUFFER_VIEW index_view{index_buffer->GetGPUVirtualAddress(), UINT(indices.size() * sizeof(UINT)),
+                                    DXGI_FORMAT_R32_UINT};
+
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12CommandAllocator> allocator;
   ComPtr<ID3D12GraphicsCommandList> list;
@@ -111,8 +141,17 @@ main(int argc, char **argv) {
   CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
   CHECK(list->Close());
 
-  for (bool indirect : {false, true}) {
-    const char *how = indirect ? "ExecuteIndirect" : "DrawInstanced";
+  enum { points, indirect_points, strip, indexed_strip };
+  for (auto draw : {points, indirect_points, strip, indexed_strip}) {
+    const bool indirect = draw == indirect_points, is_strip = draw == strip || draw == indexed_strip,
+               indexed = draw == indexed_strip;
+    const char *how = indirect ? "ExecuteIndirect" : indexed ? "indexed strip" : is_strip ? "strip" : "DrawInstanced";
+    std::vector<UINT> strip_values(is_strip ? big : 0);
+    UINT primitive = 0;
+    if (is_strip)
+      for (UINT end = 1; end < big; end++)
+        if (!indexed || (indices[end - 1] != UINT32_MAX && indices[end] != UINT32_MAX))
+          strip_values[indexed ? indices[end - 1] : end - 1] = ++primitive;
     step("%s: read every pixel and PrimitiveID of each instance", how);
     CHECK(forget(readback.Get()));
     CHECK(allocator->Reset());
@@ -131,10 +170,19 @@ main(int argc, char **argv) {
     list->DrawInstanced(marker, instances, 0, 0);
     base = indirect ? width * height : marker;
     list->SetGraphicsRoot32BitConstants(0, 1, &base, 0);
+    if (is_strip) {
+      list->SetPipelineState(strip_pso.Get());
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
+      list->IASetIndexBuffer(&index_view);
+    }
     if (indirect)
       list->ExecuteIndirect(sig.Get(), 1, arguments.Get(), 0, nullptr, 0);
+    else if (indexed)
+      list->DrawIndexedInstanced(indices.size(), instances, 0, 0, 0);
     else
       list->DrawInstanced(big, instances, 0, 0);
+    list->SetPipelineState(pso.Get());
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
     base = marker + big;
     list->SetGraphicsRoot32BitConstants(0, 1, &base, 0);
     list->DrawInstanced(marker, instances, 0, 0);
@@ -156,6 +204,8 @@ main(int argc, char **argv) {
         UINT id = (y % rows) * width + x;
         UINT want = id < marker ? id + 1 : id < marker + big ? (indirect ? 0 : id - marker + 1)
                                    : id < 2 * marker + big ? id - marker - big + 1 : 0;
+        if (is_strip && id >= marker && id < marker + big)
+          want = strip_values[id - marker];
         UINT got = pixels[y * row / sizeof(UINT) + x];
         if (!expect(got == want, "%s, pixel %u,%u: %u, want %u", how, x, y, got, want))
           break;
