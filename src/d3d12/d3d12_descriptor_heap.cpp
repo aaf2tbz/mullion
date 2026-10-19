@@ -233,6 +233,11 @@ public:
       gpu_storage.UAVTexture.resource_id = texture_view.gpuResourceID;
       gpu_storage.UAVTexture.metadata =
           WSize ? (uint64_t)FirstWSlice << 32 | WSize : TextureMetadata(Texture->arrayLength(View), 0) | MinMipFeedback;
+      // backing allocation, then first slice and mip as DWORDs, for aliased 64-bit atomics
+      gpu_storage.UAVTexture.padding[0] = texture_view.allocation->gpuResourceID;
+      gpu_storage.UAVTexture.padding[1] = std::bit_cast<uint64_t>(
+          std::array<uint32_t, 2>{uint32_t(View.array_start), uint32_t(View.mip_start)}
+      );
     }
     return S_OK;
   }
@@ -252,9 +257,11 @@ public:
         auto &buffer_view = UAVBuffer->view_(View);
         gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
         gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
+        gpu_storage.UAVTexelBuffer.padding[0] = UAVBuffer->current()->gpuAddress();
       } else {
         gpu_storage.UAVTexelBuffer.resource_id = 0;
         gpu_storage.UAVTexelBuffer.metadata = 0;
+        gpu_storage.UAVTexelBuffer.padding[0] = 0;
       }
     }
     return S_OK;

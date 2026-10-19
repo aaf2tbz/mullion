@@ -477,7 +477,7 @@ public:
 
   // the GPU address of the lock words of 64-bit atomics, which every root signature carries (AtomicLocksQword)
   virtual uint64_t GetAtomicLocks() = 0;
-  // reports, once per occurrence, a 64-bit atomic that gave up waiting for its lock (dxil_converter.cpp)
+  // removes the device if a 64-bit atomic gave up waiting for its lock (dxil_converter.cpp)
   virtual void CheckAtomicLocks() = 0;
 
   virtual D3D_FEATURE_LEVEL GetFeatureLevel() = 0;

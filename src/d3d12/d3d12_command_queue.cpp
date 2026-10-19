@@ -375,6 +375,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       auto completed = profile_ ? diag::Now() : 0;
       Watched(0);
       Trace("command buffer ", internal_seq, " completed");
+      device_->CheckAtomicLocks();
       if (record_totals_)
         CompareGPURecords(inflight.records, record_totals_);
       if (inflight.cmdbuf.status() == WMTCommandBufferStatusError) {
@@ -766,7 +767,6 @@ public:
 
   void
   Commit(const std::vector<EncoderData *> &recorded, std::vector<Com<MTLD3D12CommandAllocator>> &&allocators = {}) {
-    device_->CheckAtomicLocks();
     auto scope = StartCommitting();
     // the lists' allocators stay, and count the lists as pending, until the last command buffer of theirs completes
     struct Keeps {

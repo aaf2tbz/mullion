@@ -234,8 +234,10 @@ public:
 
   void
   CheckAtomicLocks() {
-    if (__atomic_exchange_n(atomic_locks_given_up_, 0u, __ATOMIC_RELAXED))
-      ERR("A 64-bit atomic gave up waiting for its lock, and its result is wrong: a lock holder did not run again");
+    if (__atomic_exchange_n(atomic_locks_given_up_, 0u, __ATOMIC_RELAXED)) {
+      ERR("A 64-bit atomic gave up waiting for its lock; removing the device");
+      LoseDevice(DXGI_ERROR_DEVICE_HUNG);
+    }
   }
 
   uint32_t

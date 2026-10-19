@@ -266,7 +266,7 @@ public:
         GetTextureDescriptor(Builder, HeapPointer, Index, ResourceKind, UAV.range.lower_bound, DescriptorOffset);
     return TextureDescirptor{
         Handle,  Metadata, UAV.global_coherent, ResourceKind, ResourceKindLogical, MemoryAccess, SampleType,
-        nullptr, true
+        FormatRange, true
     };
   }
 

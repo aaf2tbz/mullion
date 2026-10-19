@@ -1,6 +1,9 @@
 #include "dxmt_info.hpp"
 #include "config/config.hpp"
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include "log/log.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <version.h>
@@ -57,8 +60,17 @@ ShaderMetalVersion(WMT::Device device) {
 SM50_SHADER_FLAG
 GPUShaderFlags(WMT::Device device) {
   auto given = env::getEnvVar("MULLION_SHADER_FLAGS");
-  if (!given.empty())
-    return SM50_SHADER_FLAG(std::strtoul(given.c_str(), nullptr, 0));
+  if (!given.empty()) {
+    char *end;
+    errno = 0;
+    auto flags = std::strtoul(given.c_str(), &end, 0);
+    constexpr auto known = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO | SM50_SHADER_FLAG_DEFUSE_FMA |
+                           SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64;
+    if (end != given.c_str() && !*end && errno != ERANGE &&
+        !(flags & ~static_cast<unsigned long>(known)) && given.find('-') == std::string::npos)
+      return SM50_SHADER_FLAG(flags);
+    ERR("Invalid MULLION_SHADER_FLAGS '", given, "'; using device defaults");
+  }
   uint32_t flags = 0;
   if (!device.supportsFamily(WMTGPUFamilyApple8))
     flags |= SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64;

@@ -2084,8 +2084,7 @@ convert_dxil(
     auto lock = ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(ir.CreateAnd(hash, mask), ir.getInt32(1))});
     ir.CreateCondBr(first, spin, next);
     // the wait is bounded, well inside the GPU's watchdog, so a lock whose holder never runs again cannot hang the GPU:
-    // the lane then gives up, leaves memory as it is, and raises the table's flag after its locks, which the device
-    // reports (MTLD3D12Device::CheckAtomicLocks)
+    // a lane that gives up raises the table's flag, which removes the device (MTLD3D12Device::CheckAtomicLocks)
     constexpr uint32_t kSpins = 1u << 24;
     ir.SetInsertPoint(spin);
     auto spins = ir.CreatePHI(ir.getInt32Ty(), 2);
@@ -3062,17 +3061,26 @@ convert_dxil(
       }
       auto locks = ty->isIntegerTy(64) ? ctx.binding.GetAtomicLocks(air) : nullptr;
       if (locks) {
-        // a typed resource's 64-bit texel is an R32G32_UINT one, low half first, keyed by resource and position
+        // aliases key the backing allocation and its coordinates, rather than the Metal view and relative slice
         auto texel = [&]() -> Word64 {
           auto i64 = ir.getInt64Ty();
           auto &t = *h.texture;
           auto [address, array] = dxbc.TexelAddress(t, texel_coord(call, first, ir.getInt32(0)), no_offset, nullptr);
-          Value *key = ir.CreatePtrToInt(t.Handle, i64);
+          Value *key = ir.CreateLoad(i64, t.Range);
           auto n = isa<FixedVectorType>(address->getType()) ? cast<FixedVectorType>(address->getType())->getNumElements() : 1;
-          for (unsigned i = 0; i <= n; i++) {
-            auto c = i < n ? (n > 1 ? ir.CreateExtractElement(address, i) : address) : array;
-            if (c)
+          if (t.Logical == Texture::texture_buffer) {
+            key = ir.CreateAdd(key, ir.CreateMul(ir.CreateZExt(address, i64), ir.getInt64(sizeof(uint64_t))));
+            key = ir.CreateLShr(key, std::countr_zero(sizeof(uint64_t)));
+          } else {
+            auto origin = ir.CreateLoad(i64, ir.CreateConstGEP1_32(i64, t.Range, 1));
+            for (unsigned i = 0; i < 3; i++) {
+              Value *c = i < n ? (n > 1 ? ir.CreateExtractElement(address, i) : address) : ir.getInt32(0);
+              if (i == 2)
+                c = ir.CreateAdd(array ? array : c, ir.CreateTrunc(origin, ir.getInt32Ty()));
               key = ir.CreateAdd(ir.CreateMul(key, ir.getInt64(0x9e3779b97f4a7c15)), ir.CreateZExt(c, i64));
+            }
+            key = ir.CreateAdd(ir.CreateMul(key, ir.getInt64(0x9e3779b97f4a7c15)),
+                               ir.CreateLShr(origin, ir.getInt32Ty()->getBitWidth()));
           }
           return {key, llvm::air::MemFlags::Texture,
                   [=, &ir, &air, &t] {
