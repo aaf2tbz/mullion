@@ -1,10 +1,12 @@
-// contract: the atomic operations on UAVs, with and without the original value, do their operation once for each
-// thread (D3D11.3 7.14.6 and 22.17): and, xor, signed and unsigned min and max, compare-store and exchange, and
+// contract: UAV atomics act once per thread and return the value before the operation: "Returns value in memory
+// before the AND." (D3D11.3 22.17.19); "Returns value in memory before the max operation." (22.17.25).
+// the operations are and, xor, signed and unsigned min and max, compare-store and exchange, and
 // Consume of a consume buffer takes each element once (D3D11.3 7.14.7). 64 threads use each one on one word, so the
 // word ends the same in any order: and clears every bit, xor of the first 40 threads leaves the top 24 bits, min and
 // max end at the extremes, compare-store succeeds once, and the exchanged values and the last one are 0 to 64.
 #include "d3d11_test.hpp"
 #include <algorithm>
+#include <climits>
 
 static const char hlsl[] = R"hlsl(
 RWByteAddressBuffer words : register(u0);
@@ -131,13 +133,31 @@ main() {
   std::sort(chain.begin(), chain.end());
   for (UINT k = 0; k <= threads; k++)
     expect(chain[k] == k, "exchange: value %u of the chain is %u, want %u", k, chain[k], k);
-  // an original of a min or max is never past the word's end value, and of an and has the thread's bit still to clear
+  // each change from an original to its result must add up to the word's total change, in any thread order
+  int64_t deltas[6] = {};
   for (UINT i = 0; i < threads; i++) {
+    auto original = &got_originals[i * 8];
+    uint32_t bit = 1u << (i % (sizeof(uint32_t) * CHAR_BIT));
+    deltas[0] += int64_t(original[0] & ~bit) - original[0];
+    if (i < 40)
+      deltas[1] += int64_t(original[1] ^ bit) - original[1];
+    deltas[2] += int64_t(std::min<uint32_t>(original[2], i + 5)) - original[2];
+    deltas[3] += int64_t(std::max<uint32_t>(original[3], i + 5)) - original[3];
+    deltas[4] += int64_t(std::min<int32_t>(int32_t(original[5]), int32_t(i) - 32)) - int32_t(original[5]);
+    deltas[5] += int64_t(std::max<int32_t>(int32_t(original[6]), int32_t(i) - 32)) - int32_t(original[6]);
     expect(got_originals[i * 8 + 2] >= 5, "umin original of thread %u: %u", i, got_originals[i * 8 + 2]);
     expect(got_originals[i * 8 + 3] <= 68, "umax original of thread %u: %u", i, got_originals[i * 8 + 3]);
     expect(int32_t(got_originals[i * 8 + 5]) >= -32, "imin original of thread %u: %d", i, int32_t(got_originals[i * 8 + 5]));
     expect(int32_t(got_originals[i * 8 + 6]) <= 31, "imax original of thread %u: %d", i, int32_t(got_originals[i * 8 + 6]));
   }
+  const int64_t want_deltas[] = {int64_t(got[5]) - start[5], int64_t(got[6]) - start[6],
+                               int64_t(got[7]) - start[7], int64_t(got[8]) - start[8],
+                               int64_t(int32_t(got_signed[2])) - signed_start[2],
+                               int64_t(int32_t(got_signed[3])) - signed_start[3]};
+  const char *original_names[] = {"and", "xor", "umin", "umax", "imin", "imax"};
+  for (UINT k = 0; k < std::size(deltas); k++)
+    expect(deltas[k] == want_deltas[k], "%s originals: total change %lld, want %lld", original_names[k],
+           (long long)deltas[k], (long long)want_deltas[k]);
   std::vector<uint32_t> taken(got_consumed.begin(), got_consumed.end());
   std::sort(taken.begin(), taken.end());
   for (UINT k = 0; k < threads; k++)

@@ -1,9 +1,8 @@
-// contract: a comparison sample compares the reference with the texel and returns 1 where the comparison passes and 0
-// where it fails (D3D11.3 7.18.11); a comparison gather returns the results of the four texels it gathers, at an offset
-// given at run time (D3D11.3 22.4.6, gather4_po_c). two textures are read through SampleCmp, which only a pixel shader
-// has (sample_c), and GatherCmp with a non-constant offset of one texel, with LESS_EQUAL and a reference of 0.125,
-// 0.375, 0.625 and 0.875 across the target: a 4x4 depth texture cleared to 0.5, and a 4x4 R32_FLOAT texture whose
-// columns are 0.1, 0.3, 0.6 and 0.9, which D3D11 also compares (it is not a depth format in Metal).
+// contract: comparison sampling honors LESS_EQUAL, including equality: "srcReferenceValue {ComparisonFunction}
+// texel.R" (D3D11.3 22.4.19). "The four samples that would contribute to filtering are placed into xyzw in counter
+// clockwise order starting with the sample to the lower left of the queried location." (22.4.2; gather4_po_c:
+// 22.4.5). SampleCmp and GatherCmp read a depth texture and an R32_FLOAT texture at references below, equal to and
+// above their depths. the gather's run-time offset reaches four distinct depths, each result kept as its own bit.
 #include "d3d11_test.hpp"
 
 static const char hlsl[] = R"hlsl(
@@ -13,19 +12,20 @@ SamplerComparisonState compare : register(s0);
 float4 vs(uint id : SV_VertexID) : SV_Position {
   return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
 }
-// red: SampleCmp times 100; green: the GatherCmp results summed
 uint2 ps(float4 pos : SV_Position) : SV_Target {
-  float reference = (floor(pos.x) + 0.5) / 4;
+  float reference = floor(pos.x) / REFERENCE_STEPS;
   float2 uv = float2(0.45, 0.45);
   float single = depth.SampleCmp(compare, uv, reference);
   float4 four = depth.GatherCmp(compare, uv, reference, int2(offset, 0));
-  return uint2(single * 100 + 0.5, dot(four, 1) + 0.5);
+  return uint2(single * 100 + 0.5, dot(four, float4(1, 2, 4, 8)) + 0.5);
 }
 )hlsl";
 
 int
 main() {
-  auto vs = compile(hlsl, "vs", "vs"), ps = compile(hlsl, "ps", "ps");
+  const UINT width = 9, rows = 2;
+  const std::vector<std::string> defines = {"REFERENCE_STEPS=" + std::to_string(width - 1)};
+  auto vs = compile(hlsl, "vs", "vs", defines), ps = compile(hlsl, "ps", "ps", defines);
   if (!vs || !ps) {
     printf("failed: HLSL did not compile\n");
     return 1;
@@ -54,11 +54,11 @@ main() {
   CHECK(device->CreateShaderResourceView(depth.Get(), &srv_desc, &srvs[0]));
   context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 0.5f, 0);
 
-  // the float texture: each row 0.1, 0.3, 0.6, 0.9
-  const float columns[4] = {0.1f, 0.3f, 0.6f, 0.9f};
+  // alternating rows put a different depth at each corner of the gather's footprint
+  const float columns[4] = {0.125f, 0.375f, 0.625f, 0.875f};
   float texels[16];
   for (UINT i = 0; i < 16; i++)
-    texels[i] = columns[i % 4];
+    texels[i] = columns[(i % 4 + 2 * (i / 4)) % 4];
   D3D11_TEXTURE2D_DESC float_desc{4, 4, 1, 1, DXGI_FORMAT_R32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
                                   D3D11_BIND_SHADER_RESOURCE};
   D3D11_SUBRESOURCE_DATA float_data{texels, 4 * sizeof(float)};
@@ -73,7 +73,6 @@ main() {
   ComPtr<ID3D11SamplerState> sampler;
   CHECK(device->CreateSamplerState(&sampler_desc, &sampler));
 
-  const UINT width = 4, rows = 2;
   D3D11_TEXTURE2D_DESC target_desc{width, rows, 1, 1, DXGI_FORMAT_R32G32_UINT, {1, 0}, D3D11_USAGE_DEFAULT,
                                    D3D11_BIND_RENDER_TARGET};
   ComPtr<ID3D11Texture2D> target, target_read;
@@ -111,14 +110,15 @@ main() {
   const char *names[] = {"the depth texture of 0.5", "the float texture"};
   for (UINT row = 0; row < rows; row++) {
     step("SampleCmp and GatherCmp at a run-time offset of %s, LESS_EQUAL", names[row]);
-    auto column = [&](UINT x) { return row == 0 ? 0.5f : columns[x]; };
+    auto column = [&](UINT x, UINT y) { return row == 0 ? 0.5f : texels[y * 4 + x]; };
     auto pixels = reinterpret_cast<const uint32_t *>((const uint8_t *)mapped.pData + mapped.RowPitch * row);
     for (UINT x = 0; x < width; x++) {
-      float reference = (x + 0.5f) / 4;
-      uint32_t single = reference <= column(1) ? 100 : 0;
-      uint32_t four = 2 * (reference <= column(2)) + 2 * (reference <= column(3));
+      float reference = float(x) / (width - 1);
+      uint32_t single = reference <= column(1, 1) ? 100 : 0;
+      uint32_t four = (reference <= column(2, 2)) | ((reference <= column(3, 2)) << 1) |
+                      ((reference <= column(3, 1)) << 2) | ((reference <= column(2, 1)) << 3);
       expect(pixels[2 * x] == single, "SampleCmp at reference %.3f: %u, want %u", reference, pixels[2 * x], single);
-      expect(pixels[2 * x + 1] == four, "GatherCmp at reference %.3f: %u texels pass, want %u", reference,
+      expect(pixels[2 * x + 1] == four, "GatherCmp at reference %.3f: mask %#x, want %#x", reference,
              pixels[2 * x + 1], four);
     }
   }
