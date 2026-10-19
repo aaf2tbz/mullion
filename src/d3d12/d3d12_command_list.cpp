@@ -213,21 +213,17 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   std::vector<uint64_t> visibility_slots_;
   std::vector<std::pair<MTLD3D12QueryHeap *, OcclusionSum>> occlusion_sums_;
 
-  // pipeline statistics queries: the running ones and the ended ones the next resolve writes, each with its visibility
-  // slots and indirect dispatches; and for each visibility slot, where the CPU reads it and whether its draws had a
-  // pixel shader, since PSInvocations counts the samples of those alone
+  // running and ended queries retain their visibility slots and indirect dispatches until summed into the heap
   struct StatisticsSum {
     uint64_t counts[14];
-    uint32_t query, size, first_slot, slot_count, first_dispatch, dispatch_count;
+    uint32_t query, size, first_slot, slot_count, first_dispatch, dispatch_count, first_predicated, predicated_count;
   };
-  struct IndirectDispatchCount {
-    uint64_t arguments, count;
-    uint32_t stride, max_count;
-    uint64_t threads;
+  struct PredicatedStatistics {
+    uint64_t vertices, primitives, threads, skips;
   };
   std::vector<std::pair<MTLD3D12QueryHeap *, StatisticsSum>> active_statistics_, statistics_sums_;
-  std::vector<IndirectDispatchCount> indirect_dispatches_;
-  std::vector<const uint64_t *> visibility_counts_;
+  std::vector<uint64_t> indirect_dispatches_;
+  std::vector<PredicatedStatistics> predicated_statistics_;
   std::vector<uint32_t> visibility_shades_;
 
   // the primitives `vertices` vertices of the current topology make
@@ -264,8 +260,16 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // cuts and what geometry shaders and tessellation make are left out: the clipper counts the input's primitives
   void
   CountDraw(uint64_t vertices, uint64_t instances) {
+    if (active_statistics_.empty())
+      return;
     uint64_t primitives = Primitives(vertices) * instances;
     vertices *= instances;
+    if (predication_region_) {
+      auto skips = allocator_->gpu_heap_buffer_address_ +
+                   (reinterpret_cast<char *>(predication_region_ + 3) - static_cast<char *>(allocator_->gpu_heap_));
+      predicated_statistics_.push_back({vertices, primitives, 0, skips});
+      return;
+    }
     for (auto &[_, sum] : active_statistics_) {
       sum.counts[0] += vertices;
       sum.counts[1] += primitives;
@@ -290,12 +294,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     cmd.offset = 0;
     if (active_queries_.empty() && active_statistics_.empty())
       return;
-    auto [window, address, offset, count] = allocator_->VisibilitySlot();
+    auto [window, address, offset] = allocator_->VisibilitySlot();
     // a pass counts in one window: when that is full the pass ends, and the next pass counts in the next window
     if (render->visibility_buffer && render->visibility_buffer != window.handle)
       return allocator_->InvalidateCurrentPass();
     visibility_slots_.push_back(address);
-    visibility_counts_.push_back(count);
     visibility_shades_.push_back(pso_graphics_ && pso_graphics_->pixel_shader);
     render->visibility_buffer = window;
     cmd.mode = WMTVisibilityResultModeCounting;
@@ -456,7 +459,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     auto slots = upload(visibility_slots_.data(), visibility_slots_.size() * sizeof(uint64_t), "statistics slots");
     auto shades = upload(visibility_shades_.data(), visibility_shades_.size() * sizeof(uint32_t), "statistics shades");
     auto dispatches = upload(
-        indirect_dispatches_.data(), indirect_dispatches_.size() * sizeof(IndirectDispatchCount), "statistics dispatches"
+        indirect_dispatches_.data(), indirect_dispatches_.size() * sizeof(uint64_t), "statistics dispatches"
+    );
+    auto predicated = upload(
+        predicated_statistics_.data(), predicated_statistics_.size() * sizeof(PredicatedStatistics),
+        "predicated statistics"
     );
     for (auto &window : allocator_->visibility_) {
       auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_useresource>();
@@ -480,6 +487,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
           {allocator_->gpu_heap_buffer_, shades},
           {allocator_->gpu_heap_buffer_, dispatches},
           {first->first->results, 0},
+          {allocator_->gpu_heap_buffer_, predicated},
       };
       for (uint8_t i = 0; i < std::size(buffers); i++) {
         auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
@@ -578,7 +586,7 @@ public:
     active_statistics_.clear();
     statistics_sums_.clear();
     indirect_dispatches_.clear();
-    visibility_counts_.clear();
+    predicated_statistics_.clear();
     visibility_shades_.clear();
     predicated_.clear();
     predication_region_ = nullptr;
@@ -623,6 +631,7 @@ public:
     if (encoder_count < std::numeric_limits<size_t>::max())
       return E_FAIL;
     SumOcclusion();
+    SumStatistics();
     EndPredication();
     HRESULT hr = allocator_->EndRecord(&encoder_count);
     recorded_on = allocator_.ptr();
@@ -1369,8 +1378,15 @@ public:
     if (!PreDispatch())
       return;
     auto &group = pso_compute_->threadgroup_size;
-    for (auto &[_, sum] : active_statistics_)
-      sum.counts[10] += uint64_t(X) * Y * Z * group.width * group.height * group.depth;
+    uint64_t threads = uint64_t(X) * Y * Z * group.width * group.height * group.depth;
+    if (predication_region_ && !active_statistics_.empty()) {
+      auto skips = allocator_->gpu_heap_buffer_address_ +
+                   (reinterpret_cast<char *>(predication_region_ + 3) - static_cast<char *>(allocator_->gpu_heap_));
+      predicated_statistics_.push_back({0, 0, threads, skips});
+    } else {
+      for (auto &[_, sum] : active_statistics_)
+        sum.counts[10] += threads;
+    }
 
     if (auto offset = Predicated(D3D12_DISPATCH_ARGUMENTS{X, Y, Z}, 0)) {
       auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
@@ -2582,6 +2598,7 @@ public:
       sum.size = heap->result_size / sizeof(uint64_t);
       sum.first_slot = visibility_slots_.size();
       sum.first_dispatch = indirect_dispatches_.size();
+      sum.first_predicated = predicated_statistics_.size();
       active_statistics_.push_back({heap, sum});
       CountVisibility();
       return;
@@ -2625,6 +2642,7 @@ public:
       auto sum = query->second;
       sum.slot_count = visibility_slots_.size() - sum.first_slot;
       sum.dispatch_count = indirect_dispatches_.size() - sum.first_dispatch;
+      sum.predicated_count = predicated_statistics_.size() - sum.first_predicated;
       // sums run together at the next resolve, so a query ended again before one keeps only its latest result
       std::erase_if(statistics_sums_, [&](auto &s) { return s.first == heap && s.second.query == Index; });
       statistics_sums_.push_back({heap, sum});
@@ -2676,24 +2694,15 @@ public:
     auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
     auto dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
     SumOcclusion();
-    D3D12_HEAP_PROPERTIES placed{};
-    pDstBuffer->GetHeapProperties(&placed, nullptr);
-    bool readback = placed.Type == D3D12_HEAP_TYPE_READBACK;
-    // pipeline statistics into a readback buffer are written by the CPU too, unless they count indirect dispatches,
-    // whose arguments the GPU may write later in the command buffer. those the CPU writes are not written to the heap
-    auto resolved = [&](auto &sum) { return sum.first == heap && sum.second.query - StartIndex < QueryCount; };
-    bool statistics = heap->statistics_memory && readback && std::none_of(
-        statistics_sums_.begin(), statistics_sums_.end(), [&](auto &sum) { return resolved(sum) && sum.second.dispatch_count; }
-    );
-    if (!statistics)
-      SumStatistics();
-    // timestamps are written by the CPU as the command buffer completes
-    if (!heap->timestamps.empty() || statistics) {
+    SumStatistics();
+    if (!heap->timestamps.empty()) {
       allocator_->InvalidateCurrentPass();
       auto resolve = allocator_->AllocatePass<ResolveTimestampsData>();
       resolve->type = EncoderType::ResolveTimestamps;
       resolve->heap = heap;
-      if (readback) {
+      D3D12_HEAP_PROPERTIES placed{};
+      pDstBuffer->GetHeapProperties(&placed, nullptr);
+      if (placed.Type == D3D12_HEAP_TYPE_READBACK) {
         resolve->readback = pDstBuffer;
         resolve->memory = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->mappedMemory(0);
       }
@@ -2701,29 +2710,6 @@ public:
       resolve->count = QueryCount;
       resolve->dst = dst;
       resolve->dst_offset = AlignedDstBufferOffset;
-      if (statistics) {
-        auto ended = std::count_if(statistics_sums_.begin(), statistics_sums_.end(), resolved);
-        auto counts = allocator_->AllocateCommandData<StatisticsCount>(std::max<size_t>(ended, 1));
-        uint32_t n = 0;
-        for (auto &entry : statistics_sums_) {
-          if (!resolved(entry))
-            continue;
-          auto &sum = entry.second;
-          auto slots = allocator_->AllocateCommandData<const uint64_t *>(std::max<size_t>(sum.slot_count, 1));
-          uint32_t shaded = 0;
-          for (uint32_t k = sum.first_slot; k < sum.first_slot + sum.slot_count; k++)
-            if (visibility_shades_[k])
-              slots[shaded++] = visibility_counts_[k];
-          auto &count = counts[n++];
-          memcpy(count.counts, sum.counts, sizeof(sum.counts));
-          count.query = sum.query;
-          count.slots = slots;
-          count.slot_count = shaded;
-        }
-        resolve->statistics = counts;
-        resolve->statistics_count = n;
-        std::erase_if(statistics_sums_, resolved);
-      }
       allocator_->InvalidateCurrentPass();
       return;
     }
@@ -2731,10 +2717,10 @@ public:
     auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
     cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
     cmd.src = heap->results;
-    cmd.src_offset = StartIndex * heap->result_size;
+    cmd.src_offset = uint64_t(StartIndex) * heap->result_size;
     cmd.dst = dst;
     cmd.dst_offset = AlignedDstBufferOffset;
-    cmd.copy_length = QueryCount * heap->result_size;
+    cmd.copy_length = uint64_t(QueryCount) * heap->result_size;
   };
 
   // the region's work follows the predicate as it is when the region starts
@@ -2816,11 +2802,11 @@ public:
           return;
         cmd = allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
         if (!active_statistics_.empty()) {
-          auto &group = pso_compute_->threadgroup_size;
-          indirect_dispatches_.push_back(
-              {ArgBufferAddress + sig->DispatchOffset, CountBufferAddress, sig->ByteStride, MaxCommandCount,
-               uint64_t(group.width) * group.height * group.depth}
-          );
+          auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t), alignof(uint64_t));
+          if (allocator_->records_)
+            allocator_->RecordGPUHeap(mapped, sizeof(uint64_t), "indirect invocations", 0, sizeof(uint64_t));
+          cmd->statistics = allocator_->gpu_heap_buffer_address_ + offset;
+          indirect_dispatches_.push_back(cmd->statistics);
         }
       }
       cmd->max_count_buffer = CountBufferAddress;

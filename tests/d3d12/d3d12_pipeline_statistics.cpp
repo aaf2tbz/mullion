@@ -9,8 +9,13 @@
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_query_data_pipeline_statistics
 // clears and copies are implementation work, excluded by 20.1. A seed varies draw and dispatch sizes; replay changes
 // the indirect dispatch and its input, so counts or output left by an earlier execution cannot stand in for new work.
+// the argument and count buffers are overwritten after ExecuteIndirect, before EndQuery and resolve; that later
+// work cannot change the number of threads already invoked.
 // "CSInvocations must honor Compute Shader invocations from both Dispatch() and DispatchIndirect() APIs."
 // (20.4.7). The two dispatches write separate regions; an empty dispatch writes neither and counts no threads.
+// "If any of the Dispatch arguments are 0, while the command will be sent to the driver, the effect is that
+// nothing happens." (D3D11.3 18.6.2). every combination of zero dimensions leaves the output and counts unchanged.
+// resolves preserve the ended value in the heap, both when repeated and when recorded in another list.
 // "when a NULL pixel shader is bound to the pipeline, PSInvocations does not increment" (20.4.7).
 // "The value of PSInvocations may include or exclude helper pixels for 2x2 stamps" (20.4.7). Each triangle
 // can invoke at most all four lanes of every stamp touching the target, so two such stamp grids bound a quad.
@@ -82,13 +87,15 @@ main(int argc, char **argv) {
   const UINT64 result_stride = sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS),
                result_bytes = (Queries + 2) * result_stride;
   auto results = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, result_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto repeated = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, result_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto gpu_results = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, result_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
   auto source = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, (1 + output_words) * sizeof(UINT),
                        D3D12_RESOURCE_STATE_GENERIC_READ);
   auto output = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, output_words * sizeof(UINT),
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   auto words =
       buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, output_words * sizeof(UINT), D3D12_RESOURCE_STATE_COPY_DEST);
-  if (!expect(results && source && output && words, "buffers could not be made"))
+  if (!expect(results && repeated && gpu_results && source && output && words, "buffers could not be made"))
     return verdict();
 
   auto graphics_rs = root_signature(device.Get(), {});
@@ -120,13 +127,17 @@ main(int argc, char **argv) {
   D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument};
   ComPtr<ID3D12CommandSignature> signature;
   CHECK(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)));
-  auto arguments =
-      buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, signature_desc.ByteStride, D3D12_RESOURCE_STATE_GENERIC_READ);
-  if (!expect(bool(arguments), "indirect arguments could not be made"))
+  const UINT64 argument_bytes = signature_desc.ByteStride + sizeof(UINT);
+  auto argument_source = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, 2 * argument_bytes + sizeof(UINT64),
+                                D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto arguments = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, argument_bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!expect(arguments && argument_source, "indirect arguments could not be made"))
     return verdict();
   D3D12_DISPATCH_ARGUMENTS *dispatch_arguments;
-  CHECK(arguments->Map(0, nullptr, (void **)&dispatch_arguments));
-  *dispatch_arguments = {groups[0], groups[1], groups[2]};
+  CHECK(argument_source->Map(0, nullptr, (void **)&dispatch_arguments));
+  memset(dispatch_arguments, 0, 2 * argument_bytes + sizeof(UINT64));
+  auto indirect_count =
+      reinterpret_cast<UINT *>(reinterpret_cast<char *>(dispatch_arguments) + signature_desc.ByteStride);
   D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
   D3D12_RESOURCE_DESC texture{D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                               0,
@@ -197,14 +208,26 @@ main(int argc, char **argv) {
   list->Dispatch(groups[0], groups[1], groups[2]);
   list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress() + plane_words * sizeof(UINT));
   list->SetPipelineState(dispatch_pso.Get());
-  list->Dispatch(0, groups[1], groups[2]);
-  list->ExecuteIndirect(signature.Get(), 1, arguments.Get(), 0, nullptr, 0);
+  for (UINT zeros = 1; zeros < (1u << groups.size()); zeros++)
+    list->Dispatch(zeros & 1 ? 0 : groups[0], zeros & 2 ? 0 : groups[1], zeros & 4 ? 0 : groups[2]);
+  list->CopyBufferRegion(arguments.Get(), 0, argument_source.Get(), 0, argument_bytes);
+  transition(list.Get(), arguments.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  for (auto op : {D3D12_PREDICATION_OP_EQUAL_ZERO, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}) {
+    list->SetPredication(argument_source.Get(), 2 * argument_bytes, op);
+    list->ExecuteIndirect(signature.Get(), 1, arguments.Get(), 0, arguments.Get(), signature_desc.ByteStride);
+  }
+  list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  transition(list.Get(), arguments.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_DEST);
+  list->CopyBufferRegion(arguments.Get(), 0, argument_source.Get(), argument_bytes, argument_bytes);
   end(Compute);
   end(All);
   begin(NoPixel);
   list->SetPipelineState(no_pixel_pso.Get());
   list->DrawInstanced(vertices_per_quad * no_pixel, instances, 0, 0);
   end(NoPixel);
+  list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, First, 1, repeated.Get(), result_stride);
+  list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, First, 1, repeated.Get(),
+                         2 * result_stride);
   list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, First, results.Get(), result_stride);
   list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, First, Queries - First, results.Get(),
                          (First + 1) * result_stride);
@@ -230,8 +253,12 @@ main(int argc, char **argv) {
   for (UINT replay = 0; replay < replays; replay++) {
     step("seed %u, replay %u: counts, resolve guards, pixels and compute writes", seed, replay);
     const UINT indirect_groups_x = groups[0] + replay;
-    const UINT64 indirect_invocations = threads_per_group * indirect_groups_x * groups[1] * groups[2];
+    const UINT count = replay == 1 ? 0 : replay + 1;
+    const UINT64 indirect_invocations = count ? threads_per_group * indirect_groups_x * groups[1] * groups[2] : 0;
     *dispatch_arguments = {indirect_groups_x, groups[1], groups[2]};
+    *indirect_count = count;
+    const UINT64 predicate = replay == replays - 1 ? UINT64(1) << (sizeof(UINT) * 8) : 0;
+    memcpy(reinterpret_cast<char *>(dispatch_arguments) + 2 * argument_bytes, &predicate, sizeof(predicate));
     *input = next();
     CHECK(forget(results.Get()));
     CHECK(forget(words.Get()));
@@ -270,6 +297,12 @@ main(int argc, char **argv) {
       expect(got.CSInvocations == compute_invocations, "query %u: CS invocations %llu, want %llu", q, got.CSInvocations,
              compute_invocations);
     }
+    const unsigned char *again;
+    CHECK(repeated->Map(0, nullptr, (void **)&again));
+    for (UINT resolve = 1; resolve <= 2; resolve++)
+      expect(!memcmp(again + resolve * result_stride, bytes + (First + 1) * result_stride, result_stride),
+             "resolve %u lost the ended graphics counts", resolve);
+    repeated->Unmap(0, nullptr);
     results->Unmap(0, nullptr);
     const UINT *written;
     CHECK(words->Map(0, nullptr, (void **)&written));
@@ -277,7 +310,7 @@ main(int argc, char **argv) {
       const UINT x = i % cs_width, dispatched_width = threads[0] * (i < plane_words ? groups[0] : indirect_groups_x);
       const UINT64 z = (i % plane_words) / (UINT64(cs_width) * cs_height),
                    dispatched_depth = UINT64(i < plane_words ? flat_threads[2] : threads[2]) * groups[2];
-      const UINT want = x < dispatched_width && z < dispatched_depth ? *input : 0;
+      const UINT want = x < dispatched_width && z < dispatched_depth && (i < plane_words || count) ? *input : 0;
       if (!expect(written[i] == want, "compute word %llu: %u, want %u", i, written[i], want))
         break;
     }
@@ -289,7 +322,72 @@ main(int argc, char **argv) {
     }
     pixels->Unmap(0, nullptr);
   }
+  step("statistics span more visibility slots than the Metal feature table's Apple7+ offset limit");
+  CHECK(list->Reset(allocator.Get(), draw_pso.Get()));
+  list->SetGraphicsRootSignature(graphics_rs.Get());
+  list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  list->RSSetViewports(1, &viewport);
+  list->RSSetScissorRects(1, &scissor);
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  // Metal Feature Set Tables, maximum visibility query offset: 256 KB from Apple7. two slots per bracket.
+  const UINT visibility_bytes = 256 * 1024, brackets = visibility_bytes / (2 * sizeof(UINT64)) + 1;
+  begin(All);
+  for (UINT bracket = 0; bracket < brackets; bracket++) {
+    begin(First);
+    list->DrawInstanced(vertices_per_quad, 1, 0, 0);
+    end(First);
+  }
+  end(All);
+  list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, All, 1, results.Get(), 0);
+  CHECK(submit(device.Get(), queue.Get(), list.Get()));
+  D3D12_QUERY_DATA_PIPELINE_STATISTICS *window;
+  CHECK(results->Map(0, nullptr, (void **)&window));
+  expect(window->IAVertices == UINT64(vertices_per_quad) * brackets &&
+             window->IAPrimitives == UINT64(triangles_per_quad) * brackets &&
+             window->PSInvocations >= UINT64(width) * height * brackets,
+         "statistics lost draws across visibility windows: vertices %llu, primitives %llu, pixels %llu",
+         window->IAVertices, window->IAPrimitives, window->PSInvocations);
+  results->Unmap(0, nullptr);
+
+  step("close without a resolve, then resolve twice from another list into readback and default heaps");
+  CHECK(list->Reset(allocator.Get(), dispatch_pso.Get()));
+  list->SetComputeRootSignature(compute_rs.Get());
+  list->SetComputeRootShaderResourceView(0, source->GetGPUVirtualAddress());
+  list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+  begin(Compute);
+  list->Dispatch(groups[0], groups[1], groups[2]);
+  end(Compute);
+  CHECK(list->Close());
+  CHECK(execute(device.Get(), queue.Get(), list.Get()));
+  ComPtr<ID3D12CommandAllocator> resolve_allocator;
+  ComPtr<ID3D12GraphicsCommandList> resolve_list;
+  CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&resolve_allocator)));
+  CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, resolve_allocator.Get(), nullptr,
+                                  IID_PPV_ARGS(&resolve_list)));
+  for (UINT resolve = 1; resolve <= 2; resolve++) {
+    resolve_list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, Compute, 1, results.Get(),
+                                   resolve * result_stride);
+    resolve_list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, Compute, 1, gpu_results.Get(),
+                                   resolve * result_stride);
+  }
+  transition(resolve_list.Get(), gpu_results.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  resolve_list->CopyBufferRegion(repeated.Get(), 0, gpu_results.Get(), 0, result_bytes);
+  CHECK(resolve_list->Close());
+  CHECK(execute(device.Get(), queue.Get(), resolve_list.Get()));
+  const unsigned char *direct, *copied;
+  CHECK(results->Map(0, nullptr, (void **)&direct));
+  CHECK(repeated->Map(0, nullptr, (void **)&copied));
+  D3D12_QUERY_DATA_PIPELINE_STATISTICS expected{};
+  expected.CSInvocations = threads_per_group * groups[0] * groups[1] * groups[2];
+  for (UINT resolve = 1; resolve <= 2; resolve++) {
+    expect(!memcmp(direct + resolve * result_stride, &expected, sizeof(expected)),
+           "readback resolve %u lost the closed list's counts", resolve);
+    expect(!memcmp(copied + resolve * result_stride, &expected, sizeof(expected)),
+           "default heap resolve %u lost the closed list's counts", resolve);
+  }
+  repeated->Unmap(0, nullptr);
+  results->Unmap(0, nullptr);
   source->Unmap(0, nullptr);
-  arguments->Unmap(0, nullptr);
+  argument_source->Unmap(0, nullptr);
   return verdict();
 }

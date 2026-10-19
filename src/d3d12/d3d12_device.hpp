@@ -338,9 +338,6 @@ public:
   UINT UpdateRootArguments : 1;
   UINT UpdateVertexBuffers : 1;
   UINT UpdateIndexBuffer   : 1;
-  // the bytes between commands, and where in a command its D3D12_DISPATCH_ARGUMENTS are
-  UINT ByteStride = 0;
-  UINT DispatchOffset = 0;
   // what D3D12 resets after ExecuteIndirect: the root argument dwords the signature sets (constants become 0, root
   // views NULL), as (offset, count), and the vertex buffer slots it binds (NULL); the index buffer when it binds one
   std::vector<std::pair<uint32_t, uint32_t>> ResetRootDwords;
@@ -360,8 +357,6 @@ public:
   WMT::Reference<WMT::Buffer> results;
   uint64_t results_address = 0;
   uint32_t result_size = sizeof(uint64_t);
-  // a pipeline statistics heap's results as the CPU reads them; null for other heaps
-  const void *statistics_memory = nullptr;
   // a timestamp heap's queries: the clock each sampled, which the queue reads from its counter sample buffers when
   // the command buffer completes. Metal has few of those at once, and few samples in one
   std::vector<uint64_t> timestamps;

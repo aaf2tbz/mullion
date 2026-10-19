@@ -1,8 +1,8 @@
 # an indirect draw takes the most commands whatever its count buffer says
 --- a/src/d3d12/d3d12_command_signature.cpp
 +++ b/src/d3d12/d3d12_command_signature.cpp
-@@ -267,7 +267,7 @@
-     source << "if (x !=0 ) return;\n";
+@@ -270,7 +270,7 @@
+       source << "if (command_data.statistics) *command_data.statistics = 0;\n";
  
      source << "uint count = command_data.max_count_buffer ? "
 -              "command_data.max_count_buffer[0] : command_data.max_count;\n";

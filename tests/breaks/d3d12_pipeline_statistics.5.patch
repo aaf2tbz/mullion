@@ -1,0 +1,22 @@
+# statistics count indirect dispatches before the predicated command count is checked
+--- a/src/d3d12/d3d12_command_signature.cpp
++++ b/src/d3d12/d3d12_command_signature.cpp
+@@ -292,6 +292,9 @@
+       if (indexed)
+         source << "if (command_data.zeros) rest.reset();\n";
+     }
++    if (is_compute && !rays)
++      source << "if (command_data.statistics) *command_data.statistics += ulong(arg.dispatch.x) * arg.dispatch.y * "
++                "arg.dispatch.z * command_data.tgsize.x * command_data.tgsize.y * command_data.tgsize.z;\n";
+     source << "if (i >= count) continue;\n";
+     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords + "
+               "(i * command_data.rootsig_qwords_stride);\n";
+@@ -388,8 +391,6 @@
+         break;
+       }
+       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
+-        source << "if (command_data.statistics) *command_data.statistics += ulong(arg.dispatch.x) * arg.dispatch.y * "
+-                  "arg.dispatch.z * command_data.tgsize.x * command_data.tgsize.y * command_data.tgsize.z;\n";
+         source << "cmd.concurrent_dispatch_threadgroups(arg.dispatch, command_data.tgsize);\n";
+         break;
+       }

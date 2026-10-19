@@ -1,0 +1,12 @@
+# the query count is multiplied at 32-bit width before the allocation length is widened
+--- a/src/d3d12/d3d12_query_heap.cpp
++++ b/src/d3d12/d3d12_query_heap.cpp
+@@ -58,7 +58,7 @@
+                                                                              : sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1);
+       if (pDesc->Count > std::numeric_limits<size_t>::max() / result_size)
+         return E_OUTOFMEMORY;
+-      WMTBufferInfo info{uint64_t(pDesc->Count) * result_size, WMTResourceStorageModeShared};
++      WMTBufferInfo info{pDesc->Count * result_size, WMTResourceStorageModeShared};
+       results = metal.newBuffer(info);
+       if (!results)
+         return E_OUTOFMEMORY;

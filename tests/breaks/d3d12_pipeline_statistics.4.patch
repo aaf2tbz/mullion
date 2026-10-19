@@ -1,0 +1,12 @@
+# the resolver does not reset its invocation snapshot on replay
+--- a/src/d3d12/d3d12_command_signature.cpp
++++ b/src/d3d12/d3d12_command_signature.cpp
+@@ -266,8 +266,6 @@
+            << (is_compute ? "dxmt_compute_command_data" : "dxmt_render_command_data")
+            << " &command_data [[buffer(30)]]) {\n";
+     source << "if (x !=0 ) return;\n";
+-    if (is_compute && !rays)
+-      source << "if (command_data.statistics) *command_data.statistics = 0;\n";
+ 
+     source << "uint count = command_data.max_count_buffer ? "
+               "command_data.max_count_buffer[0] : command_data.max_count;\n";

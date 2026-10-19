@@ -880,40 +880,43 @@ struct PipelineStatisticsSum {
   uint slot_count;
   uint first_dispatch;
   uint dispatch_count;
+  uint first_predicated;
+  uint predicated_count;
 };
 
-// an ExecuteIndirect of dispatches: where its first command's D3D12_DISPATCH_ARGUMENTS are, its count buffer (null for
-// none), the signature's stride, MaxCommandCount and the threads of a threadgroup
-struct IndirectDispatchCount {
-  device const uint *arguments;
-  device const uint *count;
-  uint stride;
-  uint max_count;
-  ulong threads;
+struct PredicatedStatistics {
+  ulong vertices, primitives, threads;
+  device const uint *skips;
 };
 
 [[kernel]] void sum_pipeline_statistics(
     constant PipelineStatisticsSum *sums [[buffer(0)]],
     constant VisibilitySlot *slots [[buffer(1)]],
     constant uint *slot_shades [[buffer(2)]],
-    constant IndirectDispatchCount *dispatches [[buffer(3)]],
+    constant VisibilitySlot *dispatches [[buffer(3)]],
     device ulong *results [[buffer(4)]],
+    constant PredicatedStatistics *predicated [[buffer(5)]],
     uint i [[thread_position_in_grid]]
 ) {
   constant PipelineStatisticsSum &sum = sums[i];
-  device ulong *result = results + sum.query * sum.size;
+  device ulong *result = results + ulong(sum.query) * sum.size;
   for (uint k = 0; k < sum.size; k++)
     result[k] = sum.counts[k];
   for (uint k = sum.first_slot; k < sum.first_slot + sum.slot_count; k++)
     if (slot_shades[k])
       result[7] += *slots[k].count;
-  for (uint k = sum.first_dispatch; k < sum.first_dispatch + sum.dispatch_count; k++) {
-    IndirectDispatchCount dispatch = dispatches[k];
-    uint commands = dispatch.count ? min(*dispatch.count, dispatch.max_count) : dispatch.max_count;
-    for (uint c = 0; c < commands; c++) {
-      device const uint *groups = dispatch.arguments + c * (dispatch.stride / 4);
-      result[10] += ulong(groups[0]) * groups[1] * groups[2] * dispatch.threads;
-    }
+  for (uint k = sum.first_dispatch; k < sum.first_dispatch + sum.dispatch_count; k++)
+    result[10] += *dispatches[k].count;
+  for (uint k = sum.first_predicated; k < sum.first_predicated + sum.predicated_count; k++) {
+    constant PredicatedStatistics &count = predicated[k];
+    if (*count.skips)
+      continue;
+    result[0] += count.vertices;
+    result[1] += count.primitives;
+    result[2] += count.vertices;
+    result[5] += count.primitives;
+    result[6] += count.primitives;
+    result[10] += count.threads;
   }
 }
 

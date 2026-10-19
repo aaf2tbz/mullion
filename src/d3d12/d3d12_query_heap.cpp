@@ -19,6 +19,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include <limits>
 
 namespace dxmt {
 
@@ -49,18 +50,19 @@ public:
     case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP:
       timestamps.resize(pDesc->Count);
       return S_OK;
-    // command lists write pipeline statistics as they resolve them into a buffer the GPU reads (sum_pipeline_statistics);
+    // command lists sum ended pipeline statistics into the heap (sum_pipeline_statistics);
     // a query never ended reads the zeros written here
     case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
     case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1: {
       result_size = pDesc->Type == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)
                                                                              : sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1);
-      WMTBufferInfo info{pDesc->Count * result_size, WMTResourceStorageModeShared};
+      if (pDesc->Count > std::numeric_limits<size_t>::max() / result_size)
+        return E_OUTOFMEMORY;
+      WMTBufferInfo info{uint64_t(pDesc->Count) * result_size, WMTResourceStorageModeShared};
       results = metal.newBuffer(info);
       if (!results)
         return E_OUTOFMEMORY;
       memset(info.memory.ptr, 0, info.length);
-      statistics_memory = info.memory.ptr;
       return S_OK;
     }
     default:

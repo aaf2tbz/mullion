@@ -5,6 +5,9 @@
 // the expectations apply the op to the values. what the list does before its first SetPredication, the resets of
 // everything the cases write, runs whatever the predicates are, and ClearState ends predication: a dispatch after it
 // runs too.
+// pipeline statistics follow the same decision: "if a Dispatch() or DispatchIndirect() call is predicated off,
+// then CSInvocations will not increment, given the Compute Shader will not be invoked." (D3D11.3 20.4.7).
+// a skipped draw generates no IA vertices or primitives; each running draw here is one triangle.
 #include "d3d12_test.hpp"
 #include <iterator>
 
@@ -58,7 +61,7 @@ main(int argc, char **argv) {
   const UINT per_kind = 2 * 2;         // op, which of the two predicate values
   const UINT cases = Kinds * per_kind; // a case is a kind's `c % per_kind`-th
   const UINT cleared = cases;          // the element the dispatch after ClearState writes
-  const UINT64 runs[2][2] = {{0, 5}, {9, 0}};
+  const UINT64 runs[2][2] = {{0, UINT64(1) << (sizeof(UINT) * 8)}, {9, 0}};
   // what a whole-resource copy brings, a cleared depth, the depth before, and a resolved white pixel
   const UINT marker = 0xc0ffee, white = 0xffffffff;
   const float depth_cleared = 0.5f, depth_before = 1;
@@ -197,6 +200,14 @@ main(int argc, char **argv) {
              tiled_at = own_at + per_kind * own_size, readback_size = tiled_at + per_kind * 4;
   static_assert(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT >= Kinds * 4 * 4, "a row of cases fits a placement");
   auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, readback_size, DEST);
+  D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, cases + 1};
+  ComPtr<ID3D12QueryHeap> statistics;
+  CHECK(device->CreateQueryHeap(&statistics_desc, IID_PPV_ARGS(&statistics)));
+  auto counts = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK,
+                       UINT64(cases + 1) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS), DEST);
+  if (!expect(bool(counts), "statistics readback could not be made"))
+    return verdict();
+  step("direct draws and dispatches count only when their predicate runs them");
 
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12CommandAllocator> allocator;
@@ -267,6 +278,7 @@ main(int argc, char **argv) {
   list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   D3D12_INDEX_BUFFER_VIEW ib{va + indices_at, sizeof(indices), DXGI_FORMAT_R16_UINT};
   list->IASetIndexBuffer(&ib);
+  list->BeginQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, cases);
   for (UINT c = 0; c < cases; c++) {
     auto kind = Kind(c / per_kind);
     const UINT constants[2] = {c + 1, c}, mine = c % per_kind;
@@ -279,6 +291,9 @@ main(int argc, char **argv) {
       transition(list.Get(), out.Get(), UA, DEST);
     if (kind == CopyTexture)
       transition(list.Get(), target.Get(), RT, DEST);
+    const bool counted = kind == Draw || kind == DrawIndexed || kind == Dispatch;
+    if (counted)
+      list->BeginQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, c);
     list->SetPredication(upload.Get(), (c & 1) * 8, ops[(c >> 1) & 1]);
     switch (kind) {
     case Dispatch:
@@ -342,6 +357,16 @@ main(int argc, char **argv) {
       break;
     }
     list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    if (counted) {
+      list->EndQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, c);
+      list->ResolveQueryData(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, c, 1, counts.Get(),
+                             UINT64(c) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+    }
+    if (c + 1 == 2 * per_kind) {
+      list->EndQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, cases);
+      list->ResolveQueryData(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, cases, 1, counts.Get(),
+                             UINT64(cases) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+    }
     if (kind == CopyBuffer)
       transition(list.Get(), out.Get(), DEST, UA);
     if (kind == CopyTexture)
@@ -406,10 +431,20 @@ main(int argc, char **argv) {
       memcpy(&value, got + offset, 4);
       return value;
     };
+    const D3D12_QUERY_DATA_PIPELINE_STATISTICS *statistics_values;
+    CHECK(counts->Map(0, nullptr, (void **)&statistics_values));
     for (UINT c = 0; c < cases; c++) {
       bool skip = (values_of_run[c & 1] == 0) == (ops[(c >> 1) & 1] == D3D12_PREDICATION_OP_EQUAL_ZERO);
       auto kind = Kind(c / per_kind);
       const UINT mine = c % per_kind;
+      if (kind == Draw || kind == DrawIndexed || kind == Dispatch) {
+        const auto &count = statistics_values[c];
+        const UINT64 primitives = !skip && kind != Dispatch, threads = !skip && kind == Dispatch;
+        expect(count.IAVertices == 3 * primitives && count.IAPrimitives == primitives &&
+                   count.CSInvocations == threads,
+               "case %u: predicated statistics IA %llu/%llu, CS %llu, want %llu/%llu, %llu", c,
+               count.IAVertices, count.IAPrimitives, count.CSInvocations, 3 * primitives, primitives, threads);
+      }
       // what the case left, and what a run and a skip leave
       double value, ran = c + 1, skipped = 0;
       switch (kind) {
@@ -455,8 +490,14 @@ main(int argc, char **argv) {
     UINT after = word(out_at + cleared * 4);
     if (after != cleared + 1 && failures++ < 16)
       printf("predicate %llu: the dispatch after ClearState wrote %u, want %u\n", values_of_run[0], after, cleared + 1);
+    const auto &overlap = statistics_values[cases];
+    const UINT64 primitives = 2 * std::size(ops);
+    expect(overlap.IAVertices == 3 * primitives && overlap.IAPrimitives == primitives && !overlap.CSInvocations,
+           "overlapping query across predicates: vertices %llu, primitives %llu, CS %llu", overlap.IAVertices,
+           overlap.IAPrimitives, overlap.CSInvocations);
+    counts->Unmap(0, nullptr);
     readback->Unmap(0, nullptr);
   }
-  printf("%s: %u wrong cases over %zu runs\n", failures ? "failed" : "passed", failures, std::size(runs));
-  return failures != 0;
+  expect(!failures, "%u wrong predication cases over %zu runs", failures, std::size(runs));
+  return verdict();
 }
