@@ -1,4 +1,9 @@
-// contract: DispatchMesh runs a mesh shader's threadgroups, each setting its output counts and writing vertices,
+// contract: "DispatchMesh launches the threadgroups for the amplification shader or the mesh shader in a case where
+// no amplification shader is attached." (DirectX-Specs, Mesh Shader, "DispatchMesh API":
+// https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html). Metal's Feature Set Tables allow "Mesh shading"
+// from Apple7, but "Indirect command buffers containing mesh draws" only from Apple9:
+// https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf. both paths and ordinary indirect draws must draw.
+// each mesh threadgroup sets its output counts and writes vertices,
 // indices and per-primitive values that reach the pixel shader: an interpolated and a constant vertex attribute, a
 // per-primitive attribute, SV_PrimitiveID as the mesh shader set it, and no pixels from a primitive it culled
 // (SV_CullPrimitive) or whose vertices' SV_ClipDistance are negative; SV_RenderTargetArrayIndex chooses the slice of
@@ -84,6 +89,10 @@ void ms_payload(uint g : SV_GroupID, in payload Payload payload, out vertices V 
 uint ps(V v, uint tag : TAG, uint id : SV_PrimitiveID) : SV_Target {
   return v.value + (uint)v.weight * 1000 + (tag << 16) + (id << 24);
 }
+float4 vs(uint id : SV_VertexID) : SV_Position {
+  return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+uint ps_plain() : SV_Target { return 1; }
 )hlsl";
 
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T> struct alignas(void *) Subobject {
@@ -98,18 +107,26 @@ main(int argc, char **argv) {
     printf("skipped: dxcompiler.dll not found\n");
     return 77;
   }
+  if (!compiler.dxc) {
+    printf("skipped: mesh shaders require DXIL\n");
+    return 77;
+  }
   const UINT size = 16, groups = 7, amplified = 3, clipped = 4, sliced = 5, slices = 2, line_row = 14, line_pixels = 3;
   std::vector<std::string> defines = {
       "SIZE=" + std::to_string(size), "CLIPPED=" + std::to_string(clipped), "SLICED=" + std::to_string(sliced),
       "LINE_ROW=" + std::to_string(line_row), "LINE_PIXELS=" + std::to_string(line_pixels)
   };
+  step("compile mesh and ordinary shaders");
+  auto vs = compiler.compile(hlsl, "vs", "vs", defines), ps_plain = compiler.compile(hlsl, "ps_plain", "ps", defines);
   auto ms_line = compiler.compile(hlsl, "ms_line", "ms_6_5", defines);
   auto ms = compiler.compile(hlsl, "ms", "ms_6_5", defines), as = compiler.compile(hlsl, "as", "as_6_5", defines),
        ms_payload = compiler.compile(hlsl, "ms_payload", "ms_6_5", defines), ps = compiler.compile(hlsl, "ps", "ps_6_5", defines);
-  if (ms.empty() || ms_line.empty() || as.empty() || ms_payload.empty() || ps.empty()) {
-    printf("skipped: mesh shaders are shader model 6.5\n");
-    return 77;
+  if (ms.empty() || ms_line.empty() || as.empty() || ms_payload.empty() || ps.empty() || vs.empty() ||
+      ps_plain.empty()) {
+    printf("failed: HLSL did not compile\n");
+    return 1;
   }
+  step("create device");
   ComPtr<ID3D12Device2> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
@@ -139,6 +156,7 @@ main(int argc, char **argv) {
   stream.targets.data.RTFormats[0] = DXGI_FORMAT_R32_UINT;
   D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
   ComPtr<ID3D12PipelineState> mesh_pso, amplified_pso, line_pso;
+  step("create mesh pipelines with and without amplification");
   CHECK(device->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&mesh_pso)));
   stream.ms.data = bytecode(ms_line);
   CHECK(device->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&line_pso)));
@@ -146,6 +164,7 @@ main(int argc, char **argv) {
   stream.ms.data = bytecode(ms_payload);
   CHECK(device->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&amplified_pso)));
   ComPtr<ID3D12PipelineState> depth_pso, tested_pso;
+  step("create depth-only and depth-tested mesh pipelines");
   stream.as.data = {};
   stream.ms.data = bytecode(ms);
   stream.ps.data = {};
@@ -155,6 +174,21 @@ main(int argc, char **argv) {
   stream.ps.data = bytecode(ps);
   stream.depth.data = {TRUE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_EQUAL};
   CHECK(device->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&tested_pso)));
+
+  step("create ordinary pipeline for indirect drawing");
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC plain_desc{};
+  plain_desc.pRootSignature = rs.Get();
+  plain_desc.VS = bytecode(vs);
+  plain_desc.PS = bytecode(ps_plain);
+  plain_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  plain_desc.SampleMask = ~0u;
+  plain_desc.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
+  plain_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  plain_desc.NumRenderTargets = 1;
+  plain_desc.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+  plain_desc.SampleDesc = {1, 0};
+  ComPtr<ID3D12PipelineState> plain_pso;
+  CHECK(device->CreateGraphicsPipelineState(&plain_desc, IID_PPV_ARGS(&plain_pso)));
 
   // what the shaders draw
   const UINT untouched = ~0u;
@@ -169,8 +203,11 @@ main(int argc, char **argv) {
     want[{x, line_row}] = pixel(77, 2, 3);
   const UINT shift = 8, depth_row = 6;
   for (auto [at, value] : std::map(want))
-    if (at.second % size == 0)
+    if (at.second % size == 0) {
       want[{at.first, at.second + depth_row}] = value;
+      want[{at.first, at.second + shift}] = value;
+    }
+  want[{0, size - 1}] = 1;
   for (UINT a = 0; a < amplified; a++)
     for (UINT g = 0; g < a + 1; g++)
       want[{g, a + 2}] = want[{g, a + 2 + shift}] = pixel(100 * (a + 1) + g + 29, 1, 0);
@@ -178,10 +215,26 @@ main(int argc, char **argv) {
   D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
   D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument};
   CHECK(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)));
-  auto arguments = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), D3D12_RESOURCE_STATE_GENERIC_READ);
+  const D3D12_DISPATCH_MESH_ARGUMENTS mesh_arguments[] = {{groups, 1, 1}, {amplified, 1, 1}};
+  auto arguments = buffer(
+      device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(mesh_arguments), D3D12_RESOURCE_STATE_GENERIC_READ
+  );
   D3D12_DISPATCH_MESH_ARGUMENTS *mapped_arguments;
   CHECK(arguments->Map(0, nullptr, (void **)&mapped_arguments));
-  *mapped_arguments = {amplified, 1, 1};
+  memcpy(mapped_arguments, mesh_arguments, sizeof(mesh_arguments));
+  arguments->Unmap(0, nullptr);
+  D3D12_INDIRECT_ARGUMENT_DESC plain_argument{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+  const D3D12_DRAW_ARGUMENTS plain_arguments{3, 1, 0, 0};
+  D3D12_COMMAND_SIGNATURE_DESC plain_signature_desc{sizeof(plain_arguments), 1, &plain_argument};
+  ComPtr<ID3D12CommandSignature> plain_signature;
+  CHECK(device->CreateCommandSignature(&plain_signature_desc, nullptr, IID_PPV_ARGS(&plain_signature)));
+  auto plain_buffer = buffer(
+      device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(plain_arguments), D3D12_RESOURCE_STATE_GENERIC_READ
+  );
+  void *mapped_plain;
+  CHECK(plain_buffer->Map(0, nullptr, &mapped_plain));
+  memcpy(mapped_plain, &plain_arguments, sizeof(plain_arguments));
+  plain_buffer->Unmap(0, nullptr);
 
   const UINT64 row = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
   ComPtr<ID3D12Resource> target;
@@ -224,14 +277,22 @@ main(int argc, char **argv) {
   list->RSSetViewports(1, &viewport);
   list->RSSetScissorRects(1, &scissor);
   list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  step("draw mesh directly and indirectly without amplification");
   list->DispatchMesh(groups, 1, 1);
+  viewport.TopLeftY = shift;
+  list->RSSetViewports(1, &viewport);
+  list->ExecuteIndirect(signature.Get(), 1, arguments.Get(), 0, nullptr, 0);
+  viewport.TopLeftY = 0;
+  list->RSSetViewports(1, &viewport);
   list->SetPipelineState(line_pso.Get());
   list->DispatchMesh(1, 1, 1);
+  step("draw mesh directly and indirectly with amplification");
   list->SetPipelineState(amplified_pso.Get());
   list->DispatchMesh(amplified, 1, 1);
   viewport.TopLeftY = shift;
   list->RSSetViewports(1, &viewport);
-  list->ExecuteIndirect(signature.Get(), 1, arguments.Get(), 0, nullptr, 0);
+  list->ExecuteIndirect(signature.Get(), 1, arguments.Get(), sizeof(mesh_arguments[0]), nullptr, 0);
+  step("draw depth-only and depth-tested mesh pipelines");
   list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
   list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
   viewport.TopLeftY = depth_row;
@@ -243,6 +304,13 @@ main(int argc, char **argv) {
   viewport.TopLeftY = depth_row + 1;
   list->RSSetViewports(1, &viewport);
   list->DispatchMesh(groups, 1, 1);
+  step("draw ordinary pipeline through an indirect command buffer");
+  list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  list->SetPipelineState(plain_pso.Get());
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  viewport = {0, (float)(size - 1), 1, 1, 0, 1};
+  list->RSSetViewports(1, &viewport);
+  list->ExecuteIndirect(plain_signature.Get(), 1, plain_buffer.Get(), 0, nullptr, 0);
   transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT},
       src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -251,23 +319,19 @@ main(int argc, char **argv) {
     src.SubresourceIndex = slice;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   }
+  CHECK(forget(readback.Get()));
   CHECK(submit(device.Get(), queue.Get(), list.Get()));
   uint8_t *out;
   CHECK(readback->Map(0, nullptr, (void **)&out));
 
-  unsigned failures = 0;
+  step("check every pixel of both target slices");
   for (UINT y = 0; y < size * slices; y++)
     for (UINT x = 0; x < size; x++) {
       auto value = reinterpret_cast<const UINT *>(out + row * y)[x];
       auto it = want.find({x, y});
       auto expected = it == want.end() ? untouched : it->second;
-      if (value != expected && failures++ < 12)
-        printf("pixel %u,%u: %#x, want %#x\n", x, y, value, expected);
+      expect(value == expected, "pixel %u,%u: %#x, want %#x", x, y, value, expected);
     }
-  if (failures) {
-    printf("failed: %u wrong pixels\n", failures);
-    return 1;
-  }
-  printf("passed: %zu pixels drawn of %u\n", want.size(), size * size * slices);
-  return 0;
+  readback->Unmap(0, nullptr);
+  return verdict();
 }

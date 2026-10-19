@@ -628,10 +628,22 @@ empty_fragment_function(id<MTLDevice> device) {
   }
 }
 
+static unsigned emulated_family(void);
+
 static NTSTATUS
 _MTLDevice_newMeshRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newmeshrenderpso *params = obj;
   const struct WMTMeshRenderPipelineInfo *info = params->info.ptr;
+  // family emulation must also reject requests that the host GPU accepts (Metal Feature Set Tables, mesh draws in ICBs)
+  unsigned family = emulated_family();
+  if (info->support_indirect_command_buffers && family && family < MTLGPUFamilyApple9 - MTLGPUFamilyApple1 + 1) {
+    params->ret_pso = 0;
+    params->ret_error = (obj_handle_t)[[NSError
+        errorWithDomain:NSCocoaErrorDomain
+                   code:NSFeatureUnsupportedError
+               userInfo:@{NSLocalizedDescriptionKey : @"indirect mesh command buffers require Apple9"}] retain];
+    return STATUS_SUCCESS;
+  }
   MTLMeshRenderPipelineDescriptor *descriptor = [[MTLMeshRenderPipelineDescriptor alloc] init];
 
   for (unsigned i = 0; i < 8; i++) {
