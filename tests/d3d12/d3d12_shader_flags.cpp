@@ -18,6 +18,7 @@ static const struct {
               {"4", true},
               {"7", true},
               {"0x4", true},
+              {"0x20", true},
               {"04", true},
               {"+4", true},
               {" 4", true},

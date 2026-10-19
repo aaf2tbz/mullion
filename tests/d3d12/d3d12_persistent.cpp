@@ -19,8 +19,8 @@
 // - the loop ends when the count of pending nodes, kept with InterlockedAdd, is zero, which depends on other groups.
 // HLSL asks a barrier of the group that stores, not of the group that loads, so the kernel runs with its device
 // barrier in each PLACEMENT: 0 at the start of every turn, before the turn's loads; 1 once a turn after its loads;
-// 2 only in the threads that stored, after their stores, so that a group that waits passes none. two more are
-// not run unless asked for (PLACEMENT=n): 3 has no device barrier at all, and 4 has as many barriers a turn as
+// 2 only in the threads that stored, after their stores, so that a group that waits passes none; 3 has only group
+// barriers in the loop. PLACEMENT=4 is not run unless asked for and has as many barriers a turn as
 // Unreal's kernel: two with device and group memory and sync, two with device memory and sync, one of device memory
 // alone, six of group memory with sync.
 // a node without children is a leaf, and a leaf is appended to an output: its place comes from an InterlockedAdd on
@@ -321,7 +321,7 @@ main(int argc, char **argv) {
                                       {"TYPED", 0}, {"REPEATS", 1}, {"WORK", 0}, {"ALLOCATE", 0}, {"HEAVY", 0}, {"OWNID", 0},
                                       {"TICKS_MOST", ~0u}, {"MS", 0}};
   // PLACEMENT=n runs that one placement of the device barrier
-  std::vector<UINT> placements{0, 1, 2};
+  std::vector<UINT> placements{0, 1, 2, 3};
   for (int i = 2; i < argc; i++)
     if (auto eq = strchr(argv[i], '=')) {
       numbers[std::string(argv[i], eq)] = strtoul(eq + 1, nullptr, 0);
