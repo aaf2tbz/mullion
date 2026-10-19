@@ -41,6 +41,7 @@ struct dxmt_compute_command_data {
   device char * rays;
   uint ray_flags;
   device ulong *statistics;
+  packed_uint2 execution_range;
 };
 
 struct d3d12_draw_arguments {
@@ -112,6 +113,7 @@ struct dxmt_render_command_data {
   device dxmt_indirect_mesh_draw * draws;
   device ushort * zeros;
   uint zero_count;
+  packed_uint2 execution_range;
 };
 
 )";
@@ -255,23 +257,33 @@ public:
         return;
       const char *of[] = {"instance_count", count, start, base, "start_instance_location"};
       for (unsigned word = 0; word < std::size(of); word++)
-        source << "command_data.most[" << word << "] = max(command_data.most[" << word << "], uint(arg." << args << "."
-               << of[word] << "));\n";
-      source << "command_data.most[" << std::size(of) << "] = count;\n";
+        source << "atomic_fetch_max_explicit(reinterpret_cast<device atomic_uint *>(command_data.most) + " << word
+               << ", uint(arg." << args << "." << of[word] << "), memory_order_relaxed);\n";
+      source << "if (i == 0) command_data.most[" << std::size(of) << "] = count;\n";
     };
     CommandType = side_effect;
     UpdateIndexBuffer = ib_index != ~0u;
 
-    source << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint x, constant "
+    source << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint x, device "
            << (is_compute ? "dxmt_compute_command_data" : "dxmt_render_command_data")
            << " &command_data [[buffer(30)]]) {\n";
-    source << "if (x !=0 ) return;\n";
-    if (is_compute && !rays)
-      source << "if (command_data.statistics) *command_data.statistics = 0;\n";
-
+    // each thread resolves one command
+    source << "ulong i = x;\n";
     source << "uint count = command_data.max_count_buffer ? "
               "command_data.max_count_buffer[0] : command_data.max_count;\n";
-    source << "for (ulong i = 0; i < command_data.max_count; i++) {\n";
+    if (!rays) {
+      source << "if (i == 0) command_data.execution_range = uint2(0, "
+                "min(count, uint(command_data.max_count))";
+      if (indexed)
+        source << " * (command_data.zeros ? 2u : 1u)";
+      source << ");\n";
+    }
+    source << "if (i >= command_data.max_count) return;\n";
+    if (is_compute && !rays)
+      source << "if (command_data.statistics) command_data.statistics[i] = 0;\n";
+    if (!rays)
+      source << (is_compute ? "if (i >= count) return;\n" : "if (i >= count && !command_data.draws) return;\n");
+    source << "{\n";
     source << "device d3d12_arguments& arg = reinterpret_cast<device d3d12_arguments *>("
               "command_data.argument_buffer + i * "
            << pDesc->ByteStride << ")[0];\n";
@@ -292,7 +304,7 @@ public:
       if (indexed)
         source << "if (command_data.zeros) rest.reset();\n";
     }
-    source << "if (i >= count) continue;\n";
+    source << "if (i >= count) return;\n";
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords + "
               "(i * command_data.rootsig_qwords_stride);\n";
     if (!is_compute)
@@ -388,7 +400,7 @@ public:
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
-        source << "if (command_data.statistics) *command_data.statistics += ulong(arg.dispatch.x) * arg.dispatch.y * "
+        source << "if (command_data.statistics) command_data.statistics[i] = ulong(arg.dispatch.x) * arg.dispatch.y * "
                   "arg.dispatch.z * command_data.tgsize.x * command_data.tgsize.y * command_data.tgsize.z;\n";
         source << "cmd.concurrent_dispatch_threadgroups(arg.dispatch, command_data.tgsize);\n";
         break;
