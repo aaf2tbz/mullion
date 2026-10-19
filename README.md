@@ -1,49 +1,47 @@
 # Mullion
 
-Mullion translates Direct3D 10, 11 and 12 to Metal, so Windows games run on Apple silicon through Wine. It is free and open source, and it is a pre-release: expect games that break, and please report them.
+Mullion translates Direct3D 10, 11 and 12 to Metal, so Windows games run on Apple silicon through Wine. It is free and open source.
 
-## Status
+This is a pre-release. Expect games that break, and please report them.
+
+## How it runs today
 
 | | Mullion | D3DMetal |
 |---|---|---|
 | Black Myth: Wukong benchmark, High preset, 1512 × 982, TSR at 100%, no frame generation | 28 FPS | 35 FPS |
 | 3DMark Fire Strike | 7003 | |
 
-Both columns are from the same M5 Pro. Time Spy's graphics tests render correctly but 3DMark does not show a score for them yet, and Steel Nomad does not start yet.
+Both columns were measured on the same Mac. Time Spy's graphics tests render correctly, though 3DMark does not report a score for them yet. Steel Nomad does not start yet.
 
 | Mullion | D3DMetal |
 |---|---|
 | ![Black Myth: Wukong benchmark result on Mullion](docs/wukong-mullion.jpg) | ![The same benchmark on D3DMetal](docs/wukong-d3dmetal.jpg) |
 
-What is implemented:
-
-- Direct3D 12 at feature level 12_0 with shader models up to 6.6: ray tracing at tier 1.1, mesh and amplification shaders, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats.
-- Direct3D 10 and 11 at feature level 11_1.
-- 192 test programs that draw, read the result back and compare it with what the Direct3D specification says, run as each Apple GPU family. Wine's and vkd3d-proton's Direct3D tests are run against it as well, and their verdicts are recorded in `tests/conformance`.
+Direct3D 12 is supported at feature level 12_0 with shader models up to 6.6, including ray tracing at tier 1.1, mesh and amplification shaders, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats. Direct3D 10 and 11 are supported at feature level 11_1.
 
 ## Requirements
 
 - A Mac with an M3 or later. M1 and M2 are in progress.
 - macOS 15 or later.
-- A Wine for x86_64. Stock Wine works: Mullion needs no patches and no DLL overrides. Only 64-bit games run for now.
+- Wine for x86_64. Stock Wine works, with no patches and no DLL overrides. Only 64-bit games run for now.
 
 ## Install
 
 1. Download the latest [release](https://github.com/dttdrv/mullion/releases) and unpack it.
-2. Run `./install.sh <wine> [prefix ...]`, where `<wine>` is the directory that contains `bin/wine`.
+2. Run `./install.sh <wine> [prefix ...]`. `<wine>` is the directory that contains `bin/wine`.
 
-The script copies the libraries into `<wine>/lib/wine`, where they take the place of Wine's Direct3D, and into each prefix you name. Prefixes created afterwards need nothing.
+The script copies the libraries into `<wine>/lib/wine`, where they replace Wine's Direct3D, and into each prefix named on the command line. Prefixes created later need nothing.
 
-The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`), so a tool that installs DXMT can install Mullion the same way. By hand: copy both directories into `<wine>/lib/wine`, and the DLLs of `x86_64-windows` into `drive_c/windows/system32` of each existing prefix.
+The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`), so tools that install DXMT can install Mullion the same way. To install by hand, copy both directories into `<wine>/lib/wine`, and the DLLs of `x86_64-windows` into `drive_c/windows/system32` of each existing prefix.
 
-## Configuration
+## Settings
 
 | | |
 |---|---|
 | `MULLION_LOG_PATH=<directory>` | Writes a log file for each DLL. Attach it to bug reports. |
 | `MULLION_CONFIG="dxgi.customVendorId=106b"` | Reports Apple's vendor ID. By default Mullion reports the GPU's own name with AMD's vendor ID, because some games exit at startup when they do not know the vendor. |
 
-Options can also go in a `mullion.conf` next to the game's executable, or in the file `MULLION_CONFIG_FILE` names; the `mullion.conf` in this repository lists them. The `DXMT_` names and `dxmt.conf` of earlier builds still work.
+Options can also go in a `mullion.conf` next to the game's executable, or in the file `MULLION_CONFIG_FILE` names. The `mullion.conf` in this repository lists them. The `DXMT_` names and `dxmt.conf` of earlier builds still work.
 
 ## Building
 
@@ -61,7 +59,9 @@ meson install -C build
 
 ## Tests
 
-Configure with `-Denable_tests=true`, then run the suite in a Wine, once as each GPU family:
+About 200 test programs draw, read the result back and compare it with what the Direct3D specification says, each run as every Apple GPU family. Wine's and vkd3d-proton's Direct3D tests also run against Mullion, and their verdicts are recorded in `tests/conformance`.
+
+Configure with `-Denable_tests=true`, then run the suite in a Wine:
 
 ```sh
 python3 tests/run.py --build build --wine <wine> --prefix <prefix> --family native,9
@@ -69,13 +69,13 @@ python3 tests/run.py --build build --wine <wine> --prefix <prefix> --family nati
 
 The tests compile their own shaders, so the prefix needs `d3dcompiler_47.dll` (from [winetricks](https://github.com/Winetricks/winetricks)) and `dxcompiler.dll` (from [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)) in its `system32`.
 
-## Reporting
+## Reporting a problem
 
-Open an issue for a game that breaks, with your Mac model, macOS version, how you ran the game, and the log. A screenshot helps most. Reports of games that work are just as welcome. See `CONTRIBUTING.md` for patches.
+Open an issue with the Mac model, the macOS version, how the game was run, and the log. A screenshot helps most. Reports of games that work are welcome as well. Patches are covered in `CONTRIBUTING.md`.
 
 ## Credits
 
-Mullion is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and CodeWeavers, from commit `7c8dee1` (16 September 2026). DXMT is the Direct3D 10 and 11 foundation, the DXBC shader converter and the Metal bridge. The DXIL front end and most of the Direct3D 12 are ours: about 28,000 lines of source and 75,000 lines of tests so far.
+Mullion is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and CodeWeavers, from commit `7c8dee1` (16 September 2026). DXMT provides the Direct3D 10 and 11 foundation, the DXBC shader converter and the Metal bridge. The DXIL front end and most of Direct3D 12 were written for Mullion, about 28,000 lines of source and 78,000 lines of tests so far.
 
 Mullion is a separate project. Please do not report its problems to DXMT.
 
