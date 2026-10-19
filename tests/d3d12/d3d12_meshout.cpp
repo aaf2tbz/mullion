@@ -8,14 +8,18 @@
 //   wrote its vertices, indices and SV_CullPrimitive; a primitive with one vertex in is drawn whole, not clipped;
 // - DispatchMesh is a barrier for the amplification shader's group, so the mesh shaders get the payload all its
 //   threads built, and its arguments are the first thread's where the threads disagree.
-// every case draws triangles that cover known pixels of a row of its own; the rest of the target stays untouched.
+// "This is a per-primitive boolean culling value that indicates whether to cull the primitive for the current view
+// (SV_ViewID)." (Mesh Shader specification, SV_CullPrimitive). "If a vertex has a cull distance of NaN, that vertex
+// counts as "out" (as if it is < 0)." (D3D11.3 15.4.2). lines share vertices across two consecutive culled primitives;
+// their successor must draw whole. counts cross the group's write stride twice and reach the last legal vertex index.
+// every case draws known pixels of a row of its own; the rest of the target stays untouched.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <iterator>
 #include <map>
 
 static const char hlsl[] = R"hlsl(
-cbuffer Constants : register(b0) { uint one; uint rows; uint nan_bits; };
+cbuffer Constants : register(b0) { uint one; uint rows; uint nan_bits; uint line_count; uint line_row; };
 // vertex `corner` of a triangle that covers the centers of the pixels from (x, y) to the right that `width` reaches,
 // and no other: 1.4 reaches one, 4.6 three
 float4 corner(uint x, uint y, uint corner, float width) {
@@ -103,6 +107,41 @@ uint ps_cull(float4 pos : SV_Position, nointerpolation uint value : VALUE, noint
   return value + (uint)((cull.y + 2) * 16 + 0.5) * 100;
 }
 
+struct Lines {
+  float4 position : SV_Position;
+  nointerpolation uint value : VALUE;
+#if DISTANCES
+  float2 cull : SV_CullDistance;
+#endif
+};
+#if CULL_FLAG
+struct LineCull { bool culled : SV_CullPrimitive; };
+#endif
+[numthreads(LINE_THREADS, 1, 1)] [outputtopology("line")]
+void ms_lines(uint t : SV_GroupIndex, out vertices Lines v[LINE_VERTICES], out indices uint2 i[LINE_VERTICES - 1]
+#if CULL_FLAG
+        , out primitives LineCull p[LINE_VERTICES - 1]
+#endif
+        ) {
+  SetMeshOutputCounts(line_count ? line_count + 1 : 0, line_count);
+  for (uint m = t; line_count && m <= line_count; m += LINE_THREADS) {
+    v[m].position = float4((m + 0.25) / SIZE * 2 - 1, 1 - (line_row + 0.5) / SIZE * 2, 0, 1);
+    v[m].value = m + 1;
+#if DISTANCES
+    v[m].cull = float2(m % 4 ? (m % 2 ? -1.0 : asfloat(0x7fc00000)) : 0.0, 1.0);
+#endif
+  }
+  for (uint n = t; n < LINE_VERTICES - 1; n += LINE_THREADS) {
+    uint k = LINE_VERTICES - 2 - n;
+    if (k < line_count) {
+      i[k] = uint2(k, k + 1);
+#if CULL_FLAG
+      p[k].culled = k % 4 == 1 || k % 4 == 2;
+#endif
+    }
+  }
+}
+
 // a payload every thread of the group writes one entry of, sent without a barrier of the shader's own
 struct Shared { uint values[THREADS]; };
 groupshared Shared together;
@@ -156,8 +195,13 @@ main(int argc, char **argv) {
     printf("skipped: dxcompiler.dll not found\n");
     return 77;
   }
+  // D3D12 Mesh Shader specification, "Mesh shader max output verts": 256
+  const UINT line_threads = 32, line_vertices = 256, lines_row = 24;
   // 30 registers of four scalars beside the position: Metal passes 124 components to a pixel shader, Direct3D 128
-  const UINT size = 32, groups = 3, array_rows = 3, many = 120, threads = 128, first_groups = 2;
+  const UINT size = line_vertices, groups = 3, array_rows = 3, many = 120, threads = 128, first_groups = 2;
+  const UINT line_counts[] = {0, 1, 2, line_threads - 1, line_threads, line_threads + 1,
+                              2 * line_threads - 1, 2 * line_threads, 2 * line_threads + 1,
+                              line_vertices - 2, line_vertices - 1};
   const UINT parts_row = 0, rows_row = 2, many_row = 4, shared_row = 6, first_row = 8, cull_row = 10;
   enum : UINT { zero, in, out, nan };
   struct Pattern {
@@ -196,6 +240,8 @@ main(int argc, char **argv) {
   }
   std::vector<std::string> defines = {
       "SIZE=" + std::to_string(size),
+      "LINE_THREADS=" + std::to_string(line_threads),
+      "LINE_VERTICES=" + std::to_string(line_vertices),
       "PARTS_ROW=" + std::to_string(parts_row),
       "ROWS_ROW=" + std::to_string(rows_row),
       "ROWS=" + std::to_string(array_rows),
@@ -218,6 +264,7 @@ main(int argc, char **argv) {
       "CULLS=" + list([&](UINT p) { return std::to_string(patterns[p].culls); }, pattern_count),
   };
   auto compile = [&](const char *entry, const char *stage) { return compiler.compile(hlsl, entry, stage, defines); };
+  auto value_ps = compile("ps_value", "ps_6_5");
   struct Case {
     const char *name;
     std::string as, ms, ps;
@@ -227,8 +274,8 @@ main(int argc, char **argv) {
       {"parts", {}, compile("ms_parts", "ms_6_5"), compile("ps_parts", "ps_6_5"), groups},
       {"rows", {}, compile("ms_rows", "ms_6_5"), compile("ps_rows", "ps_6_5"), groups},
       {"many", {}, compile("ms_many", "ms_6_5"), compile("ps_many", "ps_6_5"), groups},
-      {"shared", compile("as_shared", "as_6_5"), compile("ms_shared", "ms_6_5"), compile("ps_value", "ps_6_5"), groups},
-      {"first", compile("as_first", "as_6_5"), compile("ms_first", "ms_6_5"), compile("ps_value", "ps_6_5"), 1},
+      {"shared", compile("as_shared", "as_6_5"), compile("ms_shared", "ms_6_5"), value_ps, groups},
+      {"first", compile("as_first", "as_6_5"), compile("ms_first", "ms_6_5"), value_ps, 1},
       {"cull", {}, compile("ms_cull", "ms_6_5"), compile("ps_cull", "ps_6_5"), pattern_count / 2},
   };
   for (auto &c : cases)
@@ -236,6 +283,15 @@ main(int argc, char **argv) {
       printf("skipped: mesh shaders are shader model 6.5\n");
       return 77;
     }
+  std::string line_shaders[3];
+  for (UINT mode = 0; mode < std::size(line_shaders); mode++) {
+    auto line_defines = defines;
+    line_defines.push_back("DISTANCES=" + std::to_string(mode != 0));
+    line_defines.push_back("CULL_FLAG=" + std::to_string(mode != 1));
+    line_shaders[mode] = compiler.compile(hlsl, "ms_lines", "ms_6_5", line_defines);
+    if (!expect(!line_shaders[mode].empty(), "line shader %u compiled", mode))
+      return verdict();
+  }
   ComPtr<ID3D12Device2> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
@@ -244,7 +300,7 @@ main(int argc, char **argv) {
     printf("failed: mesh shaders are not supported\n");
     return 1;
   }
-  const UINT constants[] = {1, array_rows, 0x7fc00000};
+  const UINT constants[] = {1, array_rows, 0x7fc00000, 0, 0};
   D3D12_ROOT_PARAMETER parameter{D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS};
   parameter.Constants = {0, 0, (UINT)std::size(constants)};
   auto rs = root_signature(device.Get(), {1, &parameter});
@@ -274,6 +330,14 @@ main(int argc, char **argv) {
     }
   }
 
+  ComPtr<ID3D12PipelineState> line_pipelines[std::size(line_shaders)];
+  stream.as.data = {};
+  stream.ps.data = bytecode(value_ps);
+  for (UINT mode = 0; mode < std::size(line_shaders); mode++) {
+    stream.ms.data = bytecode(line_shaders[mode]);
+    CHECK(device->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&line_pipelines[mode])));
+  }
+
   // what the shaders draw
   const UINT untouched = ~0u;
   std::map<std::pair<UINT, UINT>, UINT> want;
@@ -301,7 +365,8 @@ main(int argc, char **argv) {
         want[{x, cull_row + p}] = 70 + p + (UINT)((distance(patterns[p].codes[1][2]) + 2) * 16 + 0.5f) * 100;
   }
 
-  const UINT64 row = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+  const UINT64 row = (size * sizeof(UINT) + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
+                     D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
   ComPtr<ID3D12Resource> target;
   D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
   D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0},
@@ -336,6 +401,18 @@ main(int argc, char **argv) {
     commands->SetPipelineState(c.pso.Get());
     commands->DispatchMesh(c.dispatched, 1, 1);
   }
+  for (UINT mode = 0; mode < std::size(line_shaders); mode++)
+    for (UINT n = 0; n < std::size(line_counts); n++) {
+      UINT count = line_counts[n], y = lines_row + mode * std::size(line_counts) + n;
+      step("mesh line culling mode %u, %u lines, row %u", mode, count, y);
+      commands->SetPipelineState(line_pipelines[mode].Get());
+      commands->SetGraphicsRoot32BitConstant(0, count, 3);
+      commands->SetGraphicsRoot32BitConstant(0, y, 4);
+      commands->DispatchMesh(1, 1, 1);
+      for (UINT x = 0; x < count; x++)
+        if (x % 4 != 1 && x % 4 != 2)
+          want[{x, y}] = x + 1;
+    }
   transition(commands.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT},
       src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -345,19 +422,13 @@ main(int argc, char **argv) {
   uint8_t *pixels;
   CHECK(readback->Map(0, nullptr, (void **)&pixels));
 
-  unsigned failures = 0;
+  step("mesh output pixels");
   for (UINT y = 0; y < size; y++)
     for (UINT x = 0; x < size; x++) {
       auto value = reinterpret_cast<const UINT *>(pixels + row * y)[x];
       auto it = want.find({x, y});
       auto expected = it == want.end() ? untouched : it->second;
-      if (value != expected && failures++ < 16)
-        printf("pixel %u,%u: %u, want %u\n", x, y, value, expected);
+      expect(value == expected, "pixel %u,%u: %u, want %u", x, y, value, expected);
     }
-  if (failures) {
-    printf("failed: %u wrong pixels\n", failures);
-    return 1;
-  }
-  printf("passed: %zu pixels drawn of %u\n", want.size(), size * size);
-  return 0;
+  return verdict();
 }

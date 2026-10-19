@@ -11,8 +11,10 @@
 // triangles per point and instance with RestartStrip between them, each covering one pixel two rows apart, the second
 // starting at its lower right corner, so a strip that ignored the cut would also cover the pixel between them; and
 // another emits a point per point and instance, which draws as a square one pixel wide (3.4.6). two more emit a
-// strip of triangles and one of lines whose middle vertices are behind a cull distance, negative or NaN: the
-// primitives made of those alone are discarded, the others drawn whole (15.4.2).
+// strip of triangles and two of lines with RestartStrip between them, whose middle vertices are behind a cull
+// distance, negative or NaN: the primitives made of those alone are discarded, the others drawn whole.
+// "Primitives will be completely discarded if the plane distance(s) for all of the vertices in the primitive
+// are are < 0." (D3D11.3 15.4.2). the second line strip has different vertex and primitive bases.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <array>
@@ -83,10 +85,16 @@ void gs_cull_triangles(point V v[1], inout TriangleStream<C> s) {
     s.Append(behind(m + 0.5, TRIANGLE_ROW + (m % 2 ? 0.9 : 0.1), m));
 }
 // line n runs from a quarter into pixel n of the row to a quarter into the next, and covers the first
-[maxvertexcount(CULL_VERTICES)]
+[maxvertexcount(CULL_VERTICES * LINE_STRIPS)]
 void gs_cull_lines(point V v[1], inout LineStream<C> s) {
-  for (uint m = 0; m < CULL_VERTICES; m++)
-    s.Append(behind(m + 0.25, LINE_ROW + 0.5, m));
+  for (uint strip = 0; strip < LINE_STRIPS; strip++) {
+    for (uint m = 0; m < CULL_VERTICES; m++) {
+      C o = behind(m + 0.25, LINE_ROW + strip * SIZE / LINE_STRIPS + 0.5, m);
+      o.value |= strip << 24;
+      s.Append(o);
+    }
+    s.RestartStrip();
+  }
 }
 uint ps(P p) : SV_Target { return p.value; }
 )hlsl";
@@ -99,11 +107,12 @@ main(int argc, char **argv) {
     return 77;
   }
   // rows the other shaders leave alone
-  const UINT size = 8, instances = 2, points = 3, cull_vertices = 5, triangle_row = 7, line_row = 3;
+  const UINT size = 16, instances = 2, points = 3, cull_vertices = 5, triangle_row = 7, line_row = 3, line_strips = 2;
   std::vector<std::string> defines = {
       "SIZE=" + std::to_string(size), "INSTANCES=" + std::to_string(instances),
       "CULL_VERTICES=" + std::to_string(cull_vertices), "TRIANGLE_ROW=" + std::to_string(triangle_row),
       "LINE_ROW=" + std::to_string(line_row),
+      "LINE_STRIPS=" + std::to_string(line_strips),
   };
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), gs_triangle = compiler.compile(hlsl, "gs_triangle", "gs", defines),
        gs_adjacency = compiler.compile(hlsl, "gs_adjacency", "gs", defines),
@@ -325,6 +334,7 @@ main(int argc, char **argv) {
   list->SetPipelineState(dot_pso.Get());
   list->DrawInstanced(points, 1, 0, 0);
   for (auto &pso : cull_psos) {
+    step("geometry cull strips");
     list->SetPipelineState(pso.Get());
     list->DrawInstanced(1, 1, 0, 0);
   }
@@ -359,20 +369,19 @@ main(int argc, char **argv) {
     if (n + 2 < cull_vertices && !(middle(n) && middle(n + 1) && middle(n + 2)))
       pixels[{n + 1, triangle_row}] = (n + 1) | 3 << 16;
     if (!(middle(n) && middle(n + 1)))
-      pixels[{n, line_row}] = (n + 1) | 3 << 16;
+      for (UINT strip = 0; strip < line_strips; strip++)
+        pixels[{n, line_row + strip * size / line_strips}] = (n + 1) | 3 << 16 | strip << 24;
   }
   for (UINT y = 0; y < size; y++)
     for (UINT x = 0; x < size; x++) {
       auto value = reinterpret_cast<const UINT *>(out + row * y)[x];
       auto it = pixels.find({x, y});
       auto expected = it == pixels.end() ? untouched : it->second;
-      if (value != expected && failures++ < 8)
-        printf("pixel %u,%u: %#x, want %#x\n", x, y, value, expected);
+      expect(value == expected, "pixel %u,%u: %#x, want %#x", x, y, value, expected);
     }
   if (failures) {
     printf("failed: %u wrong records or pixels\n", failures);
     return 1;
   }
-  printf("passed: %zu primitives, %u pixels\n", want.size(), size * size);
-  return 0;
+  return verdict();
 }

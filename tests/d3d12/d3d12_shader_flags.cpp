@@ -17,6 +17,9 @@ static const struct {
               {"2", true},
               {"4", true},
               {"7", true},
+              {"8", true},
+              {"0x8", true},
+              {"15", true},
               {"0x4", true},
               {"0x20", true},
               {"04", true},
@@ -32,7 +35,8 @@ static const struct {
               {" ", false},
               {"0x", false},
               {"08", false},
-              {"8", false}};
+              {"16", false},
+              {"0x34", false}};
 static const char hlsl[] = R"hlsl(
 RWByteAddressBuffer output : register(u0);
 [numthreads(1, 1, 1)] void cs() { output.Store(0, VALUE); }
