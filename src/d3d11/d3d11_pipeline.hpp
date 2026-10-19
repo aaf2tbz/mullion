@@ -30,6 +30,7 @@ struct MTL_GRAPHICS_PIPELINE_DESC {
   // stage passes the vertex shader's primitives on to the rasterizer; without that it only streams output
   uint32_t InputPrimitive;
   bool PassThrough;
+  bool PipelineStatistics = false;
 };
 
 struct MTL_COMPUTE_PIPELINE_DESC {
@@ -79,6 +80,7 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
     state.add((size_t)v.SOLayout);
     state.add((size_t)v.InputPrimitive);
     state.add((size_t)v.PassThrough);
+    state.add(v.PipelineStatistics);
     state.add((size_t)v.SampleCount);
     state.add((size_t)v.NumColorAttachments);
     for (unsigned i = 0; i < v.NumColorAttachments; i++) {
@@ -149,7 +151,8 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
            (x.IndexBufferFormat == y.IndexBufferFormat) &&
            (x.SampleMask == y.SampleMask) &&
            (x.GSPassthrough == y.GSPassthrough) && (x.SOLayout == y.SOLayout) &&
-           (x.InputPrimitive == y.InputPrimitive) && (x.PassThrough == y.PassThrough);
+           (x.InputPrimitive == y.InputPrimitive) && (x.PassThrough == y.PassThrough) &&
+           (x.PipelineStatistics == y.PipelineStatistics);
   }
 };
 } // namespace std
@@ -161,7 +164,8 @@ public:
   /**
   NOTE: the current thread is blocked if it's not ready
    */
-  virtual void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pGraphicsPipeline) = 0;
+  const MTL_GRAPHICS_PIPELINE_DESC *description;
+  virtual void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pGraphicsPipeline, bool statistics = false) = 0;
 };
 
 class MTLCompiledComputePipeline : public ThreadpoolWork {
@@ -171,12 +175,14 @@ public:
 
 class MTLCompiledGeometryPipeline : public ThreadpoolWork {
 public:
-  virtual void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pGeometryPipeline) = 0;
+  const MTL_GRAPHICS_PIPELINE_DESC *description;
+  virtual void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pGeometryPipeline, bool statistics = false) = 0;
 };
 
 class MTLCompiledTessellationMeshPipeline : public ThreadpoolWork {
 public:
-  virtual void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pTessellationPipeline) = 0;
+  const MTL_GRAPHICS_PIPELINE_DESC *description;
+  virtual void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pTessellationPipeline, bool statistics = false) = 0;
 };
 
 std::unique_ptr<MTLCompiledGraphicsPipeline>

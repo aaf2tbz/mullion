@@ -276,6 +276,8 @@ public:
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE:
     case D3D11_QUERY_PIPELINE_STATISTICS: {
+      if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS)
+        InvalidateCurrentPass(true);
       auto building_query = ctx_state.building_visibility_queries.find(pAsync);
       if (building_query != ctx_state.building_visibility_queries.end()) {
         End(pAsync);
@@ -378,6 +380,7 @@ public:
         auto &regions = ctx_state.current_cmdlist->regions;
         regions.back().pipeline_query = static_cast<MTLD3D11OcclusionQuery *>(pAsync);
         regions.emplace_back();
+        InvalidateCurrentPass(true);
       }
       break;
     }

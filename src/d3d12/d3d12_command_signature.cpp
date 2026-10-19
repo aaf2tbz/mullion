@@ -87,6 +87,10 @@ struct dxmt_vertex_buffer {
   uint length;
 };
 
+struct dxmt_draw_statistics {
+  ulong pixels, primitives, vertices;
+};
+
 struct dxmt_render_command_data {
   command_buffer cmd_buf;
   ulong max_count;
@@ -116,15 +120,35 @@ struct dxmt_render_command_data {
   device dxmt_indirect_mesh_draw * draws;
   device ushort * zeros;
   uint zero_count;
+  device dxmt_draw_statistics *pixel_statistics;
+  device dxmt_draw_statistics *statistics;
+  uint statistics_first, statistics_step, statistics_cut, statistics_cuts;
   packed_uint2 execution_range;
 };
 
 )";
 
 class MTLD3D12CommandSignatureImpl : public MTLD3D12Pageable<MTLD3D12CommandSignature> {
+  WMT::Reference<WMT::Library> statistics_library_;
+  WMT::Reference<WMT::ComputePipelineState> statistics_resolver_;
+  dxmt::mutex statistics_mutex_;
 
 public:
   MTLD3D12CommandSignatureImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12CommandSignature>(pDevice) {}
+
+  WMT::ComputePipelineState StatisticsResolver() override {
+    std::lock_guard lock(statistics_mutex_);
+    if (!statistics_resolver_) {
+      WMT::Reference<WMT::Error> error;
+      auto function = statistics_library_.newFunction("count_indirect_strips");
+      statistics_resolver_ = device_->GetMTLDevice().newComputePipelineState(function, error);
+      if (!statistics_resolver_) {
+        ERR("Failed to create indirect statistics pipeline: ", error.description().getUTF8String());
+        abort();
+      }
+    }
+    return statistics_resolver_;
+  }
 
   HRESULT
   Initialize(const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature) {
@@ -290,6 +314,11 @@ public:
     source << "if (i >= command_data.max_count) return;\n";
     if (is_compute && !rays)
       source << "if (command_data.statistics) command_data.statistics[i] = 0;\n";
+    if (!is_compute)
+      source << "if (command_data.statistics && !command_data.statistics_cuts) {\n"
+                "command_data.statistics[i] = {};\n"
+                "if (!i) *command_data.pixel_statistics = {};\n"
+                "}\n";
     if (!rays)
       source << (is_compute ? "if (i >= count && !command_data.dispatches) return;\n"
                               : "if (i >= count && !command_data.draws) return;\n");
@@ -343,6 +372,9 @@ public:
           source << command << ".set_fragment_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
           source << command << ".set_fragment_buffer(command_data.static_samplers,"
                  << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
+          source << "if (command_data.pixel_statistics) " << command
+                 << ".set_fragment_buffer(command_data.pixel_statistics," << SM50_BINDING_INDEX_PIPELINE_STATISTICS
+                 << ");\n";
         }
         if (indexed)
           source << "}\n";
@@ -351,10 +383,23 @@ public:
     if (!is_compute)
       source << "}\n";
 
+    auto statistics = [&](bool indexed) {
+      const char *arguments = indexed ? "arg.draw_indexed" : "arg.draw";
+      source << "if (command_data.statistics && command_data.statistics_first && !command_data.statistics_cuts) {\n"
+             << "ulong vertices = " << arguments
+             << (indexed ? ".index_count_per_instance" : ".vertex_count_per_instance") << ", instances = " << arguments
+             << ".instance_count;\n"
+                "ulong first = command_data.statistics_first, step = command_data.statistics_step;\n"
+                "ulong primitives = vertices >= first ? (vertices - first) / step + 1 : 0;\n";
+      source << "command_data.statistics[i].vertices = vertices * instances;\n"
+                "command_data.statistics[i].primitives = primitives * instances;\n}\n";
+    };
+
     for (unsigned i = 0; i < pDesc->NumArgumentDescs; i++) {
       auto &arg = pDesc->pArgumentDescs[i];
       switch (arg.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
+        statistics(false);
         most("draw", "vertex_count_per_instance", "start_vertex_location", "start_vertex_location");
         tessellate(
             "draw", "vertex_count_per_instance", "command_data.index_buffer_view",
@@ -372,6 +417,7 @@ public:
           source << "device void* ib = command_data.index_buffer;\n";
           source << "uint ib_bytes = command_data.index_buffer_size;\n";
         }
+        statistics(true);
         most("draw_indexed", "index_count_per_instance", "start_index_location", "base_vertex_location");
         tessellate(
             "draw_indexed", "index_count_per_instance",
@@ -521,6 +567,43 @@ public:
     source << "}\n"
               "};\n";
 
+    if (indexed) {
+      source << "[[kernel]] void count_indirect_strips(device dxmt_render_command_data &data [[buffer(30)]],\n"
+                "uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],\n"
+                "uint3 group_size [[threads_per_threadgroup]]) {\n"
+                "uint i = group.x, lanes = group_size.x;\n"
+                "if (i >= data.max_count) return;\n"
+                "uint count = data.max_count_buffer ? min(ulong(*data.max_count_buffer), data.max_count)\n"
+                "                                  : data.max_count;\n"
+                "if (!lane) { data.statistics[i] = {}; if (!i) *data.pixel_statistics = {}; }\n"
+                "if (i >= count) return;\n"
+                "device d3d12_arguments &arg = *reinterpret_cast<device d3d12_arguments *>(data.argument_buffer + i * "
+             << pDesc->ByteStride << ");\n";
+      if (ib_index != ~0u)
+        source << "auto ib = arg.ib;\n";
+      else
+        source << "d3d12_index_buffer_view ib{data.index_buffer, data.index_buffer_size, data.index_buffer_format};\n";
+      source << "ulong vertices = arg.draw_indexed.index_count_per_instance;\n"
+                "ulong instances = arg.draw_indexed.instance_count;\n"
+                "uint first = data.statistics_first, step = data.statistics_step;\n"
+                "uint scanners = step == 1 ? lanes : 1;\n"
+                "ulong length = (vertices + scanners - 1) / scanners;\n"
+                "ulong lo = min(ulong(lane) * length, vertices), hi = min(lo + length, vertices);\n"
+                "uint run = 0, primitives = 0, stride = ib.format == " << DXGI_FORMAT_R32_UINT
+             << " ? sizeof(uint) : sizeof(ushort);\n"
+                "for (ulong at = lo - min(lo, ulong(first - 1)); at < hi; at++) {\n"
+                "uint offset = (arg.draw_indexed.start_index_location + uint(at)) * stride, value = 0;\n"
+                "if (ib.buffer && ulong(offset) + stride <= ib.size_in_bytes) {\n"
+                "auto address = reinterpret_cast<device const uchar *>(ib.buffer) + offset;\n"
+                "value = stride == sizeof(uint) ? *reinterpret_cast<device const uint *>(address)\n"
+                "                              : *reinterpret_cast<device const ushort *>(address);\n}\n"
+                "run = value == data.statistics_cut ? 0 : run + 1;\n"
+                "if (at >= lo && run >= first && (run - first) % step == 0) primitives++;\n}\n"
+                "uint total = simd_sum(primitives);\n"
+                "if (!lane) { data.statistics[i].vertices = vertices * instances;\n"
+                "data.statistics[i].primitives = ulong(total) * instances; }\n}\n";
+    }
+
     WMT::Reference<WMT::Error> err;
     auto lib = device_->GetMTLDevice().newLibraryWithSource(source.view(), err);
 
@@ -529,6 +612,8 @@ public:
       return E_FAIL;
     }
 
+    if (indexed)
+      statistics_library_ = lib;
     auto function = lib.newFunction("resolve_indirect_commands");
 
     if (!function) {

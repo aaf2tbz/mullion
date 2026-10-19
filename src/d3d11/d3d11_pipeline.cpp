@@ -32,7 +32,7 @@ public:
       PixelShader = pDesc->PixelShader->get_pixel_shader(ShaderVariantPixel{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
-          unorm_output_reg_mask}, {rtv_formats, num_rtvs});
+          unorm_output_reg_mask, pDesc->PipelineStatistics}, {rtv_formats, num_rtvs});
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;
@@ -40,7 +40,14 @@ public:
     }
   }
 
-  void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline) final {
+  void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline, bool statistics) final {
+    if (statistics && description->PixelShader && !description->PipelineStatistics) {
+      auto desc = *description;
+      desc.PipelineStatistics = true;
+      MTLCompiledGraphicsPipeline *pipeline;
+      device_->CreateGraphicsPipeline(&desc, &pipeline);
+      return pipeline->GetPipeline(pPipeline);
+    }
     ready_.wait(false, std::memory_order_acquire);
     *pPipeline = {state_};
   }

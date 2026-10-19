@@ -10,10 +10,8 @@
 
 namespace dxmt {
 
-// a geometry draw's object threadgroup (SM50GeometryWarp) for `topology`, from a vertex shader with `registers`
-// output registers
-inline SM50_GEOMETRY_WARP
-get_gs_warp(D3D_PRIMITIVE_TOPOLOGY topology, uint32_t registers) {
+// the vertices of the first primitive and of each following one (D3D11.3 8, primitive topologies)
+inline std::pair<uint32_t, uint32_t> get_primitive_vertex_count(D3D_PRIMITIVE_TOPOLOGY topology) {
   uint32_t per_primitive;
   switch (topology) {
   case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
@@ -42,7 +40,15 @@ get_gs_warp(D3D_PRIMITIVE_TOPOLOGY topology, uint32_t registers) {
   }
   bool strip = topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
                topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ || topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
-  return SM50GeometryWarp(per_primitive, strip, registers);
+  return {per_primitive, strip ? (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ ? 2u : 1u) : per_primitive};
+}
+
+// a geometry draw's object threadgroup (SM50GeometryWarp) for `topology`, from a vertex shader with `registers`
+// output registers
+inline SM50_GEOMETRY_WARP
+get_gs_warp(D3D_PRIMITIVE_TOPOLOGY topology, uint32_t registers) {
+  auto [per_primitive, step] = get_primitive_vertex_count(topology);
+  return SM50GeometryWarp(per_primitive, step != per_primitive, registers);
 }
 
 // a geometry draw's object threadgroups: the vertices each reads, and how far the next one starts

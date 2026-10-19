@@ -370,6 +370,7 @@ public:
 
   // both run as kernels: the one of draws in a compute pass before the render pass that runs its commands
   WMT::Reference<WMT::ComputePipelineState> render_resolver;
+  virtual WMT::ComputePipelineState StatisticsResolver() = 0;
   WMT::Reference<WMT::ComputePipelineState> compute_resolver;
 
   virtual void AddRefPrivate() = 0;
@@ -443,6 +444,7 @@ public:
   uint32_t object_threads[3] = {1, 1, 1}, mesh_threads[3] = {1, 1, 1};
   // whether it has a pixel shader, which PSInvocations count
   bool pixel_shader = false;
+  D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
   uint32_t slot_mask = 0;
   uint32_t rtv_mask = 0, dsv_mask = 0;
   enum WMTTriangleFillMode fill_mode;
@@ -456,8 +458,8 @@ public:
   // D3D12_DEPTH_STENCIL_DESC1::DepthBoundsTestEnable, on a device that has the test
   bool depth_bounds = false;
 
-  virtual WMT::RenderPipelineState
-  RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar) = 0;
+  virtual WMT::RenderPipelineState RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar,
+                                                 bool Statistics = false) = 0;
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
 };
 

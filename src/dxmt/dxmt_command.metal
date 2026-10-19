@@ -28,6 +28,64 @@
 using namespace metal;
 using namespace dxmt;
 
+// the strip scan's threads add to a count the draw before them zeroed: a Direct3D 12 command list runs again with the
+// same counts
+static void add_count(device ulong &count, ulong value) {
+  auto words = reinterpret_cast<device atomic_uint *>(&count);
+  uint low = atomic_fetch_add_explicit(words, uint(value), memory_order_relaxed);
+  atomic_fetch_add_explicit(words + 1, uint(value >> (sizeof(uint) * __CHAR_BIT__)) + uint(low > ~uint(0) - uint(value)),
+                            memory_order_relaxed);
+}
+
+[[vertex]] void pipeline_statistics_draw(constant PipelineStatisticsDraw &draw
+                                         [[buffer(kCustomBufferArgumentIndex0)]]) {
+  auto result = reinterpret_cast<device PipelineStatisticsResult *>(draw.result);
+  *result = {};
+  if (!draw.first || (draw.skips && *reinterpret_cast<device const uint *>(draw.skips)))
+    return;
+  ulong vertices = draw.vertices, instances = draw.instances;
+  if (draw.arguments) {
+    auto arguments = reinterpret_cast<device const uint *>(draw.arguments);
+    vertices = arguments[0];
+    instances = arguments[1];
+    result->vertices = vertices * instances;
+  }
+  ulong primitives = vertices >= draw.first ? (vertices - draw.first) / draw.step + 1 : 0;
+  if (draw.cut && draw.index_stride)
+    primitives = 0;
+  result->primitives = (primitives - draw.primitives) * instances;
+}
+
+[[vertex]] void pipeline_statistics_strip(constant PipelineStatisticsDraw &draw [[buffer(kCustomBufferArgumentIndex0)]],
+                                         uint lane [[vertex_id]]) {
+  if (draw.skips && *reinterpret_cast<device const uint *>(draw.skips))
+    return;
+  ulong vertices = draw.vertices, instances = draw.instances;
+  uint start = draw.start;
+  if (draw.arguments) {
+    auto arguments = reinterpret_cast<device const uint *>(draw.arguments);
+    vertices = arguments[0];
+    instances = arguments[1];
+    start += arguments[2];
+  }
+  ulong length = (vertices + draw.threads - 1) / draw.threads;
+  ulong lo = min(ulong(lane) * length, vertices), hi = min(lo + length, vertices);
+  ulong run = 0, primitives = 0;
+  // the preceding vertices let each run count primitives that end in it (D3D11.3 8.12).
+  for (ulong i = lo - min(lo, draw.first - 1); i < hi; i++) {
+    uint offset = (start + uint(i)) * uint(draw.index_stride), index = 0;
+    if (draw.indices && ulong(offset) + draw.index_stride <= draw.index_bytes) {
+      auto address = reinterpret_cast<device const uchar *>(draw.indices) + offset;
+      index = draw.index_stride == sizeof(ushort) ? *reinterpret_cast<device const ushort *>(address)
+                                                : *reinterpret_cast<device const uint *>(address);
+    }
+    run = index == draw.cut ? 0 : run + 1;
+    if (i >= lo && run >= draw.first && (run - draw.first) % draw.step == 0)
+      primitives++;
+  }
+  add_count(reinterpret_cast<device PipelineStatisticsResult *>(draw.result)->primitives, primitives * instances);
+}
+
 [[kernel]] void clear_texture_1d_uint(
     texture1d<uint, access::read_write> tex [[texture(0)]],
     constant uint4& value [[buffer(1)]],
@@ -875,18 +933,17 @@ struct VisibilitySlot {
 }
 
 // a pipeline statistics query's result (D3D12_QUERY_DATA_PIPELINE_STATISTICS or ..._STATISTICS1, `size` counts): the
-// counts known when its work was recorded, plus the samples its pass segments with a pixel shader passed (PSInvocations)
-// and the threads of its indirect dispatches (CSInvocations)
+// counts known when its work was recorded, plus its GPU draw counts and indirect dispatches
 struct PipelineStatisticsSum {
   ulong counts[14];
   uint query;
   uint size;
-  uint first_slot;
-  uint slot_count;
   uint first_dispatch;
   uint dispatch_count;
   uint first_predicated;
   uint predicated_count;
+  uint first_draw;
+  uint draw_count;
 };
 
 struct IndirectInvocations {
@@ -899,22 +956,28 @@ struct PredicatedStatistics {
   device const uint *skips;
 };
 
-[[kernel]] void sum_pipeline_statistics(
-    constant PipelineStatisticsSum *sums [[buffer(0)]],
-    constant VisibilitySlot *slots [[buffer(1)]],
-    constant uint *slot_shades [[buffer(2)]],
-    constant IndirectInvocations *dispatches [[buffer(3)]],
-    device ulong *results [[buffer(4)]],
-    constant PredicatedStatistics *predicated [[buffer(5)]],
-    uint i [[thread_position_in_grid]]
-) {
+struct DrawStatisticsSlot {
+  device const PipelineStatisticsResult *count;
+};
+
+[[kernel]] void sum_pipeline_statistics(constant PipelineStatisticsSum *sums [[buffer(0)]],
+                                        constant IndirectInvocations *dispatches [[buffer(1)]],
+                                        device ulong *results [[buffer(2)]],
+                                        constant PredicatedStatistics *predicated [[buffer(3)]],
+                                        constant DrawStatisticsSlot *draws [[buffer(4)]],
+                                        uint i [[thread_position_in_grid]]) {
   constant PipelineStatisticsSum &sum = sums[i];
   device ulong *result = results + ulong(sum.query) * sum.size;
   for (uint k = 0; k < sum.size; k++)
     result[k] = sum.counts[k];
-  for (uint k = sum.first_slot; k < sum.first_slot + sum.slot_count; k++)
-    if (slot_shades[k])
-      result[7] += *slots[k].count;
+  for (uint k = sum.first_draw; k < sum.first_draw + sum.draw_count; k++) {
+    result[7] += draws[k].count->pixels;
+    result[1] += draws[k].count->primitives;
+    result[5] += draws[k].count->primitives;
+    result[6] += draws[k].count->primitives;
+    result[0] += draws[k].count->vertices;
+    result[2] += draws[k].count->vertices;
+  }
   for (uint k = sum.first_dispatch; k < sum.first_dispatch + sum.dispatch_count; k++)
     for (ulong c = 0; c < dispatches[k].length; c++)
       result[10] += dispatches[k].counts[c];

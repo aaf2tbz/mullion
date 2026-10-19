@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Metal.hpp"
+#include "../airconv/airconv_public.h"
 #include "dxmt_buffer.hpp"
 #include "dxmt_command_constants.hpp"
 #include "dxmt_texture.hpp"
@@ -9,6 +10,55 @@
 #include <unordered_map>
 
 namespace dxmt {
+
+template <typename Emit>
+void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT::RenderPipelineState restore,
+                                  WMT::Buffer arguments, uint64_t offset, WMT::Buffer result, uint64_t result_offset,
+                                  WMT::RenderPipelineState scan = {}, uint32_t scanners = 0) {
+  auto &resource = emit.template operator()<wmtcmd_render_useresource>();
+  resource.type = WMTRenderCommandUseResource;
+  resource.resource = result;
+  resource.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
+  resource.stages = WMTRenderStageVertex | WMTRenderStageFragment;
+  auto &pipeline = emit.template operator()<wmtcmd_render_setpso>();
+  pipeline.type = WMTRenderCommandSetPSO;
+  pipeline.pso = count;
+  auto &input = emit.template operator()<wmtcmd_render_setbuffer>();
+  input.type = WMTRenderCommandSetVertexBuffer;
+  input.buffer = arguments;
+  input.offset = offset;
+  input.index = kCustomBufferArgumentIndex0;
+  auto &draw = emit.template operator()<wmtcmd_render_draw>();
+  draw.type = WMTRenderCommandDraw;
+  draw.primitive_type = WMTPrimitiveTypePoint;
+  draw.vertex_start = draw.base_instance = 0;
+  draw.vertex_count = draw.instance_count = 1;
+  auto &zeroed = emit.template operator()<wmtcmd_render_memory_barrier>();
+  zeroed.type = WMTRenderCommandMemoryBarrier;
+  zeroed.scope = WMTBarrierScopeBuffers;
+  zeroed.stages_after = WMTRenderStageVertex;
+  zeroed.stages_before = WMTRenderStageVertex | WMTRenderStageFragment;
+  if (scan) {
+    auto &strip_pipeline = emit.template operator()<wmtcmd_render_setpso>();
+    strip_pipeline.type = WMTRenderCommandSetPSO;
+    strip_pipeline.pso = scan;
+    auto &strips = emit.template operator()<wmtcmd_render_draw>();
+    strips.type = WMTRenderCommandDraw;
+    strips.primitive_type = WMTPrimitiveTypePoint;
+    strips.vertex_start = strips.base_instance = 0;
+    strips.vertex_count = scanners;
+    strips.instance_count = 1;
+  }
+  auto &pixel = emit.template operator()<wmtcmd_render_setbuffer>();
+  pixel.type = WMTRenderCommandSetFragmentBuffer;
+  pixel.buffer = result;
+  pixel.offset = result_offset;
+  pixel.index = SM50_BINDING_INDEX_PIPELINE_STATISTICS;
+  auto &previous = emit.template operator()<wmtcmd_render_setpso>();
+  previous.type = WMTRenderCommandSetPSO;
+  previous.pso = restore;
+}
+
 struct TileBarrierPSOKey {
   WMTPixelFormat color_formats[8];
   unsigned raster_sample_count;
@@ -46,9 +96,13 @@ public:
   getLibrary() {
     return library_;
   }
+  WMT::RenderPipelineState PipelineStatistics(bool scan = false);
 
 private:
   WMT::Reference<WMT::Library> library_;
+  WMT::Device device_;
+  dxmt::mutex statistics_mutex_;
+  WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2];
 };
 
 class EmulatedCommandContext {
@@ -184,6 +238,8 @@ public:
     encoder.drawPrimitives(WMTPrimitiveTypePoint, 0, 1);
     encoder.setVertexBuffer({}, 0, kCustomBufferArgumentIndex0);
   }
+
+  uint32_t SIMDWidth() const { return clear_buffer_uint_pipeline.threadExecutionWidth(); }
 
 private:
   void setComputePipelineState(WMT::ComputePipelineState state, const WMTSize &threadgroup_size);

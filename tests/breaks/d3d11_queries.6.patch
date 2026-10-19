@@ -1,8 +1,8 @@
 --- a/src/d3d11/d3d11_context_imm.cpp
 +++ b/src/d3d11/d3d11_context_imm.cpp
-@@ -288,7 +288,7 @@
-     case D3D11_QUERY_OCCLUSION_PREDICATE:
-     case D3D11_QUERY_PIPELINE_STATISTICS: {
+@@ -290,7 +290,7 @@
+       if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS)
+         InvalidateCurrentPass(true);
        if (static_cast<MTLD3D11Query *>(pAsync)->state_ == QueryState::Building)
 -        End(pAsync);
 +        return;

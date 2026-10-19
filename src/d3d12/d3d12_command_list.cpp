@@ -23,6 +23,7 @@
 #include "com/com_pointer.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_geometry.hpp"
+#include "dxmt_command.hpp"
 #include <span>
 #include "util_env.hpp"
 
@@ -214,10 +215,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   std::vector<uint64_t> visibility_slots_;
   std::vector<std::pair<MTLD3D12QueryHeap *, OcclusionSum>> occlusion_sums_;
 
-  // running and ended queries retain their visibility slots and indirect dispatches until summed into the heap
+  // running and ended queries retain their GPU draw counts and indirect dispatches until summed into the heap
   struct StatisticsSum {
     uint64_t counts[14];
-    uint32_t query, size, first_slot, slot_count, first_dispatch, dispatch_count, first_predicated, predicated_count;
+    uint32_t query, size, first_dispatch, dispatch_count, first_predicated, predicated_count;
+    uint32_t first_draw, draw_count;
   };
   struct PredicatedStatistics {
     uint64_t vertices, primitives, threads, skips;
@@ -229,7 +231,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   };
   std::vector<IndirectInvocations> indirect_dispatches_;
   std::vector<PredicatedStatistics> predicated_statistics_;
-  std::vector<uint32_t> visibility_shades_;
+  std::vector<uint64_t> draw_statistics_;
 
   // the primitives `vertices` vertices of the current topology make
   uint64_t
@@ -261,12 +263,47 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     }
   }
 
-  // adds a draw's input assembler, vertex shader and clipper counts to the running pipeline statistics queries. strip
-  // cuts and what geometry shaders and tessellation make are left out: the clipper counts the input's primitives
-  void
-  CountDraw(uint64_t vertices, uint64_t instances) {
+  // the GPU captures pixel executions and strip cuts before later work can change the draw's inputs
+  void CountDraw(uint64_t vertices, uint64_t instances, bool indexed = false, uint32_t start = 0) {
     if (active_statistics_.empty())
       return;
+    PipelineStatisticsDraw draw{};
+    draw.vertices = vertices;
+    draw.instances = instances;
+    draw.primitives = Primitives(vertices);
+    if (indexed && pso_graphics_->strip_cut != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED) {
+      draw.indices = index_view_.BufferLocation;
+      draw.index_bytes = index_view_.SizeInBytes;
+      draw.index_stride = index_view_.Format == DXGI_FORMAT_R32_UINT ? sizeof(uint32_t) : sizeof(uint16_t);
+      draw.start = start;
+      draw.cut = pso_graphics_->strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
+                     ? D3D12_16BIT_INDEX_STRIP_CUT_VALUE
+                     : D3D12_32BIT_INDEX_STRIP_CUT_VALUE;
+      auto [first, step] = get_primitive_vertex_count(topology_);
+      if (step != first)
+        draw.first = first, draw.step = step;
+    }
+    if (draw.cut && draw.first)
+      draw.threads = draw.step == 1 ? device_->GetSIMDWidth() : 1;
+    if (predication_region_)
+      draw.skips = allocator_->gpu_heap_buffer_address_ +
+                   (reinterpret_cast<char *>(predication_region_ + 3) - static_cast<char *>(allocator_->gpu_heap_));
+    auto [result, result_offset] =
+        allocator_->AllocateGPUHeap(sizeof(PipelineStatisticsResult), alignof(PipelineStatisticsResult));
+    if (allocator_->records_)
+      allocator_->RecordGPUHeap(result, sizeof(PipelineStatisticsResult), "draw statistics", 0,
+                                sizeof(PipelineStatisticsResult));
+    draw.result = allocator_->gpu_heap_buffer_address_ + result_offset;
+    draw_statistics_.push_back(draw.result);
+    auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(draw), alignof(PipelineStatisticsDraw));
+    if (allocator_->records_)
+      allocator_->RecordGPUHeap(mapped, sizeof(draw), "statistics draw");
+    memcpy(mapped, &draw, sizeof(draw));
+    EncodePipelineStatisticsDraw([&]<typename T>() -> T & { return allocator_->EncodeRenderCommand<T>(); },
+                                 device_->GetLib().PipelineStatistics(), Pipeline(), allocator_->gpu_heap_buffer_,
+                                 offset, allocator_->gpu_heap_buffer_, result_offset,
+                                 draw.threads ? device_->GetLib().PipelineStatistics(true) : WMT::RenderPipelineState{},
+                                 draw.threads);
     uint64_t primitives = Primitives(vertices) * instances;
     vertices *= instances;
     if (predication_region_) {
@@ -297,14 +334,13 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     cmd.type = WMTRenderCommandSetVisibilityMode;
     cmd.mode = WMTVisibilityResultModeDisabled;
     cmd.offset = 0;
-    if (active_queries_.empty() && active_statistics_.empty())
+    if (active_queries_.empty())
       return;
     auto [window, address, offset] = allocator_->VisibilitySlot();
     // a pass counts in one window: when that is full the pass ends, and the next pass counts in the next window
     if (render->visibility_buffer && render->visibility_buffer != window.handle)
       return allocator_->InvalidateCurrentPass();
     visibility_slots_.push_back(address);
-    visibility_shades_.push_back(pso_graphics_ && pso_graphics_->pixel_shader);
     render->visibility_buffer = window;
     cmd.mode = WMTVisibilityResultModeCounting;
     cmd.offset = offset;
@@ -461,8 +497,6 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
         memcpy(mapped, data, length);
       return offset;
     };
-    auto slots = upload(visibility_slots_.data(), visibility_slots_.size() * sizeof(uint64_t), "statistics slots");
-    auto shades = upload(visibility_shades_.data(), visibility_shades_.size() * sizeof(uint32_t), "statistics shades");
     auto dispatches = upload(
         indirect_dispatches_.data(), indirect_dispatches_.size() * sizeof(IndirectInvocations), "statistics dispatches"
     );
@@ -470,12 +504,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
         predicated_statistics_.data(), predicated_statistics_.size() * sizeof(PredicatedStatistics),
         "predicated statistics"
     );
-    for (auto &window : allocator_->visibility_) {
-      auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_useresource>();
-      cmd.type = WMTComputeCommandUseResource;
-      cmd.usage = WMTResourceUsageRead;
-      cmd.resource = window;
-    }
+    auto draws =
+        upload(draw_statistics_.data(), draw_statistics_.size() * sizeof(uint64_t), "draw statistics addresses");
     std::stable_sort(statistics_sums_.begin(), statistics_sums_.end(), [](auto &x, auto &y) { return x.first < y.first; });
     for (auto first = statistics_sums_.begin(); first != statistics_sums_.end();) {
       auto last = std::find_if(first, statistics_sums_.end(), [&](auto &x) { return x.first != first->first; });
@@ -488,11 +518,10 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       cmd_setpso.threadgroup_size = {1, 1, 1};
       const std::pair<obj_handle_t, uint64_t> buffers[] = {
           {allocator_->gpu_heap_buffer_, upload(sums.data(), sums.size() * sizeof(StatisticsSum), "statistics sums")},
-          {allocator_->gpu_heap_buffer_, slots},
-          {allocator_->gpu_heap_buffer_, shades},
           {allocator_->gpu_heap_buffer_, dispatches},
           {first->first->results, 0},
           {allocator_->gpu_heap_buffer_, predicated},
+          {allocator_->gpu_heap_buffer_, draws},
       };
       for (uint8_t i = 0; i < std::size(buffers); i++) {
         auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
@@ -591,8 +620,8 @@ public:
     active_statistics_.clear();
     statistics_sums_.clear();
     indirect_dispatches_.clear();
+    draw_statistics_.clear();
     predicated_statistics_.clear();
-    visibility_shades_.clear();
     predicated_.clear();
     predication_region_ = nullptr;
     left_for_later_ = false;
@@ -807,7 +836,7 @@ public:
       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef, DirtyState::DepthBounds);
       depth_bounds_set_ = false;
       dirty_state_.set(DirtyState::GraphicsPipelineState);
-      if (!active_queries_.empty() || !active_statistics_.empty())
+      if (!active_queries_.empty())
         CountVisibility();
     }
 
@@ -1053,7 +1082,7 @@ public:
     for (unsigned i = 0; i < std::size(pass->colors); i++)
       if (pass->colors[i].attachment)
         mask |= 1u << i;
-    return pso_graphics_->RenderTargets(Pipeline, mask, pass->dsv_planar_flags);
+    return pso_graphics_->RenderTargets(Pipeline, mask, pass->dsv_planar_flags, !active_statistics_.empty());
   }
 
   // the pipeline's variant for the topology: a geometry pipeline has one for strips, and with stream output one
@@ -1227,7 +1256,7 @@ public:
     DrawCallStatus status = PreDraw();
     if (status == DrawCallStatus::Invalid)
       return;
-    CountDraw(IndexCountPerInstance, InstanceCount);
+    CountDraw(IndexCountPerInstance, InstanceCount, true, StartVertexLocation);
     if (pso_graphics_->threads_per_patch) {
       EncodeTessellationDraw(
           D3D12_DRAW_INDEXED_ARGUMENTS{
@@ -2034,10 +2063,6 @@ public:
       allocator_->InvalidateCurrentPass();
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;
-    // PSInvocations leaves out the samples of draws without a pixel shader, so those count in slots of their own
-    if (!active_statistics_.empty() && !visibility_shades_.empty() &&
-        visibility_shades_.back() != graphics_pso->pixel_shader)
-      CountVisibility();
     dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState, DirtyState::VertexBuffer);
     dirty_state_.set(DirtyState::DepthBounds);
   };
@@ -2596,17 +2621,17 @@ public:
 
   void STDMETHODCALLTYPE
   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
-    // pipeline statistics count from here, in a visibility slot of their own
+    // pipeline statistics count the draws and dispatches captured from here
     if (Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS || Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1) {
       auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
       StatisticsSum sum{};
       sum.query = Index;
       sum.size = heap->result_size / sizeof(uint64_t);
-      sum.first_slot = visibility_slots_.size();
       sum.first_dispatch = indirect_dispatches_.size();
       sum.first_predicated = predicated_statistics_.size();
+      sum.first_draw = draw_statistics_.size();
       active_statistics_.push_back({heap, sum});
-      CountVisibility();
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
       return;
     }
     // stream output statistics start at zero, and the stream's draws add to them
@@ -2646,14 +2671,14 @@ public:
         return;
       }
       auto sum = query->second;
-      sum.slot_count = visibility_slots_.size() - sum.first_slot;
       sum.dispatch_count = indirect_dispatches_.size() - sum.first_dispatch;
       sum.predicated_count = predicated_statistics_.size() - sum.first_predicated;
+      sum.draw_count = draw_statistics_.size() - sum.first_draw;
       // sums run together at the next resolve, so a query ended again before one keeps only its latest result
       std::erase_if(statistics_sums_, [&](auto &s) { return s.first == heap && s.second.query == Index; });
       statistics_sums_.push_back({heap, sum});
       active_statistics_.erase(query);
-      CountVisibility();
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
       return;
     }
     if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
@@ -2909,7 +2934,37 @@ public:
       IMPLEMENT_ME // TODO: (potential) emulated pipeline
     }
 
-    auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), Pipeline(), MaxCommandCount, tessellation);
+    uint64_t statistics = 0, pixel_statistics = 0;
+    if (!active_statistics_.empty() && MaxCommandCount) {
+      auto size = (uint64_t(MaxCommandCount) + 1) * sizeof(PipelineStatisticsResult);
+      auto [mapped, offset] = allocator_->AllocateGPUHeap(size, alignof(PipelineStatisticsResult));
+      if (allocator_->records_)
+        allocator_->RecordGPUHeap(mapped, size, "indirect draw statistics", 0, size);
+      statistics = allocator_->gpu_heap_buffer_address_ + offset;
+      pixel_statistics = statistics + uint64_t(MaxCommandCount) * sizeof(PipelineStatisticsResult);
+      for (uint64_t i = 0; i <= MaxCommandCount; i++)
+        draw_statistics_.push_back(statistics + i * sizeof(PipelineStatisticsResult));
+      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, pixel_statistics - allocator_->gpu_heap_buffer_address_,
+                   SM50_BINDING_INDEX_PIPELINE_STATISTICS);
+    }
+    bool statistics_cuts = false;
+    if (statistics && sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED) {
+      auto [first, step] = get_primitive_vertex_count(topology_);
+      statistics_cuts = step != first && pso_graphics_->strip_cut != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    }
+    auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), Pipeline(), MaxCommandCount,
+                                                       tessellation, statistics_cuts);
+    cmd->statistics = statistics;
+    cmd->pixel_statistics = pixel_statistics;
+    if (statistics) {
+      auto [first, step] = get_primitive_vertex_count(topology_);
+      cmd->statistics_first = dispatch_mesh ? 0 : first;
+      cmd->statistics_step = step;
+      cmd->statistics_cut = pso_graphics_->strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
+                                ? D3D12_16BIT_INDEX_STRIP_CUT_VALUE
+                                : D3D12_32BIT_INDEX_STRIP_CUT_VALUE;
+      cmd->statistics_cuts = statistics_cuts;
+    }
     cmd->max_count_buffer = CountBufferAddress;
     PredicateIndirect(cmd);
     cmd->argument_buffer = ArgBufferAddress;
@@ -3831,6 +3886,7 @@ public:
       return;
     if (PreDraw() == DrawCallStatus::Invalid)
       return;
+    CountDraw(0, 0);
     // the groups are the amplification shader's, or without one the mesh shader's
     auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
     cmd.type = WMTRenderCommandDrawMeshThreadgroups;

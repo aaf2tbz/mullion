@@ -1,17 +1,17 @@
 # statistics count indirect dispatches before the command count is checked
 --- a/src/d3d12/d3d12_command_signature.cpp
 +++ b/src/d3d12/d3d12_command_signature.cpp
-@@ -282,9 +282,6 @@
-     source << "if (i >= command_data.max_count) return;\n";
-     if (is_compute && !rays)
-       source << "if (command_data.statistics) command_data.statistics[i] = 0;\n";
+@@ -294,9 +294,6 @@
+                 "command_data.statistics[i] = {};\n"
+                 "if (!i) *command_data.pixel_statistics = {};\n"
+                 "}\n";
 -    if (!rays)
 -      source << (is_compute ? "if (i >= count && !command_data.dispatches) return;\n"
 -                              : "if (i >= count && !command_data.draws) return;\n");
      source << "{\n";
      source << "device d3d12_arguments& arg = reinterpret_cast<device d3d12_arguments *>("
                "command_data.argument_buffer + i * "
-@@ -308,6 +305,9 @@
+@@ -320,6 +317,9 @@
        if (indexed)
          source << "if (command_data.zeros) rest.reset();\n";
      }

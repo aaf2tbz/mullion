@@ -401,8 +401,8 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
-      auto &[next, type, mask, dual, depth, unorm, formats] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
-      hash(mask, dual, depth, unorm, formats);
+      auto &[next, type, mask, dual, depth, unorm, formats, statistics] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+      hash(mask, dual, depth, unorm, formats, statistics);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -554,12 +554,14 @@ protected:
   };
   std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
   dxmt::mutex render_targets_mutex_;
+  std::function<WMT::Reference<WMT::Function>()> statistics_pixel_shader_;
+  WMT::Reference<WMT::Function> statistics_ps_;
 
   template <typename Info>
   WMT::Reference<WMT::RenderPipelineState>
   CreatePipeline(const Info &info, WMT::Reference<WMT::Error> &error) {
     auto pipeline = device_->GetMTLDevice().newRenderPipelineState(info, error);
-    if (!pipeline || (!rtv_mask && !dsv_mask))
+    if (!pipeline || (!rtv_mask && !dsv_mask && !pixel_shader))
       return pipeline;
     std::lock_guard<dxmt::mutex> lock(render_targets_mutex_);
     auto &descriptor = pipeline_descriptors_[pipeline.handle];
@@ -931,6 +933,7 @@ public:
     stream_output = pDesc->StreamOutput.NumEntries;
     mesh_shader = MS.pShaderBytecode;
     pixel_shader = pDesc->PS.pShaderBytecode;
+    strip_cut = pDesc->IBStripCutValue;
 
     bool tessellation = pDesc->HS.pShaderBytecode;
     // stream output runs through the geometry pipeline, with or without a geometry shader; after a tessellator the
@@ -1071,6 +1074,7 @@ public:
       data_ps.sample_mask = pDesc->SampleMask;
       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
       data_ps.next = &common;
+      data_ps.pipeline_statistics = false;
 
       std::array<WMTPixelFormat, std::size(data_ps.pixel_formats)> formats{};
       for (unsigned i = 0; i < pDesc->NumRenderTargets; i++)
@@ -1082,6 +1086,23 @@ public:
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       if (!(ps_func = function(shader_ps, pDesc->PS, root_signature(rootsig, &data_ps), ps_name.c_str())))
         return E_INVALIDARG;
+      statistics_pixel_shader_ =
+          [this, code = std::string((const char *)pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength),
+           signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common, ps_name]() mutable {
+            D3D12_SHADER_BYTECODE bytecode{code.data(), code.size()};
+            SM50Shader shader;
+            MTL_SHADER_REFLECTION reflection;
+            if (FAILED(InitializeShader(bytecode, &shader, &reflection)))
+              return WMT::Reference<WMT::Function>{};
+            data_ps.pipeline_statistics = true;
+            data_ps.next = &common;
+            SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
+            auto arguments = RootSignature(rootsig, signature.ptr(), &data_ps);
+            return CompileFunction(device_, this, std::span(&bytecode, 1), arguments, (ps_name + "_statistics").c_str(),
+                                   [&shader](auto args, auto name, auto bitcode, auto error) {
+                                     return SM50Compile(shader, args, name, bitcode, error);
+                                   });
+          };
     }
 
     auto geometry_inputs = [&] {
@@ -1296,31 +1317,43 @@ public:
     return GetCachedPipelineBlob(blob);
   }
 
-  WMT::RenderPipelineState
-  RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar) override {
+  WMT::RenderPipelineState RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar,
+                                         bool Statistics) override {
     Mask &= rtv_mask;
     DSVPlanar &= dsv_mask;
-    if (!Pipeline || (Mask == rtv_mask && DSVPlanar == dsv_mask))
+    Statistics &= pixel_shader;
+    if (!Pipeline || (!Statistics && Mask == rtv_mask && DSVPlanar == dsv_mask))
       return Pipeline;
     std::lock_guard<dxmt::mutex> lock(render_targets_mutex_);
     auto &descriptor = pipeline_descriptors_.at(Pipeline.handle);
-    auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+    auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) |
+               (uint32_t(Statistics) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 2));
     auto found = descriptor.variants.find(key);
     if (found != descriptor.variants.end())
       return found->second;
     WMT::Reference<WMT::Error> error;
     // Metal's pipeline formats must match its pass, including the slots with no texture (Metal Programming Guide,
     // Graphics Rendering: Render Command Encoder, Creating and Configuring a Render Pipeline Descriptor)
-    auto pipeline = std::visit([&](auto info) {
-      for (unsigned i = 0; i < std::size(info.colors); i++)
-        if (!(Mask & (1u << i)))
-          info.colors[i] = {.pixel_format = WMTPixelFormatInvalid};
-      if (!(DSVPlanar & 1))
-        info.depth_pixel_format = WMTPixelFormatInvalid;
-      if (!(DSVPlanar & 2))
-        info.stencil_pixel_format = WMTPixelFormatInvalid;
-      return device_->GetMTLDevice().newRenderPipelineState(info, error);
-    }, descriptor.info);
+    auto pipeline = std::visit(
+        [&](auto info) {
+          if (Statistics && info.fragment_function) {
+            if (!statistics_ps_) {
+              if (!(statistics_ps_ = statistics_pixel_shader_()))
+                return WMT::Reference<WMT::RenderPipelineState>{};
+              statistics_pixel_shader_ = {};
+            }
+            info.fragment_function = statistics_ps_;
+          }
+          for (unsigned i = 0; i < std::size(info.colors); i++)
+            if (!(Mask & (1u << i)))
+              info.colors[i] = {.pixel_format = WMTPixelFormatInvalid};
+          if (!(DSVPlanar & 1))
+            info.depth_pixel_format = WMTPixelFormatInvalid;
+          if (!(DSVPlanar & 2))
+            info.stencil_pixel_format = WMTPixelFormatInvalid;
+          return device_->GetMTLDevice().newRenderPipelineState(info, error);
+        },
+        descriptor.info);
     if (!pipeline) {
       ERR("Failed to create attachment PSO of shaders ", name, ": ", error.description().getUTF8String());
       return {};

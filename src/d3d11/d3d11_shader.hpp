@@ -108,6 +108,7 @@ struct ShaderVariantPixel {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
+  bool pipeline_statistics = false;
   std::array<uint8_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
   bool operator==(const this_type &rhs) const = default;
 };

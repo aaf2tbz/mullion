@@ -19,6 +19,10 @@
 // "when a NULL pixel shader is bound to the pipeline, PSInvocations does not increment" (20.4.7).
 // "The value of PSInvocations may include or exclude helper pixels for 2x2 stamps" (20.4.7). Each triangle
 // can invoke at most all four lanes of every stamp touching the target, so two such stamp grids bound a quad.
+// "OCCLUSION measures multi-samples (not pixels)"; "If the Pixel Shader outputs depth, then PSInvocations
+// must increment as expected, even if the output depth fails" (20.4.7). none of these shaders requests sample
+// frequency. a cut means "the strip defined up to the previous index is to be completed, and the next index
+// is a new strip" (8.12); the expected count sums the authored strips, or one strip when cuts are disabled.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <array>
@@ -34,6 +38,11 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
   return float4(corners[id % VERTICES], 0.5, 1);
 }
 uint ps() : SV_Target { return 1; }
+uint ps_depth(out float depth : SV_Depth) : SV_Target { depth = 0.5; return 1; }
+float4 vs_strip(uint id : SV_VertexID) : SV_Position {
+  float2 corners[] = {float2(-1, 1), float2(1, 1), float2(-1, -1), float2(1, -1)};
+  return float4(corners[id % 4], 0.5, 1);
+}
 StructuredBuffer<uint> values : register(t0);
 RWStructuredBuffer<uint> output : register(u0);
 [numthreads(TX, TY, TZ)]
@@ -68,10 +77,11 @@ main(int argc, char **argv) {
       "VERTICES=" + std::to_string(vertices_per_quad), "TZ=" + std::to_string(threads[2])};
   step("seed %u, %s: compile VS, PS and CS", seed, compiler.dxc ? "dxil" : "dxbc");
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), ps = compiler.compile(hlsl, "ps", "ps", defines),
-       cs = compiler.compile(hlsl, "cs", "cs", defines);
+       cs = compiler.compile(hlsl, "cs", "cs", defines), depth_ps = compiler.compile(hlsl, "ps_depth", "ps", defines),
+       strip_vs = compiler.compile(hlsl, "vs_strip", "vs", defines);
   defines.back() = "TZ=" + std::to_string(flat_threads[2]);
   auto cs_flat = compiler.compile(hlsl, "cs", "cs", defines);
-  if (vs.empty() || ps.empty() || cs.empty() || cs_flat.empty()) {
+  if (vs.empty() || ps.empty() || cs.empty() || cs_flat.empty() || depth_ps.empty() || strip_vs.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
@@ -157,6 +167,17 @@ main(int argc, char **argv) {
   CHECK(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtvs)));
   auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
   device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+  struct IndexedArguments {
+    D3D12_INDEX_BUFFER_VIEW view;
+    D3D12_DRAW_INDEXED_ARGUMENTS draw;
+  };
+  D3D12_INDIRECT_ARGUMENT_DESC indexed_desc[2]{};
+  indexed_desc[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+  indexed_desc[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+  D3D12_COMMAND_SIGNATURE_DESC indexed_signature_desc{sizeof(IndexedArguments), UINT(std::size(indexed_desc)),
+                                                      indexed_desc};
+  ComPtr<ID3D12CommandSignature> indexed_signature;
+  CHECK(device->CreateCommandSignature(&indexed_signature_desc, nullptr, IID_PPV_ARGS(&indexed_signature)));
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT64 pixel_bytes;
   device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint, nullptr, nullptr, &pixel_bytes);
@@ -389,5 +410,163 @@ main(int argc, char **argv) {
   results->Unmap(0, nullptr);
   source->Unmap(0, nullptr);
   argument_source->Unmap(0, nullptr);
+  auto read_statistics = [&](UINT64 primitives, UINT64 minimum, UINT64 maximum) {
+    D3D12_QUERY_DATA_PIPELINE_STATISTICS *got;
+    if (!expect(SUCCEEDED(results->Map(0, nullptr, (void **)&got)), "statistics could not be mapped"))
+      return;
+    expect(got->IAPrimitives == primitives && got->CInvocations == primitives,
+           "strip primitives IA %llu clipper %llu, want %llu", got->IAPrimitives, got->CInvocations, primitives);
+    expect(got->PSInvocations >= minimum && got->PSInvocations <= maximum, "PS invocations %llu, want [%llu, %llu]",
+           got->PSInvocations, minimum, maximum);
+    results->Unmap(0, nullptr);
+  };
+  D3D12_DESCRIPTOR_HEAP_DESC depth_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+  ComPtr<ID3D12DescriptorHeap> depth_heap;
+  CHECK(device->CreateDescriptorHeap(&depth_heap_desc, IID_PPV_ARGS(&depth_heap)));
+  const auto depth_handle = depth_heap->GetCPUDescriptorHandleForHeapStart();
+  for (UINT samples : {1u, 4u}) {
+    D3D12_RESOURCE_DESC color_desc = texture;
+    color_desc.SampleDesc = {samples, 0};
+    ComPtr<ID3D12Resource> color, depth;
+    CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &color_desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                          nullptr, IID_PPV_ARGS(&color)));
+    D3D12_RESOURCE_DESC depth_desc = color_desc;
+    depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                          nullptr, IID_PPV_ARGS(&depth)));
+    device->CreateRenderTargetView(color.Get(), nullptr, rtv);
+    device->CreateDepthStencilView(depth.Get(), nullptr, depth_handle);
+    for (UINT shader_kind = 0; shader_kind < 3; shader_kind++)
+      for (bool passes : {false, true}) {
+        step("%u samples, shader %u, depth passes %u", samples, shader_kind, passes);
+        auto desc = graphics;
+        desc.PS = shader_kind == 0 ? D3D12_SHADER_BYTECODE{} : bytecode(shader_kind == 1 ? ps : depth_ps);
+        desc.SampleDesc = {samples, 0};
+        desc.DSVFormat = depth_desc.Format;
+        desc.DepthStencilState.DepthEnable = TRUE;
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        ComPtr<ID3D12PipelineState> pipeline;
+        CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)));
+        CHECK(list->Reset(allocator.Get(), pipeline.Get()));
+        list->SetGraphicsRootSignature(graphics_rs.Get());
+        list->OMSetRenderTargets(1, &rtv, FALSE, &depth_handle);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->ClearDepthStencilView(depth_handle, D3D12_CLEAR_FLAG_DEPTH, passes ? 1.0f : 0.0f, 0, 0, nullptr);
+        begin(All);
+        list->DrawInstanced(vertices_per_quad, 1, 0, 0);
+        end(All);
+        list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, All, 1, results.Get(), 0);
+        CHECK(submit(device.Get(), queue.Get(), list.Get()));
+        const UINT64 covered = UINT64(width) * height;
+        const UINT64 minimum = shader_kind && (passes || shader_kind == 2) ? covered : 0;
+        const UINT64 maximum = shader_kind ? triangles_per_quad * ((width + 1) / 2) * ((height + 1) / 2) * 4 : 0;
+        read_statistics(triangles_per_quad, minimum, maximum);
+      }
+  }
+  device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+  for (DXGI_FORMAT format : {DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT})
+    for (auto topology : {D3D_PRIMITIVE_TOPOLOGY_LINESTRIP, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP})
+      for (UINT strips : {1u, 2u, 19u})
+        for (UINT edge_cuts : {0u, 1u, 2u, 3u})
+          for (bool enabled : {false, true}) {
+            const UINT cut =
+                format == DXGI_FORMAT_R16_UINT ? D3D12_16BIT_INDEX_STRIP_CUT_VALUE : D3D12_32BIT_INDEX_STRIP_CUT_VALUE;
+            const UINT buffer_offset_indices = 2, start_index = 3,
+                       leading_indices = buffer_offset_indices + start_index;
+            std::vector<UINT> index(leading_indices, cut);
+            UINT64 primitives = 0;
+            const UINT first_vertices = topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP ? 2 : 3;
+            if (edge_cuts & 1)
+              index.push_back(cut);
+            for (UINT strip = 0; strip < strips; strip++) {
+              if (strip) {
+                index.push_back(cut);
+                if (strip % 2)
+                  index.push_back(cut);
+              }
+              const UINT vertices = 3 + (strip ? strip % 3 : width * height);
+              for (UINT v = 0; v < vertices; v++)
+                index.push_back(v % 4);
+              primitives += vertices - first_vertices + 1;
+            }
+            if (edge_cuts & 2)
+              index.push_back(cut);
+            if (!enabled)
+              primitives = index.size() - leading_indices - first_vertices + 1;
+            std::vector<UINT16> narrow(index.begin(), index.end());
+            const UINT stride = format == DXGI_FORMAT_R16_UINT ? sizeof(UINT16) : sizeof(UINT);
+            auto ib =
+                buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, index.size() * stride, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void *mapped;
+            CHECK(ib->Map(0, nullptr, &mapped));
+            memcpy(mapped, format == DXGI_FORMAT_R16_UINT ? (void *)narrow.data() : (void *)index.data(),
+                   index.size() * stride);
+            ib->Unmap(0, nullptr);
+            auto desc = graphics;
+            desc.VS = bytecode(strip_vs);
+            desc.PS = bytecode(ps);
+            desc.PrimitiveTopologyType = topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
+                                             ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                             : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.IBStripCutValue = !enabled                         ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED
+                                   : format == DXGI_FORMAT_R16_UINT ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
+                                                                    : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+            ComPtr<ID3D12PipelineState> pipeline;
+            CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)));
+            D3D12_INDEX_BUFFER_VIEW view{ib->GetGPUVirtualAddress() + buffer_offset_indices * stride,
+                                         (UINT(index.size()) - buffer_offset_indices) * stride, format};
+            for (UINT instances : {1u, 3u})
+              for (bool indirect : {false, true}) {
+                step("format %u, topology %u, strips %u, edge cuts %u, enabled %u, instances %u, indirect %u", format,
+                     topology, strips, edge_cuts, enabled, instances, indirect);
+                const std::array<IndexedArguments, 2> draws{
+                    {{view, {UINT(index.size()) - leading_indices, instances, start_index}},
+                     {view, {UINT(index.size()) - leading_indices, instances, start_index}}}};
+                auto indirect_arguments = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(draws) + sizeof(UINT),
+                                                 D3D12_RESOURCE_STATE_GENERIC_READ);
+                CHECK(indirect_arguments->Map(0, nullptr, &mapped));
+                memcpy(mapped, draws.data(), sizeof(draws));
+                const UINT count = 1;
+                memcpy((BYTE *)mapped + sizeof(draws), &count, sizeof(count));
+                indirect_arguments->Unmap(0, nullptr);
+                CHECK(list->Reset(allocator.Get(), pipeline.Get()));
+                list->SetGraphicsRootSignature(graphics_rs.Get());
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->IASetPrimitiveTopology(topology);
+                list->IASetIndexBuffer(&view);
+                begin(All);
+                if (indirect)
+                  list->ExecuteIndirect(indexed_signature.Get(), draws.size(), indirect_arguments.Get(), 0,
+                                        indirect_arguments.Get(), sizeof(draws));
+                else
+                  list->DrawIndexedInstanced(index.size() - leading_indices, instances, start_index, 0, 0);
+                end(All);
+                list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, All, 1, results.Get(), 0);
+                CHECK(submit(device.Get(), queue.Get(), list.Get()));
+                const UINT64 covered = topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+                                           ? UINT64(width / 2) * (height / 2) * strips * instances
+                                           : 0;
+                read_statistics(primitives * instances, covered, ~UINT64(0));
+              }
+          }
+  step("zero maximum indirect commands leave the statistics empty");
+  CHECK(list->Reset(allocator.Get(), draw_pso.Get()));
+  list->SetGraphicsRootSignature(graphics_rs.Get());
+  list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  list->RSSetViewports(1, &viewport);
+  list->RSSetScissorRects(1, &scissor);
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  begin(All);
+  list->ExecuteIndirect(indexed_signature.Get(), 0, arguments.Get(), 0, nullptr, 0);
+  end(All);
+  list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, All, 1, results.Get(), 0);
+  CHECK(submit(device.Get(), queue.Get(), list.Get()));
+  read_statistics(0, 0, 0);
   return verdict();
 }

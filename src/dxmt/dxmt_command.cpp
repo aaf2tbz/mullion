@@ -11,7 +11,7 @@
 
 namespace dxmt {
 
-InternalCommandLibrary::InternalCommandLibrary(WMT::Device device) {
+InternalCommandLibrary::InternalCommandLibrary(WMT::Device device) : device_(device) {
   WMT::Reference<WMT::Error> error;
   library_ = device.newLibrary(dxmt_command, dxmt_command_len, error);
 
@@ -69,6 +69,25 @@ EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalComma
     ts_marshal_pipeline.rasterization_enabled = false;
     ts_draw_arguments_marshal = device.newRenderPipelineState(ts_marshal_pipeline, error);
   }
+}
+
+WMT::RenderPipelineState InternalCommandLibrary::PipelineStatistics(bool scan) {
+  std::lock_guard lock(statistics_mutex_);
+  auto &pipeline = pipeline_statistics_draw_[scan];
+  if (!pipeline) {
+    WMTRenderPipelineInfo info;
+    WMT::InitializeRenderPipelineInfo(info);
+    auto function = library_.newFunction(scan ? "pipeline_statistics_strip" : "pipeline_statistics_draw");
+    info.vertex_function = function;
+    info.rasterization_enabled = false;
+    WMT::Reference<WMT::Error> error;
+    pipeline = device_.newRenderPipelineState(info, error);
+    if (!pipeline) {
+      ERR("Failed to create statistics pipeline: ", error.description().getUTF8String());
+      abort();
+    }
+  }
+  return pipeline;
 }
 
 void

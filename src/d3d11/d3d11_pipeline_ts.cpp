@@ -64,7 +64,7 @@ public:
       PixelShader = pDesc->PixelShader->get_pixel_shader(ShaderVariantPixel{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
-          unorm_output_reg_mask}, {rtv_formats, num_rtvs});
+          unorm_output_reg_mask, pDesc->PipelineStatistics}, {rtv_formats, num_rtvs});
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;
@@ -100,7 +100,14 @@ public:
         max_mesh_threadgroups});
   }
 
-  void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pPipeline) final {
+  void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pPipeline, bool statistics) final {
+    if (statistics && description->PixelShader && !description->PipelineStatistics) {
+      auto desc = *description;
+      desc.PipelineStatistics = true;
+      MTLCompiledTessellationMeshPipeline *pipeline;
+      device_->CreateTessellationMeshPipeline(&desc, &pipeline);
+      return pipeline->GetPipeline(pPipeline);
+    }
     ready_.wait(false, std::memory_order_acquire);
     *pPipeline = {state_rasterization_, hull_reflection.NumOutputElement,
                   hull_reflection.ThreadsPerPatch, parts};

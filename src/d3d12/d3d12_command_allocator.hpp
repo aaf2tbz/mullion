@@ -118,6 +118,9 @@ struct IndirectRenderCommandData {
   // past it, as many of these zero indices of 16 bits (D3D11.3 8.19.2: "the return is 0"), `zero_count` at most
   uint64_t zeros;
   uint32_t zero_count;
+  uint64_t pixel_statistics;
+  uint64_t statistics;
+  uint32_t statistics_first, statistics_step, statistics_cut, statistics_cuts;
   WMTIndirectCommandBufferExecutionRange execution_range;
 };
 
@@ -447,7 +450,10 @@ public:
   IndirectComputeCommandData *EncodeIndirectComputeCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount);
 
   // `Pipeline` is the variant of pPSO that the commands draw with
-  IndirectRenderCommandData *EncodeIndirectRenderCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, WMT::RenderPipelineState Pipeline, size_t MaxCount, bool tessellation);
+  IndirectRenderCommandData *EncodeIndirectRenderCommand(
+      MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, WMT::RenderPipelineState Pipeline,
+      size_t MaxCount, bool tessellation, bool statistics_cuts
+  );
 };
 
 } // namespace dxmt

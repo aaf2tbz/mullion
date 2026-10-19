@@ -4,8 +4,12 @@
 namespace dxmt {
 
 class OcclusionQuery : public MTLD3DQueryBase<MTLD3D11OcclusionQuery> {
-  using MTLD3DQueryBase<MTLD3D11OcclusionQuery>::MTLD3DQueryBase;
+public:
+  OcclusionQuery(MTLD3D11Device *device, const D3D11_QUERY_DESC1 *desc) : MTLD3DQueryBase(device, desc) {
+    query_->pipeline_statistics = desc->Query == D3D11_QUERY_PIPELINE_STATISTICS;
+  }
 
+private:
   Rc<VisibilityResultQuery> query_ = new VisibilityResultQuery();
   uint64_t accumulated_value_ = 0;
 
@@ -22,10 +26,19 @@ class OcclusionQuery : public MTLD3DQueryBase<MTLD3D11OcclusionQuery> {
       if (desc_.Query == D3D11_QUERY_OCCLUSION_PREDICATE) {
         *((BOOL *)data) = accumulated_value_ != 0;
       } else if (desc_.Query == D3D11_QUERY_PIPELINE_STATISTICS) {
-        // samples drawn, not shader runs: a draw without a pixel shader counts too, and MSAA counts each sample
         auto statistics = static_cast<D3D11_QUERY_DATA_PIPELINE_STATISTICS *>(data);
         *statistics = counts;
-        statistics->PSInvocations = accumulated_value_;
+        for (auto &[result, offset] : query_->statistics) {
+          auto values = reinterpret_cast<const PipelineStatisticsResult *>(
+              static_cast<const char *>(result->current()->mappedMemory(0)) + offset);
+          statistics->PSInvocations += values->pixels;
+          statistics->IAPrimitives += values->primitives;
+          statistics->CInvocations += values->primitives;
+          statistics->CPrimitives += values->primitives;
+          statistics->IAVertices += values->vertices;
+          statistics->VSInvocations += values->vertices;
+        }
+        counts = *statistics;
       } else {
         *((uint64_t *)data) = accumulated_value_;
       }
@@ -40,6 +53,7 @@ class OcclusionQuery : public MTLD3DQueryBase<MTLD3D11OcclusionQuery> {
   Begin() override {
     if (state_ == QueryState::Issued)
       query_ = new VisibilityResultQuery();
+    query_->pipeline_statistics = desc_.Query == D3D11_QUERY_PIPELINE_STATISTICS;
     state_ = QueryState::Building;
     return query_.ptr();
   };

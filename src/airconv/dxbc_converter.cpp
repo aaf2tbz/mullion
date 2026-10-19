@@ -427,6 +427,25 @@ llvm::Error convert_dxbc_pixel_shader(
     };
   }
 
+  std::optional<uint32_t> statistics;
+  uint32_t sample = 0, coverage = 0;
+  if (pso_data && pso_data->pipeline_statistics) {
+    statistics = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = sizeof(uint64_t),
+        .location_index = SM50_BINDING_INDEX_PIPELINE_STATISTICS,
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read_write,
+        .address_space = air::AddressSpace::device,
+        .type = air::msl_uint,
+        .arg_name = "pipeline_statistics",
+    });
+    // with a sample index input Metal runs the function once for each covered sample, each run given the pixel's
+    // coverage: the run of the first covered sample counts, unless the shader runs per sample itself, which its own
+    // sample index, declared before the counter, tells
+    sample = func_signature.DefineInput(air::InputSampleIndex{});
+    coverage = sample < *statistics ? ~0u : func_signature.DefineInput(air::InputInputCoverage{});
+  }
+
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -452,6 +471,21 @@ llvm::Error convert_dxbc_pixel_shader(
   );
 
   setup_metal_version(module, metal_version);
+
+  if (statistics) {
+    // D3D11.3 20.4.7 counts executions even when an output depth fails the test.
+    auto counter = function->getArg(*statistics);
+    llvm::Value *counts = builder.getTrue();
+    if (coverage != ~0u) {
+      auto before = builder.CreateSub(builder.CreateShl(builder.getInt32(1), function->getArg(sample)), builder.getInt32(1));
+      counts = builder.CreateICmpEQ(builder.CreateAnd(function->getArg(coverage), before), builder.getInt32(0));
+    }
+    auto low = air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, counter, builder.CreateZExt(counts, builder.getInt32Ty()));
+    air.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, builder.CreateConstGEP1_32(builder.getInt32Ty(), counter, 1),
+        builder.CreateZExt(builder.CreateAnd(counts, builder.CreateICmpEQ(low, builder.getInt32(UINT32_MAX))),
+                           builder.getInt32Ty()));
+  }
 
   resource_map.input.ptr_int4 =
     builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));

@@ -287,6 +287,8 @@ public:
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE:
     case D3D11_QUERY_PIPELINE_STATISTICS: {
+      if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS)
+        InvalidateCurrentPass(true);
       if (static_cast<MTLD3D11Query *>(pAsync)->state_ == QueryState::Building)
         End(pAsync);
       static_cast<MTLD3D11OcclusionQuery *>(pAsync)->begun = pipeline_counts_;
@@ -367,6 +369,8 @@ public:
         enc.endVisibilityResultQuery(std::move(query));
       });
       promote_flush = true;
+      if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS)
+        InvalidateCurrentPass(true);
       break;
     }
     case D3D11_QUERY_SO_STATISTICS:
@@ -562,6 +566,9 @@ public:
     auto query_list = std::make_shared<std::vector<Rc<VisibilityResultQuery>>>(cmdlist->issued_visibility_query.size());
     for (size_t i = 0; i < cmdlist->issued_visibility_query.size(); i++) {
       (*query_list)[i] = new VisibilityResultQuery();
+      D3D11_QUERY_DESC desc;
+      cmdlist->issued_visibility_query[i].first->GetDesc(&desc);
+      (*query_list)[i]->pipeline_statistics = desc.Query == D3D11_QUERY_PIPELINE_STATISTICS;
       cmdlist->issued_visibility_query[i].first->DoDeferredQuery((*query_list)[i].ptr());
     }
 

@@ -2,6 +2,7 @@
 
 #include "Metal.hpp"
 #include "dxmt_diag.hpp"
+#include "dxmt_buffer.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "wsi_platform.hpp"
 #include <algorithm>
@@ -88,6 +89,8 @@ private:
 
 class VisibilityResultQuery {
 public:
+  bool pipeline_statistics = false;
+  std::vector<std::pair<Rc<Buffer>, uint32_t>> statistics;
   void
   incRef() {
     refcount_.fetch_add(1u, std::memory_order_acquire);
@@ -101,6 +104,7 @@ public:
   void
   begin(uint64_t seqId, unsigned offset) {
     accumulated_value_ = 0;
+    statistics.clear();
     seq_id_begin = seqId;
     occlusion_counter_begin = offset;
     seq_id_end = ~0uLL;
@@ -111,7 +115,7 @@ public:
   end(uint64_t seqId, unsigned offset) {
     seq_id_end = seqId;
     occlusion_counter_end = offset;
-    if (seq_id_begin == seq_id_end && occlusion_counter_begin == occlusion_counter_end) {
+    if (seq_id_begin == seq_id_end && occlusion_counter_begin == occlusion_counter_end && statistics.empty()) {
       seq_id_issued = seq_id_end;
     }
   }

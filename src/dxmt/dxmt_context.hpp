@@ -33,7 +33,7 @@
 #include "dxmt_texture.hpp"
 #include "log/log.hpp"
 #include "rc/util_rc_ptr.hpp"
-#include "airconv_public.h"
+#include "../airconv/airconv_public.h"
 #include <cassert>
 
 #define DXMT_IMPLEMENT_ME __builtin_unreachable();
@@ -236,6 +236,7 @@ struct RenderEncoderData : EncoderData {
   bool use_geometry = 0;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
+  bool statistics_separate_rasterization = false;
   // the bound geometry pipeline's stream output counting pass and geometry instances, and the last draw's targets
   WMT::RenderPipelineState so_count_pso = {};
   uint32_t so_geometry_instances = 1;
@@ -871,6 +872,11 @@ public:
   void bumpVisibilityResultOffset();
   void beginVisibilityResultQuery(Rc<VisibilityResultQuery> &&query);
   void endVisibilityResultQuery(Rc<VisibilityResultQuery> &&query);
+  bool pipelineStatisticsActive() const { return !pipeline_queries_.empty(); }
+  void countPipelineStatistics(PipelineStatisticsDraw draw);
+  void countPipelineStatistics(uint64_t vertices, uint64_t instances, std::pair<uint32_t, uint32_t> topology,
+                               uint32_t index_stride = 0, uint64_t index_offset = 0, uint32_t start = 0,
+                               uint64_t arguments = 0);
   // while the region of a deferred command list whose predicate skips its operations is replayed
   bool skips_predicated = false;
 
@@ -1009,6 +1015,9 @@ private:
   VisibilityResultOffsetBumpState vro_state_;
   std::vector<Rc<VisibilityResultQuery>> pending_queries_;
   unsigned active_visibility_query_count_ = 0;
+  std::vector<Rc<VisibilityResultQuery>> pipeline_queries_;
+  Rc<Buffer> statistics_page_;
+  uint32_t statistics_offset_ = 0;
   uint64_t visibility_result_size_;
   std::vector<uint64_t> visibility_result_offsets_;
   TimestampQueryState timestamp_state_;

@@ -1,7 +1,7 @@
 # a deferred statistics End never publishes its executed counts
 --- a/src/d3d11/d3d11_context_def.cpp
 +++ b/src/d3d11/d3d11_context_def.cpp
-@@ -374,11 +374,6 @@
+@@ -376,12 +376,6 @@
        });
        ctx_state.pending_visibility_queries.erase(query_id);
        ctx_state.building_visibility_queries.erase(building_query);
@@ -9,6 +9,7 @@
 -        auto &regions = ctx_state.current_cmdlist->regions;
 -        regions.back().pipeline_query = static_cast<MTLD3D11OcclusionQuery *>(pAsync);
 -        regions.emplace_back();
+-        InvalidateCurrentPass(true);
 -      }
        break;
      }

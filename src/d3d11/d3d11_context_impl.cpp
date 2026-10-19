@@ -117,6 +117,17 @@ to_metal_primitive_type(D3D11_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType& primiti
   return true;
 }
 
+inline std::pair<uint32_t, uint32_t> get_primitive_vertex_count(WMTPrimitiveType topology) {
+  switch (topology) {
+  case WMTPrimitiveTypePoint: return get_primitive_vertex_count(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+  case WMTPrimitiveTypeLine: return get_primitive_vertex_count(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+  case WMTPrimitiveTypeLineStrip: return get_primitive_vertex_count(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
+  case WMTPrimitiveTypeTriangle: return get_primitive_vertex_count(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  case WMTPrimitiveTypeTriangleStrip: return get_primitive_vertex_count(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+  }
+  __builtin_unreachable();
+}
+
 // the primitives `vertices` vertices of `topo` make
 inline uint64_t
 topology_primitives(D3D11_PRIMITIVE_TOPOLOGY topo, uint64_t vertices) {
@@ -1352,6 +1363,8 @@ public:
       return TessellationDraw(ControlPointCount, VertexCount, 1, StartVertexLocation, 0);
     }
     EmitOP([Primitive, StartVertexLocation, VertexCount](ArgumentEncodingContext& enc) {
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(VertexCount, 1, get_primitive_vertex_count(Primitive));
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
@@ -1396,8 +1409,12 @@ public:
         state_.InputAssembler.IndexBufferOffset +
         StartIndexLocation * (state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT ? 4 : 2);
     EmitOP([IndexType, IndexBufferOffset, Primitive, IndexCount, BaseVertexLocation](ArgumentEncodingContext &enc) {
-      enc.bumpVisibilityResultOffset();
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(IndexCount, 1, get_primitive_vertex_count(Primitive),
+                                    IndexType == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t),
+                                    IndexBufferOffset + index_sub_offset);
+      enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       cmd.type = WMTRenderCommandDrawIndexed;
@@ -1443,6 +1460,8 @@ public:
     }
     EmitOP([Primitive, StartVertexLocation, VertexCountPerInstance, InstanceCount,
           StartInstanceLocation](ArgumentEncodingContext &enc) {
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(VertexCountPerInstance, InstanceCount, get_primitive_vertex_count(Primitive));
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
@@ -1496,8 +1515,12 @@ public:
         StartIndexLocation * (state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT ? 4 : 2);
     EmitOP([IndexType, IndexBufferOffset, Primitive, InstanceCount, BaseVertexLocation, StartInstanceLocation,
           IndexCountPerInstance](ArgumentEncodingContext &enc) {
-      enc.bumpVisibilityResultOffset();
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(IndexCountPerInstance, InstanceCount, get_primitive_vertex_count(Primitive),
+                                    IndexType == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t),
+                                    IndexBufferOffset + index_sub_offset);
+      enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       cmd.type = WMTRenderCommandDrawIndexed;
@@ -1539,6 +1562,8 @@ public:
         return;
       }
 
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(VertexCountPerInstance, InstanceCount, std::pair{NumControlPoint, NumControlPoint});
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
@@ -1554,17 +1579,20 @@ public:
 
   auto
   MeshIndexBuffer() {
-    const bool index_view = IndexFormat<true>() == SM50_INDEX_BUFFER_FORMAT_VIEW;
+    const auto format = IndexFormat<true>();
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto index_view_offset =
-        index_view ? PreAllocateArgumentBuffer(sizeof(D3D12_INDEX_BUFFER_VIEW), alignof(D3D12_INDEX_BUFFER_VIEW)) : 0;
-    return [=](ArgumentEncodingContext &enc) -> std::pair<WMT::Buffer, uint64_t> {
-      if (index_view) {
+        format == SM50_INDEX_BUFFER_FORMAT_VIEW
+            ? PreAllocateArgumentBuffer(sizeof(D3D12_INDEX_BUFFER_VIEW), alignof(D3D12_INDEX_BUFFER_VIEW))
+            : 0;
+    return [=](ArgumentEncodingContext &enc) -> std::tuple<WMT::Buffer, uint64_t, uint32_t> {
+      if (format == SM50_INDEX_BUFFER_FORMAT_VIEW) {
         *enc.getMappedArgumentBuffer<D3D12_INDEX_BUFFER_VIEW>(index_view_offset) = {0, 0, DXGI_FORMAT_R16_UINT};
-        return {enc.getFinalArgumentBuffer(), enc.getFinalArgumentBufferOffset(index_view_offset)};
+        return {enc.getFinalArgumentBuffer(), enc.getFinalArgumentBufferOffset(index_view_offset), 0};
       }
       auto [buffer, offset] = enc.currentIndexBuffer();
-      return {buffer, IndexBufferOffset + offset};
+      return {buffer, IndexBufferOffset + offset,
+              format == SM50_INDEX_BUFFER_FORMAT_UINT32 ? sizeof(uint32_t) : sizeof(uint16_t)};
     };
   }
 
@@ -1599,7 +1627,10 @@ public:
         return;
       }
 
-      auto [index_buffer, index_buffer_offset] = IndexBuffer(enc);
+      auto [index_buffer, index_buffer_offset, index_stride] = IndexBuffer(enc);
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(IndexCountPerInstance, InstanceCount, std::pair{NumControlPoint, NumControlPoint},
+                                    index_stride, index_buffer_offset, StartIndexLocation);
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
@@ -1647,6 +1678,8 @@ public:
       if (!parts)
         return;
 
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(VertexCountPerInstance, InstanceCount, get_primitive_vertex_count(topo));
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto draw = [&] {
@@ -1684,7 +1717,7 @@ public:
       draw_argument->InstanceCount = InstanceCount;
       draw_argument->StartInstance = BaseInstance;
 
-      auto [index_buffer, index_buffer_offset] = IndexBuffer(enc);
+      auto [index_buffer, index_buffer_offset, index_stride] = IndexBuffer(enc);
       auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo, vertex_registers);
       // not one primitive fits an object threadgroup's payload
       if (!vertex_increment_per_wrap)
@@ -1701,6 +1734,9 @@ public:
       if (!parts)
         return;
 
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(IndexCountPerInstance, InstanceCount, get_primitive_vertex_count(topo),
+                                    index_stride, index_buffer_offset, StartIndexLocation);
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto draw = [&] {
@@ -1754,8 +1790,13 @@ public:
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
-        enc.bumpVisibilityResultOffset();
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
+        if (enc.pipelineStatisticsActive())
+          enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive),
+                                      IndexType == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t),
+                                      IndexBufferOffset + index_sub_offset, 0,
+                                     buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
+        enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
         cmd.type = WMTRenderCommandDrawIndexedIndirect;
@@ -1797,6 +1838,9 @@ public:
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
         );
+        if (enc.pipelineStatisticsActive())
+          enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive), 0, 0, 0,
+                                     buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
@@ -1827,6 +1871,9 @@ public:
         if (!vertex_increment_per_wrap)
           return;
   
+        if (enc.pipelineStatisticsActive())
+          enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(topo), 0, 0, 0,
+                                     buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto draw = [&] {
@@ -1880,8 +1927,11 @@ public:
         // not one primitive fits an object threadgroup's payload
         if (!vertex_increment_per_wrap)
           return;
-        auto [index_buffer, index_buffer_offset] = IndexBuffer(enc);
+        auto [index_buffer, index_buffer_offset, index_stride] = IndexBuffer(enc);
   
+        if (enc.pipelineStatisticsActive())
+          enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(topo), index_stride, index_buffer_offset, 0,
+                                     buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto draw = [&] {
@@ -1932,6 +1982,9 @@ public:
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
   
+        if (enc.pipelineStatisticsActive())
+          enc.countPipelineStatistics(0, 0, std::pair{NumControlPoint, NumControlPoint}, 0, 0, 0,
+                                     buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
         enc.bumpVisibilityResultOffset();
         enc.encodeTSDispatchArgumentsMarshal(
             buffer->buffer(), buffer->gpuAddress() + buffer_offset,
@@ -1968,8 +2021,12 @@ public:
 
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
-        auto [index_buffer, index_buffer_offset] = IndexBuffer(enc);
+        auto [index_buffer, index_buffer_offset, index_stride] = IndexBuffer(enc);
   
+        if (enc.pipelineStatisticsActive())
+          enc.countPipelineStatistics(0, 0, std::pair{NumControlPoint, NumControlPoint},
+                                      index_stride, index_buffer_offset, 0,
+                                     buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
         enc.bumpVisibilityResultOffset();
         enc.encodeTSDispatchArgumentsMarshal(
             buffer->buffer(), buffer->gpuAddress() + buffer_offset,
@@ -2017,6 +2074,9 @@ public:
     auto mesh_budget = mesh_bytes_per_draw_;
     auto vertex_registers = GetManagedShader<PipelineStage::Vertex>()->reflection().NumOutputElement;
     auto ordinary = [Primitive](ArgumentEncodingContext &enc) {
+      if (enc.pipelineStatisticsActive())
+        enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive), 0, 0, 0,
+                                    enc.draw_auto_arguments.gpu_address + enc.draw_auto_arguments.offset);
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
       cmd.type = WMTRenderCommandDrawIndirect;
       cmd.primitive_type = Primitive;
@@ -2041,6 +2101,9 @@ public:
       task.offset = offset;
       task.stride = stride;
       task.vertex_count_per_warp = 1;
+      if (enc.pipelineStatisticsActive() && status != DrawCallStatus::Ordinary)
+        enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(topo), 0, 0, 0,
+                                    arguments.gpu_address + arguments.offset);
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       if (status == DrawCallStatus::Geometry) {
@@ -5301,7 +5364,7 @@ public:
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_tessellation = 1;
       MTL_COMPILED_TESSELLATION_MESH_PIPELINE GraphicsPipeline{};
-      pso->GetPipeline(&GraphicsPipeline); // may block
+      pso->GetPipeline(&GraphicsPipeline, enc.pipelineStatisticsActive()); // may block
       enc.tess_num_output_control_point_element = GraphicsPipeline.NumControlPointOutputElement;
       enc.tess_threads_per_patch = GraphicsPipeline.ThreadsPerPatch;
       enc.tess_parts = GraphicsPipeline.Parts;
@@ -5350,11 +5413,16 @@ public:
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
     device->CreateGeometryPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext &enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_geometry = 1;
+      if (enc.pipelineStatisticsActive()) {
+        auto desc = pso->description;
+        render_encoder->statistics_separate_rasterization =
+            desc->SOLayout && !desc->GeometryShader && desc->SOLayout->RasterizedStream() == 0 && !desc->PassThrough;
+      }
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
-      pso->GetPipeline(&GraphicsPipeline); // may block
+      pso->GetPipeline(&GraphicsPipeline, enc.pipelineStatisticsActive()); // may block
       render_encoder->so_count_pso = GraphicsPipeline.StreamOutputCount;
       render_encoder->so_geometry_instances = GraphicsPipeline.GeometryInstances;
       render_encoder->geometry_mesh_instances = GraphicsPipeline.MeshInstances;
@@ -5410,9 +5478,11 @@ public:
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext &enc) {
+      if (enc.pipelineStatisticsActive())
+        enc.currentRenderEncoder()->statistics_separate_rasterization = false;
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
-      pso->GetPipeline(&GraphicsPipeline); // may block
+      pso->GetPipeline(&GraphicsPipeline, enc.pipelineStatisticsActive()); // may block
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;

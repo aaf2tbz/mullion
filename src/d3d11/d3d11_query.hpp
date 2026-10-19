@@ -165,8 +165,7 @@ private:
   uint64_t should_be_signaled_at = 0;
 };
 
-// also the PIPELINE_STATISTICS query: its pixel shader count is the samples its range drew, and the rest the context
-// counts on the CPU
+// pipeline statistics use visibility for completion, with shader executions and strip corrections captured on the GPU
 class MTLD3D11OcclusionQuery : public MTLD3D11Query {
 public:
   // the context's counts as the range began, and the range's counts

@@ -23,6 +23,18 @@ struct SparseTexelClear {
   sm50_sparse_qword texel_size;
 };
 
+// the draw's pixel invocations and strip primitive correction, captured before its index buffer can change
+struct PipelineStatisticsDraw {
+  sm50_sparse_qword indices, index_bytes, result, skips, arguments;
+  sm50_sparse_qword primitives;
+  sm50_sparse_qword vertices, instances, start, index_stride;
+  sm50_sparse_qword first, step, cut, threads;
+};
+
+struct PipelineStatisticsResult {
+  sm50_sparse_qword pixels, primitives, vertices;
+};
+
 constexpr CONSTANT auto kPresentFCIndex_BackbufferSizeMatched = 0x100;
 constexpr CONSTANT auto kPresentFCIndex_BackbufferIsSRGB = 0x103;
 constexpr CONSTANT auto kPresentFCIndex_HDRPQ = 0x101;

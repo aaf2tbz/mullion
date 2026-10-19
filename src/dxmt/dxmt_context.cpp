@@ -858,14 +858,76 @@ ArgumentEncodingContext::allocateTempBuffer1(size_t size, size_t alignment) {
 void
 ArgumentEncodingContext::beginVisibilityResultQuery(Rc<VisibilityResultQuery> &&query) {
   query->begin(seq_id_, vro_state_.getNextReadOffset());
+  if (query->pipeline_statistics)
+    pipeline_queries_.push_back(query);
   active_visibility_query_count_++;
   pending_queries_.push_back(std::move(query));
 }
 void
 ArgumentEncodingContext::endVisibilityResultQuery(Rc<VisibilityResultQuery> &&query) {
   query->end(seq_id_, vro_state_.getNextReadOffset());
+  if (query->pipeline_statistics)
+    std::erase_if(pipeline_queries_, [&](auto &active) { return active.ptr() == query.ptr(); });
   assert(active_visibility_query_count_);
   active_visibility_query_count_--;
+}
+
+void ArgumentEncodingContext::countPipelineStatistics(uint64_t vertices, uint64_t instances,
+                                                      std::pair<uint32_t, uint32_t> topology, uint32_t index_stride,
+                                                      uint64_t index_offset, uint32_t start, uint64_t arguments) {
+  if (pipeline_queries_.empty())
+    return;
+  if (currentRenderEncoder()->statistics_separate_rasterization)
+    return countPipelineStatistics({});
+  auto [first, step] = topology;
+  PipelineStatisticsDraw draw{};
+  draw.vertices = vertices;
+  draw.instances = instances;
+  draw.first = first;
+  draw.step = step;
+  draw.primitives = !arguments && vertices >= first ? (vertices - first) / step + 1 : 0;
+  draw.arguments = arguments;
+  draw.index_stride = index_stride;
+  draw.start = start + (index_stride ? index_offset / index_stride : 0);
+  if (index_stride && first != step)
+    draw.cut = index_stride == sizeof(uint32_t) ? UINT32_MAX : UINT16_MAX;
+  countPipelineStatistics(draw);
+}
+
+void ArgumentEncodingContext::countPipelineStatistics(PipelineStatisticsDraw draw) {
+  if (pipeline_queries_.empty())
+    return;
+  if (!statistics_page_ || statistics_offset_ + sizeof(PipelineStatisticsResult) > statistics_page_->length()) {
+    statistics_page_ = new Buffer(DXMT_PAGE_SIZE, device_);
+    Flags<BufferAllocationFlag> flags;
+#ifdef __i386__
+    flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
+    statistics_page_->rename(statistics_page_->allocate(flags));
+    statistics_offset_ = 0;
+  }
+  auto allocation = statistics_page_->current();
+  retainAllocation(allocation);
+  draw.result = allocation->gpuAddress() + statistics_offset_;
+  for (auto &query : pipeline_queries_)
+    query->statistics.emplace_back(statistics_page_, statistics_offset_);
+  if (draw.first && draw.index_stride && ibuf_) {
+    auto [indices, offset] = access<PipelineStage::Vertex>(ibuf_, 0, ibuf_->length(), ResourceAccess::Read);
+    draw.start -= offset / draw.index_stride;
+    draw.indices = indices->gpuAddress() + offset;
+    draw.index_bytes = ibuf_->length();
+  }
+  if (draw.cut)
+    draw.threads = draw.step == 1 ? emulated_cmd.SIMDWidth() : 1;
+  auto [mapped, buffer, offset] = queue_.AllocateArgumentBuffer(seq_id_, sizeof(draw));
+  memcpy(mapped, &draw, sizeof(draw));
+  resolveRenderPassBarrier();
+  EncodePipelineStatisticsDraw(
+      [&]<typename T>() -> T & { return encodeRenderCommand<T>(); }, lib.PipelineStatistics(),
+      currentRenderEncoder()->last_pso, buffer, offset, allocation->buffer(), statistics_offset_,
+      draw.cut ? lib.PipelineStatistics(true) : WMT::RenderPipelineState{}, draw.threads
+  );
+  statistics_offset_ += sizeof(PipelineStatisticsResult);
 }
 void
 ArgumentEncodingContext::bumpVisibilityResultOffset() {
@@ -1020,7 +1082,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
 
   QueryReadbacks readbacks{};
 
-  if (auto count = vro_state_.reset()) {
+  auto count = vro_state_.reset();
+  if (count || std::any_of(pending_queries_.begin(), pending_queries_.end(), [](auto &query) {
+        return !query->statistics.empty();
+      })) {
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
         device_, seqId, count, pending_queries_, std::move(visibility_result_offsets_)
     );

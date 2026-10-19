@@ -11,12 +11,16 @@
 // stream-output gaps leave bytes untouched: "the components specified by RegisterMask are skipped in
 // the output (and the output memory is unchanged)." (D3D11.3 14.3). changing a leading gap moves DATA while
 // keeping its stream, slot, component and stride fixed. the ordered declaration includes every gap component.
+// a target's format chooses "writing raw integer values vs. writing normalized float values" (D3D11.3 7.6): one
+// float output drawn to a float and to an integer target stores the same bits in each, so the integer one is converted
+// again while another float format is not.
 #include "d3d12_test.hpp"
 #include <array>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <climits>
+#include <cmath>
 #include <thread>
 #include "../../src/airconv/airconv_public.h"
 
@@ -418,15 +422,17 @@ main(int argc, char **argv) {
       readback->Unmap(0, nullptr);
     }
 
+  std::vector<UINT> float_pixels;
   for (UINT kind = 0; kind < 6; kind++)
-    for (UINT variant = 0; variant < 25; variant++) {
+    for (UINT variant = 0; variant < 27; variant++) {
       const bool mesh = kind == 3 || kind == 4, tessellation = kind == 2 || kind == 5;
       if (kind == 0 && variant == 22)
         continue;
-      const bool points = variant == 17 || variant == 18 || variant == 21;
+      const bool points = variant == 17 || variant == 18 || variant == 21, embedded = variant == 23 || variant == 24;
       if ((mesh && !compiler.dxc) || (kind == 1 && variant != 0 && variant != 14) ||
           (kind == 2 && variant != 0 && variant != 15 && variant != 16 && variant != 22) ||
-          (mesh && variant != 0 && variant != 2 && variant != 13) || (kind == 5 && variant != 0))
+          (mesh && variant != 0 && variant != 2 && variant != 13) || (kind == 5 && variant != 0) ||
+          (kind && variant >= 25))
         continue;
       step("graphics kind %u, key variant %u", kind, variant);
       const UINT root = variant == 1, shader = variant == 2 || variant == 24, offset = variant == 3 ? sizeof(UINT) : 0;
@@ -445,7 +451,7 @@ main(int argc, char **argv) {
                                           : 0u
       };
       D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{
-          variant >= 23 ? nullptr : rs, bytecode(variant >= 23 ? embedded_vs[shader] : points ? vs_points : vs[shader]),
+          embedded ? nullptr : rs, bytecode(embedded ? embedded_vs[shader] : points ? vs_points : vs[shader]),
           bytecode(
               variant == 11 || variant == 12 ? dual
               : variant == 13                ? reordered
@@ -473,7 +479,10 @@ main(int argc, char **argv) {
       desc.PrimitiveTopologyType =
           points ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
       desc.NumRenderTargets = 1;
-      desc.RTVFormats[0] = variant == 6 ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.RTVFormats[0] = variant == 6    ? DXGI_FORMAT_B8G8R8A8_UNORM
+                           : variant == 25 ? DXGI_FORMAT_R32_FLOAT
+                           : variant == 26 ? DXGI_FORMAT_R32_UINT
+                                           : DXGI_FORMAT_R8G8B8A8_UNORM;
       desc.SampleDesc = {samples, 0};
       if (kind == 1 || kind == 5)
         desc.GS = bytecode(gs[variant == 14]);
@@ -517,10 +526,10 @@ main(int argc, char **argv) {
           expect(conversions - made_before == 1, "a different signature supplier converts only its own stage");
         if (variant == 4)
           expect(conversions == made_before, "sample count changes the Metal pipeline, not the conversion");
-        if (variant == 6)
+        if (variant == 6 || variant == 25)
           expect(conversions == made_before, "a target format of the output's own type is not a conversion input");
         if (variant == 3 || variant == 5 || (variant >= 7 && variant <= 13) || variant == 17 || variant == 18 ||
-            variant == 19 || variant == 21)
+            variant == 19 || variant == 21 || variant == 26)
           expect(conversions - made_before == 1, "a new conversion input must have its own entry");
       }
       if (!strcmp(argv[2], "cold") && store_exists() && mesh && variant == 13)
@@ -648,7 +657,19 @@ main(int argc, char **argv) {
                                 (UINT(std::numeric_limits<BYTE>::max()) << ((sizeof(UINT) - sizeof(BYTE)) * CHAR_BIT));
           UINT actual;
           memcpy(&actual, got + footprint.Offset + y * footprint.Footprint.RowPitch + x * sizeof(UINT), sizeof(actual));
-          expect(actual == want, "pixel (%u, %u): %#x, want %#x", x, y, actual, want);
+          if (variant == 25) {
+            float red;
+            memcpy(&red, &actual, sizeof(red));
+            expect(std::lround(red * std::numeric_limits<BYTE>::max()) == long(color), "pixel (%u, %u): %g, want %u / %u",
+                   x, y, red, color, UINT(std::numeric_limits<BYTE>::max()));
+            float_pixels.push_back(actual);
+          } else if (variant == 26) {
+            // "writing raw integer values vs. writing normalized float values" is the format's choice (D3D11.3 7.6)
+            expect(actual == float_pixels.at(y * size + x), "pixel (%u, %u): %#x, want the float target's %#x", x, y,
+                   actual, float_pixels.at(y * size + x));
+          } else {
+            expect(actual == want, "pixel (%u, %u): %#x, want %#x", x, y, actual, want);
+          }
           results.push_back(actual);
         }
       pixels->Unmap(0, nullptr);

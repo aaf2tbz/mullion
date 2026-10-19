@@ -1,8 +1,8 @@
 # each render pass reuses its window first counter
 --- a/src/d3d12/d3d12_command_list.cpp
 +++ b/src/d3d12/d3d12_command_list.cpp
-@@ -295,6 +295,10 @@
-     if (active_queries_.empty() && active_statistics_.empty())
+@@ -333,6 +333,10 @@
+     if (active_queries_.empty())
        return;
      auto [window, address, offset] = allocator_->VisibilitySlot();
 +    if (!render->visibility_buffer) {

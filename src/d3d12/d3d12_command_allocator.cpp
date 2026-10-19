@@ -420,7 +420,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
 IndirectRenderCommandData *
 MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, WMT::RenderPipelineState Pipeline,
-    size_t MaxCount, bool tessellation
+    size_t MaxCount, bool tessellation, bool statistics_cuts
 ) {
   // for a tessellated, geometry or mesh command (`tessellation`) the resolver leaves an IndirectMeshDraw, and the
   // caller draws each: mesh commands in indirect command buffers come only with Apple9 GPUs, and one way serves all
@@ -483,6 +483,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     data->geometry_threads = 0;
     data->geometry_increment = 0;
     data->geometry_max_warps = 0;
+    data->pixel_statistics = data->statistics = 0;
+    data->statistics_first = data->statistics_step = data->statistics_cut = data->statistics_cuts = 0;
     for (unsigned i = 0; i < 3; i++) {
       data->object_threads[i] = pPSO->mesh_shader ? pPSO->object_threads[i] : 0;
       data->mesh_threads[i] = pPSO->mesh_shader ? pPSO->mesh_threads[i] : 0;
@@ -538,6 +540,21 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     cmd_write_icb.type = WMTComputeCommandUseResource;
     cmd_write_icb.usage = WMTResourceUsageWrite;
     cmd_write_icb.resource = icb;
+  }
+
+  if (statistics_cuts) {
+    auto pipeline = pCmdSig->StatisticsResolver();
+    auto &set = EncodeBeforeRender<wmtcmd_compute_setpso>();
+    set.type = WMTComputeCommandSetPSO;
+    set.pso = pipeline;
+    set.threadgroup_size = {pipeline.threadExecutionWidth(), 1, 1};
+    auto &scan = EncodeBeforeRender<wmtcmd_compute_dispatch>();
+    scan.type = WMTComputeCommandDispatch;
+    scan.size = {MaxCount, 1, 1};
+    auto &restore = EncodeBeforeRender<wmtcmd_compute_setpso>();
+    restore.type = WMTComputeCommandSetPSO;
+    restore.pso = pCmdSig->render_resolver;
+    restore.threadgroup_size = {pCmdSig->render_resolver.maxTotalThreadsPerThreadgroup(), 1, 1};
   }
 
   auto &cmd_dispatch_res = EncodeBeforeRender<wmtcmd_compute_dispatch>();

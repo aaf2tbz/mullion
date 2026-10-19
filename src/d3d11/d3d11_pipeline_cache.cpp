@@ -462,6 +462,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     if (!inserted) {
       D3D11_ASSERT(0 && "duplicated graphics pipeline");
     } else {
+      iter->second->description = &iter->first;
       scheduler_.submit(iter->second.get());
     }
     *ppPipeline = iter->second.get();
@@ -480,6 +481,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     if (!inserted) {
       D3D11_ASSERT(0 && "duplicated geometry pipeline");
     } else {
+      iter->second->description = &iter->first;
       scheduler_.submit(iter->second.get());
     }
     *ppPipeline = iter->second.get();
@@ -498,6 +500,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     if (!inserted) {
       D3D11_ASSERT(0 && "duplicated tessellation pipeline");
     } else {
+      iter->second->description = &iter->first;
       scheduler_.submit(iter->second.get());
     }
     *ppPipeline = iter->second.get();

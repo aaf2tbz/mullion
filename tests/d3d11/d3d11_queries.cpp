@@ -26,6 +26,13 @@
 // "Number of times PS is executed" (20.4.7). The restarted range excludes its discarded draw on both contexts.
 // "The value of PSInvocations may include or exclude helper pixels for 2x2 stamps" (20.4.7). The triangle covers
 // the viewport's quad; clipping can split it into two triangles, each needing all lanes of its target's stamps.
+// "OCCLUSION measures multi-samples (not pixels)"; "If the Pixel Shader outputs depth, then PSInvocations
+// must increment as expected, even if the output depth fails"; "when a NULL pixel shader is bound to the
+// pipeline, PSInvocations does not increment" (D3D11.3 20.4.7). sample frequency is not requested here.
+// "the data associated with the Query is expected to be returned/ copied out through the pData parameter."
+// (D3D11.3 20.3.5). repeated reads of one ended range must return that same data.
+// a cut means "the strip defined up to the previous index is to be completed, and the next index is a new strip"
+// (8.12). the expected primitive count is the sum over the complete strips authored below.
 #include "d3d11_test.hpp"
 #include <d3d10.h>
 #include <d3d11_1.h>
@@ -44,10 +51,16 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
   return float4(p * 2 - 1, 0, 1);
 }
 uint ps() : SV_Target { return 1; }
+uint ps_depth(out float depth : SV_Depth) : SV_Target { depth = 0.5; return 1; }
+float4 vs_strip(uint id : SV_VertexID) : SV_Position {
+  float2 corners[] = {float2(-1, 1), float2(1, 1), float2(-1, -1), float2(1, -1)};
+  return float4(corners[id % 4], 0.5, 1);
+}
 )";
   step("seed %u: compile VS and PS", seed);
-  auto vs_code = compile(shader, "vs", "vs"), ps_code = compile(shader, "ps", "ps");
-  if (!vs_code || !ps_code)
+  auto vs_code = compile(shader, "vs", "vs"), ps_code = compile(shader, "ps", "ps"),
+       depth_code = compile(shader, "ps_depth", "ps"), strip_code = compile(shader, "vs_strip", "vs");
+  if (!vs_code || !ps_code || !depth_code || !strip_code)
     return 1;
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> immediate, deferred;
@@ -74,6 +87,16 @@ uint ps() : SV_Target { return 1; }
         Sleep(1);
     }
     return expect(hr == S_OK, "query never ready: %#lx", hr);
+  };
+
+  auto read_statistics = [&](ID3D11Query *query, D3D11_QUERY_DATA_PIPELINE_STATISTICS &data) {
+    HRESULT hr = immediate->GetData(query, &data, sizeof(data), 0);
+    if (hr == S_OK) {
+      D3D11_QUERY_DATA_PIPELINE_STATISTICS repeated{};
+      HRESULT again = immediate->GetData(query, &repeated, sizeof(repeated), 0);
+      expect(again == S_OK && !memcmp(&data, &repeated, sizeof(data)), "repeated statistics read changed the result");
+    }
+    return hr;
   };
 
   auto source = buffer(device.Get(), sizeof(UINT), 0, seed);
@@ -299,7 +322,7 @@ uint ps() : SV_Target { return 1; }
     if (!ready(statistics.Get()))
       return verdict();
     D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
-    if (!expect(immediate->GetData(statistics.Get(), &data, sizeof(data), 0) == S_OK, "pipeline data is not ready"))
+    if (!expect(read_statistics(statistics.Get(), data) == S_OK, "pipeline data is not ready"))
       return verdict();
     expect(data.IAVertices == UINT64(3) * draws, "pipeline IA vertices %llu for %u retained draws",
            data.IAVertices, draws);
@@ -407,7 +430,7 @@ uint ps() : SV_Target { return 1; }
     if (!ready(query))
       return false;
     D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
-    HRESULT hr = immediate->GetData(query, &data, sizeof(data), 0);
+    HRESULT hr = read_statistics(query, data);
     bool valid = expect(hr == S_OK && data.IAVertices == primitives * triangle_vertices && data.IAPrimitives == primitives,
                         "statistics %#lx: IA vertices %llu, primitives %llu; want %llu, %llu", hr, data.IAVertices,
                         data.IAPrimitives, primitives * triangle_vertices, primitives);
@@ -415,6 +438,10 @@ uint ps() : SV_Target { return 1; }
                data.CPrimitives >= primitives,
            "VS %llu, clipper %llu/%llu for %llu primitives", data.VSInvocations, data.CInvocations,
            data.CPrimitives, primitives);
+    const UINT64 pixels = UINT64(width) * height * primitives;
+    const UINT64 maximum = UINT64(2) * ((width + 1) / 2) * ((height + 1) / 2) * 4 * primitives;
+    valid &= expect(data.PSInvocations >= pixels && data.PSInvocations <= maximum,
+                    "PS invocations %llu, want [%llu, %llu]", data.PSInvocations, pixels, maximum);
     return valid;
   };
   const D3D11_QUERY_DESC query_desc{D3D11_QUERY_PIPELINE_STATISTICS};
@@ -423,6 +450,40 @@ uint ps() : SV_Target { return 1; }
   CHECK(device->CreateQuery(&query_desc, &outer));
   CHECK(device->CreateQuery(&query_desc, &overlap));
   std::array<ComPtr<ID3D11CommandList>, 2> lists;
+  step("immediate statistics include a deferred list with no query of its own");
+  setup(deferred.Get());
+  const UINT list_draws = width * height;
+  for (UINT i = 0; i < list_draws; i++)
+    deferred->DrawInstanced(triangle_vertices, i ? 1 : 2, 0, 0);
+  ComPtr<ID3D11CommandList> unqueried;
+  CHECK(deferred->FinishCommandList(FALSE, &unqueried));
+  for (UINT replay = 0; replay < 2; replay++) {
+    immediate->Begin(outer.Get());
+    immediate->ExecuteCommandList(unqueried.Get(), TRUE);
+    immediate->End(outer.Get());
+    counts(outer.Get(), list_draws + 1);
+  }
+
+  step("stream output and its rasterization count the input once");
+  ComPtr<ID3D11GeometryShader> streamed;
+  const D3D11_SO_DECLARATION_ENTRY position{0, "SV_Position", 0, 0, 4, 0};
+  const UINT position_stride = 4 * sizeof(float);
+  CHECK(device->CreateGeometryShaderWithStreamOutput(
+      vs_code->GetBufferPointer(), vs_code->GetBufferSize(), &position, 1, &position_stride, 1, 0, nullptr, &streamed));
+  auto positions = buffer(device.Get(), position_stride * triangle_vertices, D3D11_BIND_STREAM_OUTPUT);
+  if (!expect(positions, "stream output buffer was not created"))
+    return verdict();
+  setup(immediate.Get());
+  immediate->GSSetShader(streamed.Get(), nullptr, 0);
+  const UINT output_offset = 0;
+  immediate->SOSetTargets(1, positions.GetAddressOf(), &output_offset);
+  immediate->Begin(outer.Get());
+  immediate->Draw(triangle_vertices, 0);
+  immediate->End(outer.Get());
+  counts(outer.Get(), 1);
+  immediate->GSSetShader(nullptr, nullptr, 0);
+  immediate->SOSetTargets(0, nullptr, nullptr);
+
   step("two contexts interleave one query's recording");
   for (UINT i = 0; i < contexts.size(); i++) {
     setup(contexts[i]);
@@ -526,5 +587,137 @@ uint ps() : SV_Target { return 1; }
       immediate->ExecuteCommandList(list.Get(), TRUE);
       counts(shared.Get(), instances);
     }
+  ComPtr<ID3D11PixelShader> depth_pixel;
+  ComPtr<ID3D11VertexShader> strip_vertex;
+  CHECK(device->CreatePixelShader(depth_code->GetBufferPointer(), depth_code->GetBufferSize(), nullptr, &depth_pixel));
+  CHECK(
+      device->CreateVertexShader(strip_code->GetBufferPointer(), strip_code->GetBufferSize(), nullptr, &strip_vertex));
+  D3D11_DEPTH_STENCIL_DESC depth_state_desc{};
+  depth_state_desc.DepthEnable = TRUE;
+  depth_state_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+  depth_state_desc.DepthFunc = D3D11_COMPARISON_LESS;
+  ComPtr<ID3D11DepthStencilState> depth_state;
+  CHECK(device->CreateDepthStencilState(&depth_state_desc, &depth_state));
+  for (auto *context : {immediate.Get(), deferred.Get()}) {
+    auto finish = [&] {
+      if (context == deferred.Get()) {
+        ComPtr<ID3D11CommandList> list;
+        HRESULT hr = deferred->FinishCommandList(FALSE, &list);
+        if (FAILED(hr))
+          return expect(false, "FinishCommandList returned %#lx", hr);
+        immediate->ExecuteCommandList(list.Get(), TRUE);
+      }
+      return ready(shared.Get());
+    };
+    for (UINT samples : {1u, 4u}) {
+      D3D11_TEXTURE2D_DESC desc{
+          width, height, 1, 1, DXGI_FORMAT_R32_UINT, {samples, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET};
+      ComPtr<ID3D11Texture2D> color, depth;
+      ComPtr<ID3D11RenderTargetView> color_view;
+      ComPtr<ID3D11DepthStencilView> depth_view;
+      CHECK(device->CreateTexture2D(&desc, nullptr, &color));
+      CHECK(device->CreateRenderTargetView(color.Get(), nullptr, &color_view));
+      desc.Format = DXGI_FORMAT_D32_FLOAT;
+      desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+      CHECK(device->CreateTexture2D(&desc, nullptr, &depth));
+      CHECK(device->CreateDepthStencilView(depth.Get(), nullptr, &depth_view));
+      for (UINT shader_kind = 0; shader_kind < 3; shader_kind++)
+        for (bool passes : {false, true}) {
+          step("%s, %u samples, shader %u, depth passes %u", context == immediate.Get() ? "immediate" : "deferred",
+               samples, shader_kind, passes);
+          setup(context);
+          context->OMSetRenderTargets(1, color_view.GetAddressOf(), depth_view.Get());
+          context->OMSetDepthStencilState(depth_state.Get(), 0);
+          context->ClearDepthStencilView(depth_view.Get(), D3D11_CLEAR_DEPTH, passes ? 1.0f : 0.0f, 0);
+          context->PSSetShader(shader_kind == 0   ? nullptr
+                               : shader_kind == 1 ? pixel.Get()
+                                                  : depth_pixel.Get(),
+                               nullptr, 0);
+          context->Begin(shared.Get());
+          context->Draw(triangle_vertices, 0);
+          context->End(shared.Get());
+          if (!finish())
+            return verdict();
+          D3D11_QUERY_DATA_PIPELINE_STATISTICS got{};
+          CHECK(read_statistics(shared.Get(), got));
+          const UINT64 covered = UINT64(width) * height;
+          const UINT64 minimum = shader_kind && (passes || shader_kind == 2) ? covered : 0;
+          const UINT64 maximum = shader_kind ? 2 * ((width + 1) / 2) * ((height + 1) / 2) * 4 : 0;
+          expect(got.PSInvocations >= minimum && got.PSInvocations <= maximum, "PS invocations %llu, want [%llu, %llu]",
+                 got.PSInvocations, minimum, maximum);
+        }
+    }
+    for (DXGI_FORMAT format : {DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT})
+      for (auto topology : {D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP})
+        for (UINT strips : {1u, 2u, 19u})
+          for (UINT edge_cuts : {0u, 1u, 2u, 3u}) {
+            const UINT cut =
+                format == DXGI_FORMAT_R16_UINT ? D3D11_16BIT_INDEX_STRIP_CUT_VALUE : D3D11_32BIT_INDEX_STRIP_CUT_VALUE;
+            const UINT buffer_offset_indices = 2, start_index = 3,
+                       leading_indices = buffer_offset_indices + start_index;
+            std::vector<UINT> index(leading_indices, cut);
+            UINT64 primitives = 0;
+            if (edge_cuts & 1)
+              index.push_back(cut);
+            for (UINT strip = 0; strip < strips; strip++) {
+              if (strip) {
+                index.push_back(cut);
+                if (strip % 2)
+                  index.push_back(cut);
+              }
+              const UINT vertices = 3 + (strip ? strip % 3 : width * height);
+              for (UINT v = 0; v < vertices; v++)
+                index.push_back(v % 4);
+              primitives += vertices - (topology == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP ? 1 : 2);
+            }
+            if (edge_cuts & 2)
+              index.push_back(cut);
+            std::vector<UINT16> narrow(index.begin(), index.end());
+            const UINT stride = format == DXGI_FORMAT_R16_UINT ? sizeof(UINT16) : sizeof(UINT);
+            D3D11_BUFFER_DESC desc{UINT(index.size()) * stride, D3D11_USAGE_DEFAULT, D3D11_BIND_INDEX_BUFFER};
+            D3D11_SUBRESOURCE_DATA data{format == DXGI_FORMAT_R16_UINT ? (void *)narrow.data() : (void *)index.data()};
+            ComPtr<ID3D11Buffer> ib;
+            CHECK(device->CreateBuffer(&desc, &data, &ib));
+            for (UINT instances : {1u, 3u})
+              for (bool indirect : {false, true}) {
+                step("%s, format %u, topology %u, strips %u, edge cuts %u, instances %u, indirect %u",
+                     context == immediate.Get() ? "immediate" : "deferred", format, topology, strips, edge_cuts,
+                     instances, indirect);
+                const D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS args{UINT(index.size()) - leading_indices, instances,
+                                                                      start_index};
+                D3D11_BUFFER_DESC args_desc{sizeof(args), D3D11_USAGE_DEFAULT};
+                args_desc.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+                D3D11_SUBRESOURCE_DATA args_data{&args};
+                ComPtr<ID3D11Buffer> arguments;
+                CHECK(device->CreateBuffer(&args_desc, &args_data, &arguments));
+                setup(context);
+                context->OMSetDepthStencilState(nullptr, 0);
+                context->IASetIndexBuffer(ib.Get(), format, buffer_offset_indices * stride);
+                context->IASetPrimitiveTopology(topology);
+                context->VSSetShader(strip_vertex.Get(), nullptr, 0);
+                context->Begin(shared.Get());
+                if (indirect)
+                  context->DrawIndexedInstancedIndirect(arguments.Get(), 0);
+                else if (instances == 1)
+                  context->DrawIndexed(index.size() - leading_indices, start_index, 0);
+                else
+                  context->DrawIndexedInstanced(index.size() - leading_indices, instances, start_index, 0, 0);
+                const D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS empty{};
+                context->UpdateSubresource(arguments.Get(), 0, nullptr, &empty, 0, 0);
+                context->End(shared.Get());
+                if (!finish())
+                  return verdict();
+                D3D11_QUERY_DATA_PIPELINE_STATISTICS got{};
+                CHECK(read_statistics(shared.Get(), got));
+                const UINT64 expected = primitives * instances;
+                expect(got.IAPrimitives == expected && got.CInvocations == expected,
+                       "strip primitives IA %llu clipper %llu, want %llu", got.IAPrimitives, got.CInvocations,
+                       expected);
+                if (topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+                  expect(got.PSInvocations >= UINT64(width / 2) * (height / 2) * strips * instances,
+                         "strip draw lost pixel invocations: %llu", got.PSInvocations);
+              }
+          }
+  }
   return verdict();
 }
