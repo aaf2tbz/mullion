@@ -5359,7 +5359,7 @@ public:
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
         cmd.dsso = state->GetDepthStencilState(encoder->dsv_planar_flags);
-        cmd.stencil_ref = stencil_ref;
+        cmd.stencil_ref = cmd.back_stencil_ref = stencil_ref;
       });
     }
     if (dirty_state.any(DirtyState::RasterizerState)) {
@@ -5381,7 +5381,7 @@ public:
         cmd.green = g;
         cmd.blue = b;
         cmd.alpha = a;
-        cmd.stencil_ref = stencil_ref;
+        cmd.stencil_ref = cmd.back_stencil_ref = stencil_ref;
       });
     }
     IMTLD3D11RasterizerState *current_rs =

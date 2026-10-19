@@ -1118,7 +1118,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetDSSO: {
       struct wmtcmd_render_setdsso *body = (struct wmtcmd_render_setdsso *)next;
       [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->dsso];
-      [encoder setStencilReferenceValue:body->stencil_ref];
+      [encoder setStencilFrontReferenceValue:body->stencil_ref backReferenceValue:body->back_stencil_ref];
       break;
     }
     case WMTRenderCommandSetDepthStencilState: {
@@ -1129,7 +1129,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetBlendFactorAndStencilRef: {
       struct wmtcmd_render_setblendcolor *body = (struct wmtcmd_render_setblendcolor *)next;
       [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
-      [encoder setStencilReferenceValue:body->stencil_ref];
+      [encoder setStencilFrontReferenceValue:body->stencil_ref backReferenceValue:body->back_stencil_ref];
       break;
     }
     case WMTRenderCommandSetBlendFactor: {
@@ -1139,7 +1139,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandSetStencilRef: {
       struct wmtcmd_render_setstencilref *body = (struct wmtcmd_render_setstencilref *)next;
-      [encoder setStencilReferenceValue:body->stencil_ref];
+      [encoder setStencilFrontReferenceValue:body->stencil_ref backReferenceValue:body->back_stencil_ref];
       break;
     }
     case WMTRenderCommandSetDepthTestBounds: {

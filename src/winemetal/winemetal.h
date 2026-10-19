@@ -1503,6 +1503,7 @@ struct wmtcmd_render_setdsso {
   struct WMTMemoryPointer next;
   obj_handle_t dsso;
   uint8_t stencil_ref;
+  uint8_t back_stencil_ref;
 };
 
 struct wmtcmd_render_setdepthstencilstate {
@@ -1521,6 +1522,7 @@ struct wmtcmd_render_setblendcolor {
   float blue;
   float alpha;
   uint8_t stencil_ref;
+  uint8_t back_stencil_ref;
 };
 
 struct wmtcmd_render_setstencilref {
@@ -1528,6 +1530,7 @@ struct wmtcmd_render_setstencilref {
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   uint8_t stencil_ref;
+  uint8_t back_stencil_ref;
 };
 
 struct wmtcmd_render_setdepthtestbounds {

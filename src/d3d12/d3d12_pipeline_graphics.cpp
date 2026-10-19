@@ -286,7 +286,8 @@ MTLD3D12PipelineState::InitializeShader(
 template <typename Desc>
 static HRESULT
 GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
-               D3D12_SHADER_BYTECODE as = {}, D3D12_SHADER_BYTECODE ms = {}) {
+               D3D12_SHADER_BYTECODE as = {}, D3D12_SHADER_BYTECODE ms = {},
+               const D3D12_DEPTH_STENCIL_DESC2 *depth_stencil2 = nullptr) {
   Sha1HashState h;
   bool valid = true;
   auto hash = [&](const auto &...values) { (h.update(values), ...); };
@@ -337,6 +338,9 @@ GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
     hash(fill, cull, front, bias, clamp, slope, clip, multisample, aa, forced, conservative);
     auto &[enabled, write, function, stencil, read_mask, write_mask, front_face, back_face] = depth;
     hash(enabled, write, function, stencil, read_mask, write_mask);
+    if (depth_stencil2 && (depth_stencil2->BackFace.StencilReadMask != read_mask ||
+                           depth_stencil2->BackFace.StencilWriteMask != write_mask))
+      hash(depth_stencil2->BackFace.StencilReadMask, depth_stencil2->BackFace.StencilWriteMask);
     for (auto &face : {front_face, back_face}) {
       auto &[fail, depth_fail, pass, compare] = face;
       hash(fail, depth_fail, pass, compare);
@@ -364,8 +368,8 @@ PipelineKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key) {
 
 HRESULT
 PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key, bool DepthBounds,
-            D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS) {
-  return GetPipelineKey(Desc, Key, DepthBounds, AS, MS);
+            D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS, const D3D12_DEPTH_STENCIL_DESC2 *DepthStencil2) {
+  return GetPipelineKey(Desc, Key, DepthBounds, AS, MS, DepthStencil2);
 }
 
 WMT::Reference<WMT::Function>
@@ -820,7 +824,7 @@ public:
   }
 
   void
-  InitializeDSSO(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+  InitializeDSSO(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, const D3D12_DEPTH_STENCIL_DESC2 *depth_stencil2) {
     WMTDepthStencilInfo info;
     info.depth_compare_function = WMTCompareFunctionAlways;
     info.depth_write_enabled = false;
@@ -846,8 +850,10 @@ public:
       info.back_stencil.stencil_fail_op = kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilFailOp];
       info.back_stencil.depth_fail_op = kStencilOperationMap[pDesc->DepthStencilState.BackFace.StencilDepthFailOp];
       info.back_stencil.stencil_compare_function = kCompareFunctionMap[pDesc->DepthStencilState.BackFace.StencilFunc];
-      info.back_stencil.write_mask = pDesc->DepthStencilState.StencilWriteMask;
-      info.back_stencil.read_mask = pDesc->DepthStencilState.StencilReadMask;
+      info.back_stencil.write_mask = depth_stencil2 ? depth_stencil2->BackFace.StencilWriteMask
+                                                  : pDesc->DepthStencilState.StencilWriteMask;
+      info.back_stencil.read_mask = depth_stencil2 ? depth_stencil2->BackFace.StencilReadMask
+                                                 : pDesc->DepthStencilState.StencilReadMask;
     }
 
     auto metal = device_->GetMTLDevice();
@@ -919,7 +925,8 @@ public:
   // AS and MS make a mesh shader pipeline: the amplification shader, if any, is Metal's object stage, the mesh shader
   // its mesh stage
   virtual HRESULT
-  Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {}) {
+  Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS,
+             const D3D12_DEPTH_STENCIL_DESC2 *depth_stencil2) {
     auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     stream_output = pDesc->StreamOutput.NumEntries;
     mesh_shader = MS.pShaderBytecode;
@@ -1253,7 +1260,7 @@ public:
     }
 
     // DSSO
-    InitializeDSSO(pDesc);
+    InitializeDSSO(pDesc, depth_stencil2);
 
     InitializeRasterizerState(pDesc);
 
@@ -1350,7 +1357,8 @@ public:
 HRESULT
 CreateGraphicsPipelineState(
     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
-    bool depth_bounds, D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS, const PipelineShaderCache *cached
+    bool depth_bounds, D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS, const PipelineShaderCache *cached,
+    const D3D12_DEPTH_STENCIL_DESC2 *depth_stencil2
 ) {
   InitReturnPtr(ppPipelineState);
   if (HRESULT hr = CheckCachedPipeline(pDesc->CachedPSO); FAILED(hr))
@@ -1390,12 +1398,12 @@ CreateGraphicsPipelineState(
     desc.pRootSignature = embedded.ptr();
   }
   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
-  if (HRESULT hr = PipelineKey(*pDesc, pso->library_key, depth_bounds, AS, MS); FAILED(hr))
+  if (HRESULT hr = PipelineKey(*pDesc, pso->library_key, depth_bounds, AS, MS, depth_stencil2); FAILED(hr))
     return hr;
   if (cached)
     pso->cached_shaders = *cached;
   pso->depth_bounds = depth_bounds && pDevice->GetMTLDevice().supportsFamily(WMTGPUFamilyApple10);
-  HRESULT hr = pso->Initialize(&desc, AS, MS);
+  HRESULT hr = pso->Initialize(&desc, AS, MS, depth_stencil2);
   if (FAILED(hr))
     return hr;
   return pso->QueryInterface(riid, ppPipelineState);
@@ -1404,7 +1412,8 @@ CreateGraphicsPipelineState(
 HRESULT
 PipelineStateStream::Key(Sha1Digest &key) const {
   return desc_cs.CS.pShaderBytecode ? PipelineKey(desc_cs, key)
-                                  : PipelineKey(desc_graphics, key, depth_bounds, desc_as, desc_ms);
+                                  : PipelineKey(desc_graphics, key, depth_bounds, desc_as, desc_ms,
+                                                depth_stencil2 ? &*depth_stencil2 : nullptr);
 }
 
 HRESULT
@@ -1417,7 +1426,8 @@ PipelineStateStream::Create(
     compute.CachedPSO = {}, graphics.CachedPSO = {};
   return compute.CS.pShaderBytecode
              ? CreateComputePipelineState(device, &compute, iid, pipeline, cached)
-             : CreateGraphicsPipelineState(device, &graphics, iid, pipeline, depth_bounds, desc_as, desc_ms, cached);
+             : CreateGraphicsPipelineState(device, &graphics, iid, pipeline, depth_bounds, desc_as, desc_ms, cached,
+                                           depth_stencil2 ? &*depth_stencil2 : nullptr);
 }
 
 } // namespace dxmt

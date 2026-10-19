@@ -234,7 +234,7 @@ DepthStencilBlitContext::copyFromBuffer(
   auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
   setdsso.type = WMTRenderCommandSetDSSO;
   setdsso.dsso = depth_stencil_state_.handle;
-  setdsso.stencil_ref = 0;
+  setdsso.stencil_ref = setdsso.back_stencil_ref = 0;
 
   auto &setbuf = ctx_.encodeRenderCommand<wmtcmd_render_setbuffer>();
   setbuf.type = WMTRenderCommandSetFragmentBuffer;

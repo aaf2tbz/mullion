@@ -68,6 +68,21 @@ ID3D12GraphicsCommandList8 : public ID3D12GraphicsCommandList7 {
   virtual void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) = 0;
 };
 __CRT_UUID_DECL(ID3D12GraphicsCommandList8, 0xee936ef9, 0x599d, 0x4d28, 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51)
+// DirectX-Headers, d3d12.idl; absent from the installed SDK together with interface 8
+constexpr auto D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2 = (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)26;
+struct D3D12_DEPTH_STENCILOP_DESC1 {
+  D3D12_STENCIL_OP StencilFailOp, StencilDepthFailOp, StencilPassOp;
+  D3D12_COMPARISON_FUNC StencilFunc;
+  UINT8 StencilReadMask, StencilWriteMask;
+};
+struct D3D12_DEPTH_STENCIL_DESC2 {
+  BOOL DepthEnable;
+  D3D12_DEPTH_WRITE_MASK DepthWriteMask;
+  D3D12_COMPARISON_FUNC DepthFunc;
+  BOOL StencilEnable;
+  D3D12_DEPTH_STENCILOP_DESC1 FrontFace, BackFace;
+  BOOL DepthBoundsTestEnable;
+};
 #endif
 
 namespace dxmt {
@@ -645,7 +660,7 @@ HRESULT
 CreateGraphicsPipelineState(
     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState,
     bool depth_bounds = false, D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {},
-    const PipelineShaderCache *cached = nullptr
+    const PipelineShaderCache *cached = nullptr, const D3D12_DEPTH_STENCIL_DESC2 *depth_stencil2 = nullptr
 );
 
 HRESULT

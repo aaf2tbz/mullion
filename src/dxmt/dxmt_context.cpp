@@ -2038,7 +2038,7 @@ void
 SimpleCommandContext<ArgumentEncodingContext>::setStencilReference(uint8_t stencil_ref) {
   auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setstencilref>();
   cmd.type = WMTRenderCommandSetStencilRef;
-  cmd.stencil_ref = stencil_ref;
+  cmd.stencil_ref = cmd.back_stencil_ref = stencil_ref;
 }
 
 template <>

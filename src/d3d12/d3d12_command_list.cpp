@@ -195,6 +195,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
 
   FLOAT blend_factor_[4];
   UINT8 stencil_ref_;
+  UINT8 back_stencil_ref_;
   // OMSetDepthBounds' range, NaN as 0; the pass has a range set when depth_bounds_set_
   FLOAT depth_bounds_[2];
   bool depth_bounds_set_ = false;
@@ -547,7 +548,7 @@ public:
     blend_factor_[1] = 1.0f;
     blend_factor_[2] = 1.0f;
     blend_factor_[3] = 1.0f;
-    stencil_ref_ = 0;
+    stencil_ref_ = back_stencil_ref_ = 0;
     depth_bounds_[0] = 0.0f;
     depth_bounds_[1] = 1.0f;
 
@@ -935,6 +936,7 @@ public:
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setstencilref>();
       cmd.type = WMTRenderCommandSetStencilRef;
       cmd.stencil_ref = stencil_ref_;
+      cmd.back_stencil_ref = back_stencil_ref_;
       dirty_state_.clr(DirtyState::StencilRef);
     }
 
@@ -1982,18 +1984,18 @@ public:
 
   void STDMETHODCALLTYPE
   OMSetStencilRef(UINT StencilRef) {
-    if (Record([=](auto *l) { l->OMSetStencilRef(StencilRef); }))
-      return;
-    if (stencil_ref_ == (UINT8)StencilRef)
-      return;
-    stencil_ref_ = (UINT8)StencilRef;
-    dirty_state_.set(DirtyState::StencilRef);
+    OMSetFrontAndBackStencilRef(StencilRef, StencilRef);
   };
 
-  // both faces take the front reference: OPTIONS14 reports no independent front and back references
   void STDMETHODCALLTYPE
   OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) {
-    OMSetStencilRef(FrontStencilRef);
+    if (Record([=](auto *l) { l->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef); }))
+      return;
+    if (stencil_ref_ == (UINT8)FrontStencilRef && back_stencil_ref_ == (UINT8)BackStencilRef)
+      return;
+    stencil_ref_ = (UINT8)FrontStencilRef;
+    back_stencil_ref_ = (UINT8)BackStencilRef;
+    dirty_state_.set(DirtyState::StencilRef);
   }
 
   void STDMETHODCALLTYPE

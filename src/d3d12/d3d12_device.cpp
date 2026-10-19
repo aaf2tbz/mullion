@@ -737,6 +737,13 @@ public:
       reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData)->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
       return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS14: {
+      if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS14>(pFeatureData, DataSize) != S_OK)
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14 *>(pFeatureData);
+      out->IndependentFrontAndBackStencilRefMaskSupported = TRUE;
+      return S_OK;
+    }
     /* capabilities with no complete path yet: D3D12 defines an all-zero answer as unsupported, or tier 0, in each */
     case D3D12_FEATURE_D3D12_OPTIONS6:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS6>(pFeatureData, DataSize);
@@ -746,8 +753,6 @@ public:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS10>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS13:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS13>(pFeatureData, DataSize);
-    case D3D12_FEATURE_D3D12_OPTIONS14:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS14>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS15:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS15>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS17:
@@ -2045,7 +2050,8 @@ PipelineStateStream::Parse(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc) {
     }
     auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *>(stream_start);
 
-    if (uint32_t(type) >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID || (defined_type & (1 << type))) {
+    if ((uint32_t(type) >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID &&
+         type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) || (defined_type & (1 << type))) {
       ERR("CreatePipelineState: unknown or duplicated subobject type ", type);
       return E_INVALIDARG;
     }
@@ -2184,6 +2190,23 @@ PipelineStateStream::Parse(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc) {
       desc_graphics.DepthStencilState.StencilReadMask = subobject->data.StencilReadMask;
       desc_graphics.DepthStencilState.BackFace = subobject->data.BackFace;
       desc_graphics.DepthStencilState.FrontFace = subobject->data.FrontFace;
+      depth_bounds = subobject->data.DepthBoundsTestEnable;
+      break;
+    }
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
+      GET_STREAM_DATA(D3D12_DEPTH_STENCIL_DESC2);
+      depth_stencil2 = subobject->data;
+      auto &depth = desc_graphics.DepthStencilState;
+      depth.DepthEnable = subobject->data.DepthEnable;
+      depth.DepthWriteMask = subobject->data.DepthWriteMask;
+      depth.DepthFunc = subobject->data.DepthFunc;
+      depth.StencilEnable = subobject->data.StencilEnable;
+      depth.StencilReadMask = subobject->data.FrontFace.StencilReadMask;
+      depth.StencilWriteMask = subobject->data.FrontFace.StencilWriteMask;
+      auto &front = subobject->data.FrontFace;
+      auto &back = subobject->data.BackFace;
+      depth.FrontFace = {front.StencilFailOp, front.StencilDepthFailOp, front.StencilPassOp, front.StencilFunc};
+      depth.BackFace = {back.StencilFailOp, back.StencilDepthFailOp, back.StencilPassOp, back.StencilFunc};
       depth_bounds = subobject->data.DepthBoundsTestEnable;
       break;
     }

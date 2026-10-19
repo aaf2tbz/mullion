@@ -64,7 +64,8 @@ public:
 HRESULT PipelineKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key);
 HRESULT PipelineKey(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key, bool DepthBounds = false,
-    D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {}
+    D3D12_SHADER_BYTECODE AS = {}, D3D12_SHADER_BYTECODE MS = {},
+    const D3D12_DEPTH_STENCIL_DESC2 *DepthStencil2 = nullptr
 );
 HRESULT CreatePipelineLibrary(MTLD3D12Device *Device, const void *Blob, SIZE_T Size, REFIID Iid, void **Library);
 
@@ -80,6 +81,7 @@ struct PipelineStateStream {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc_graphics{};
   D3D12_SHADER_BYTECODE desc_as{}, desc_ms{};
   bool depth_bounds = false;
+  std::optional<D3D12_DEPTH_STENCIL_DESC2> depth_stencil2;
 
   HRESULT Parse(const D3D12_PIPELINE_STATE_STREAM_DESC *desc);
   HRESULT Key(Sha1Digest &key) const;
