@@ -85,7 +85,8 @@ public:
   WMT::MetalDrawable encodeCommands(
       WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-      std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+      std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
+      uint64_t seq_id = 0, unsigned *encoder_count = nullptr
   );
 
   // draws the oldest frame encoded without a layer, at least `after` seconds after the previous one (as

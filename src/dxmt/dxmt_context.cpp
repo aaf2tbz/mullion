@@ -1030,6 +1030,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
 
   readbacks.timestamp = timestamp_state_.flush(cmdbuf, queue_.timestamp_samples);
 
+  unsigned metal_encoder_count = 0;
   WMTSampleBufferAttachmentInfo timestamp_sample{};
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
@@ -1058,6 +1059,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       }
     }
     auto scaler_boundary = [&](bool end) {
+      metal_encoder_count++;
       if constexpr (Profile) {
         if (samples.sample_buffer) {
           auto boundary = samples;
@@ -1133,7 +1135,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = samples.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, samples)
                                           : cmdbuf.renderCommandEncoder(render_pass_info);
-      // the pass named by its place, size and draws, which a failed command buffer's report lists its encoders by
+      auto index = metal_encoder_count++;
       if (diag::errors || diag::trace_encoders) {
         unsigned draws = 0, geometry = 0, tessellation = 0;
         for (auto cmd = reinterpret_cast<const wmtcmd_base *>(&data->cmd_head); cmd;
@@ -1144,9 +1146,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           draws += cmd->type >= WMTRenderCommandDraw && cmd->type <= WMTRenderCommandDrawMeshThreadgroupsIndirect;
         }
         auto label = str::format(
-            "render ", seqId, ".", encoder_count - encoder_index, ": ", data->render_target_width, "x",
-            data->render_target_height, ", ", draws + geometry + tessellation, " draws (", geometry, " geometry, ",
-            tessellation, " tessellation)"
+            "render ", seqId, ".", index, ": ", data->render_target_width, "x", data->render_target_height, ", ",
+            draws + geometry + tessellation, " draws (", geometry, " geometry, ", tessellation, " tessellation)"
         );
         if (diag::errors)
           encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
@@ -1297,6 +1298,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto data = static_cast<ComputeEncoderData *>(current);
       auto encoder = samples.sample_buffer ? cmdbuf.computeCommandEncoder(samples, true)
                                           : cmdbuf.computeCommandEncoder(true);
+      metal_encoder_count++;
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       struct wmtcmd_compute_setbuffer setcmd;
       setcmd.type = WMTComputeCommandSetBuffer;
@@ -1317,6 +1319,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto data = static_cast<BlitEncoderData *>(current);
       auto encoder = samples.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&samples, 1)
                                           : cmdbuf.blitCommandEncoder();
+      metal_encoder_count++;
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id]); });
@@ -1334,7 +1337,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           },
           [&](WMT::RenderCommandEncoder encoder) {
             data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
-          }
+          },
+          seqId, &metal_encoder_count
       );
       auto t1 = clock::now();
       currentFrameStatistics().drawable_blocking_interval += (t1 - t0);
@@ -1377,6 +1381,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         auto encoder = samples.sample_buffer ? cmdbuf.renderCommandEncoder(info, samples)
                                             : cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
+        auto index = metal_encoder_count++;
+        if (diag::errors || diag::trace_encoders) {
+          auto label = str::format(
+              "clear ", seqId, ".", index, ": ", data->attachment.texture().width(), "x",
+              data->attachment.texture().height(), ", 0 draws (0 geometry, 0 tessellation)"
+          );
+          if (diag::errors)
+            encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
+          if (diag::trace_encoders)
+            Logger::info("encoder " + label);
+        }
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
         data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
         encoder.endEncoding();
@@ -1397,6 +1412,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         auto encoder = samples.sample_buffer ? cmdbuf.renderCommandEncoder(info, samples)
                                             : cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
+        auto index = metal_encoder_count++;
+        if (diag::errors || diag::trace_encoders) {
+          auto label = str::format(
+              "resolve ", seqId, ".", index, ": ", data->src.texture().width(), "x", data->src.texture().height(),
+              ", 0 draws (0 geometry, 0 tessellation)"
+          );
+          if (diag::errors)
+            encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
+          if (diag::trace_encoders)
+            Logger::info("encoder " + label);
+        }
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
         data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
         encoder.endEncoding();
@@ -1465,6 +1491,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         timestamp_sample = readbacks.timestamp->sampleBuffer(data->readback_index);
         if (timestamp_sample.sample_buffer) {
           auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&timestamp_sample, 1);
+          metal_encoder_count++;
           // an empty blit pass does not sample its counters.
           wmtcmd_blit_fillbuffer fill{};
           fill.type = WMTBlitCommandFillBuffer;

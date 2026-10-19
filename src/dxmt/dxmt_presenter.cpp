@@ -3,6 +3,7 @@
 #include "Metal.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_diag.hpp"
 #include "util_likely.hpp"
 
 
@@ -153,7 +154,8 @@ WMT::MetalDrawable
 Presenter::encodeCommands(
     WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-    std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+    std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
+    uint64_t seq_id, unsigned *encoder_count
 ) {
   const auto &metadata = state.metadata;
   double width = state.layer_props.drawable_width;
@@ -184,6 +186,19 @@ Presenter::encodeCommands(
   info.colors[0].store_action = WMTStoreActionStore;
   info.colors[0].texture = target;
   auto encoder = cmdbuf.renderCommandEncoder(info);
+  if (encoder_count) {
+    auto index = (*encoder_count)++;
+    if (diag::errors || diag::trace_encoders) {
+      auto label = str::format(
+          "present ", seq_id, ".", index, ": ", target.width(), "x", target.height(),
+          ", 1 draws (0 geometry, 0 tessellation)"
+      );
+      if (diag::errors)
+        encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
+      if (diag::trace_encoders)
+        Logger::info("encoder " + label);
+    }
+  }
   wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);
   encoder.setFragmentTexture(state.gamma_lut, 1);
@@ -215,6 +230,8 @@ Presenter::encodeCommands(
     copy.bytes_per_row = frame.width * 4;
     copy.bytes_per_image = frame.width * frame.height * 4;
     auto blit = cmdbuf.blitCommandEncoder();
+    if (encoder_count)
+      (*encoder_count)++;
     blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
     blit.endEncoding();
     std::lock_guard lock(window_mutex_);
