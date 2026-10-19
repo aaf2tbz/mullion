@@ -254,9 +254,10 @@ def environment(args):
     binary = wine / "bin" / "wine"
     if not (prefix / "drive_c").exists():
         subprocess.run([binary, "wineboot", "-u"], env=base, stdin=subprocess.DEVNULL, check=True)
-        # a display mode a test asks for is Wine's to give (win32u, sysparams.c), never the machine's display's
-        subprocess.run([binary, "reg", "add", r"HKCU\Software\Wine\X11 Driver", "/v", "EmulateModeset", "/d", "Y", "/f"],
-                       env=base, stdin=subprocess.DEVNULL, check=True)
+    # a display mode a test asks for is Wine's to give (win32u, sysparams.c), never the machine's display's: in every
+    # prefix, as one made before the runner set this changes the real display
+    subprocess.run([binary, "reg", "add", r"HKCU\Software\Wine\X11 Driver", "/v", "EmulateModeset", "/d", "Y", "/f"],
+                   env=base, stdin=subprocess.DEVNULL, check=True)
     if not args.no_install:
         install(wine, prefix, unix, pe)
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
