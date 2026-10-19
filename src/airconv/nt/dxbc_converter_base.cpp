@@ -1026,8 +1026,20 @@ Converter::FirstBit(IntegerUnaryOp Op, llvm::Value *Value) {
 llvm::Value *
 Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
   // Metal's fast sine and cosine are both 0 from 2^23 radians on and of an infinity, where D3D's are in [-1, 1] and
-  // NaN (D3D11.3 22.10.20), and a tangent made of them is 0 / 0. the precise ones are right for every value
-  return air.CreateFPUnOp(Op, Value, false);
+  // NaN (D3D11.3 22.10.20), and a tangent made of them is 0 / 0. the precise ones are right for every other value:
+  // sine and tangent of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3
+  // 22.10.20; DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
+  auto Result = air.CreateFPUnOp(Op, Value, false);
+  if (Op == llvm::air::AIRBuilder::cos)
+    return Result;
+  auto Scalar = Value->getType()->getScalarType();
+  auto Width = Scalar->getScalarSizeInBits();
+  auto Bits = ir.CreateBitCast(Value, Value->getType()->getWithNewType(ir.getIntNTy(Width)));
+  auto Sign = llvm::APInt::getSignMask(Width);
+  // a 32-bit denormal has no exponent bits; 16-bit denormals are kept (D3D11.3 3.1.5), so there only a zero counts
+  auto Counted = Scalar->isFloatTy() ? llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt() : ~Sign;
+  auto Zero = ir.CreateICmpEQ(ir.CreateAnd(Bits, Counted), llvm::ConstantInt::get(Bits->getType(), 0));
+  return ir.CreateSelect(Zero, ir.CreateBitCast(ir.CreateAnd(Bits, Sign), Value->getType()), Result);
 }
 
 void

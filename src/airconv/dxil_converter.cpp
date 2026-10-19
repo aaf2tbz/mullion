@@ -3244,7 +3244,7 @@ convert_dxil(
                                         AIRBuilder::cosh, AIRBuilder::sinh, AIRBuilder::tanh};
       // Metal's fast tanh overflows to NaN for large inputs, and its fast tan is NaN from about 2^30 radians on; the
       // precise ones saturate and stay finite as they must
-      ret = air.CreateFPUnOp(ops[op - Tan], a(1), op != Htan && op != Tan);
+      ret = op == Tan ? dxbc.SinCos(AIRBuilder::tan, a(1)) : air.CreateFPUnOp(ops[op - Tan], a(1), op != Htan);
       break;
     }
     case Round_ne:

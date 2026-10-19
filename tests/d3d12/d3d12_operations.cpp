@@ -1,3 +1,12 @@
+// contract: sin and cos obey every entry of D3D11.3 22.10.20, including outside the accuracy interval.
+// "Theta values can be any IEEE 32-bit floating point values."
+// "The maximum absolute error is 0.0008 in the interval from -100*Pi to +100*Pi."
+// TableSinCos quotes, in source order:
+// src:     -inf, -F,         -denorm, -0, +0, +denorm, +F,         +inf, NaN
+// DestSin: NaN,  [-1 to +1], -0,      -0, +0, +0,      [-1 to +1], NaN,  NaN
+// DestCos: NaN,  [-1 to +1], +1,      +1, +1, +1,      [-1 to +1], NaN,  NaN
+// tan is built from sincos by FXC; DXIL.rst, Tan gives "[-inf to +inf]" for finite sources and the sine table's
+// other entries (https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst#tan).
 // contract: an operation of the shading language gives what Direct3D defines for it, whatever the type it is done in
 // and whatever the stage it is done in. every operation below runs on every value triple of every type the device
 // has (16, 32 and 64-bit integers of both signs, half, float, double) in the vertex, hull, domain, geometry, pixel and
@@ -36,10 +45,14 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <numbers>
 #include <type_traits>
 #include <vector>
 
 #pragma STDC FP_CONTRACT OFF
+
+constexpr double sincos_accuracy_limit = 100 * std::numbers::pi;
+constexpr double sincos_absolute_error = 0.0008;
 
 enum Tolerance { same, zero, ulp, fused, relative, logarithm, sine, converted, products, arc, tangent };
 
@@ -280,6 +293,13 @@ values() {
   return bits;
 }
 
+struct Stage {
+  const char *name, *vs, *hs, *ds, *gs, *ps;
+  D3D12_PRIMITIVE_TOPOLOGY_TYPE kind;
+  D3D_PRIMITIVE_TOPOLOGY topology;
+  std::string code[5];
+};
+
 struct Type {
   const char *name, *unsigned_name;
   bool real;
@@ -291,6 +311,7 @@ struct Type {
   std::vector<Case> cases;
   std::vector<uint64_t> values;
   std::function<uint64_t(unsigned, const uint64_t *)> reference;
+  std::vector<Stage> stages;
 };
 
 template <class V>
@@ -308,7 +329,7 @@ type(const char *name, const char *unsigned_name, bool dxbc, const wchar_t *flag
             for (unsigned i = 0; i < 3; i++)
               memcpy(&operands[i], &in[i], sizeof(V));
             return references[which](operands[0], operands[1], operands[2]);
-          }};
+          }, {}};
 }
 
 static double
@@ -334,6 +355,15 @@ allowed(const Type &type, const Case &c, uint64_t got, uint64_t want, uint64_t u
   if (strcmp(c.type, "float") && (!type.real || strcmp(c.type, "T")))
     return false;
   double g = decoded(got, width), w = decoded(want, width), k = decoded(kept, width);
+  if (c.tolerance == sine || c.tolerance == tangent) {
+    if (!std::isfinite(a))
+      return std::isnan(g);
+    // the zero and fp32 denormal columns have exact results, including their signs
+    if (a == 0 || (type.width == 32 && std::fpclassify(float(a)) == FP_SUBNORMAL))
+      return false;
+    if (c.tolerance == sine && !(g >= -1 && g <= 1))
+      return false;
+  }
   // a dot product that kept precision where its steps left the range: as near to that result as any dot product
   // has to be to its own
   double largest = 0;
@@ -365,11 +395,12 @@ allowed(const Type &type, const Case &c, uint64_t got, uint64_t want, uint64_t u
   case logarithm:
     return apart <= 1 || std::abs(g - w) <= std::ldexp(a >= 0.5 && a <= 2 ? 1 : std::abs(w), -21);
   case sine:
-    return std::abs(a) > 100 * 3.14159265358979 || std::abs(g - w) <= 0.0008;
+    return std::abs(a) > sincos_accuracy_limit || std::abs(g - w) <= sincos_absolute_error;
   case arc:
     return apart <= 1 || std::abs(g - w) <= 0.0008;
   case tangent:
-    return std::abs(a) > 100 * 3.14159265358979 || apart <= 1 || std::abs(g - w) <= 0.0008 * (1 + w * w);
+    return std::abs(a) > sincos_accuracy_limit || apart <= 1 ||
+           std::abs(g - w) <= sincos_absolute_error * (1 + w * w);
   case products:
     return !std::isfinite(largest * largest) || std::abs(g - w) <= product_error;
   default:
@@ -466,6 +497,75 @@ main(int argc, char **argv) {
     return 77;
   }
   const bool dxbc = !compiler.dxc;
+  const wchar_t *narrow = L"-enable-16bit-types";
+  std::vector<uint64_t> trig_values;
+  for (float a : {0.0f, 1.0f, std::nextafter(float(sincos_accuracy_limit), 0.0f), float(sincos_accuracy_limit),
+                  std::nextafter(float(sincos_accuracy_limit), std::numeric_limits<float>::infinity()),
+                  std::numeric_limits<float>::denorm_min(), std::nextafter(std::numeric_limits<float>::min(), 0.0f),
+                  std::numeric_limits<float>::min(), std::numeric_limits<float>::max(),
+                  std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()})
+    trig_values.insert(trig_values.end(), {hlsl::raw(a), hlsl::raw(-a)});
+  for (int exponent = std::numeric_limits<float>::min_exponent; exponent <= std::numeric_limits<float>::max_exponent;
+       exponent++) {
+    float a = std::ldexp(1.0f, exponent - 1);
+    trig_values.insert(trig_values.end(), {hlsl::raw(a), hlsl::raw(-a)});
+  }
+  Type types[] = {
+      type<int32_t>("int", "uint", true, nullptr, TRUE),
+      type<uint32_t>("uint", "uint", true, nullptr, TRUE),
+      type<float>("float", "float", true, nullptr, TRUE),
+      type<double>("double", "double", true, nullptr, TRUE),
+      type<int64_t>("int64_t", "uint64_t", false, nullptr, TRUE),
+      type<uint64_t>("uint64_t", "uint64_t", false, nullptr, TRUE),
+      type<int16_t>("int16_t", "uint16_t", false, narrow, TRUE),
+      type<uint16_t>("uint16_t", "uint16_t", false, narrow, TRUE),
+      type<_Float16>("float16_t", "float16_t", false, narrow, TRUE),
+      {"float", "float", true, 8 * sizeof(float), true, nullptr, TRUE,
+       {{"T", "sin(a)", sine}, {"T", "cos(a)", sine}, {"T", "tan(a)", tangent}}, trig_values,
+       [](unsigned which, const uint64_t *in) {
+         float a = std::bit_cast<float>(uint32_t(in[0]));
+         if (std::fpclassify(a) == FP_SUBNORMAL)
+           a = std::copysign(0.0f, a);
+         double result = which == 0 ? std::sin(double(a)) : which == 1 ? std::cos(double(a)) : std::tan(double(a));
+         return hlsl::raw(float(result));
+       }, {}},
+  };
+
+  for (auto &type : types) {
+    if (dxbc && !type.dxbc)
+      continue;
+    const UINT cases = type.cases.size(), count = type.values.size();
+    std::string body;
+    for (UINT i = 0; i < cases; i++)
+      body += "case " + std::to_string(i) + ": { precise " + type.cases[i].type + " r = (" + type.cases[i].type + ")(" +
+              type.cases[i].expression + "); return bits(r); } ";
+    const std::vector<std::string> defines = {
+        std::string("T=") + type.name, std::string("U=") + type.unsigned_name, "REAL=" + std::to_string(type.real),
+        "WIDTH=" + std::to_string(type.width), "CASES=" + std::to_string(cases), "VALUES=" + std::to_string(count),
+        "SWITCH=" + body};
+    auto compiled = [&](const char *entry) {
+      std::string stage(entry, 2);
+      return compiler.compile(hlsl_source, entry, type.flag ? (stage + "_6_2").c_str() : stage.c_str(), defines,
+                              type.flag ? std::vector<std::wstring>{type.flag} : std::vector<std::wstring>{});
+    };
+
+    type.stages = {
+        {"compute"},
+        {"pixel", "vs_fills", nullptr, nullptr, nullptr, "ps_runs", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST},
+        {"vertex", "vs_runs", nullptr, nullptr, nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D_PRIMITIVE_TOPOLOGY_POINTLIST},
+        {"geometry", "vs_passes", nullptr, nullptr, "gs_runs", "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D_PRIMITIVE_TOPOLOGY_POINTLIST},
+        {"hull", "vs_passes", "hs_runs", "ds_passes", nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST},
+        {"domain", "vs_passes", "hs_passes", "ds_runs", nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST},
+    };
+    for (auto &stage : type.stages) {
+      step("compile the operations of %s in the %s shader", type.name, stage.name);
+      const char *entries[] = {stage.vs ? stage.vs : "cs", stage.hs, stage.ds, stage.gs, stage.ps};
+      for (UINT i = 0; i < std::size(entries); i++)
+        if (entries[i] && !expect(!(stage.code[i] = compiled(entries[i])).empty(), "%s %s HLSL", type.name, entries[i]))
+          return verdict();
+    }
+  }
+
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
@@ -474,18 +574,9 @@ main(int argc, char **argv) {
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1)));
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &options4, sizeof(options4)));
-  const wchar_t *narrow = L"-enable-16bit-types";
-  const Type types[] = {
-      type<int32_t>("int", "uint", true, nullptr, TRUE),
-      type<uint32_t>("uint", "uint", true, nullptr, TRUE),
-      type<float>("float", "float", true, nullptr, TRUE),
-      type<double>("double", "double", true, nullptr, options.DoublePrecisionFloatShaderOps),
-      type<int64_t>("int64_t", "uint64_t", false, nullptr, options1.Int64ShaderOps),
-      type<uint64_t>("uint64_t", "uint64_t", false, nullptr, options1.Int64ShaderOps),
-      type<int16_t>("int16_t", "uint16_t", false, narrow, options4.Native16BitShaderOpsSupported),
-      type<uint16_t>("uint16_t", "uint16_t", false, narrow, options4.Native16BitShaderOpsSupported),
-      type<_Float16>("float16_t", "float16_t", false, narrow, options4.Native16BitShaderOpsSupported),
-  };
+  for (auto &type : types)
+    type.supported = type.width == 64 ? (type.real ? options.DoublePrecisionFloatShaderOps : options1.Int64ShaderOps)
+                     : type.width == 16 ? options4.Native16BitShaderOpsSupported : TRUE;
 
   D3D12_ROOT_PARAMETER params[2] = {{D3D12_ROOT_PARAMETER_TYPE_SRV}, {D3D12_ROOT_PARAMETER_TYPE_UAV}};
   auto rs = root_signature(device.Get(), {(UINT)std::size(params), params});
@@ -516,20 +607,6 @@ main(int argc, char **argv) {
     std::vector<uint64_t> triples;
     for (UINT i = 0; i < count; i++)
       triples.insert(triples.end(), {type.values[i], type.values[i % 8 ? (i * 7 + 3) % count : i], type.values[(i * 11 + 5) % count]});
-    std::string body;
-    for (UINT i = 0; i < cases; i++)
-      body += "case " + std::to_string(i) + ": { precise " + type.cases[i].type + " r = (" + type.cases[i].type + ")(" +
-              type.cases[i].expression + "); return bits(r); } ";
-    const std::vector<std::string> defines = {
-        std::string("T=") + type.name, std::string("U=") + type.unsigned_name, "REAL=" + std::to_string(type.real),
-        "WIDTH=" + std::to_string(type.width), "CASES=" + std::to_string(cases), "VALUES=" + std::to_string(count),
-        "SWITCH=" + body};
-    auto compiled = [&](const char *entry) {
-      std::string stage(entry, 2);
-      return compiler.compile(hlsl_source, entry, type.flag ? (stage + "_6_2").c_str() : stage.c_str(), defines,
-                              type.flag ? std::vector<std::wstring>{type.flag} : std::vector<std::wstring>{});
-    };
-
     auto input = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, triples.size() * 8, D3D12_RESOURCE_STATE_GENERIC_READ);
     auto computed = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, total * 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -550,36 +627,17 @@ main(int argc, char **argv) {
     auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, std::max<UINT64>(bytes, total * 8), D3D12_RESOURCE_STATE_COPY_DEST);
 
     // a stage's pipeline: the shader that runs the operations, and the ones that carry its results to the target
-    struct Stage {
-      const char *name, *vs, *hs, *ds, *gs, *ps;
-      D3D12_PRIMITIVE_TOPOLOGY_TYPE kind;
-      D3D_PRIMITIVE_TOPOLOGY topology;
-    };
-    const Stage stages[] = {
-        {"compute"},
-        {"pixel", "vs_fills", nullptr, nullptr, nullptr, "ps_runs", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST},
-        {"vertex", "vs_runs", nullptr, nullptr, nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D_PRIMITIVE_TOPOLOGY_POINTLIST},
-        {"geometry", "vs_passes", nullptr, nullptr, "gs_runs", "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D_PRIMITIVE_TOPOLOGY_POINTLIST},
-        {"hull", "vs_passes", "hs_runs", "ds_passes", nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST},
-        {"domain", "vs_passes", "hs_passes", "ds_runs", nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST},
-    };
-    for (auto &stage : stages) {
+    for (auto &stage : type.stages) {
       step("the operations of %s in the %s shader", type.name, stage.name);
       ComPtr<ID3D12PipelineState> pso;
-      std::string code[5];
-      const char *entries[5] = {stage.vs ? stage.vs : "cs", stage.hs, stage.ds, stage.gs, stage.ps};
-      bool compiles = true;
-      for (UINT i = 0; i < 5; i++)
-        if (entries[i] && (code[i] = compiled(entries[i])).empty())
-          compiles = false;
-      if (!expect(compiles, "the HLSL did not compile"))
-        continue;
       HRESULT made;
       if (stage.vs) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = rs.Get();
         // a stage the pipeline does not have has no bytecode at all
-        auto stage_code = [&](UINT i) { return entries[i] ? bytecode(code[i]) : D3D12_SHADER_BYTECODE{}; };
+        auto stage_code = [&](UINT i) {
+          return stage.code[i].empty() ? D3D12_SHADER_BYTECODE{} : bytecode(stage.code[i]);
+        };
         desc.VS = stage_code(0), desc.HS = stage_code(1), desc.DS = stage_code(2), desc.GS = stage_code(3), desc.PS = stage_code(4);
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask = ~0u;
@@ -589,7 +647,7 @@ main(int argc, char **argv) {
         desc.SampleDesc = {1, 0};
         made = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
       } else {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(code[0])};
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(stage.code[0])};
         made = device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
       }
       if (!expect(made == S_OK, "the pipeline: %08lx", made))
