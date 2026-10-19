@@ -499,7 +499,17 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     data->draws = gpu_heap_buffer_address_ + at;
   }
 
-  data->omitted = device_->GetOmittedDraws();
+  data->omitted = 0;
+  if (draws && !pPSO->threads_per_patch && !pPSO->mesh_shader) {
+    // a word for each command, which its resolver thread writes
+    size_t words = std::max<size_t>(MaxCount, 1);
+    auto [word, offset] = AllocateGPUHeap(words * sizeof(uint32_t), alignof(uint32_t));
+    memset(word, 0, words * sizeof(uint32_t));
+    data->omitted = gpu_heap_buffer_address_ + offset;
+    auto render = static_cast<RenderEncoderData *>(encoder_current);
+    render->omitted = new (AllocateCPUHeap(sizeof(RenderEncoderData::Omitted), alignof(RenderEncoderData::Omitted)))
+        RenderEncoderData::Omitted{gpu_heap_buffer_, offset, words, render->omitted};
+  }
   data->most = 0;
   if (diag::errors) {
     auto [words, offset] = AllocateGPUHeap(kMostWords * sizeof(uint32_t), sizeof(uint32_t));

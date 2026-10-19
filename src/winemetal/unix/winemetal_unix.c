@@ -1036,8 +1036,10 @@ draw_geometry_parts(id<MTLRenderCommandEncoder> encoder, uint32_t warps, uint32_
   }
   /* whole instances at a time where one fits, otherwise parts of one instance */
   uint32_t width = warps <= max ? warps : max, height = warps <= max ? max / warps : 1;
-  for (origin[1] = 0; origin[1] < instances; origin[1] += height)
-    for (origin[0] = 0; origin[0] < warps; origin[0] += width) {
+  for (uint64_t instance = 0; instance < instances; instance += height)
+    for (uint64_t warp = 0; warp < warps; warp += width) {
+      origin[0] = warp;
+      origin[1] = instance;
       [encoder setObjectBytes:origin length:sizeof(origin) atIndex:SM50_BINDING_INDEX_DRAW_ORIGIN];
       [encoder drawMeshThreadgroups:MTLSizeMake(MIN(width, warps - origin[0]), MIN(height, instances - origin[1]), 1)
           threadsPerObjectThreadgroup:object

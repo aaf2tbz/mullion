@@ -108,6 +108,12 @@ struct RenderEncoderData : EncoderData {
     const struct IndirectRenderCommandData *call;
     Most *next;
   } *most;
+  struct Omitted {
+    WMT::Buffer buffer;
+    uint64_t offset;
+    uint64_t words;
+    Omitted *next;
+  } *omitted = nullptr;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
   uint8_t render_target_count;

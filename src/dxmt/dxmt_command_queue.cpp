@@ -342,6 +342,11 @@ CommandQueue::WaitForFinishThread() {
       buffer = {};
     }
 
+    uint64_t omitted = 0;
+    for (auto word : chunk.readback.omitted)
+      omitted = std::max(omitted, *word);
+    if (omitted)
+      WARN("Omitted indirect mesh draw (GS) because of too many object threadgroups (", omitted, ")");
     if (chunk.completed)
       chunk.completed();
     if (chunk.signal_frame_latency_fence_ != ~0ull)

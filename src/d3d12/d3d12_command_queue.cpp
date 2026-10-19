@@ -34,6 +34,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <span>
 #include <sstream>
 #include "d3d10_1.h"
 #include "d3d11_4.h"
@@ -262,6 +263,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::shared_ptr<GPURecordChecks> records{};
     HANDLE semaphore{};
     std::function<void()> completed{};
+    std::vector<std::pair<WMT::Reference<WMT::Buffer>, std::span<const uint32_t>>> omitted{};
     // the timestamp queries the command buffer samples: the device's counter sample buffer it holds until it
     // completes, and where each sample taken is with the queries it is for
     WMT::Reference<WMT::CounterSampleBuffer> samples{};
@@ -445,6 +447,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         memcpy(resolve.to, &resolve.heap->timestamps[resolve.first], resolve.count * sizeof(uint64_t));
       }
       sample(inflight.sampled.size());
+      uint32_t omitted = 0;
+      if (inflight.cmdbuf.status() == WMTCommandBufferStatusCompleted)
+        for (auto &[buffer, words] : inflight.omitted)
+          for (auto word : words)
+            omitted = std::max(omitted, word);
+      if (omitted)
+        WARN("Omitted indirect mesh draw (GS) because of too many object threadgroups (", omitted, ")");
       for (auto &allocator : inflight.allocators)
         if (allocator)
           allocator->pending--;
@@ -1000,6 +1009,30 @@ public:
             before.encodeCommands(&data->before_head);
             before.updateFence(fence_);
             before.endEncoding();
+            if (data->omitted) {
+              size_t count = 0;
+              for (auto omitted = data->omitted; omitted; omitted = omitted->next)
+                count += omitted->words;
+              WMTBufferInfo info{count * sizeof(uint32_t), WMTResourceStorageModeShared};
+              auto buffer = device_->GetMTLDevice().newBuffer(info);
+              if (!buffer) {
+                device_->LoseDevice();
+                return;
+              }
+              // a replay may overwrite the resolver's words before the completion thread runs
+              auto copy = cmdbuf.blitCommandEncoder();
+              copy.waitForFence(fence_);
+              size_t offset = 0;
+              for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
+                copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset, omitted->words * sizeof(uint32_t));
+                offset += omitted->words * sizeof(uint32_t);
+              }
+              copy.updateFence(fence_);
+              copy.endEncoding();
+              scope.inflight->omitted.emplace_back(
+                  std::move(buffer), std::span(static_cast<const uint32_t *>(info.memory.get()), count)
+              );
+            }
           }
           auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
                                                   : cmdbuf.renderCommandEncoder(render_pass_info);

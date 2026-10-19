@@ -112,7 +112,7 @@ struct dxmt_render_command_data {
   uint vertex_slots;
   uint index_buffer_size;
   device uint * most;
-  device atomic_uint * omitted;
+  device uint * omitted;
   device dxmt_indirect_mesh_draw * draws;
   device ushort * zeros;
   uint zero_count;
@@ -253,9 +253,8 @@ public:
              << ".instance_count, patches ? command_data.tessellation_parts : 0);\n";
       // a geometry command over the mesh threadgroups a draw may start draws nothing
       source << "ulong object_groups = ulong(draw.threadgroups.x) * draw.threadgroups.y;\n";
-      source << "if (command_data.geometry_threads && object_groups > command_data.geometry_max_warps) {\n";
-      source << "atomic_fetch_max_explicit(command_data.omitted, uint(min(object_groups, ulong(UINT_MAX))), "
-                "memory_order_relaxed);\n";
+      source << "if (command_data.omitted && object_groups > command_data.geometry_max_warps) {\n";
+      source << "command_data.omitted[i] = uint(min(object_groups, ulong(UINT_MAX)));\n";
       source << "draw.threadgroups = uint3(0);\n";
       source << "}\n";
       source << "} else\n";
@@ -314,6 +313,7 @@ public:
         source << "render_command rest(command_data.cmd_buf, 2 * i + 1);\n";
       // no command to write where each command's draw is left in an IndirectMeshDraw, with no threadgroups so far
       source << "if (command_data.draws) command_data.draws[i].threadgroups = uint3(0); else cmd.reset();\n";
+      source << "if (command_data.omitted) command_data.omitted[i] = 0;\n";
       if (indexed)
         source << "if (command_data.zeros) rest.reset();\n";
     }

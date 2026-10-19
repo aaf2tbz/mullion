@@ -111,7 +111,6 @@ struct IndirectRenderCommandData {
   // MULLION_D3D12_GPU_ERRORS: where the resolver keeps the largest numbers its commands ask for (kMostWords words)
   uint64_t most;
   // where the resolver leaves the most object threadgroups of a geometry command it left out
-  // (MTLD3D12Device::GetOmittedDraws)
   uint64_t omitted;
   // the commands' IndirectMeshDraws, where the resolver writes those instead of commands; zero otherwise
   uint64_t draws;

@@ -344,6 +344,7 @@ private:
 struct QueryReadbacks {
   std::unique_ptr<VisibilityResultReadback> visibility;
   std::unique_ptr<TimestampReadback> timestamp;
+  std::vector<const uint64_t *> omitted;
 };
 
 } // namespace dxmt
