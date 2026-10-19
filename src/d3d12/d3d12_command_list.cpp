@@ -2699,8 +2699,11 @@ public:
       resolve->heap = heap;
       D3D12_HEAP_PROPERTIES placed{};
       pDstBuffer->GetHeapProperties(&placed, nullptr);
-      if (placed.Type == D3D12_HEAP_TYPE_READBACK) {
-        resolve->readback = pDstBuffer;
+      // custom cached pages are CPU-writable, but only READBACK forbids later GPU reads (D3D12_HEAP_TYPE)
+      if (placed.Type == D3D12_HEAP_TYPE_READBACK ||
+          (placed.Type == D3D12_HEAP_TYPE_CUSTOM && placed.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK)) {
+        if (placed.Type == D3D12_HEAP_TYPE_READBACK)
+          resolve->readback = pDstBuffer;
         resolve->memory = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->mappedMemory(0);
       }
       resolve->start = StartIndex;
