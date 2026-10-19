@@ -1,7 +1,7 @@
 --- a/src/d3d11/d3d11_context_def.cpp
 +++ b/src/d3d11/d3d11_context_def.cpp
-@@ -334,8 +334,7 @@
-     case D3D11_QUERY_OCCLUSION_PREDICATE: {
+@@ -353,8 +353,7 @@
+     case D3D11_QUERY_PIPELINE_STATISTICS: {
        auto building_query = ctx_state.building_visibility_queries.find(pAsync);
        if (building_query == ctx_state.building_visibility_queries.end()) {
 -        Begin(pAsync);

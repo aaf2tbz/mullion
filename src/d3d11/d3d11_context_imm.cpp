@@ -22,6 +22,12 @@ template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj) {
 using ImmediateContextBase = MTLD3D11DeviceContextImplBase<ContextInternalState>;
 
 template <>
+D3D11_QUERY_DATA_PIPELINE_STATISTICS &
+ImmediateContextBase::PipelineCounts() {
+  return pipeline_counts_;
+}
+
+template <>
 template <CommandWithContext<ArgumentEncodingContext> cmd>
 void
 ImmediateContextBase::EmitST(cmd &&fn) {
@@ -558,10 +564,8 @@ public:
       (*query_list)[i] = new VisibilityResultQuery();
       cmdlist->issued_visibility_query[i].first->DoDeferredQuery((*query_list)[i].ptr());
     }
-    for (const auto &[query, counts] : cmdlist->ended_pipeline_statistics)
-      query->counts = counts;
 
-    for (const auto &query : cmdlist->issued_event_query) {
+    for (const auto &query : cmdlist->ended_queries) {
       End(query.ptr());
     }
 
@@ -608,6 +612,20 @@ public:
         enc.skips_predicated = false;
         enc.popDeferredVisibilityQueries();
       });
+      const auto &part = cmdlist->regions[region];
+      if (!skips) {
+        pipeline_counts_.IAVertices += part.pipeline_counts.IAVertices;
+        pipeline_counts_.IAPrimitives += part.pipeline_counts.IAPrimitives;
+        pipeline_counts_.VSInvocations += part.pipeline_counts.VSInvocations;
+        pipeline_counts_.CInvocations += part.pipeline_counts.CInvocations;
+        pipeline_counts_.CPrimitives += part.pipeline_counts.CPrimitives;
+      }
+      if (auto &query = part.pipeline_query) {
+        if (part.begins_pipeline_query)
+          query->begun = pipeline_counts_;
+        else
+          query->counts = PipelineCountsSince(query->begun);
+      }
       // as End does for a query the immediate context ends: an event tells when the copies are done, here those of
       // the queries the region ended, which a later region's predicate may be
       auto &ended = cmdlist->regions[region].ended_stream_output_queries;

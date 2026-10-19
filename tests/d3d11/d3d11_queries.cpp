@@ -1,3 +1,12 @@
+// "the driver will be asked to calculate the difference between two requests (one request for Issue( BEGIN ),
+// and one request for Issue( END ))." (D3D11.3 20.4.7). "However, the Issue command is not able to be predicated."
+// (20.2). recording contexts can bracket the same query independently; statistics count only the draws executed
+// by each list, including nested lists and immediate queries enclosing their execution.
+// contract: finishing a deferred list ends every open query in that list (D3D11.3 6.3.6): "In addition, any Queries
+// that have been Begun in the Deferred Contexts but not Ended, are implicitly Ended by the invocation to Finalize."
+// https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#6.3.6%20Query%20Interactions
+// visible single-sample draws count width * height (20.4.6); scissored-out draws count zero. predicates return
+// "FALSE. Otherwise, the OCCLUSION Predicate would return TRUE" (20.4.8).
 // contract: query reads require an ended range on the immediate context, and copy data only when ready and sized.
 // "If DataSize is 0, GetData is only used to check status." (Microsoft Learn, ID3D11DeviceContext::GetData).
 // "Returning S_OK indicates the Query is \"signaled\""; "A second D3DISSUE_BEGIN will result in the range being
@@ -327,5 +336,195 @@ uint ps() : SV_Target { return 1; }
     }
     immediate->Unmap(staging.Get(), 0);
   }
+  constexpr std::array kinds{D3D11_QUERY_OCCLUSION, D3D11_QUERY_OCCLUSION_PREDICATE};
+  std::array<ComPtr<ID3D11Query>, 2 * kinds.size()> unfinished;
+  for (UINT i = 0; i < unfinished.size(); i++) {
+    D3D11_QUERY_DESC desc{kinds[i % kinds.size()]};
+    CHECK(device->CreateQuery(&desc, &unfinished[i]));
+  }
+  raster_desc.ScissorEnable = TRUE;
+  CHECK(device->CreateRasterizerState(&raster_desc, raster.ReleaseAndGetAddressOf()));
+  const D3D11_RECT full{0, 0, LONG(width), LONG(height)}, clipped{};
+  for (BOOL restore : {FALSE, TRUE}) {
+    for (UINT active : {0u, 1u, UINT(kinds.size()), UINT(unfinished.size())}) {
+      step("seed %u, implicit End, restore %d, active %u: record", seed, restore, active);
+      deferred->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+      deferred->RSSetState(raster.Get());
+      deferred->RSSetViewports(1, &viewport);
+      deferred->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      deferred->VSSetShader(vertex.Get(), nullptr, 0);
+      deferred->PSSetShader(pixel.Get(), nullptr, 0);
+      for (UINT i = 0; i < std::min(active, UINT(kinds.size())); i++)
+        deferred->Begin(unfinished[i].Get());
+      deferred->RSSetScissorRects(1, &full);
+      deferred->Draw(3, 0);
+      for (UINT i = kinds.size(); i < active; i++)
+        deferred->Begin(unfinished[i].Get());
+      deferred->RSSetScissorRects(1, &clipped);
+      deferred->Draw(3, 0);
+      ComPtr<ID3D11CommandList> list;
+      CHECK(deferred->FinishCommandList(restore, &list));
+      for (UINT replay = 0; replay < 2; replay++) {
+        immediate->ExecuteCommandList(list.Get(), TRUE);
+        for (UINT i = 0; i < active; i++) {
+          step("seed %u, implicit End, restore %d, active %u, replay %u, query %u", seed, restore, active, replay, i);
+          if (!ready(unfinished[i].Get()))
+            return verdict();
+          const UINT64 expected = i < kinds.size() ? UINT64(width) * height : 0;
+          if (kinds[i % kinds.size()] == D3D11_QUERY_OCCLUSION_PREDICATE) {
+            BOOL visible = -1;
+            CHECK(immediate->GetData(unfinished[i].Get(), &visible, sizeof(visible), 0));
+            expect(visible == (expected != 0), "implicit predicate %d, want %d", visible, expected != 0);
+          } else {
+            UINT64 count = ~UINT64(0);
+            CHECK(immediate->GetData(unfinished[i].Get(), &count, sizeof(count), 0));
+            expect(count == expected, "implicit count %llu, want %llu", count, expected);
+          }
+        }
+      }
+    }
+  }
+  constexpr UINT triangle_vertices = 3;
+  const UINT indices[] = {0, 1, 2};
+  D3D11_BUFFER_DESC index_desc{sizeof(indices), D3D11_USAGE_IMMUTABLE, D3D11_BIND_INDEX_BUFFER};
+  D3D11_SUBRESOURCE_DATA index_data{indices};
+  ComPtr<ID3D11Buffer> index_buffer;
+  CHECK(device->CreateBuffer(&index_desc, &index_data, &index_buffer));
+  ComPtr<ID3D11DeviceContext> other;
+  CHECK(device->CreateDeferredContext(0, &other));
+  const std::array contexts{deferred.Get(), other.Get()};
+  auto setup = [&](ID3D11DeviceContext *context) {
+    context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    context->RSSetState(raster.Get());
+    context->RSSetScissorRects(1, &full);
+    context->RSSetViewports(1, &viewport);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->IASetIndexBuffer(index_buffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+    context->VSSetShader(vertex.Get(), nullptr, 0);
+    context->PSSetShader(pixel.Get(), nullptr, 0);
+  };
+  auto counts = [&](ID3D11Query *query, UINT64 primitives) {
+    if (!ready(query))
+      return false;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
+    HRESULT hr = immediate->GetData(query, &data, sizeof(data), 0);
+    bool valid = expect(hr == S_OK && data.IAVertices == primitives * triangle_vertices && data.IAPrimitives == primitives,
+                        "statistics %#lx: IA vertices %llu, primitives %llu; want %llu, %llu", hr, data.IAVertices,
+                        data.IAPrimitives, primitives * triangle_vertices, primitives);
+    expect(data.VSInvocations == primitives * triangle_vertices && data.CInvocations == primitives &&
+               data.CPrimitives >= primitives,
+           "VS %llu, clipper %llu/%llu for %llu primitives", data.VSInvocations, data.CInvocations,
+           data.CPrimitives, primitives);
+    return valid;
+  };
+  const D3D11_QUERY_DESC query_desc{D3D11_QUERY_PIPELINE_STATISTICS};
+  ComPtr<ID3D11Query> shared, outer, overlap;
+  CHECK(device->CreateQuery(&query_desc, &shared));
+  CHECK(device->CreateQuery(&query_desc, &outer));
+  CHECK(device->CreateQuery(&query_desc, &overlap));
+  std::array<ComPtr<ID3D11CommandList>, 2> lists;
+  step("two contexts interleave one query's recording");
+  for (UINT i = 0; i < contexts.size(); i++) {
+    setup(contexts[i]);
+    contexts[i]->DrawInstanced(triangle_vertices, i + 1, 0, 0);
+    contexts[i]->Begin(shared.Get());
+    contexts[i]->DrawInstanced(triangle_vertices, i + 1, 0, 0);
+  }
+  for (UINT i = 0; i < contexts.size(); i++) {
+    contexts[i]->End(shared.Get());
+    CHECK(contexts[i]->FinishCommandList(FALSE, &lists[i]));
+  }
+  for (UINT replay = 0; replay < 3; replay++)
+    for (UINT i : {1u, 0u}) {
+      step("interleaved context %u replay %u", i, replay);
+      immediate->Begin(outer.Get());
+      immediate->ExecuteCommandList(lists[i].Get(), TRUE);
+      immediate->End(outer.Get());
+      counts(shared.Get(), i + 1);
+      counts(outer.Get(), 2 * (i + 1));
+    }
+
+  step("seed %u, recording must not change an immediate range", seed);
+  setup(immediate.Get());
+  immediate->Begin(shared.Get());
+  immediate->Draw(triangle_vertices, 0);
+  setup(deferred.Get());
+  deferred->Begin(shared.Get());
+  deferred->DrawInstanced(triangle_vertices, 2, 0, 0);
+  deferred->End(shared.Get());
+  ComPtr<ID3D11CommandList> recorded_range;
+  CHECK(deferred->FinishCommandList(FALSE, &recorded_range));
+  immediate->Draw(triangle_vertices, 0);
+  immediate->End(shared.Get());
+  counts(shared.Get(), 2);
+  immediate->ExecuteCommandList(recorded_range.Get(), TRUE);
+  counts(shared.Get(), 2);
+
+  const D3D11_QUERY_DESC predicate_desc{D3D11_QUERY_OCCLUSION_PREDICATE};
+  ComPtr<ID3D11Predicate> predicate;
+  CHECK(device->CreatePredicate(&predicate_desc, &predicate));
+  for (bool seen : {false, true}) {
+    setup(immediate.Get());
+    immediate->Begin(predicate.Get());
+    if (seen)
+      immediate->Draw(triangle_vertices, 0);
+    immediate->End(predicate.Get());
+    if (!ready(predicate.Get()))
+      return verdict();
+    for (BOOL value : {FALSE, TRUE})
+      for (bool recorded : {false, true}) {
+        auto *context = recorded ? contexts[0] : immediate.Get();
+        setup(context);
+        context->Begin(shared.Get());
+        context->Draw(triangle_vertices, 0);
+        context->SetPredication(predicate.Get(), value);
+        context->Begin(overlap.Get());
+        context->Draw(triangle_vertices, 0);
+        context->DrawIndexed(triangle_vertices, 0, 0);
+        context->DrawInstanced(triangle_vertices, 2, 0, 0);
+        context->DrawIndexedInstanced(triangle_vertices, 2, 0, 0, 0);
+        context->End(overlap.Get());
+        context->SetPredication(nullptr, FALSE);
+        context->Draw(triangle_vertices, 0);
+        context->End(shared.Get());
+        ComPtr<ID3D11CommandList> list;
+        if (recorded)
+          CHECK(context->FinishCommandList(FALSE, &list));
+        const UINT retained = BOOL(seen) != value ? 6 : 0;
+        for (UINT replay = 0; replay < (recorded ? 3u : 1u); replay++) {
+          step("seed %u, predicate %u value %d recorded %u replay %u", seed, seen, value, recorded, replay);
+          if (recorded) {
+            immediate->Begin(outer.Get());
+            immediate->ExecuteCommandList(list.Get(), TRUE);
+            immediate->End(outer.Get());
+            counts(outer.Get(), retained + 2);
+          }
+          counts(shared.Get(), retained + 2);
+          counts(overlap.Get(), retained);
+        }
+        if (recorded) {
+          step("seed %u, nested list", seed);
+          contexts[1]->Begin(outer.Get());
+          contexts[1]->ExecuteCommandList(list.Get(), TRUE);
+          contexts[1]->End(outer.Get());
+          ComPtr<ID3D11CommandList> nested;
+          CHECK(contexts[1]->FinishCommandList(FALSE, &nested));
+          immediate->ExecuteCommandList(nested.Get(), TRUE);
+          counts(outer.Get(), retained + 2);
+          counts(shared.Get(), retained + 2);
+        }
+      }
+  }
+  for (BOOL restore : {FALSE, TRUE})
+    for (UINT instances : {0u, 1u, 2u}) {
+      step("seed %u, implicit statistics End, restore %d, instances %u", seed, restore, instances);
+      setup(deferred.Get());
+      deferred->Begin(shared.Get());
+      deferred->DrawInstanced(triangle_vertices, instances, 0, 0);
+      ComPtr<ID3D11CommandList> list;
+      CHECK(deferred->FinishCommandList(restore, &list));
+      immediate->ExecuteCommandList(list.Get(), TRUE);
+      counts(shared.Get(), instances);
+    }
   return verdict();
 }

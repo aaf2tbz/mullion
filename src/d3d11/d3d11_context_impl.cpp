@@ -4735,6 +4735,7 @@ public:
   unsigned active_visibility_queries_ = 0;
   // the pipeline statistics of every draw so far, but the pixel shader's, which queries count on the GPU
   D3D11_QUERY_DATA_PIPELINE_STATISTICS pipeline_counts_{};
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS &PipelineCounts();
 
   // adds a draw's input assembler, vertex shader and clipper counts to pipeline_counts_. indirect draws and what
   // geometry shaders and tessellation make are left out: the clipper counts the input's primitives
@@ -4742,11 +4743,12 @@ public:
   CountDraw(uint64_t vertices, uint64_t instances) {
     uint64_t primitives = topology_primitives(state_.InputAssembler.Topology, vertices) * instances;
     vertices *= instances;
-    pipeline_counts_.IAVertices += vertices;
-    pipeline_counts_.IAPrimitives += primitives;
-    pipeline_counts_.VSInvocations += vertices;
-    pipeline_counts_.CInvocations += primitives;
-    pipeline_counts_.CPrimitives += primitives;
+    auto &counts = PipelineCounts();
+    counts.IAVertices += vertices;
+    counts.IAPrimitives += primitives;
+    counts.VSInvocations += vertices;
+    counts.CInvocations += primitives;
+    counts.CPrimitives += primitives;
   }
 
   // pipeline_counts_ since `begun`
@@ -5998,8 +6000,7 @@ public:
     read_staging_resources.clear();
     written_staging_resources.clear();
     issued_visibility_query.clear();
-    ended_pipeline_statistics.clear();
-    issued_event_query.clear();
+    ended_queries.clear();
     regions.clear();
     regions.emplace_back();
     staging_allocator.free_blocks(~0uLL);
@@ -6084,15 +6085,17 @@ public:
   std::vector<Rc<StagingResource>> written_staging_resources;
   // private references: a list queued on the immediate context does not keep the device alive
   std::vector<std::pair<Com<MTLD3D11OcclusionQuery, false>, bool>> issued_visibility_query;
-  // the pipeline statistics queries the list ends, with their counts, which the immediate context gives them
-  std::vector<std::pair<Com<MTLD3D11OcclusionQuery, false>, D3D11_QUERY_DATA_PIPELINE_STATISTICS>>
-      ended_pipeline_statistics;
-  std::vector<Com<MTLD3D11EventQuery>> issued_event_query;
+  // the queries the immediate context ends as it executes the list
+  std::vector<Com<MTLD3D11Query>> ended_queries;
 
   // a list is regions of one predication each: the immediate context decides each as it executes the list, so a
   // predicate may get its data from the regions before
   struct Region {
     CommandList<ArgumentEncodingContext> list;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS pipeline_counts{};
+    // a query boundary after this region's draws, including when its predicate skips them
+    Com<MTLD3D11OcclusionQuery, false> pipeline_query;
+    bool begins_pipeline_query = false;
     Com<MTLD3D11Query, false> predicate;
     BOOL value = FALSE;
     // a list that a deferred context executed here (it has no commands of its own then)

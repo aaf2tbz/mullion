@@ -31,6 +31,12 @@ template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj) {
 using DeferredContextBase = MTLD3D11DeviceContextImplBase<DeferredContextInternalState>;
 
 template <>
+D3D11_QUERY_DATA_PIPELINE_STATISTICS &
+DeferredContextBase::PipelineCounts() {
+  return ctx_state.current_cmdlist->regions.back().pipeline_counts;
+}
+
+template <>
 template <CommandWithContext<ArgumentEncodingContext> cmd>
 void
 DeferredContextBase::EmitST(cmd &&fn) {
@@ -274,7 +280,6 @@ public:
       if (building_query != ctx_state.building_visibility_queries.end()) {
         End(pAsync);
       }
-      static_cast<MTLD3D11OcclusionQuery *>(pAsync)->begun = pipeline_counts_;
       VisibilityQueryBoundary(true);
       auto query_id = ctx_state.current_cmdlist->issued_visibility_query.size();
       ctx_state.current_cmdlist->issued_visibility_query.emplace_back(
@@ -288,6 +293,12 @@ public:
       ctx_state.building_visibility_queries.insert(
           {(void *)pAsync, {static_cast<MTLD3D11OcclusionQuery *>(pAsync), query_id}}
       );
+      if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) {
+        auto &regions = ctx_state.current_cmdlist->regions;
+        regions.back().pipeline_query = static_cast<MTLD3D11OcclusionQuery *>(pAsync);
+        regions.back().begins_pipeline_query = true;
+        regions.emplace_back();
+      }
       break;
     }
     case D3D11_QUERY_SO_STATISTICS:
@@ -325,7 +336,7 @@ public:
     case D3D11_QUERY_EVENT:
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
       promote_flush = true;
-      ctx_state.current_cmdlist->issued_event_query.push_back(static_cast<MTLD3D11EventQuery *>(pAsync));
+      ctx_state.current_cmdlist->ended_queries.push_back(static_cast<MTLD3D11Query *>(pAsync));
       break;
     case D3D11_QUERY_TIMESTAMP: {
       auto &queries = ctx_state.current_cmdlist->regions.back().issued_timestamp_query;
@@ -345,10 +356,6 @@ public:
         Begin(pAsync);
         building_query = ctx_state.building_visibility_queries.find(pAsync);
       }
-      if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) {
-        auto query = static_cast<MTLD3D11OcclusionQuery *>(pAsync);
-        ctx_state.current_cmdlist->ended_pipeline_statistics.emplace_back(query, PipelineCountsSince(query->begun));
-      }
       promote_flush = true;
       auto query_id = building_query->second.second;
       bool counted = !dirty_state.any(DirtyState::VisibilityQuery);
@@ -367,6 +374,11 @@ public:
       });
       ctx_state.pending_visibility_queries.erase(query_id);
       ctx_state.building_visibility_queries.erase(building_query);
+      if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) {
+        auto &regions = ctx_state.current_cmdlist->regions;
+        regions.back().pipeline_query = static_cast<MTLD3D11OcclusionQuery *>(pAsync);
+        regions.emplace_back();
+      }
       break;
     }
     case D3D11_QUERY_SO_STATISTICS:
@@ -436,10 +448,8 @@ public:
     ctx_state.current_cmdlist->promote_flush = promote_flush;
     promote_flush = false;
 
-    for (const auto &[_, building_query] : ctx_state.building_visibility_queries) {
-      End(building_query.first.ptr());
-    }
-    ctx_state.building_visibility_queries.clear();
+    while (!ctx_state.building_visibility_queries.empty())
+      End(ctx_state.building_visibility_queries.begin()->second.first.ptr());
     ctx_state.current_dynamic_buffer_allocations.clear();
     ctx_state.current_dynamic_texture_allocations.clear();
 
