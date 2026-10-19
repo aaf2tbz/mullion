@@ -134,6 +134,17 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
       cmd.type = WMTRenderCommandSetVertexBufferOffset;
   }
 }
+uint64_t
+ArgumentEncodingContext::indirectGeometryBound(uint32_t invocations) {
+  auto bound = indirect_geometry_bound.load(std::memory_order_relaxed);
+  if (invocations) {
+    // the per-invocation counts alone bound how many object threadgroups the scratch can hold
+    auto per_group = SM50StreamOutputScratch(1, invocations) - SM50StreamOutputScratch(1, 0);
+    bound = std::max(bound, std::max(so_scratch_budget_, *so_scratch_overflow_host_) / per_group);
+  }
+  return bound;
+}
+
 std::pair<uint64_t, uint64_t>
 ArgumentEncodingContext::encodeStreamOutputTargets(uint32_t warps, uint32_t instances, uint32_t invocations) {
   // the scratch area (SM50_STREAM_OUTPUT_TARGETS). an indirect draw's (no `warps`) is the GS dispatch marshal's to give
@@ -1284,6 +1295,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint64_t so_overflow;
           uint32_t so_invocations;
           uint64_t omitted;
+          uint64_t origins;
+          uint32_t parts;
         };
         auto [mapped_task_data, task_data_buffer, task_data_buffer_offset] =
             queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
@@ -1312,6 +1325,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           tasks_data[i].so_overflow = so_scratch_overflow_va_;
           tasks_data[i].so_invocations = task.so_invocations;
           tasks_data[i].omitted = omitted_address;
+          tasks_data[i].origins = task.origins_va;
+          tasks_data[i].parts = task.parts;
           encoder.useResource(task.draw_arguments, WMTResourceUsageRead, WMTRenderStageVertex);
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
           if (task.so_targets_va)
@@ -1712,6 +1727,10 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     auto r1 = reinterpret_cast<RenderEncoderData *>(latter);
     auto r0 = reinterpret_cast<RenderEncoderData *>(former);
 
+    // a merged pass runs latter's marshals as it begins, before former's draws, whose writes they may wait for
+    if ((!r1->draw_auto_marshal_tasks.empty() || !r1->gs_arg_marshal_tasks.empty() || !r1->ts_arg_marshal_tasks.empty()) &&
+        r1->fence_wait_vertex.intersectedWith(r0->fence_update_vertex))
+      return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
     if (r0->visibility_result_count + r1->visibility_result_count <=
             VisibilityResultOffsetBumpState::kVisibilitySegments &&
         r0->scissors + r1->scissors <= WMT::kPassRectangles && r0->viewports + r1->viewports <= WMT::kPassRectangles &&

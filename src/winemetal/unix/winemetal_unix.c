@@ -1047,6 +1047,20 @@ draw_geometry_parts(id<MTLRenderCommandEncoder> encoder, uint32_t warps, uint32_
     }
 }
 
+/* an indirect geometry draw's `parts` Metal draws, whose grids and origins the GS dispatch marshal wrote in `args`:
+ * grids from `grids` on, 12 bytes apart, origins (SM50_BINDING_INDEX_DRAW_ORIGIN) from `origins` on, 8 bytes apart */
+static void
+draw_geometry_indirect_parts(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> args, uint64_t grids, uint64_t origins,
+                             uint32_t parts, uint32_t threads) {
+  for (uint32_t i = 0; i < parts; i++) {
+    [encoder setObjectBuffer:args offset:origins + 8 * i atIndex:SM50_BINDING_INDEX_DRAW_ORIGIN];
+    [encoder drawMeshThreadgroupsWithIndirectBuffer:args
+                               indirectBufferOffset:grids + 12 * i
+                        threadsPerObjectThreadgroup:MTLSizeMake(threads, 1, 1)
+                          threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+  }
+}
+
 static NTSTATUS
 _MTLRenderCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
@@ -1287,15 +1301,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
-      static const uint32_t origin[2] = {0, 0};
-      [encoder setObjectBytes:origin length:sizeof(origin) atIndex:SM50_BINDING_INDEX_DRAW_ORIGIN];
       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                         offset:body->indirect_args_offset
                        atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
-                                 indirectBufferOffset:body->dispatch_args_offset
-                          threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
-                            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+      draw_geometry_indirect_parts(encoder, (id<MTLBuffer>)body->dispatch_args_buffer, body->dispatch_args_offset,
+                                   body->origins_offset, body->parts, body->vertex_per_warp);
       [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
                         offset:0
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
@@ -1304,18 +1314,14 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
           (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
-      static const uint32_t origin[2] = {0, 0};
-      [encoder setObjectBytes:origin length:sizeof(origin) atIndex:SM50_BINDING_INDEX_DRAW_ORIGIN];
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                         offset:body->indirect_args_offset
                        atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
-                                 indirectBufferOffset:body->dispatch_args_offset
-                          threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
-                            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+      draw_geometry_indirect_parts(encoder, (id<MTLBuffer>)body->dispatch_args_buffer, body->dispatch_args_offset,
+                                   body->origins_offset, body->parts, body->vertex_per_warp);
       [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments
                         offset:0
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];

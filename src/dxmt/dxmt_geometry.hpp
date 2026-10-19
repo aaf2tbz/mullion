@@ -84,4 +84,18 @@ geometry_draw_parts(uint32_t warps, uint32_t instances, uint64_t max) {
   return uint64_t(warps) * instances <= max ? 0 : uint32_t(std::min<uint64_t>(max, UINT32_MAX));
 }
 
+// how many Metal draws an indirect geometry draw is encoded as, the GS dispatch marshal filling each one's grid and
+// origin: one when a draw may have any number of object threadgroups (`max` of 2^32 or more), otherwise enough for
+// `bound` object threadgroups, or kIndirectGeometryParts when the draw has no known bound
+constexpr uint32_t kIndirectGeometryParts = 4;
+
+inline uint32_t
+indirect_geometry_parts(uint64_t max, uint64_t bound) {
+  if (max >= (1ull << 32))
+    return 1;
+  if (!bound)
+    return kIndirectGeometryParts;
+  return uint32_t(std::clamp<uint64_t>((bound + std::max<uint64_t>(max, 1) - 1) / std::max<uint64_t>(max, 1), 1, 16));
+}
+
 } // namespace dxmt
