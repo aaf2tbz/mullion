@@ -9,10 +9,10 @@
  #include "llvm/IR/Constants.h"
  #include "llvm/IR/DerivedTypes.h"
  #include "llvm/IR/Instructions.h"
-@@ -1030,6 +1031,12 @@
-   // sine and tangent of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3
-   // 22.10.20; DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
-   auto Result = air.CreateFPUnOp(Op, Value, false);
+@@ -1040,6 +1041,12 @@
+     Result = ir.CreateFPTrunc(air.CreateFPUnOp(Op, ir.CreateFPExt(Value, Wide), false), Type);
+   } else
+     Result = air.CreateFPUnOp(Op, Value, false);
 +  if (Op == llvm::air::AIRBuilder::sin) {
 +    auto Magnitude = air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, Value, false);
 +    auto Beyond = ir.CreateFCmpOGT(Magnitude, llvm::ConstantFP::get(Value->getType(), 100 * std::numbers::pi));
