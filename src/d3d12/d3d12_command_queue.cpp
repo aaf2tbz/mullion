@@ -1134,16 +1134,18 @@ public:
                                                 scope.inflight->sampled.size()});
             break;
           }
-          // the command buffer ends here; when it has completed and the CPU has read the samples, the next one
-          // copies them
-          WMTBufferInfo info{data->count * sizeof(uint64_t), WMTResourceStorageModeShared};
-          auto staging = device_->GetMTLDevice().newBuffer(info);
+          // custom heaps may be read by later GPU work: the CPU writes them only after earlier work has completed
           Trace("waits for the timestamps of command buffer ", inflight_cmdbuf_seq_.load());
           if (scope.Settle())
             retired_.Expect(inflight_cmdbuf_seq_ - 1)->wait(false);
-          memcpy(info.memory.ptr, &data->heap->timestamps[data->start], data->count * sizeof(uint64_t));
+          WMTBufferInfo info{data->count * sizeof(uint64_t), WMTResourceStorageModeShared};
+          auto staging = data->memory ? WMT::Reference<WMT::Buffer>{} : device_->GetMTLDevice().newBuffer(info);
+          memcpy(data->memory ? static_cast<char *>(data->memory) + data->dst_offset : info.memory.ptr,
+                 &data->heap->timestamps[data->start], data->count * sizeof(uint64_t));
           scope.Start();
           cmdbuf = scope.inflight->cmdbuf;
+          if (data->memory)
+            break;
           auto encoder = cmdbuf.blitCommandEncoder();
           encoder.waitForFence(fence_);
           encoder.copyFromBuffer(staging, 0, data->dst, data->dst_offset, data->count * sizeof(uint64_t));

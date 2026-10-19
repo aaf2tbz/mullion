@@ -1,0 +1,13 @@
+# pipeline statistics resolve zeros even when the query enclosed draws and dispatches
+--- a/src/dxmt/dxmt_command.metal
++++ b/src/dxmt/dxmt_command.metal
+@@ -902,7 +902,8 @@
+   constant PipelineStatisticsSum &sum = sums[i];
+   device ulong *result = results + ulong(sum.query) * sum.size;
+   for (uint k = 0; k < sum.size; k++)
+-    result[k] = sum.counts[k];
++    result[k] = 0;
++  return;
+   for (uint k = sum.first_slot; k < sum.first_slot + sum.slot_count; k++)
+     if (slot_shades[k])
+       result[7] += *slots[k].count;
