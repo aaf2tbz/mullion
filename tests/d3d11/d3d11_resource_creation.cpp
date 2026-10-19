@@ -429,9 +429,12 @@ void main(uint3 id : SV_DispatchThreadID) {
                   dimension != D3D11_RESOURCE_DIMENSION_TEXTURE3D && !!(support & D3D11_FORMAT_SUPPORT_DEPTH_STENCIL);
             else if (bind == D3D11_BIND_UNORDERED_ACCESS)
               valid &= !!(support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW);
+            // a typeless format's own row lists no shader operations (Format support for Direct3D Feature Level 11.0
+            // hardware), yet Windows makes its textures for shader resources, read through its family's typed views
+            // (Wine's d3d11 tests, test_create_texture2d: R32G32B32A32_TYPELESS and R24G8_TYPELESS succeed)
             else if (bind == D3D11_BIND_SHADER_RESOURCE)
-              valid &= !!(support & D3D11_FORMAT_SUPPORT_SHADER_LOAD) &&
-                       (parent || !(support & D3D11_FORMAT_SUPPORT_DEPTH_STENCIL));
+              valid &= parent || (!!(support & D3D11_FORMAT_SUPPORT_SHADER_LOAD) &&
+                                  !(support & D3D11_FORMAT_SUPPORT_DEPTH_STENCIL));
             else if (bind)
               valid = false;
             // D3D11.3 19.1.4: shared-exponent data is for shader reads, even on Metal formats that render it
