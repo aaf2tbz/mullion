@@ -4,26 +4,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
-#include <unordered_set>
-#include "log/log.hpp"
-#include "thread.hpp"
 
 namespace dxmt {
-
-/// Records a Metal sampler's id and warns when the distinct ones near or pass the 1024 an Apple7 or Apple8 GPU holds.
-static void
-CountDistinctSampler(uint64_t id) {
-  static dxmt::mutex mutex;
-  static std::unordered_set<uint64_t> ids;
-  std::lock_guard<dxmt::mutex> lock(mutex);
-  if (!ids.insert(id).second)
-    return;
-  // Metal does not free a slot when a sampler is released, so the count only grows
-  if (ids.size() == 768)
-    WARN("Sampler: 768 distinct Metal samplers; an M1 or M2 samples wrong past 1024");
-  else if (ids.size() == 1025)
-    WARN("Sampler: more than 1024 distinct Metal samplers; on an M1 or M2 the newest ones sample wrong");
-}
 
 void
 Sampler::incRef() {
@@ -45,7 +27,7 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
   WMTSamplerInfo capped = info;
   capped.lod_min_clamp = step(capped.lod_min_clamp);
   capped.lod_max_clamp = step(capped.lod_max_clamp);
-  capped.max_anisotroy = std::bit_floor(std::max(capped.max_anisotroy, 1u));
+  capped.max_anisotroy = std::bit_ceil(std::max(capped.max_anisotroy, 1u));
   ret->info_ = capped;
 
   ret->sampler_state = device.newSamplerState(ret->info_);
@@ -53,7 +35,6 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     return nullptr;
   }
   ret->sampler_state_handle = ret->info_.gpu_resource_id;
-  CountDistinctSampler(ret->sampler_state_handle);
 
   WMTSamplerInfo cube_sampler_info = capped;
   // it's probably still wrong, but the best result we can get
@@ -72,7 +53,6 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     return nullptr;
   }
   ret->sampler_state_cube_handle = cube_sampler_info.gpu_resource_id;
-  CountDistinctSampler(ret->sampler_state_cube_handle);
   if (border_color) {
     WMTSamplerInfo white_info = capped;
     white_info.border_color = WMTSamplerBorderColorOpaqueWhite;
@@ -80,7 +60,6 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     if (!ret->sampler_state_white)
       return nullptr;
     ret->sampler_state_white_handle = white_info.gpu_resource_id;
-    CountDistinctSampler(ret->sampler_state_white_handle);
     std::copy_n(border_color, 4, ret->border_color);
   }
   constexpr uint64_t field_max = (1 << SM50_SAMPLER_METADATA_LOD_BITS) - 1;
