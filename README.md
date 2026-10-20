@@ -8,16 +8,18 @@ This is a pre-release. Expect games that break, and please report them.
 
 | | Mullion | D3DMetal |
 |---|---|---|
-| Black Myth: Wukong benchmark, High preset, 1512 × 982, TSR at 100%, no frame generation | 28 FPS | 35 FPS |
+| Black Myth: Wukong benchmark, High preset, 1512 × 982, TSR at 100%, no frame generation | 28 FPS | 34 FPS (D3DMetal 4.0 beta 3) |
+| God of War Ragnarök, High preset, 1512 × 982, no vsync, where a save starts | 26 to 28 FPS, 35 ms of GPU time a frame | 29 to 40 FPS, 22 to 25 ms of GPU time a frame (D3DMetal 4.0 beta 3) |
 | 3DMark Fire Strike | 7003 | |
 
-Both columns were measured on the same Mac. Time Spy's graphics tests render correctly, though 3DMark does not report a score for them yet. Steel Nomad does not start yet.
+Both columns were measured on the same Mac. The God of War numbers are premature: they come from screenshots taken while the game was still compiling shaders, not from a benchmark. Time Spy's graphics tests render correctly, though 3DMark does not report a score for them yet. Steel Nomad does not start yet.
 
 | Mullion | D3DMetal |
 |---|---|
 | ![Black Myth: Wukong benchmark result on Mullion](docs/wukong-mullion.jpg) | ![The same benchmark on D3DMetal](docs/wukong-d3dmetal.jpg) |
+| ![God of War Ragnarök on Mullion](docs/gow-mullion.jpg) | ![The same place on D3DMetal](docs/gow-d3dmetal.jpg) |
 
-Direct3D 12 is supported at feature level 12_0 with shader models up to 6.6, including ray tracing at tier 1.1, mesh and amplification shaders, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats. Direct3D 10 and 11 are supported at feature level 11_1.
+Direct3D 12 is supported at feature level 12_0 with shader models up to 6.6, including ray tracing at tier 1.1, mesh and amplification shaders, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats. Direct3D 10 and 11 are supported at feature level 11_1. Next for Direct3D 12 are shader model 6.7, D3D11On12, a Metal 4 backend, and more work on performance and reliability.
 
 ## Requirements
 
@@ -31,6 +33,8 @@ Direct3D 12 is supported at feature level 12_0 with shader models up to 6.6, inc
 2. Run `./install.sh <wine> [prefix ...]`. `<wine>` is the directory that contains `bin/wine`.
 
 The script copies the libraries into `<wine>/lib/wine`, where they replace Wine's Direct3D, and into each prefix named on the command line. Prefixes created later need nothing.
+
+In CrossOver, rename `CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt` to `dxmt-original`, put the unpacked release folder in its place under the name `dxmt`, and set the bottle's graphics to DXMT. Replace the whole folder: CrossOver's 32-bit DXMT cannot drive Mullion, and the release's empty `i386-windows` leaves 32-bit games on Wine's own Direct3D. On the first launch macOS blocks `winemetal.so`; allow it under System Settings, Privacy & Security, and start the game again. A CrossOver update brings back its own DXMT.
 
 The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`), so tools that install DXMT can install Mullion the same way. To install by hand, copy both directories into `<wine>/lib/wine`, and the DLLs of `x86_64-windows` into `drive_c/windows/system32` of each existing prefix.
 

@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 wine=$1
 shift
 for kind in "$here"/*-windows "$here"/*-unix; do
-  cp "$kind"/* "$wine/lib/wine/$(basename "$kind")/"
+  cp -R "$kind"/. "$wine/lib/wine/$(basename "$kind")/"
 done
 for prefix; do
   cp "$here"/x86_64-windows/*.dll "$prefix/drive_c/windows/system32/"
