@@ -9,4 +9,4 @@
 -      return DXGI_ERROR_INVALID_CALL;
      if (hWnd == GetDesktopWindow())
        return E_ACCESSDENIED;
-     return dxmt::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+     return mullion::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);

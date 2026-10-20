@@ -14,7 +14,7 @@
 #include "util_string.hpp"
 #include "log/log.hpp"
 
-namespace dxmt::wsi {
+namespace mullion::wsi {
 
 void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
   if (pWidth)
@@ -24,7 +24,7 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
     *pHeight = 1024;
 }
 
-bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, MullionWindowState *pState, uint32_t width,
                   uint32_t height) {
   return false;
 }
@@ -34,12 +34,12 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
 }
 
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
-                         DXMTWindowState *pState,
+                         MullionWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
   return false;
 }
 
-bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
+bool leaveFullscreenMode(HWND hWindow, MullionWindowState *pState,
                          bool restoreCoordinates) {
   return false;
 }
@@ -54,7 +54,7 @@ HMONITOR getWindowMonitor(HWND hWindow) {
 
 bool isWindow(HWND hWindow) { return true; }
 
-bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, DXMTWindowState *pState,
+bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, MullionWindowState *pState,
                             bool forceTopmost) {
   return false;
 }
@@ -63,4 +63,4 @@ bool isForeground(HWND hWindow) { return true; }
 
 bool isMinimized(HWND hWindow) { return false; }
 
-} // namespace dxmt::wsi
+} // namespace mullion::wsi

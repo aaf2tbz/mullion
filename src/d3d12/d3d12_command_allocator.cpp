@@ -18,10 +18,10 @@
 
 #include "d3d12_command_allocator.hpp"
 #include "com/com_pointer.hpp"
-#include "dxmt_diag.hpp"
+#include "mullion_diag.hpp"
 #include <map>
 
-namespace dxmt {
+namespace mullion {
 
 struct GPURecord {
   const char *bytes, *kind;
@@ -54,7 +54,7 @@ struct GPURecordChecks {
   bool checked = false;
 };
 struct GPURecordTotals {
-  dxmt::mutex mutex;
+  mullion::mutex mutex;
   std::map<std::string, std::pair<uint64_t, uint64_t>> kinds;
 };
 
@@ -86,7 +86,7 @@ void
 CompareGPURecords(const std::shared_ptr<GPURecordChecks> &Checks, const std::shared_ptr<GPURecordTotals> &Totals) {
   if (!Checks)
     return;
-  std::lock_guard<dxmt::mutex> lock(Totals->mutex);
+  std::lock_guard<mullion::mutex> lock(Totals->mutex);
   if (std::exchange(Checks->checked, true))
     return;
   size_t changed = 0, first = 0, word = 0;
@@ -263,7 +263,7 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   // the device's arenas, and the one Metal buffer over what the GPU reads: there from the first allocator on
   auto &recording = device_->recording;
   {
-    std::lock_guard<dxmt::mutex> lock(recording.mutex);
+    std::lock_guard<mullion::mutex> lock(recording.mutex);
     if (!recording.commands.Initialize() || !recording.arguments.Initialize())
       return E_OUTOFMEMORY;
     if (!recording.buffer) {
@@ -847,4 +847,4 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::draw(
   draw.instance_count = instance_count;
 }
 
-}; // namespace dxmt
+}; // namespace mullion

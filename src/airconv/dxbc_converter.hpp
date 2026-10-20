@@ -19,7 +19,7 @@
 
 #include "airconv_public.h"
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 struct ResourceRange {
   uint32_t range_id;
@@ -120,7 +120,7 @@ Instruction readInstruction(
   ShaderInfo &shader_info, uint32_t phase
 );
 
-using pvalue = dxmt::air::pvalue;
+using pvalue = mullion::air::pvalue;
 using epvalue = llvm::Expected<pvalue>;
 using dxbc::Swizzle;
 using dxbc::swizzle_identity;
@@ -459,8 +459,8 @@ private:
 
 class SM50ShaderInternal {
 public:
-  dxmt::dxbc::ShaderInfo shader_info;
-  dxmt::air::FunctionSignatureBuilder func_signature;
+  mullion::dxbc::ShaderInfo shader_info;
+  mullion::air::FunctionSignatureBuilder func_signature;
   std::vector<Signature> output_signature;
   std::vector<std::unique_ptr<BasicBlock>> bbs;
   std::vector<std::function<void(SignatureContext &)>> signature_handlers;
@@ -696,4 +696,4 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
   return false;
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

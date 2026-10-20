@@ -16,7 +16,7 @@
 #include "../util_env.hpp"
 #include "util_string.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 Logger::Logger(const std::string &fileName)
     : m_minLevel(getMinLogLevel()), m_fileName(fileName) {}
@@ -52,7 +52,7 @@ constexpr size_t kWineLine = 1018;
 
 void Logger::emitMsg(LogLevel level, const std::string &message) {
   if (level >= m_minLevel) {
-    std::lock_guard<dxmt::mutex> lock(m_mutex);
+    std::lock_guard<mullion::mutex> lock(m_mutex);
 
     static std::array<const char *, 5> s_prefixes = {
         {"trace: ", "debug: ", "info:  ", "warn:  ", "err:   "}};
@@ -137,4 +137,4 @@ LogLevel Logger::getMinLogLevel() {
   return LogLevel::Info;
 }
 
-} // namespace dxmt
+} // namespace mullion

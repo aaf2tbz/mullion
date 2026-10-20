@@ -26,9 +26,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include <stack>
 
-char dxmt::UnsupportedFeature::ID;
+char mullion::UnsupportedFeature::ID;
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 template <typename T = std::monostate>
 ReaderIO<context, T> throwUnsupported(llvm::StringRef ref) {
@@ -431,7 +431,7 @@ IREffect pull_vertex_input(
     if (!ctx.resource.vertex_buffer_table) {
       ctx.resource.vertex_buffer_table = ctx.builder.CreateBitCast(
         ctx.function->getArg(vbuf_table),
-        ctx.types._dxmt_vertex_buffer_entry->getPointerTo((uint32_t
+        ctx.types._mullion_vertex_buffer_entry->getPointerTo((uint32_t
         )air::AddressSpace::constant)
       );
     }
@@ -440,9 +440,9 @@ IREffect pull_vertex_input(
       element_info.slot ? __builtin_popcount((slot_mask << shift) >> shift) : 0;
     auto vertex_buffer_table = ctx.resource.vertex_buffer_table;
     auto vertex_buffer_entry = builder.CreateLoad(
-      types._dxmt_vertex_buffer_entry,
+      types._mullion_vertex_buffer_entry,
       builder.CreateConstGEP1_32(
-        types._dxmt_vertex_buffer_entry, vertex_buffer_table,
+        types._mullion_vertex_buffer_entry, vertex_buffer_table,
         vertex_buffer_entry_index
       )
     );
@@ -658,11 +658,11 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
   return visited[entry];
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc
 
 template <>
-struct environment_cast<::dxmt::dxbc::context, ::dxmt::air::AIRBuilderContext> {
-  ::dxmt::air::AIRBuilderContext cast(const ::dxmt::dxbc::context &src) {
+struct environment_cast<::mullion::dxbc::context, ::mullion::air::AIRBuilderContext> {
+  ::mullion::air::AIRBuilderContext cast(const ::mullion::dxbc::context &src) {
     return {src.llvm, src.module, src.builder, src.types, src.air};
   };
 };

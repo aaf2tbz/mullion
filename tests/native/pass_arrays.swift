@@ -1,4 +1,4 @@
-// how many scissors and viewports one render pass takes (src/dxmt/dxmt_context.hpp kPassRectangles). Apple documents
+// how many scissors and viewports one render pass takes (src/mullion/mullion_context.hpp kPassRectangles). Apple documents
 // no limit; the driver ends the process inside the draw that follows one set too many, in a pass that has several
 // viewports: every set of viewports counts as many as it sets, and every set of scissors, even of one, as many as the
 // pass has viewports. a pass of `each` viewports sets its viewports, its scissors or one scissor before every one of

@@ -38,7 +38,7 @@
 
 using namespace llvm;
 
-namespace dxmt {
+namespace mullion {
 
 void initializeModule(llvm::Module &M) {
   M.setSourceFileName("airconv_generated.metal");
@@ -214,4 +214,4 @@ linkTessellation(llvm::Module &M) {
   linkShader(M, air_tessellation);
 }
 
-} // namespace dxmt
+} // namespace mullion

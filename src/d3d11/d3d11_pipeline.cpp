@@ -6,7 +6,7 @@
 #include "log/log.hpp"
 #include <atomic>
 
-namespace dxmt {
+namespace mullion {
 
 class MTLCompiledGraphicsPipelineImpl
     : public MTLCompiledGraphicsPipeline {
@@ -205,4 +205,4 @@ CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader) {
   return std::make_unique<MTLCompiledComputePipelineImpl>(pDevice, ComputeShader);
 }
 
-} // namespace dxmt
+} // namespace mullion

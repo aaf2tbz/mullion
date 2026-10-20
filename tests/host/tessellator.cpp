@@ -6,7 +6,7 @@
 // many workloads of a patch, which is all the hull stage is given, and a workload has no more vertices than the mesh.
 // this runs the tessellator's own source, src/airconv/shaders/air_tessellation.metal, built for the host
 // (metal/metal_stdlib stands in for Metal's library): the hull stage's workloads, what the mesh stage makes of each,
-// and what a geometry shader's threadgroup looks up for each primitive (dxmt.get_domain_primitive_location). the
+// and what a geometry shader's threadgroup looks up for each primitive (mullion.get_domain_primitive_location). the
 // d3d11 and d3d12 tessellator tests check the same source as the GPU runs it, by its points and what it covers.
 // listing work is the zip's attempted slots, including ones that make no triangle. D3D11.3 11.7.5 defines an epoch
 // as "a power of 2 number of vertices on one half of the domain (excluding corners)"; 11.7.6.2 omits "one segment
@@ -67,7 +67,7 @@ expected(Domain domain, Partitioning partitioning, const Factors &patch, int ver
 
 int
 main() {
-  using namespace dxmt::dxbc;
+  using namespace mullion::dxbc;
   unsigned failures = 0, patches_checked = 0;
   size_t primitives = 0, frames_checked = 0, zip_slots = 0;
   // the largest factors a hull shader may declare: the tessellator's, and lower ones whole and not, odd and even

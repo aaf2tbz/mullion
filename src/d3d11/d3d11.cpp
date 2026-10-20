@@ -16,17 +16,17 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "dxmt_names.hpp"
+#include "mullion_names.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
 #include "d3d11_device.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
-#include "dxmt_capture.hpp"
+#include "mullion_capture.hpp"
 #include <exception>
 
-namespace dxmt {
+namespace mullion {
 Logger Logger::s_instance("d3d11.log");
 
 D3D_FEATURE_LEVEL
@@ -120,7 +120,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
     Logger::info(str::format("Using feature level ", devFeatureLevel));
 
     auto device = CreateD3D11Device(
-        CreateDXMTDevice({.device = dxgi_adapter->GetMTLDevice()}),
+        CreateMullionDevice({.device = dxgi_adapter->GetMTLDevice()}),
         dxgi_adapter.ptr(), devFeatureLevel, Flags);
 
     return device->QueryInterface(IID_PPV_ARGS(ppDevice));
@@ -250,7 +250,7 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
   return E_NOTIMPL;
 }
 
-} // namespace dxmt
+} // namespace mullion
 
 #ifdef _WIN32
 
@@ -266,13 +266,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 
 extern "C" void _massert(const char *_Message, const char *_File,
                          unsigned _Line) {
-  dxmt::Logger::err(dxmt::str::format("Assertion failed: ", _Message,
+  mullion::Logger::err(mullion::str::format("Assertion failed: ", _Message,
                                       "\nfile: ", _File, ":", _Line));
   std::terminate();
 }
 
 extern "C" void __cxa_pure_virtual() {
-  dxmt::Logger::err(dxmt::str::format("Pure virtual function called"));
+  mullion::Logger::err(mullion::str::format("Pure virtual function called"));
 #ifndef NDEBUG
   __builtin_trap();
 #endif

@@ -203,7 +203,7 @@ main(int argc, char **argv) {
     }
     return 0;
   };
-  for (UINT boundary = 2; boundary <= DXMT_PAGE_SIZE / sizeof(UINT); boundary *= 2)
+  for (UINT boundary = 2; boundary <= MULLION_PAGE_SIZE / sizeof(UINT); boundary *= 2)
     for (UINT count : {boundary - 1, boundary, boundary + 1})
       for (UINT kind = 0; kind < 3; kind++)
         for (UINT first : {0u, 3u})
@@ -235,7 +235,7 @@ main(int argc, char **argv) {
             if (run(desc, view, stride, first, count, 0, 0, 1, floating))
               return 1;
           }
-  for (UINT boundary = 4; boundary <= DXMT_PAGE_SIZE / sizeof(UINT); boundary *= 2)
+  for (UINT boundary = 4; boundary <= MULLION_PAGE_SIZE / sizeof(UINT); boundary *= 2)
     for (UINT dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D; dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D;
          dimension++)
       for (UINT width : {boundary - 1, boundary, boundary + 1})

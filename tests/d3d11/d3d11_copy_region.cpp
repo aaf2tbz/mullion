@@ -132,7 +132,7 @@ main(int argc, char **argv) {
     }
     return 0;
   };
-  const UINT page_words = DXMT_PAGE_SIZE / sizeof(UINT);
+  const UINT page_words = MULLION_PAGE_SIZE / sizeof(UINT);
   const UINT widths[] = {1, page_words - 1, page_words, page_words + 1};
   UINT variant = 0;
   for (UINT src_dimension = D3D11_RESOURCE_DIMENSION_TEXTURE1D;

@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <utility>
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 // the most segments an edge is cut into by factors up to `factor`
 inline uint32_t
@@ -172,4 +172,4 @@ tessellation_grids(uint32_t workloads, uint32_t primitives, uint32_t instances, 
   return grids;
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

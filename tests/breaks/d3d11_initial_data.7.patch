@@ -5,8 +5,8 @@
        case D3D11_USAGE_DEFAULT:
        case D3D11_USAGE_IMMUTABLE:
        case D3D11_USAGE_DYNAMIC:
--        return ppBuffer ? dxmt::CreateBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
-+        return ppBuffer ? dxmt::CreateBuffer(this, &desc, pInitialData, ppBuffer) : E_INVALIDARG;
+-        return ppBuffer ? mullion::CreateBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
++        return ppBuffer ? mullion::CreateBuffer(this, &desc, pInitialData, ppBuffer) : E_INVALIDARG;
        case D3D11_USAGE_STAGING:
          return ppBuffer ? CreateStagingBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
        default:

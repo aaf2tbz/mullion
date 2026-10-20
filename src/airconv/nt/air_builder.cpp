@@ -1160,8 +1160,8 @@ AIRBuilder::CreateGetNumSamples() {
   return builder.CreateCall(Fn, Ops);
 }
 
-// the sample's offset from the pixel center (dxmt.sample_pos, linked from air_samplepos.metal). Metal's own
-// get_sample_position fails to compile in pipelines that support indirect command buffers, as DXMT's all do
+// the sample's offset from the pixel center (mullion.sample_pos, linked from air_samplepos.metal). Metal's own
+// get_sample_position fails to compile in pipelines that support indirect command buffers, as Mullion's all do
 Value *
 AIRBuilder::CreateSamplePos(Value *SampleCount, Value *Index) {
   auto &Context = getContext();
@@ -1171,7 +1171,7 @@ AIRBuilder::CreateSamplePos(Value *SampleCount, Value *Index) {
                 {~0U, Attribute::get(Context, Attribute::AttrKind::ReadNone)}}
   );
   auto Fn = getModule()->getOrInsertFunction(
-      "dxmt.sample_pos.i32", FunctionType::get(getFloatTy(2), {getIntTy(), getIntTy()}, false), Attrs
+      "mullion.sample_pos.i32", FunctionType::get(getFloatTy(2), {getIntTy(), getIntTy()}, false), Attrs
   );
   return builder.CreateCall(Fn, {SampleCount, Index});
 }

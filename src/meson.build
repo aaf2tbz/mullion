@@ -1,13 +1,13 @@
 subdir('util')
 subdir('airconv')
 
-if not dxmt_crossbuild
+if not mullion_crossbuild
 subdir('nativemetal')
 else
 subdir('winemetal')
 endif
 
-subdir('dxmt')
+subdir('mullion')
 subdir('dxgi')
 subdir('d3d11')
 subdir('d3d10')

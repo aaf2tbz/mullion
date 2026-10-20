@@ -26,7 +26,7 @@
 #include <functional>
 #include <span>
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D12Device;
 
@@ -166,4 +166,4 @@ CheckCachedPipeline(const D3D12_CACHED_PIPELINE_STATE &Cached) {
   return ours || !Cached.CachedBlobSizeInBytes ? S_OK : D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 }
 
-} // namespace dxmt
+} // namespace mullion

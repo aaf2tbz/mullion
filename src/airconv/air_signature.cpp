@@ -38,7 +38,7 @@
 
 using namespace llvm;
 
-namespace dxmt::air {
+namespace mullion::air {
 
 class StreamMDHelper {
 public:
@@ -274,16 +274,16 @@ auto build_argument_binding_texture(
     ->integer(texture.array_size);
 
   switch (texture.memory_access) {
-  case dxmt::air::MemoryAccess::read:
+  case mullion::air::MemoryAccess::read:
     md.string("air.read");
     break;
-  case dxmt::air::MemoryAccess::write:
+  case mullion::air::MemoryAccess::write:
     md.string("air.write");
     break;
-  case dxmt::air::MemoryAccess::read_write:
+  case mullion::air::MemoryAccess::read_write:
     md.string("air.read_write");
     break;
-  case dxmt::air::MemoryAccess::sample:
+  case mullion::air::MemoryAccess::sample:
     md.string("air.sample");
     break;
   }
@@ -1071,4 +1071,4 @@ auto FunctionSignatureBuilder::CreateFunction(
   return std::make_pair(function, MDTuple::get(context, function_def_tuple));
 };
 
-} // namespace dxmt::air
+} // namespace mullion::air

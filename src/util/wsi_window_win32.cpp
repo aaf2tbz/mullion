@@ -15,7 +15,7 @@
 #include "util_string.hpp"
 #include "log/log.hpp"
 
-namespace dxmt::wsi {
+namespace mullion::wsi {
 
 // fullscreen styles recorded by Wine's test_swapchain_window_styles (dlls/dxgi/tests/dxgi.c).
 constexpr LONG fullscreen_style_mask = WS_POPUP | WS_OVERLAPPEDWINDOW;
@@ -87,7 +87,7 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
     *pHeight = rect.bottom - rect.top;
 }
 
-bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, MullionWindowState *pState, uint32_t width,
                   uint32_t height) {
   // Adjust window position and size
   RECT newRect = {0, 0, 0, 0};
@@ -132,7 +132,7 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
 }
 
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
-                         DXMTWindowState *pState,
+                         MullionWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
   RECT rect = {};
   if (!getDesktopCoordinates(hMonitor, &rect))
@@ -168,7 +168,7 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
   return true;
 }
 
-bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
+bool leaveFullscreenMode(HWND hWindow, MullionWindowState *pState,
                          bool restoreCoordinates) {
   // Only restore the window style if the application hasn't
   // changed them. This is in line with what native DXGI does.
@@ -244,7 +244,7 @@ HMONITOR getWindowMonitor(HWND hWindow) {
 
 bool isWindow(HWND hWindow) { return ::IsWindow(hWindow); }
 
-bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, DXMTWindowState *pState,
+bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, MullionWindowState *pState,
                             bool forceTopmost) {
   RECT bounds = {};
   if (!wsi::getDesktopCoordinates(hMonitor, &bounds))
@@ -285,4 +285,4 @@ bool isMinimized(HWND hWindow) {
   return ::IsIconic(hWindow);
 }
 
-} // namespace dxmt::wsi
+} // namespace mullion::wsi

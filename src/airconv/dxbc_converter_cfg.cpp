@@ -5,9 +5,9 @@
 #include <stack>
 
 using namespace microsoft;
-using namespace dxmt::shader::common;
+using namespace mullion::shader::common;
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 inline ResourceType
 to_shader_resource_type(D3D10_SB_RESOURCE_DIMENSION dim) {
@@ -757,4 +757,4 @@ read_control_flow(
   return all_bb;
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

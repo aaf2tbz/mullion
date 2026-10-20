@@ -14,7 +14,7 @@
 #include <format>
 #include <utility>
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 using namespace microsoft;
 
@@ -1451,8 +1451,8 @@ convert_dxbc_vertex_for_geometry_shader(
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = is_indexed_draw //
-          ? air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
-          : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
+          ? air::MSLWhateverStruct{"draw_indexed_arguments", types._mullion_draw_indexed_arguments}
+          : air::MSLWhateverStruct{"draw_arguments", types._mullion_draw_arguments},
       .arg_name = "draw_arguments",
       .raster_order_group = {}
   });
@@ -1524,8 +1524,8 @@ convert_dxbc_vertex_for_geometry_shader(
   );
 
   auto draw_arguments = builder.CreateLoad(
-    is_indexed_draw ? types._dxmt_draw_indexed_arguments
-                    : types._dxmt_draw_arguments,
+    is_indexed_draw ? types._mullion_draw_indexed_arguments
+                    : types._mullion_draw_arguments,
     function->getArg(draw_argument_idx)
   );
 
@@ -1967,11 +1967,11 @@ convert_dxbc_vertex_for_geometry_shader(
   return llvm::Error::success();
 };
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc
 
-template <> struct environment_cast<::dxmt::dxbc::context, ::dxmt::air::AIRBuilderContext> {
-  ::dxmt::air::AIRBuilderContext
-  cast(const ::dxmt::dxbc::context &src) {
+template <> struct environment_cast<::mullion::dxbc::context, ::mullion::air::AIRBuilderContext> {
+  ::mullion::air::AIRBuilderContext
+  cast(const ::mullion::dxbc::context &src) {
     return {src.llvm, src.module, src.builder, src.types, src.air};
   };
 };

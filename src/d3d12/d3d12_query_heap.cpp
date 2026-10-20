@@ -21,7 +21,7 @@
 #include "d3d12_pageable.hpp"
 #include <limits>
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D12QueryHeapImpl : public MTLD3D12Pageable<MTLD3D12QueryHeap> {
 public:
@@ -104,4 +104,4 @@ CreateQueryHeap(MTLD3D12Device *pDevice, const D3D12_QUERY_HEAP_DESC *pDesc, REF
   return heap->QueryInterface(riid, ppQueryHeap);
 }
 
-} // namespace dxmt
+} // namespace mullion

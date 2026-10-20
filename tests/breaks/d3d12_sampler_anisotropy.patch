@@ -1,6 +1,6 @@
 # anisotropy rounds down and selects a coarser mip for non-power-of-two requests
---- a/src/dxmt/dxmt_sampler.cpp
-+++ b/src/dxmt/dxmt_sampler.cpp
+--- a/src/mullion/mullion_sampler.cpp
++++ b/src/mullion/mullion_sampler.cpp
 @@ -27,5 +27,5 @@
    WMTSamplerInfo capped = info;
    capped.lod_min_clamp = step(capped.lod_min_clamp);

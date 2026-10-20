@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_format.cpp
-+++ b/src/dxmt/dxmt_format.cpp
+--- a/src/mullion/mullion_format.cpp
++++ b/src/mullion/mullion_format.cpp
 @@ -1507,4 +1507,4 @@
    if (metal_format.PixelFormat) {
 -    Support1 |= D3D11_FORMAT_SUPPORT_SHADER_LOAD |

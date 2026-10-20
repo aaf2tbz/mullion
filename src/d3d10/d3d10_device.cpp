@@ -9,7 +9,7 @@
 #include "../d3d11/d3d11_context.hpp"
 #include "../d3d11/d3d11_device.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 template <typename Impl, typename Interface>
 auto
@@ -1339,4 +1339,4 @@ MTLD3D10Device::GetFeatureLevel() {
   return D3D10_FEATURE_LEVEL1(d3d11_device_->GetFeatureLevel());
 }
 
-} // namespace dxmt
+} // namespace mullion

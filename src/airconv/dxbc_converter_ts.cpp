@@ -10,7 +10,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/AtomicOrdering.h"
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 // air_tessellation.metal's tess_workload
 struct TessMeshWorkload {
@@ -353,8 +353,8 @@ convert_dxbc_vertex_hull_shader(
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = is_indexed_draw //
-                  ? air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
-                  : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
+                  ? air::MSLWhateverStruct{"draw_indexed_arguments", types._mullion_draw_indexed_arguments}
+                  : air::MSLWhateverStruct{"draw_arguments", types._mullion_draw_arguments},
       .arg_name = "draw_arguments",
       .raster_order_group = {}
   });
@@ -480,7 +480,7 @@ convert_dxbc_vertex_hull_shader(
     auto draw_arguments = function->getArg(draw_argument_idx);
     auto argument = [&](unsigned field) {
       return builder.CreateStructGEP(
-          is_indexed_draw ? types._dxmt_draw_indexed_arguments : types._dxmt_draw_arguments, draw_arguments, field
+          is_indexed_draw ? types._mullion_draw_indexed_arguments : types._mullion_draw_arguments, draw_arguments, field
       );
     };
     // with an index buffer view, whether the draw has indices is known only at run time
@@ -1170,4 +1170,4 @@ convert_dxbc_tesselator_domain_shader(
   return llvm::Error::success();
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

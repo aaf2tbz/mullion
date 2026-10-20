@@ -27,7 +27,7 @@ winemetal_unix_link_depends = []
 shared_library('winemetal', winemetal_unix_src,
   name_prefix         : '',
   dependencies        : [ airconv_dep_darwin ],
-  include_directories : dxmt_include_path,
+  include_directories : mullion_include_path,
   c_args              : ['-ObjC'],
   link_args           : winemetal_unix_ld_args,
   native              : true,

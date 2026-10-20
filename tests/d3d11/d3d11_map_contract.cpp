@@ -46,7 +46,7 @@ main() {
   CHECK(device->CreateTexture2D(&probe_desc, nullptr, &probe));
   D3D11_MAPPED_SUBRESOURCE probe_map{};
   CHECK(immediate->Map(probe.Get(), 0, D3D11_MAP_READ, 0, &probe_map));
-  const UINT row_words = probe_map.RowPitch / word_bytes, page_words = DXMT_PAGE_SIZE / word_bytes;
+  const UINT row_words = probe_map.RowPitch / word_bytes, page_words = MULLION_PAGE_SIZE / word_bytes;
   immediate->Unmap(probe.Get(), 0);
   if (!expect(row_words > 0, "the control has no row pitch"))
     return verdict();

@@ -262,7 +262,7 @@ main(int argc, char **argv) {
     }
     return 0;
   };
-  for (UINT boundary = 2; boundary <= DXMT_PAGE_SIZE / sizeof(UINT); boundary *= 2)
+  for (UINT boundary = 2; boundary <= MULLION_PAGE_SIZE / sizeof(UINT); boundary *= 2)
     for (UINT count : {boundary - 1, boundary, boundary + 1})
       for (UINT kind = 0; kind < 3; kind++)
         for (UINT first : {0u, 3u})
@@ -272,7 +272,7 @@ main(int argc, char **argv) {
                     true, listed))
               return 1;
           }
-  for (UINT boundary = 4; boundary <= DXMT_PAGE_SIZE / sizeof(UINT); boundary *= 2)
+  for (UINT boundary = 4; boundary <= MULLION_PAGE_SIZE / sizeof(UINT); boundary *= 2)
     for (UINT dimension = D3D11_RESOURCE_DIMENSION_TEXTURE1D; dimension <= D3D11_RESOURCE_DIMENSION_TEXTURE3D;
          dimension++)
       for (UINT width : {boundary - 1, boundary, boundary + 1})
@@ -317,7 +317,7 @@ main(int argc, char **argv) {
         return verdict();
       at = end;
     }
-    const UINT count = DXMT_PAGE_SIZE / format.bytes + 1, first = 3, total = first + count + 3;
+    const UINT count = MULLION_PAGE_SIZE / format.bytes + 1, first = 3, total = first + count + 3;
     for (bool listed : {false, true}) {
       step("seed %u typed Uint %s first %u count %u listed %u", seed, format.name, first, count, listed);
       std::vector<unsigned char> bytes(total * format.bytes, 0xa5);

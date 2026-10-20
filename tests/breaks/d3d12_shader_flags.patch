@@ -1,6 +1,6 @@
 # an invalid shader flag override is accepted as a number
---- a/src/dxmt/dxmt_info.cpp
-+++ b/src/dxmt/dxmt_info.cpp
+--- a/src/mullion/mullion_info.cpp
++++ b/src/mullion/mullion_info.cpp
 @@ -60,18 +60,8 @@
  SM50_SHADER_FLAG
  GPUShaderFlags(WMT::Device device) {

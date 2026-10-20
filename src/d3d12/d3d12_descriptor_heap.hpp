@@ -18,19 +18,19 @@
 
 #pragma once
 #include "d3d12.h"
-#include "dxmt_buffer.hpp"
-#include "dxmt_texture.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_texture.hpp"
 #include <bit>
 #include <cstdint>
 
 #if UINTPTR_MAX == 0xffffffffffffffffULL
-#define DXMT_USE_EMBEDDED_HEAP_POINTER
+#define MULLION_USE_EMBEDDED_HEAP_POINTER
 #endif
 
-namespace dxmt {
+namespace mullion {
 
 struct EMBEDDED_DESCRIPTOR_HANDLE {
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
   SIZE_T Tag        : 5;
   SIZE_T Descriptor : 20;
   SIZE_T Heap       : 7;
@@ -38,7 +38,7 @@ struct EMBEDDED_DESCRIPTOR_HANDLE {
   // a heap is aligned to a page and a user address has 47 bits, which leaves the heap's bits; consecutive
   // descriptors' handles differ in the bits above the low ones, and the descriptor's index has the rest
   static constexpr unsigned kIncrementBits = 5, kAddressBits = 47,
-                            kHeapBits = kAddressBits - std::countr_zero(size_t(DXMT_PAGE_SIZE)),
+                            kHeapBits = kAddressBits - std::countr_zero(size_t(MULLION_PAGE_SIZE)),
                             kDescriptorBits = sizeof(SIZE_T) * 8 - kIncrementBits - kHeapBits;
   SIZE_T Increment  : kIncrementBits;
   SIZE_T Descriptor : kDescriptorBits;
@@ -138,7 +138,7 @@ struct ShaderVisibleDescriptorCPUStorage {
   ShaderVisibleDescriptorCPUStorage() : type(ShaderVisibleDescriptorType::Null) {}
 };
 
-class alignas(DXMT_PAGE_SIZE) MTLD3D12DescriptorHeap : public ID3D12DescriptorHeap {
+class alignas(MULLION_PAGE_SIZE) MTLD3D12DescriptorHeap : public ID3D12DescriptorHeap {
 public:
   virtual HRESULT AddShaderResourceView(
       UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp, std::array<float, 2> BorderRange,
@@ -175,7 +175,7 @@ public:
   virtual void CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
 };
 
-class alignas(DXMT_PAGE_SIZE) MTLD3D12SamplerDescriptorHeap : public ID3D12DescriptorHeap {
+class alignas(MULLION_PAGE_SIZE) MTLD3D12SamplerDescriptorHeap : public ID3D12DescriptorHeap {
 public:
   virtual HRESULT AddSampler(UINT Index, const D3D12_SAMPLER_DESC *Desc) = 0;
 
@@ -193,7 +193,7 @@ struct MTL_RENDER_TARGET_DESC {
   bool operator==(const MTL_RENDER_TARGET_DESC &) const = default;
 };
 
-class alignas(DXMT_PAGE_SIZE) MTLD3D12RenderTargetDescriptorHeap : public ID3D12DescriptorHeap {
+class alignas(MULLION_PAGE_SIZE) MTLD3D12RenderTargetDescriptorHeap : public ID3D12DescriptorHeap {
 public:
   virtual HRESULT AddRenderTarget(UINT Index, MTL_RENDER_TARGET_DESC const *pDesc) = 0;
   virtual MTL_RENDER_TARGET_DESC GetRenderTarget(UINT Index) = 0;
@@ -201,4 +201,4 @@ public:
   virtual void CopyDescriptors(UINT From, MTLD3D12RenderTargetDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
 };
 
-} // namespace dxmt
+} // namespace mullion

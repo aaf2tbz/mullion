@@ -8,4 +8,4 @@
 +    static_cast<MTLD3D12Fence *>(pFence)->Reach(Value);
      auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
        // after a submission another thread is in the middle of
-       std::lock_guard<dxmt::mutex> lock(mutex_commit_);
+       std::lock_guard<mullion::mutex> lock(mutex_commit_);

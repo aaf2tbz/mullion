@@ -18,18 +18,18 @@
 
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
-#include "dxmt_diag.hpp"
+#include "mullion_diag.hpp"
 #include "d3d12_pageable.hpp"
 #include "d3d12_command_allocator.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 constexpr auto kSharedHeader = R"(
 #include <metal_stdlib>
 
 using namespace metal;
 
-struct dxmt_compute_command_data {
+struct mullion_compute_command_data {
   command_buffer cmd_buf;
   ulong max_count;
   device uint * max_count_buffer;
@@ -73,7 +73,7 @@ struct d3d12_index_buffer_view {
 };
 
 // IndirectMeshDraw
-struct dxmt_indirect_mesh_draw {
+struct mullion_indirect_mesh_draw {
   d3d12_index_buffer_view view;
   uint control_points;
   uint padding[3];
@@ -81,17 +81,17 @@ struct dxmt_indirect_mesh_draw {
   packed_uint3 threadgroups;
 };
 
-struct dxmt_vertex_buffer {
+struct mullion_vertex_buffer {
   device void * buffer;
   uint stride;
   uint length;
 };
 
-struct dxmt_draw_statistics {
+struct mullion_draw_statistics {
   ulong pixels, primitives, vertices;
 };
 
-struct dxmt_render_command_data {
+struct mullion_render_command_data {
   command_buffer cmd_buf;
   ulong max_count;
   device uint * max_count_buffer;
@@ -117,11 +117,11 @@ struct dxmt_render_command_data {
   uint index_buffer_size;
   device uint * most;
   device uint * omitted;
-  device dxmt_indirect_mesh_draw * draws;
+  device mullion_indirect_mesh_draw * draws;
   device ushort * zeros;
   uint zero_count;
-  device dxmt_draw_statistics *pixel_statistics;
-  device dxmt_draw_statistics *statistics;
+  device mullion_draw_statistics *pixel_statistics;
+  device mullion_draw_statistics *statistics;
   uint statistics_first, statistics_step, statistics_cut, statistics_cuts;
   packed_uint2 execution_range;
 };
@@ -131,7 +131,7 @@ struct dxmt_render_command_data {
 class MTLD3D12CommandSignatureImpl : public MTLD3D12Pageable<MTLD3D12CommandSignature> {
   WMT::Reference<WMT::Library> statistics_library_;
   WMT::Reference<WMT::ComputePipelineState> statistics_resolver_;
-  dxmt::mutex statistics_mutex_;
+  mullion::mutex statistics_mutex_;
 
 public:
   MTLD3D12CommandSignatureImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12CommandSignature>(pDevice) {}
@@ -263,7 +263,7 @@ public:
     // ordinary pipeline's draw follows as the else branch
     auto tessellate = [&](const char *args, const char *count, const char *view, size_t words) {
       source << "if (command_data.draws) {\n";
-      source << "device dxmt_indirect_mesh_draw &draw = command_data.draws[i];\n";
+      source << "device mullion_indirect_mesh_draw &draw = command_data.draws[i];\n";
       source << "draw.view = *(" << view << ");\n";
       source << "draw.control_points = command_data.control_points;\n";
       source << "for (uint word = 0; word < " << words << "; word++)\n";
@@ -298,7 +298,7 @@ public:
     UpdateIndexBuffer = ib_index != ~0u;
 
     source << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint x, device "
-           << (is_compute ? "dxmt_compute_command_data" : "dxmt_render_command_data")
+           << (is_compute ? "mullion_compute_command_data" : "mullion_render_command_data")
            << " &command_data [[buffer(30)]]) {\n";
     // each thread resolves one command
     source << "ulong i = x;\n";
@@ -350,8 +350,8 @@ public:
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords + "
               "(i * command_data.rootsig_qwords_stride);\n";
     if (!is_compute)
-      source << "device dxmt_vertex_buffer * vertex_buffer = "
-                "reinterpret_cast<device dxmt_vertex_buffer *>(command_data.vertex_buffer + "
+      source << "device mullion_vertex_buffer * vertex_buffer = "
+                "reinterpret_cast<device mullion_vertex_buffer *>(command_data.vertex_buffer + "
                 "(i * command_data.vertex_argbuf_stride));\n";
 
     // the caller binds what an IndirectMeshDraw's stages read; a command of the indirect command buffer binds its own
@@ -568,7 +568,7 @@ public:
               "};\n";
 
     if (indexed) {
-      source << "[[kernel]] void count_indirect_strips(device dxmt_render_command_data &data [[buffer(30)]],\n"
+      source << "[[kernel]] void count_indirect_strips(device mullion_render_command_data &data [[buffer(30)]],\n"
                 "uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],\n"
                 "uint3 group_size [[threads_per_threadgroup]]) {\n"
                 "uint i = group.x, lanes = group_size.x;\n"
@@ -667,4 +667,4 @@ CreateCommandSignature(
   return sig->QueryInterface(riid, ppCommandSignature);
 }
 
-} // namespace dxmt
+} // namespace mullion

@@ -20,7 +20,7 @@
 int
 main() {
   static const unsigned char commands[] = {
-#embed "../../src/dxmt/dxmt_command.cpp"
+#embed "../../src/mullion/mullion_command.cpp"
       , 0};
   struct Format {
     DXGI_FORMAT format;
@@ -64,7 +64,7 @@ main() {
                  D3D10_1_SDK_VERSION, &device10));
   for (auto &format : formats) {
     const UINT texel_bytes = (format.depth_bits + format.stencil_bits + format.unused_bits) / CHAR_BIT;
-    const UINT page_texels = DXMT_PAGE_SIZE / texel_bytes;
+    const UINT page_texels = MULLION_PAGE_SIZE / texel_bytes;
     const UINT widths[] = {1, std::max(1u, group[0] - 1), group[0], group[0] + 1,
                            page_texels - 1, page_texels, page_texels + 1};
     const UINT heights[] = {1, std::max(1u, group[1] - 1), group[1], group[1] + 1};

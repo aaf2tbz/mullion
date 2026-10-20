@@ -4,7 +4,7 @@
 // NO_OVERWRITE changes a row no pending draw reads, before any full-buffer copies. CB ranges follow 5.3.4.3.2:
 // "FirstConstant must be a multiple of 16 constants." ordinary CBs use their whole binding, larger CBs also use a
 // nonzero range.
-// sizes cross BufferAllocation's minimum and DXMT_PAGE_SIZE. fifteen page / bytes capacities (one above a page)
+// sizes cross BufferAllocation's minimum and MULLION_PAGE_SIZE. fifteen page / bytes capacities (one above a page)
 // plus one update pass at least the first and last names of the first three doublings, including names above a page.
 // every generation draws distinct integer pixels. copies check every byte through staging Map, including bytes
 // outside partial writes. view, vertex, index, constant and argument offsets are nonzero independently of storage
@@ -89,10 +89,10 @@ main(int argc, char **argv) {
                                       &layouts[kind]));
   }
   std::vector<UINT> sizes;
-  for (UINT bytes = 4 * sizeof(Row); bytes < DXMT_PAGE_SIZE; bytes *= 2)
+  for (UINT bytes = 4 * sizeof(Row); bytes < MULLION_PAGE_SIZE; bytes *= 2)
     sizes.push_back(bytes);
-  sizes.insert(sizes.end(), {DXMT_PAGE_SIZE - sizeof(Row), DXMT_PAGE_SIZE, DXMT_PAGE_SIZE + sizeof(Row),
-                              4 * DXMT_PAGE_SIZE});
+  sizes.insert(sizes.end(), {MULLION_PAGE_SIZE - sizeof(Row), MULLION_PAGE_SIZE, MULLION_PAGE_SIZE + sizeof(Row),
+                              4 * MULLION_PAGE_SIZE});
   const char *names[] = {"vertex", "index", "constant", "typed", "structured", "raw", "indirect", "indexed indirect",
                          "vertex/output", "typed/output"};
   for (UINT bytes : sizes)
@@ -105,7 +105,7 @@ main(int argc, char **argv) {
           deferred->ClearState();
           auto context = recorded ? deferred1.Get() : immediate1.Get();
           const UINT rows = bytes / sizeof(Row);
-          const UINT generations = (1 + 2 + 4 + 8) * std::max(1u, DXMT_PAGE_SIZE / bytes) + 1;
+          const UINT generations = (1 + 2 + 4 + 8) * std::max(1u, MULLION_PAGE_SIZE / bytes) + 1;
           // D3D11.3 5.3.4.3.2 defines binding alignment in constants, distinct from a constant's byte size
           const UINT range_alignment = 16, first = kind == Constant && rows > range_alignment ? range_alignment : 0;
           const UINT probes[] = {first + 1, std::max(first + 1, rows / 2), rows - 1};

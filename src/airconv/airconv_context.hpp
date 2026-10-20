@@ -2,7 +2,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/OptimizationLevel.h"
 
-namespace dxmt {
+namespace mullion {
 
 void initializeModule(llvm::Module &M);
 
@@ -17,4 +17,4 @@ void linkSamplePos(llvm::Module &M);
 
 void linkTessellation(llvm::Module &M);
 
-} // namespace dxmt
+} // namespace mullion

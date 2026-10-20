@@ -5,8 +5,8 @@
 #include "d3d11_3.h"
 #include "d3d11_multithread.hpp"
 #include "dxgi_interfaces.h"
-#include "dxmt_device.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_device.hpp"
+#include "mullion_format.hpp"
 
 struct MTL_GRAPHICS_PIPELINE_DESC;
 struct MTL_COMPUTE_PIPELINE_DESC;
@@ -23,7 +23,7 @@ DEFINE_COM_INTERFACE("3a3f085a-d0fe-4324-b0ae-fe04de18571c",
   virtual HRESULT ReleaseSync(ID3D11Resource *pResource, UINT64 Key) = 0;
 };
 
-namespace dxmt {
+namespace mullion {
 
 class MTLCompiledGraphicsPipeline;
 class MTLCompiledComputePipeline;
@@ -55,7 +55,7 @@ public:
 
   virtual bool IsTraced() = 0;
 
-  virtual Device& GetDXMTDevice() = 0;
+  virtual Device& GetMullionDevice() = 0;
 
   virtual void CreateCommandList(ID3D11CommandList** pCommandList) = 0;
 
@@ -74,4 +74,4 @@ Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,
                                       IMTLDXGIAdapter *pAdapter,
                                       D3D_FEATURE_LEVEL FeatureLevel,
                                       UINT Flags);
-} // namespace dxmt
+} // namespace mullion

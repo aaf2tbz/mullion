@@ -57,7 +57,7 @@ TOKEN = re.compile(r'''(?P<comment>//(?:\\\r?\n|[^\n])*|/\*.*?\*/)|
     <<|>>|[+*/%&|^!-]=|\.\.\.|[^\s])''', re.S | re.X)
 CONTROL = {"if", "for", "while", "switch", "catch", "sizeof", "alignof", "decltype", "noexcept", "requires"}
 PROTECTED = re.compile(r"^(?:assert|static_assert|_Static_assert|[A-Z_]*ASSERT[A-Z_]*|ERR|WARN|TRACE|DEBUG|INFO|FIXME|"
-                       r"DXMT_UNREACHABLE|printf|fprintf|snprintf|NSLog|os_log\w*)$")
+                       r"MULLION_UNREACHABLE|printf|fprintf|snprintf|NSLog|os_log\w*)$")
 SOURCE_SUFFIXES = {".cpp", ".c", ".cc", ".cxx", ".hpp", ".h", ".hh", ".mm", ".m", ".metal", ".inc"}
 
 

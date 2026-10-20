@@ -15,7 +15,7 @@
 #include "wsi_monitor.hpp"
 #include "wsi_platform_win32.hpp"
 
-namespace dxmt::wsi {
+namespace mullion::wsi {
 
 /**
  * \brief The size of the window
@@ -35,7 +35,7 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pWeight);
  * \param [in] height The new height
  * \returns \c true on success, \c false on failure
  */
-bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, MullionWindowState *pState, uint32_t width,
                   uint32_t weight);
 
 /**
@@ -58,7 +58,7 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode);
  * \returns \c true on success, \c false on failure
  */
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
-                         DXMTWindowState *pState,
+                         MullionWindowState *pState,
                          [[maybe_unused]] bool modeSwitch);
 
 /**
@@ -68,7 +68,7 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
  * \param [in] pState The swapchain's window state
  * \returns \c true on success, \c false on failure
  */
-bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
+bool leaveFullscreenMode(HWND hWindow, MullionWindowState *pState,
                          bool restoreCoordinates);
 
 /**
@@ -104,10 +104,10 @@ bool isWindow(HWND hWindow);
  * (D3D9 behaviour)
  * \returns \c true on success, \c false on failure
  */
-bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, DXMTWindowState *pState, bool forceTopmost);
+bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, MullionWindowState *pState, bool forceTopmost);
 
 bool isForeground(HWND hWindow);
 
 bool isMinimized(HWND hWindow);
 
-} // namespace dxmt::wsi
+} // namespace mullion::wsi

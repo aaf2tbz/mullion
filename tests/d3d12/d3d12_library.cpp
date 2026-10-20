@@ -646,7 +646,7 @@ main(int argc, char **argv) {
   if (instrumented) {
     std::vector<char> data(library->GetSerializedSize());
     CHECK(library->Serialize(data.data(), data.size()));
-    const auto offset = strlen(empty.data()) + 1 + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(dxmt::Sha1Digest);
+    const auto offset = strlen(empty.data()) + 1 + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(mullion::Sha1Digest);
     uint64_t before, after;
     memcpy(&before, data.data() + offset, sizeof(before));
     CHECK(library->StorePipeline(L"shared", pipeline.Get()));
@@ -730,11 +730,11 @@ main(int argc, char **argv) {
     step("seed %u: checksum-valid incompatible and malformed blobs", seed);
     const auto magic_size = strlen(empty.data()) + 1;
     const auto checksum_at = magic_size + sizeof(uint32_t) + sizeof(uint64_t);
-    const auto header_size = checksum_at + sizeof(dxmt::Sha1Digest);
+    const auto header_size = checksum_at + sizeof(mullion::Sha1Digest);
     UINT blob_index = 0;
     auto validate = [&](std::vector<char> blob, HRESULT wanted) {
       step("seed %u blob %u: checksum-valid validation", seed, blob_index++);
-      dxmt::Sha1HashState hash;
+      mullion::Sha1HashState hash;
       hash.update(blob.data(), checksum_at);
       hash.update(blob.data() + header_size, blob.size() - header_size);
       auto checksum = hash.final();
@@ -755,7 +755,7 @@ main(int argc, char **argv) {
       auto begin = (const char *)&value;
       blob.insert(blob.end(), begin, begin + sizeof(value));
     };
-    dxmt::Sha1Digest key;
+    mullion::Sha1Digest key;
     uint64_t shader_size, one = 1;
     const auto shader_at = header_size + sizeof(uint64_t);
     memcpy(&key, bytes.data() + shader_at, sizeof(key));

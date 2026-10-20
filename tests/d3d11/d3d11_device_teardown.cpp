@@ -3,7 +3,7 @@
 // IUnknown::Release: "When the reference count on an object reaches zero, Release must cause the interface pointer
 // to free itself." https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nf-unknwn-iunknown-release
 // the 30 s watchdog is a test deadline, not an API timing limit. four concurrent callers repeat each case 64 times.
-// a single pipeline and a burst past 2 * hardware_concurrency (dxmt_tasks.hpp's worker cap) meet active work and
+// a single pipeline and a burst past 2 * hardware_concurrency (mullion_tasks.hpp's worker cap) meet active work and
 // queued dependencies without a GPU loop. completed cases read every shader's output before releasing the device;
 // pending cases release without a flush. the API cannot identify an internal worker's exact instruction: the
 // lost-wake fault synchronizes the shutdown notification into the predicate-to-sleep window.

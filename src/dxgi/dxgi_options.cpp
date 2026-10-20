@@ -1,6 +1,6 @@
 #include "dxgi_options.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 static int32_t parsePciId(const std::string &str) {
   if (str.size() != 4)
@@ -35,4 +35,4 @@ DxgiOptions::DxgiOptions(const Config &config) {
   this->forceSDR = config.getOption<bool>("dxgi.forceSDR", false);
 }
 
-} // namespace dxmt
+} // namespace mullion

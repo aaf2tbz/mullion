@@ -1,8 +1,8 @@
 # omit attachment records
-diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+diff --git a/src/mullion/mullion_command_queue.cpp b/src/mullion/mullion_command_queue.cpp
 index b459e15..b034175 100644
---- a/src/dxmt/dxmt_command_queue.cpp
-+++ b/src/dxmt/dxmt_command_queue.cpp
+--- a/src/mullion/mullion_command_queue.cpp
++++ b/src/mullion/mullion_command_queue.cpp
 @@ -51,7 +51,7 @@ CommandQueue::ProfilePass(EncoderData *pass, diag::ProfileBuffer *&profiled) {
    auto seq = pass->id;
    std::string runs, targets;

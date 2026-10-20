@@ -21,11 +21,11 @@
 #include "d3d12_pageable.hpp"
 #include <deque>
 #include "airconv_ray.h"
-#include "dxmt_command_clear.hpp"
-#include "dxmt_command_feedback.hpp"
-#include "dxmt_ring_bump_allocator.hpp"
+#include "mullion_command_clear.hpp"
+#include "mullion_command_feedback.hpp"
+#include "mullion_ring_bump_allocator.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 inline std::size_t
 align_forward_adjustment(const void *const ptr, const std::size_t &alignment) noexcept {
@@ -456,4 +456,4 @@ public:
   );
 };
 
-} // namespace dxmt
+} // namespace mullion

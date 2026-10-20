@@ -2,7 +2,7 @@
 #include "nvngx.hpp"
 #include <cstdint>
 
-namespace dxmt {
+namespace mullion {
 
 struct CommonFeature {
   unsigned int handle;

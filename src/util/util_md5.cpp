@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cassert>
 
-namespace dxmt::md5 {
+namespace mullion::md5 {
 
 void Hasher::update(const void *data, size_t size) {
   auto src = reinterpret_cast<const unsigned char *>(data);
@@ -235,4 +235,4 @@ DxbcHash checkDxbcHash(const void *data, size_t size) {
   return all(1) || given == hashDxbcBinary(data, size) ? DxbcHash::Holds : DxbcHash::Wrong;
 }
 
-} // namespace dxmt::md5
+} // namespace mullion::md5

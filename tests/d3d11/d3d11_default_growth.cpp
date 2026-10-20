@@ -4,7 +4,7 @@
 // the mapped resource, the pointer must be 16-byte aligned." (5.6.1). words at both ends give independent pixels;
 // a staging copy checks every byte of the last name. a profile buffer record (time, handle, length) counts one
 // successful BufferAllocation construction. shaders are compiled before any device is made.
-// the storage contract is a page (DXMT_PAGE_SIZE from the build) below a page, otherwise one name, followed by
+// the storage contract is a page (MULLION_PAGE_SIZE from the build) below a page, otherwise one name, followed by
 // twice the names when the preceding allocation filled with all names pending, capped at the queue's block.
 // stride s rounds a name to Map's alignment. a page holds c = floor(page / s) names, or one above a page;
 // a deferred list starts with c;
@@ -118,7 +118,7 @@ main(int argc, char **argv) {
   ComPtr<ID3D11PixelShader> ps;
   CHECK(device->CreateVertexShader(vs_code->GetBufferPointer(), vs_code->GetBufferSize(), nullptr, &vs));
   CHECK(device->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps));
-  const UINT page = DXMT_PAGE_SIZE, map_alignment = 16, word = sizeof(UINT);
+  const UINT page = MULLION_PAGE_SIZE, map_alignment = 16, word = sizeof(UINT);
   UINT64 block = 0;
   auto exercise = [&](UINT bytes, UINT rewrites, bool dynamic, bool recorded, bool many, bool completed,
                       bool calibration) -> int {

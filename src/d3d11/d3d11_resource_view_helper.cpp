@@ -1,7 +1,7 @@
-#include "dxmt_format.hpp"
+#include "mullion_format.hpp"
 #include "d3d11_resource.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 void FixDepthStencilFormat(Texture *pTexture, MTL_DXGI_FORMAT_DESC &Desc) {
   switch (pTexture->pixelFormat()) {
@@ -918,4 +918,4 @@ void UpgradeViewDescription(const D3D11_RENDER_TARGET_VIEW_DESC *pSrc,
   }
 };
 
-} // namespace dxmt
+} // namespace mullion

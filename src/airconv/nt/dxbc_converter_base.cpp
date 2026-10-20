@@ -30,7 +30,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 llvm::ArrayType *
 GetArrayType(llvm::Value *Array) {
@@ -1403,11 +1403,11 @@ Converter::BufferResidency(llvm::Value *Pointer) {
   if (!Table)
     return ir.getInt32(0);
   auto Module = air.getModule();
-  auto Function = Module->getFunction("dxmt.buffer_residency");
+  auto Function = Module->getFunction("mullion.buffer_residency");
   if (!Function) {
     Function = llvm::Function::Create(
         llvm::FunctionType::get(ir.getInt32Ty(), {Table->getType(), ir.getInt64Ty()}, false),
-        llvm::GlobalValue::InternalLinkage, "dxmt.buffer_residency", Module
+        llvm::GlobalValue::InternalLinkage, "mullion.buffer_residency", Module
     );
     Function->addFnAttr(llvm::Attribute::AlwaysInline);
     auto Entry = llvm::BasicBlock::Create(ctx.llvm, "entry", Function);
@@ -2960,7 +2960,7 @@ Converter::MaskedSumOfAbsDiff(llvm::Value *Ref, llvm::Value *Src, llvm::Value *A
   Tys.push_back(Accum->getType());
   Ops.push_back(Accum);
 
-  std::string FnName = "dxmt.msad";
+  std::string FnName = "mullion.msad";
   FnName += air.getTypeOverloadSuffix(Ref->getType());
 
   auto Fn = air.getModule()->getOrInsertFunction(FnName, FunctionType::get(Accum->getType(), Tys, false), Attrs);
@@ -3001,7 +3001,7 @@ Converter::HullGenerateWorkload(
     Tys.push_back(Op->getType());
 
   auto Fn = air.getModule()->getOrInsertFunction(
-      std::string("dxmt.generate_workload.") + Domain, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs
+      std::string("mullion.generate_workload.") + Domain, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs
   );
   ir.CreateCall(Fn, Ops);
 }
@@ -3027,7 +3027,7 @@ Converter::DomainGetPatchIndex(llvm::Value *WorkloadIndex, llvm::Value *DataPtr)
   Tys.push_back(DataPtr->getType());
   Ops.push_back(DataPtr);
 
-  std::string FnName = "dxmt.get_domain_patch_index";
+  std::string FnName = "mullion.get_domain_patch_index";
   auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getIntTy(), Tys, false), Attrs);
   return ir.CreateCall(Fn, Ops);
 }
@@ -3056,7 +3056,7 @@ Converter::DomainGetLocation(llvm::Value *WorkloadIndex, llvm::Value *ThreadInde
   Ops.push_back(DataPtr);
 
   auto Fn = air.getModule()->getOrInsertFunction(
-      "dxmt.get_domain_location",
+      "mullion.get_domain_location",
       llvm::FunctionType::get(
           llvm::StructType::create(Context, {air.getFloatTy(2), air.getByteTy(), air.getByteTy()}, ""), Tys, false
       ),
@@ -3098,7 +3098,7 @@ Converter::DomainGetPrimitiveLocation(
     Tys.push_back(Op->getType());
 
   auto Fn = air.getModule()->getOrInsertFunction(
-      "dxmt.get_domain_primitive_location",
+      "mullion.get_domain_primitive_location",
       llvm::FunctionType::get(
           llvm::StructType::create(Context, {air.getFloatTy(2), air.getByteTy(), air.getByteTy()}, ""), Tys, false
       ),
@@ -3136,7 +3136,7 @@ Converter::DomainGetPieceLocation(
   for (auto Op : Ops)
     Tys.push_back(Op->getType());
   auto Fn = air.getModule()->getOrInsertFunction(
-      "dxmt.get_domain_piece_location",
+      "mullion.get_domain_piece_location",
       llvm::FunctionType::get(
           llvm::StructType::create(Context, {air.getFloatTy(2), air.getByteTy(), air.getByteTy()}, ""), Tys, false
       ),
@@ -3173,7 +3173,7 @@ Converter::DomainGeneratePiece(
   for (auto Op : Ops)
     Tys.push_back(Op->getType());
   auto Fn = air.getModule()->getOrInsertFunction(
-      "dxmt.domain_generate_piece", llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs
+      "mullion.domain_generate_piece", llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs
   );
   ir.CreateCall(Fn, Ops);
 }
@@ -3206,7 +3206,7 @@ Converter::DomainGeneratePrimitives(
   Tys.push_back(ir.getInt32Ty()->getPointerTo(3));
   Ops.push_back(Behind ? Behind : llvm::Constant::getNullValue(Tys.back()));
 
-  std::string FnName = "dxmt.domain_generate_primitives";
+  std::string FnName = "mullion.domain_generate_primitives";
   switch (Primitive) {
   case TessellatorOutputPrimitive::point:
     FnName += ".point";
@@ -3345,4 +3345,4 @@ Converter::CoherentGroupSync() const {
   return ctx.coherent_group_sync;
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

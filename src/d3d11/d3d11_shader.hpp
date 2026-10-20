@@ -7,7 +7,7 @@
 #include "d3d11_input_layout.hpp"
 #include "sha1/sha1_util.hpp"
 #include "log/log.hpp"
-#include "dxmt_shader_cache.hpp"
+#include "mullion_shader_cache.hpp"
 #include <variant>
 
 struct MTL_COMPILED_SHADER {
@@ -17,10 +17,10 @@ struct MTL_COMPILED_SHADER {
   WMT::Function Function;
 };
 
-namespace dxmt {
+namespace mullion {
 class Shader;
 };
-typedef dxmt::Shader *ManagedShader;
+typedef mullion::Shader *ManagedShader;
 
 DEFINE_COM_INTERFACE("e95ba1c7-e43f-49c3-a907-4ac669c9fb42", IMTLD3D11Shader)
     : public IUnknown {
@@ -30,7 +30,7 @@ DEFINE_COM_INTERFACE("e95ba1c7-e43f-49c3-a907-4ac669c9fb42", IMTLD3D11Shader)
   virtual void ReleasePrivate() = 0;
 };
 
-namespace dxmt {
+namespace mullion {
 
 class NullD3D10Shader {
 public:
@@ -222,11 +222,11 @@ template <typename Variant>
 std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *, ManagedShader, Variant);
 
-} // namespace dxmt
+} // namespace mullion
 
 namespace std {
-template <> struct hash<dxmt::ShaderVariant> {
-  size_t operator()(const dxmt::ShaderVariant &v) const noexcept {
+template <> struct hash<mullion::ShaderVariant> {
+  size_t operator()(const mullion::ShaderVariant &v) const noexcept {
     return v.index(); // FIXME:
   };
 };

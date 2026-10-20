@@ -28,7 +28,7 @@
 #include <algorithm>
 #include <atomic>
 
-namespace dxmt {
+namespace mullion {
 
 Logger Logger::s_instance("d3d12.log");
 
@@ -77,7 +77,7 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
 
   // the device, if it reaches the minimum feature level
   Com<ID3D12Device> device;
-  if (FAILED(hr = dxmt::CreateD3D12Device(dxgi_adapter_mtl.ptr(), IID_PPV_ARGS(&device))))
+  if (FAILED(hr = mullion::CreateD3D12Device(dxgi_adapter_mtl.ptr(), IID_PPV_ARGS(&device))))
     return hr;
   D3D12_FEATURE_DATA_FEATURE_LEVELS levels{1, &MinimumFeatureLevel};
   if (FAILED(hr = device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof(levels))))
@@ -93,7 +93,7 @@ extern "C" HRESULT WINAPI
 D3D12GetInterface(REFCLSID rcslid, REFIID iid, void **debug) {
   if (debug)
     *debug = nullptr;
-  WARN("D3D12GetInterface: Unknown interface query ", dxmt::str::format(iid));
+  WARN("D3D12GetInterface: Unknown interface query ", mullion::str::format(iid));
   return E_NOINTERFACE;
 }
 
@@ -101,7 +101,7 @@ extern "C" HRESULT WINAPI
 D3D12GetDebugInterface(REFIID iid, void **debug) {
   if (debug)
     *debug = nullptr;
-  WARN("D3D12GetDebugInterface: Unknown interface query ", dxmt::str::format(iid));
+  WARN("D3D12GetDebugInterface: Unknown interface query ", mullion::str::format(iid));
   return E_NOINTERFACE;
 }
 
@@ -144,4 +144,4 @@ DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   return TRUE;
 }
 
-} // namespace dxmt
+} // namespace mullion

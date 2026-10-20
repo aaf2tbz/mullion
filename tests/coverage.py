@@ -77,7 +77,7 @@ def member(symbol):
             parts.append(name[start:i])
             start = i + 2
     # the libraries' own classes are in their namespace
-    return (parts[-2], parts[-1]) if len(parts) > 2 and parts[0] == "dxmt" else None
+    return (parts[-2], parts[-1]) if len(parts) > 2 and parts[0] == "mullion" else None
 
 
 def report(build, notes, out):

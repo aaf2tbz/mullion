@@ -18,10 +18,10 @@
 
 #pragma once
 
-#include "dxmt_texture.hpp"
+#include "mullion_texture.hpp"
 #include <cstdint>
 
-namespace dxmt {
+namespace mullion {
 
 enum class EncoderType {
   Null,
@@ -197,4 +197,4 @@ struct ResolveTimestampsData : EncoderData {
   uint64_t dst_offset;
 };
 
-}; // namespace dxmt
+}; // namespace mullion

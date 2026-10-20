@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace dxmt::md5 {
+namespace mullion::md5 {
 
 /** 128-bit MD5 digest */
 struct Digest {
@@ -75,4 +75,4 @@ Digest hashDxbcBinary(const void *data, size_t size);
 enum class DxbcHash { Wrong, None, Holds };
 DxbcHash checkDxbcHash(const void *data, size_t size);
 
-} // namespace dxmt::md5
+} // namespace mullion::md5

@@ -22,7 +22,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
-#include "dxmt_sampler.hpp"
+#include "mullion_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
 #include <cstring>
@@ -30,7 +30,7 @@
 #include "../d3d10/d3d10_blob.hpp"
 #include "../airconv/dxbc_root_signature.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 #pragma region Serialization
 
@@ -608,4 +608,4 @@ CreateRootSignature(
   return root_sig->QueryInterface(riid, ppRootSignature);
 }
 
-} // namespace dxmt
+} // namespace mullion

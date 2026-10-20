@@ -553,7 +553,7 @@ _MTLCommandEncoder_endEncoding(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef MULLION_NO_PRIVATE_API
 
 typedef NS_ENUM(NSUInteger, MTLLogicOperation) {
   MTLLogicOperationClear,
@@ -619,7 +619,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
       descriptor.vertexBuffers[i].mutability = MTLMutabilityImmutable;
   }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef MULLION_NO_PRIVATE_API
   [descriptor setLogicOperationEnabled:info->logic_operation_enabled];
   [descriptor setLogicOperation:(MTLLogicOperation)info->logic_operation];
 #endif
@@ -715,7 +715,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
       descriptor.objectBuffers[i].mutability = MTLMutabilityImmutable;
   }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef MULLION_NO_PRIVATE_API
   [descriptor setLogicOperationEnabled:info->logic_operation_enabled];
   [descriptor setLogicOperation:(MTLLogicOperation)info->logic_operation];
 #endif
@@ -1071,8 +1071,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
   while (next) {
     enum WMTRenderCommandType type = next->type;
     if (!pipeline && ((type >= WMTRenderCommandDraw && type <= WMTRenderCommandDrawMeshThreadgroupsIndirect) ||
-                      (type >= WMTRenderCommandDXMTGeometryDraw && type <= WMTRenderCommandDXMTGeometryDrawIndexedIndirect) ||
-                      (type >= WMTRenderCommandDXMTTessellationMeshDraw &&
+                      (type >= WMTRenderCommandMullionGeometryDraw && type <= WMTRenderCommandMullionGeometryDrawIndexedIndirect) ||
+                      (type >= WMTRenderCommandMullionTessellationMeshDraw &&
                        type <= WMTRenderCommandExecuteCommandsInBuffer) ||
                       type == WMTRenderCommandExecuteCommandsInBufferIndirect)) {
       next = next->next.ptr;
@@ -1282,15 +1282,15 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                          beforeStages:(MTLRenderStages)body->stages_before];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDraw: {
-      struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
+    case WMTRenderCommandMullionGeometryDraw: {
+      struct wmtcmd_render_mullion_geometry_draw *body = (struct wmtcmd_render_mullion_geometry_draw *)next;
       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       draw_geometry_parts(encoder, body->warp_count, body->instance_count, body->vertex_per_warp,
                           body->max_object_threadgroups);
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndexed: {
-      struct wmtcmd_render_dxmt_geometry_draw_indexed *body = (struct wmtcmd_render_dxmt_geometry_draw_indexed *)next;
+    case WMTRenderCommandMullionGeometryDrawIndexed: {
+      struct wmtcmd_render_mullion_geometry_draw_indexed *body = (struct wmtcmd_render_mullion_geometry_draw_indexed *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -1299,8 +1299,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                           body->max_object_threadgroups);
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndirect: {
-      struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
+    case WMTRenderCommandMullionGeometryDrawIndirect: {
+      struct wmtcmd_render_mullion_geometry_draw_indirect *body = (struct wmtcmd_render_mullion_geometry_draw_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                         offset:body->indirect_args_offset
                        atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
@@ -1311,9 +1311,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
-      struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
-          (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
+    case WMTRenderCommandMullionGeometryDrawIndexedIndirect: {
+      struct wmtcmd_render_mullion_geometry_draw_indexed_indirect *body =
+          (struct wmtcmd_render_mullion_geometry_draw_indexed_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -1327,17 +1327,17 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDraw: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw *)next;
+    case WMTRenderCommandMullionTessellationMeshDraw: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw *body = (struct wmtcmd_render_mullion_tessellation_mesh_draw *)next;
       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, body->parts)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body =
-          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
+    case WMTRenderCommandMullionTessellationMeshDrawIndexed: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed *body =
+          (struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -1348,8 +1348,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       break;
     }
 
-    case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
+    case WMTRenderCommandMullionTessellationMeshDrawIndirect: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_mullion_tessellation_mesh_draw_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                         offset:body->indirect_args_offset
                        atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
@@ -1362,9 +1362,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *body =
-          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
+    case WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect *body =
+          (struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -2183,7 +2183,7 @@ UInt32ToPtr(uint32_t v) {
   return (void *)(uint64_t)v;
 }
 
-#ifndef DXMT_NATIVE
+#ifndef MULLION_NATIVE
 
 static NTSTATUS
 thunk32_SM50Initialize(void *args) {
@@ -2554,7 +2554,7 @@ thunk32_SM50GetArgumentsInfo(void *args) {
 
   return STATUS_SUCCESS;
 }
-#endif /* DXMT_NATIVE */
+#endif /* MULLION_NATIVE */
 
 static NTSTATUS
 _MTLCommandBuffer_error(void *obj) {
@@ -2885,7 +2885,7 @@ _MTLSharedEvent_signalValue(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#ifndef DXMT_NATIVE
+#ifndef MULLION_NATIVE
 
 typedef struct {
   _Atomic(CFRunLoopRef) runloop_ref;
@@ -4161,7 +4161,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLComputePipelineState_maxTotalThreadsPerThreadgroup,
 };
 
-#ifndef DXMT_NATIVE
+#ifndef MULLION_NATIVE
 const void *__wine_unix_call_wow64_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,

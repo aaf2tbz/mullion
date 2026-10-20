@@ -1,6 +1,6 @@
 # completed omitted draws do not grow the part bound for later indirect draws
---- a/src/dxmt/dxmt_command_queue.cpp
-+++ b/src/dxmt/dxmt_command_queue.cpp
+--- a/src/mullion/mullion_command_queue.cpp
++++ b/src/mullion/mullion_command_queue.cpp
 @@ -347,7 +347,6 @@
        omitted = std::max(omitted, *word);
      if (omitted) {

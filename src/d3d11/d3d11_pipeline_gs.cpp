@@ -23,7 +23,7 @@
 #include "d3d11_pipeline.hpp"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 class MTLCompiledGeometryPipelineImpl
     : public MTLCompiledGeometryPipeline {
@@ -208,4 +208,4 @@ CreateGeometryPipeline(MTLD3D11Device *pDevice,
   return std::make_unique<MTLCompiledGeometryPipelineImpl>(pDevice, pDesc);
 }
 
-} // namespace dxmt
+} // namespace mullion

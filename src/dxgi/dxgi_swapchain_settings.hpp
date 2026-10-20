@@ -1,9 +1,9 @@
 #pragma once
 
 #include "dxgi1_3.h"
-#include "dxmt_presenter.hpp"
+#include "mullion_presenter.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 // what a swap chain keeps for the settings of IDXGISwapChain1 and IDXGISwapChain2 that leave its buffers as they are
 struct SwapChainSettings {
@@ -64,7 +64,7 @@ struct SwapChainSettings {
   bool
   Update(const DXGI_SWAP_CHAIN_DESC1 &desc, bool windowed, HWND window, Presenter &presenter) {
     UINT width = source_width ? source_width : desc.Width, height = source_height ? source_height : desc.Height;
-    DXMTPresentation presentation{{(float)width / desc.Width, (float)height / desc.Height}};
+    MullionPresentation presentation{{(float)width / desc.Width, (float)height / desc.Height}};
     // the back buffer holds the picture turned clockwise by quarters, and moved back into its sides: for the
     // picture's place (u, v), the back buffer's is (u cos - v sin, u sin + v cos), plus 1 where that is below 0
     // ("Supporting screen rotation": Matrix3x2F::Rotation and the Translation after it)
@@ -93,4 +93,4 @@ struct SwapChainSettings {
   }
 };
 
-} // namespace dxmt
+} // namespace mullion

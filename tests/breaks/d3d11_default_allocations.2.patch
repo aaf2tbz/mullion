@@ -1,6 +1,6 @@
 # resource buffer creations are absent from the profile
---- a/src/dxmt/dxmt_buffer.cpp
-+++ b/src/dxmt/dxmt_buffer.cpp
+--- a/src/mullion/mullion_buffer.cpp
++++ b/src/mullion/mullion_buffer.cpp
 @@ -48,7 +48,7 @@
      info_.memory.set(placed_buffer);
    }

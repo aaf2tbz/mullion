@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace dxmt {
+namespace mullion {
 
 // the installed headers lack these 1.2 ABI types (DirectX-Headers, d3d12.h): 1.1 parameters, sampler flags appended
 constexpr auto RootSignatureVersion12 = D3D_ROOT_SIGNATURE_VERSION(3);
@@ -331,4 +331,4 @@ private:
   std::vector<void *> malloc_ptrs_;
 };
 
-} // namespace dxmt
+} // namespace mullion

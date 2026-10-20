@@ -27,8 +27,8 @@
 #include "dxgi_interfaces.h"
 #include "log/log.hpp"
 #include "util_env.hpp"
-#include "dxmt_diag.hpp"
-#include "dxmt_command_constants.hpp"
+#include "mullion_diag.hpp"
+#include "mullion_command_constants.hpp"
 #include <atomic>
 #include <charconv>
 #include <fstream>
@@ -39,7 +39,7 @@
 #include "d3d10_1.h"
 #include "d3d11_4.h"
 
-namespace dxmt {
+namespace mullion {
 
 constexpr auto kCommandQueueSize = 32u;
 const auto dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES");
@@ -60,28 +60,28 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // Metal fails a command buffer that waits for an event for more than a few seconds, and ignores the queue's
   // later ones, so no command buffer waits: the CPU does. after Wait for a value the fence has yet to reach, the
   // work the application gives the queue is held, and a thread commits it in order once the fence is there
-  dxmt::mutex held_mutex_;
-  dxmt::condition_variable held_changed_;
+  mullion::mutex held_mutex_;
+  mullion::condition_variable held_changed_;
   std::deque<std::function<void()>> held_;
   bool holding_ = false, held_stop_ = false;
   // a Wait's fence has the queue's later command buffers until it is there: they are encoded ahead and committed
   // in order by the signal that brings it. one gate is closed at a time, and is open only once its buffers are
   // committed, so the order is the queue's. a queue that ends behind its Wait cancels: its buffers never run
   struct Gate {
-    dxmt::mutex mutex;
+    mullion::mutex mutex;
     std::atomic<bool> closed;
     bool cancelled = false;
     std::vector<std::pair<WMT::Reference<WMT::CommandBuffer>, uint64_t *>> buffers;
 
     void
     Commit(WMT::CommandBuffer buffer, uint64_t *committed) {
-      std::lock_guard<dxmt::mutex> lock(mutex);
+      std::lock_guard<mullion::mutex> lock(mutex);
       closed ? (void)buffers.emplace_back(buffer, committed) : Run(buffer, committed);
     }
 
     void
     Open(bool cancel = false) {
-      std::lock_guard<dxmt::mutex> lock(mutex);
+      std::lock_guard<mullion::mutex> lock(mutex);
       cancelled |= cancel && closed;
       for (auto &[buffer, committed] : std::exchange(buffers, {}))
         Run(buffer, committed);
@@ -100,7 +100,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     }
   };
   std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
-  dxmt::thread held_thread_;
+  mullion::thread held_thread_;
   std::atomic<DWORD> held_thread_id_{0};
 
   // what the queue does and where it waits, with MULLION_LOG_LEVEL=trace: the last lines of a hang name it
@@ -115,11 +115,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   template <typename Work>
   bool
   Hold(Work &&work, bool begin = false) {
-    std::unique_lock<dxmt::mutex> lock(held_mutex_);
+    std::unique_lock<mullion::mutex> lock(held_mutex_);
     if (!holding_ && !begin && !gate_->closed)
       return false;
     if (!held_thread_.joinable())
-      held_thread_ = dxmt::thread([this] { CommitHeld(); });
+      held_thread_ = mullion::thread([this] { CommitHeld(); });
     holding_ = true;
     held_.emplace_back(std::forward<Work>(work));
     held_changed_.notify_all();
@@ -128,7 +128,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   bool
   Holding() {
-    std::unique_lock<dxmt::mutex> lock(held_mutex_);
+    std::unique_lock<mullion::mutex> lock(held_mutex_);
     return holding_ || gate_->closed;
   }
 
@@ -136,7 +136,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   CommitHeld() {
     env::setThreadName("mullion-held-work-thread");
     held_thread_id_ = GetCurrentThreadId();
-    std::unique_lock<dxmt::mutex> lock(held_mutex_);
+    std::unique_lock<mullion::mutex> lock(held_mutex_);
     for (;;) {
       held_changed_.wait(lock, [&] { return held_stop_ || !held_.empty(); });
       if (held_stop_)
@@ -307,22 +307,22 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::unique_ptr<ProfileQueue> profile_ = diag::profile ? std::make_unique<ProfileQueue>() : nullptr;
 
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
-  dxmt::thread inflight_cmdbuf_wait_thread_;
+  mullion::thread inflight_cmdbuf_wait_thread_;
 
   // a command buffer that does not complete stops the queue with no error from Metal: a thread reports the one the
   // completion thread has waited on for kStuckSeconds, with what Metal says of it and what is in it. a warning: one
   // list of very many draws takes as long
   static constexpr auto kStuckSeconds = std::chrono::seconds(10);
-  dxmt::mutex watch_mutex_;
-  dxmt::condition_variable watch_changed_;
+  mullion::mutex watch_mutex_;
+  mullion::condition_variable watch_changed_;
   uint64_t watched_seq_ = 0;
   bool watch_stop_ = false;
-  dxmt::thread watch_thread_;
+  mullion::thread watch_thread_;
 
   void
   Watch() {
     env::setThreadName("mullion-cmdbuf-watch-thread");
-    std::unique_lock<dxmt::mutex> lock(watch_mutex_);
+    std::unique_lock<mullion::mutex> lock(watch_mutex_);
     while (!watch_stop_) {
       auto seq = watched_seq_;
       // the same one still, after the time: it is reported once, and the thread sleeps until another is waited on
@@ -342,12 +342,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // the command buffer the completion thread waits on, 0 for none
   void
   Watched(uint64_t seq) {
-    std::lock_guard<dxmt::mutex> lock(watch_mutex_);
+    std::lock_guard<mullion::mutex> lock(watch_mutex_);
     watched_seq_ = seq;
     watch_changed_.notify_all();
   }
 
-  dxmt::mutex mutex_commit_;
+  mullion::mutex mutex_commit_;
 
   void
   CommandBufferWaitingThread() {
@@ -474,7 +474,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   struct CommittingScope {
     MTLD3D12CommandQueueImpl *queue;
-    std::lock_guard<dxmt::mutex> lock;
+    std::lock_guard<mullion::mutex> lock;
     InflightCommandBuffer *inflight;
     WMT::Reference<WMT::Object> pool;
 
@@ -539,7 +539,7 @@ public:
     if (!refs) {
       // a queued Present can release the queue's last reference on the thread its destructor joins
       if (held_thread_id_ == GetCurrentThreadId())
-        dxmt::thread([this] { ReleasePrivate(); }).detach();
+        mullion::thread([this] { ReleasePrivate(); }).detach();
       else
         ReleasePrivate();
     }
@@ -554,7 +554,7 @@ public:
   ~MTLD3D12CommandQueueImpl() {
     if (held_thread_.joinable()) {
       {
-        std::unique_lock<dxmt::mutex> lock(held_mutex_);
+        std::unique_lock<mullion::mutex> lock(held_mutex_);
         // the lists given before are committed, unless the queue waits for a fence
         held_changed_.wait(lock, [&] { return held_.empty() || gate_->closed; });
         held_stop_ = true;
@@ -564,14 +564,14 @@ public:
       }
       held_thread_.join();
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_commit_);
+    std::lock_guard<mullion::mutex> lock(mutex_commit_);
     // the marker first: the completion thread reads it as soon as the sequence moves
     inflight_cmdbuf_stop_.store(inflight_cmdbuf_seq_.load());
     inflight_cmdbuf_seq_.fetch_add(1);
     inflight_cmdbuf_seq_.notify_one();
     inflight_cmdbuf_wait_thread_.join();
     {
-      std::lock_guard<dxmt::mutex> watch(watch_mutex_);
+      std::lock_guard<mullion::mutex> watch(watch_mutex_);
       watch_stop_ = true;
       watch_changed_.notify_all();
     }
@@ -1370,7 +1370,7 @@ public:
     // from the CPU, once the work before has completed and what it left for the CPU is done
     auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
       // after a submission another thread is in the middle of
-      std::lock_guard<dxmt::mutex> lock(mutex_commit_);
+      std::lock_guard<mullion::mutex> lock(mutex_commit_);
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
         fence->Reach(Value);
@@ -1444,7 +1444,7 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     if (hWnd == GetDesktopWindow())
       return E_ACCESSDENIED;
-    return dxmt::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+    return mullion::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
   HRESULT
@@ -1583,4 +1583,4 @@ CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDes
   return command_queue->QueryInterface(riid, ppCommandQueue);
 };
 
-} // namespace dxmt
+} // namespace mullion

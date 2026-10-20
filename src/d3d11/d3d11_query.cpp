@@ -1,7 +1,7 @@
 #include "d3d11_query.hpp"
-#include "dxmt_occlusion_query.hpp"
+#include "mullion_query.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 class OcclusionQuery : public MTLD3DQueryBase<MTLD3D11OcclusionQuery> {
 public:
@@ -206,4 +206,4 @@ CreateStreamOutputQuery(MTLD3D11Device *pDevice, const D3D11_QUERY_DESC1 *pDesc,
   return S_FALSE;
 }
 
-} // namespace dxmt
+} // namespace mullion

@@ -25,7 +25,7 @@
 #include <limits>
 #include <map>
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D12ComputePipelineStateImpl : public MTLD3D12PipelineObject<MTLD3D12ComputePipelineState> {
 
@@ -165,7 +165,7 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
     Com<MTLD3D12PipelineState, false> pipeline;
     std::vector<Sha1Digest> shaders;
   };
-  dxmt::mutex mutex_;
+  mullion::mutex mutex_;
   std::map<std::wstring, Entry, std::less<>> entries_;
   PipelineShaderCache shaders_;
 
@@ -407,4 +407,4 @@ CreatePipelineLibrary(MTLD3D12Device *Device, const void *Blob, SIZE_T Size, REF
   }
 }
 
-} // namespace dxmt
+} // namespace mullion

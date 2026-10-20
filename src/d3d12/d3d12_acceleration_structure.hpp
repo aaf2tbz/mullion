@@ -2,7 +2,7 @@
 
 #include "d3d12_device.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 // what the memory of a Direct3D 12 acceleration structure starts with. the GPU finds a structure by its address
 // through it: a top-level build for its instances' structures, a shader for the one it traces
@@ -318,4 +318,4 @@ AccelerationStructureInfo(
   return info;
 }
 
-} // namespace dxmt
+} // namespace mullion

@@ -5,7 +5,7 @@
 #include <mutex>
 #include <utility>
 
-namespace dxmt {
+namespace mullion {
 Logger Logger::s_instance("dxgi.log");
 
 VendorExtension g_extension_enabled = VendorExtension::None;
@@ -78,8 +78,8 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
 extern "C" HRESULT __stdcall DXGIGetDebugInterface1(UINT Flags, REFIID riid,
                                                     void **ppDebug) {
 #ifdef _WIN32
-  // it's a DXMT implementation detail
-  if (riid == DXMT_NVEXT_GUID) {
+  // it's a Mullion implementation detail
+  if (riid == MULLION_NVEXT_GUID) {
     std::call_once(nvext_init, InitializeVendorExtensionNV);
     return g_extension_enabled == VendorExtension::Nvidia ? S_OK : E_NOINTERFACE;
   }
@@ -98,4 +98,4 @@ extern "C" HRESULT __stdcall DXGIDeclareAdapterRemovalSupport() {
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace mullion

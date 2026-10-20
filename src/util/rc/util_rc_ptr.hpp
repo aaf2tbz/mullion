@@ -13,7 +13,7 @@
 #include <ostream>
 #include "../util_likely.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 /**
  * \brief Pointer for reference-counted objects
@@ -114,9 +114,9 @@ private:
   }
 };
 
-} // namespace dxmt
+} // namespace mullion
 
 template <typename T>
-std::ostream &operator<<(std::ostream &os, const dxmt::Rc<T> &rc) {
+std::ostream &operator<<(std::ostream &os, const mullion::Rc<T> &rc) {
   return os << rc.ptr();
 }

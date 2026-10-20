@@ -20,10 +20,10 @@
 #include <format>
 
 using namespace microsoft;
-using namespace dxmt::air;
-using namespace dxmt::shader::common;
+using namespace mullion::air;
+using namespace mullion::shader::common;
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 inline air::Interpolation
 to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
@@ -1254,4 +1254,4 @@ void handle_signature(
   }
 }
 
-}; // namespace dxmt::dxbc
+}; // namespace mullion::dxbc

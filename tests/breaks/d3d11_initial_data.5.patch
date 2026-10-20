@@ -4,7 +4,7 @@ diff --git a/src/d3d11/d3d11_buffer.cpp b/src/d3d11/d3d11_buffer.cpp
 +++ b/src/d3d11/d3d11_buffer.cpp
 @@ -105,7 +105,10 @@
      auto allocation = buffer_->allocate(flags);
-     auto &initializer = device->GetDXMTDevice().queue().initializer;
+     auto &initializer = device->GetMullionDevice().queue().initializer;
      if (pInitialData) {
 -      allocation->updateContents(0, pInitialData->pSysMem, pDesc->ByteWidth);
 +      std::vector<uint8_t> repeated(pDesc->ByteWidth);

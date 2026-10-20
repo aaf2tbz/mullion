@@ -4,7 +4,7 @@
 #include "d3d11.h"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace mullion {
 Logger Logger::s_instance("d3d10core.log");
 
 extern "C" HRESULT WINAPI D3D11CoreCreateDevice(
@@ -37,7 +37,7 @@ D3D10CoreCreateDevice(
   if (Flags & D3D10_CREATE_DEVICE_DEBUGGABLE)
     d3d11_flags |= D3D11_CREATE_DEVICE_DEBUGGABLE;
 
-  hr = D3D11CoreCreateDevice(pFactory, pAdapter, d3d11_flags | 0x80000000 /* DXMT_D3D10_DEVICE */, &FeatureLevel, 1, &d3d11_device);
+  hr = D3D11CoreCreateDevice(pFactory, pAdapter, d3d11_flags | 0x80000000 /* MULLION_D3D10_DEVICE */, &FeatureLevel, 1, &d3d11_device);
 
   if (FAILED(hr))
     return hr;
@@ -54,4 +54,4 @@ D3D10CoreRegisterLayers() {
   // there are no layers to register
   return S_OK;
 }
-} // namespace dxmt
+} // namespace mullion

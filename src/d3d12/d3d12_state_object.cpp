@@ -20,7 +20,7 @@
 // the device gave it, and a shader identifier holds its shaders' slots (airconv_ray.h): a pipeline is the kernel
 // that dispatches rays, linked with the functions of every export, and a function table with each at its slot
 
-namespace dxmt {
+namespace mullion {
 
 namespace {
 
@@ -223,7 +223,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
     WMT::Reference<WMT::VisibleFunctionTable> table;
   };
   // by call depth; commands in flight keep using the one they were recorded with
-  dxmt::mutex pipeline_lock_;
+  mullion::mutex pipeline_lock_;
   std::map<uint32_t, Pipeline> pipelines_;
 
   // the shaders `pExports` takes from `all` under their new names, or all of them without a list
@@ -322,7 +322,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
       return data;
     };
     auto function = std::make_shared<RayFunction>(device_, device_->AllocateRayFunction(), pGlobal, pLocal);
-    auto name = "dxmt_ray_shader_" + std::to_string(function->slot);
+    auto name = "mullion_ray_shader_" + std::to_string(function->slot);
 
     SM50_SHADER_LIBRARIES_DATA linkable{nullptr, SM50_SHADER_LIBRARIES, libraries.data(), (uint32_t)libraries.size()};
     SM50_SHADER_RAY_SHADER_DATA ray{&linkable, SM50_SHADER_RAY_SHADER, shader.function.c_str()};
@@ -876,7 +876,7 @@ public:
 
   bool
   GetPipeline(WMT::ComputePipelineState &Pipeline, WMT::VisibleFunctionTable &Table, uint32_t &Flags) {
-    std::unique_lock<dxmt::mutex> lock(pipeline_lock_);
+    std::unique_lock<mullion::mutex> lock(pipeline_lock_);
     Flags = pipeline_config_.Flags;
     uint32_t depth = std::max<uint64_t>(std::min(stack_size_, max_call_depth_), 1);
     auto &made = pipelines_[depth];
@@ -884,8 +884,8 @@ public:
       auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
       auto library = device_->GetLib().getLibrary();
       WMT::Reference<WMT::Function> runtime[] = {
-          library.newFunction("dxmt_ray_trace"), library.newFunction("dxmt_ray_report_hit"),
-          library.newFunction("dxmt_ray_call")
+          library.newFunction("mullion_ray_trace"), library.newFunction("mullion_ray_report_hit"),
+          library.newFunction("mullion_ray_call")
       };
       // the table has each function at its slot; the pipeline links them all
       std::vector<obj_handle_t> slots(SM50_RAY_FUNCTION_FIRST_SHADER), linked;
@@ -938,4 +938,4 @@ CreateStateObject(
   return state->QueryInterface(riid, ppStateObject);
 }
 
-} // namespace dxmt
+} // namespace mullion

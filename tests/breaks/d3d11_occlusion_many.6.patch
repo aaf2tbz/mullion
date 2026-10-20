@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_context.cpp
-+++ b/src/dxmt/dxmt_context.cpp
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
 @@ -1442,5 +1442,5 @@
          (!r0->use_visibility_result || !r1->use_visibility_result ||
           r0->visibility_result_window == r1->visibility_result_window) &&

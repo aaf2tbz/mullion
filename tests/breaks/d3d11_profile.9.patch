@@ -1,6 +1,6 @@
 # disable per-pass GPU timestamp attachment
---- a/src/dxmt/dxmt_command_queue.cpp
-+++ b/src/dxmt/dxmt_command_queue.cpp
+--- a/src/mullion/mullion_command_queue.cpp
++++ b/src/mullion/mullion_command_queue.cpp
 @@ -112,7 +112,7 @@
    auto &samples = buffer.samples.back();
    uint32_t first = ~0u;

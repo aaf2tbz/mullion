@@ -18,10 +18,10 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_format.hpp"
 #include "com/com_pointer.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 HRESULT
 PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc, UINT Plane) {
@@ -1070,7 +1070,7 @@ public:
 
   ULONG STDMETHODCALLTYPE
   AddRef() override {
-    std::lock_guard<dxmt::mutex> lock(buffers_.mutex);
+    std::lock_guard<mullion::mutex> lock(buffers_.mutex);
     auto count = MTLD3D12Texture::AddRef();
     if (count == 1 && !buffers_.referenced_buffers++)
       buffers_.swapchain->AddRef();
@@ -1081,7 +1081,7 @@ public:
   Release() override {
     auto &buffers = buffers_;
     auto swapchain = buffers.swapchain;
-    std::unique_lock<dxmt::mutex> lock(buffers.mutex);
+    std::unique_lock<mullion::mutex> lock(buffers.mutex);
     auto count = MTLD3D12Texture::Release();
     bool last = !count && !--buffers.referenced_buffers;
     if (last) {
@@ -1148,4 +1148,4 @@ CreatePlacedTexture(
   return texture->QueryInterface(riid, ppResource);
 }
 
-} // namespace dxmt
+} // namespace mullion

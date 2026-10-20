@@ -1,8 +1,8 @@
 # an occlusion sum record runs only once, retaining the first execution's result
-diff --git a/src/dxmt/dxmt_command.metal b/src/dxmt/dxmt_command.metal
+diff --git a/src/mullion/mullion_command.metal b/src/mullion/mullion_command.metal
 index fccd5fd..8be957c 100644
---- a/src/dxmt/dxmt_command.metal
-+++ b/src/dxmt/dxmt_command.metal
+--- a/src/mullion/mullion_command.metal
++++ b/src/mullion/mullion_command.metal
 @@ -787,12 +787,15 @@ struct VisibilitySlot {
  };
  

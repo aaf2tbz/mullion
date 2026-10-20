@@ -18,12 +18,12 @@
 
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_dynamic.hpp"
+#include "mullion_format.hpp"
 #include "d3d11_resource.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 struct BufferViewInfo {
   BufferViewKey viewKey;
@@ -35,7 +35,7 @@ struct BufferViewInfo {
 
 class D3D11Buffer : public TResourceBase<tag_buffer> {
 private:
-#ifdef DXMT_DEBUG
+#ifdef MULLION_DEBUG
   std::string debug_name;
 #endif
   bool structured;
@@ -130,7 +130,7 @@ public:
       flags.set(BufferAllocationFlag::GpuPrivate);
     }
     auto allocation = buffer_->allocate(flags);
-    auto &initializer = device->GetDXMTDevice().queue().initializer;
+    auto &initializer = device->GetMullionDevice().queue().initializer;
     if (pInitialData) {
       allocation->updateContents(0, pInitialData->pSysMem, pDesc->ByteWidth);
     } else if (flags.test(BufferAllocationFlag::GpuPrivate)) {
@@ -369,7 +369,7 @@ public:
     if (!Name) {
       return;
     }
-#ifdef DXMT_DEBUG
+#ifdef MULLION_DEBUG
     debug_name = std::string(Name);
 #endif
   }
@@ -384,4 +384,4 @@ CreateBuffer(
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace mullion

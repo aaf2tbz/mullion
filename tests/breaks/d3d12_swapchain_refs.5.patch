@@ -5,7 +5,7 @@
    ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags) final {
 -    // held buffers cannot be retired (IDXGISwapChain::ResizeBuffers, Remarks).
 -    {
--      std::lock_guard<dxmt::mutex> lock(buffer_refs_.mutex);
+-      std::lock_guard<mullion::mutex> lock(buffer_refs_.mutex);
 -      if (buffer_refs_.referenced_buffers)
 -        return DXGI_ERROR_INVALID_CALL;
 -    }

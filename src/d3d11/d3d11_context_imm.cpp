@@ -2,12 +2,12 @@
 #include "d3d11_fence.hpp"
 #include "d3d11_private.h"
 #include "d3d11_query.hpp"
-#include "dxmt_command_queue.hpp"
+#include "mullion_command_queue.hpp"
 #include "d3d11_context_impl.cpp"
-#include "dxmt_context.hpp"
-#include "dxmt_staging.hpp"
+#include "mullion_context.hpp"
+#include "mullion_staging.hpp"
 
-namespace dxmt {
+namespace mullion {
 struct ContextInternalState {
   using device_mutex_t = d3d11_device_mutex;
   CommandQueue &cmd_queue;
@@ -771,4 +771,4 @@ InitializeImmediateContext(MTLD3D11Device *pDevice, CommandQueue &cmd_queue) {
   return std::make_unique<MTLD3D11ImmediateContext>(pDevice, cmd_queue);
 }
 
-}; // namespace dxmt
+}; // namespace mullion

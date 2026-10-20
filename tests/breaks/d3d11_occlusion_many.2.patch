@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_occlusion_query.hpp
-+++ b/src/dxmt/dxmt_occlusion_query.hpp
+--- a/src/mullion/mullion_query.hpp
++++ b/src/mullion/mullion_query.hpp
 @@ -124,4 +124,6 @@
      assert(seqId >= seq_id_begin);
      assert(seqId <= seq_id_end);

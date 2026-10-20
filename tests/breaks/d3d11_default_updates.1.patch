@@ -1,6 +1,6 @@
 # vertex fetch omits the current storage offset
---- a/src/dxmt/dxmt_context.cpp
-+++ b/src/dxmt/dxmt_context.cpp
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
 @@ -118,7 +118,7 @@
      auto valid_length = buffer->length() > state.offset ? buffer->length() - state.offset : 0;
      auto [buffer_alloc, buffer_offset] =

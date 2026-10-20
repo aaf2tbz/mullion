@@ -2,19 +2,19 @@
 #include "Metal.hpp"
 #include "airconv_public.h"
 #include "config/config.hpp"
-#include "dxmt_info.hpp"
+#include "mullion_info.hpp"
 #include "d3d11_input_layout.hpp"
 #include "sha1/sha1_util.hpp"
 #include <mutex>
 
-namespace dxmt {
+namespace mullion {
 
 SM50_SHADER_FLAG
 getGlobalShaderFlag(MTLD3D11Device *pDevice) {
   static SM50_SHADER_FLAG shader_flag;
   static std::once_flag get_shader_flag_once;
   std::call_once(get_shader_flag_once, [=]() {
-    shader_flag = GPUShaderFlags(pDevice->GetDXMTDevice().device());
+    shader_flag = GPUShaderFlags(pDevice->GetMullionDevice().device());
     if (Config::getInstance().getOption<bool>("d3d11.sampleNaNToZero", false))
       shader_flag |= SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     if (Config::getInstance().getOption<bool>("d3d11.defuseFma", false))
@@ -31,7 +31,7 @@ public:
       : CompiledShader(), proc(std::forward<Proc>(proc)), func_name(func_name), device_(pDevice),
         shader_(shader), variant_digest_(variant_digest) {
     sm50_common.type = SM50_SHADER_COMMON;
-    sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetDXMTDevice().metalVersion();
+    sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetMullionDevice().metalVersion();
     sm50_common.flags = getGlobalShaderFlag(pDevice);
     sm50_common.simd_width = 0; // DXBC has no wave operations
     sm50_common.next = nullptr;
@@ -445,4 +445,4 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
       pDevice, shader, std::move(proc), func_name, variant_digest);
 }
 
-} // namespace dxmt
+} // namespace mullion

@@ -26,8 +26,8 @@ d3d12_link_depends = []
 
 d3d12core_dll = shared_library('d3d12core', d3d12_src,
   name_prefix         : '',
-  dependencies        : [ dxgi_dep, dxmt_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep ],
-  include_directories : [ dxmt_include_path ],
+  dependencies        : [ dxgi_dep, mullion_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep ],
+  include_directories : [ mullion_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,
   vs_module_defs      : 'd3d12core.def',
@@ -46,7 +46,7 @@ d3d12_dll = shared_library('d3d12', 'd3d12_loader.cpp',
 
 d3d12_dep = declare_dependency(
   link_with           : [ d3d12_dll ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ mullion_include_path, include_directories('.') ],
 )
 
 if wine_builtin_dll

@@ -4,7 +4,7 @@
 #include <variant>
 #include <string>
 
-namespace dxmt {
+namespace mullion {
 
 using Parameter =
     std::variant<unsigned long long, float, double, unsigned int, int, void *, ID3D11Resource *, ID3D12Resource *>;
@@ -221,4 +221,4 @@ private:
   }
 };
 
-} // namespace dxmt
+} // namespace mullion

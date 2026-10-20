@@ -20,7 +20,7 @@
 #include "d3d12_pageable.hpp"
 #include "com/com_pointer.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D12HeapImpl : public MTLD3D12Pageable<MTLD3D12Heap> {
 
@@ -152,4 +152,4 @@ CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, v
   return heap->QueryInterface(riid, ppHeap);
 }
 
-}; // namespace dxmt
+}; // namespace mullion

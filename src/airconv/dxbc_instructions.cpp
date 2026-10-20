@@ -21,7 +21,7 @@
 #include "shader_common.hpp"
 #include "DXBCParser/ShaderBinary.h"
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 auto readOperandRelativeIndex(
   const microsoft::D3D10ShaderBinary::COperandIndex &OpIndex, uint32_t phase,
@@ -2138,4 +2138,4 @@ BasicBlockCondition readCondition(
     .test_nonzero = TestType == D3D10_SB_INSTRUCTION_TEST_NONZERO
   };
 }
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

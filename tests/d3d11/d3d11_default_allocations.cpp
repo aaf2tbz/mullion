@@ -5,7 +5,7 @@
 // each list holds every name alive until measurement, then every draw's integer pixel is read. a profile buffer
 // record means one successful Metal buffer creation by BufferAllocation, not bytes charged or names reused. the
 // bound is the count for identical writes using dynamic DISCARD; both start with a fresh deferred context and
-// retain every name. DXMT_PAGE_SIZE is the allocator's page. sizes cross its minimum and page branches; twice the
+// retain every name. MULLION_PAGE_SIZE is the allocator's page. sizes cross its minimum and page branches; twice the
 // number of uint4 constants in the larger of it and GetSystemInfo's page plus one updates cross every
 // suballocation boundary. the name FIFO has no fixed cap. scratch and query buffers are outside this count.
 #include "d3d11_test.hpp"
@@ -92,11 +92,11 @@ main(int argc, char **argv) {
   ComPtr<ID3D11PixelShader> ps;
   CHECK(device->CreateVertexShader(vs_code->GetBufferPointer(), vs_code->GetBufferSize(), nullptr, &vs));
   CHECK(device->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps));
-  const UINT updates = 2 * std::max<uint64_t>(page, DXMT_PAGE_SIZE) / sizeof(Row) + 1;
+  const UINT updates = 2 * std::max<uint64_t>(page, MULLION_PAGE_SIZE) / sizeof(Row) + 1;
   std::vector<UINT> sizes;
-  for (UINT bytes = sizeof(Row); bytes < DXMT_PAGE_SIZE; bytes *= 2)
+  for (UINT bytes = sizeof(Row); bytes < MULLION_PAGE_SIZE; bytes *= 2)
     sizes.push_back(bytes);
-  sizes.insert(sizes.end(), {DXMT_PAGE_SIZE - sizeof(Row), DXMT_PAGE_SIZE, DXMT_PAGE_SIZE + sizeof(Row)});
+  sizes.insert(sizes.end(), {MULLION_PAGE_SIZE - sizeof(Row), MULLION_PAGE_SIZE, MULLION_PAGE_SIZE + sizeof(Row)});
   for (UINT bytes : sizes)
     for (bool initialized : {false, true}) {
       step("%u bytes, initial data %u, %u updates (%llu bytes written)", bytes, initialized, updates,

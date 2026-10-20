@@ -1,6 +1,6 @@
 # a rectangular grid is assumed to fill every part to capacity
---- a/src/dxmt/dxmt_geometry.hpp
-+++ b/src/dxmt/dxmt_geometry.hpp
+--- a/src/mullion/mullion_geometry.hpp
++++ b/src/mullion/mullion_geometry.hpp
 @@ -83,7 +83,7 @@
  indirect_geometry_parts(uint64_t max, uint64_t bound) {
    if (bound <= max)

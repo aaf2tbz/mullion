@@ -18,9 +18,9 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_stream_output.hpp"
-#include "dxmt_shader_cache.hpp"
+#include "mullion_format.hpp"
+#include "mullion_stream_output.hpp"
+#include "mullion_shader_cache.hpp"
 #include "tessellation_limits.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
@@ -34,7 +34,7 @@
 #include <unordered_set>
 #include <variant>
 
-namespace dxmt {
+namespace mullion {
 
 constexpr WMTCompareFunction kCompareFunctionMap[] = {
     WMTCompareFunctionNever, // padding 0
@@ -491,8 +491,8 @@ CompileFunction(
   };
   if (auto function = cached())
     return function;
-  static dxmt::mutex pending_mutex;
-  static dxmt::condition_variable completed;
+  static mullion::mutex pending_mutex;
+  static mullion::condition_variable completed;
   static std::unordered_set<Sha1Digest> pending;
   struct Conversion {
     Sha1Digest key;
@@ -553,7 +553,7 @@ protected:
     std::unordered_map<uint32_t, WMT::Reference<WMT::RenderPipelineState>> variants;
   };
   std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
-  dxmt::mutex render_targets_mutex_;
+  mullion::mutex render_targets_mutex_;
   std::function<WMT::Reference<WMT::Function>()> statistics_pixel_shader_;
   WMT::Reference<WMT::Function> statistics_ps_;
 
@@ -563,7 +563,7 @@ protected:
     auto pipeline = device_->GetMTLDevice().newRenderPipelineState(info, error);
     if (!pipeline || (!rtv_mask && !dsv_mask && !pixel_shader))
       return pipeline;
-    std::lock_guard<dxmt::mutex> lock(render_targets_mutex_);
+    std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
     auto &descriptor = pipeline_descriptors_[pipeline.handle];
     descriptor.info = info;
     descriptor.functions.emplace_back(WMT::Function(info.fragment_function));
@@ -601,7 +601,7 @@ protected:
     uint32_t primitive; // D3D10_SB_PRIMITIVE of the topology type
   };
   std::unique_ptr<GeometryInputs> adjacency_inputs_;
-  dxmt::mutex adjacency_mutex_;
+  mullion::mutex adjacency_mutex_;
   // by stream output's counting pass and strip
   WMT::Reference<WMT::RenderPipelineState> adjacency_[2][2];
 
@@ -691,7 +691,7 @@ public:
   // made when first drawn
   WMT::RenderPipelineState
   AdjacencyPipeline(bool strip, bool counting) final {
-    std::lock_guard<dxmt::mutex> lock(adjacency_mutex_);
+    std::lock_guard<mullion::mutex> lock(adjacency_mutex_);
     auto &variant = adjacency_[counting][strip];
     if (!variant && adjacency_inputs_) {
       auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
@@ -777,7 +777,7 @@ public:
 
     // one logic op, the first target's, for all: independent blending cannot carry one
     if (pDesc->BlendState.RenderTarget[0].LogicOpEnable) {
-#ifdef DXMT_NO_PRIVATE_API
+#ifdef MULLION_NO_PRIVATE_API
       return E_INVALIDARG;
 #else
       info.logic_operation_enabled = true;
@@ -1324,7 +1324,7 @@ public:
     Statistics &= pixel_shader;
     if (!Pipeline || (!Statistics && Mask == rtv_mask && DSVPlanar == dsv_mask))
       return Pipeline;
-    std::lock_guard<dxmt::mutex> lock(render_targets_mutex_);
+    std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
     auto &descriptor = pipeline_descriptors_.at(Pipeline.handle);
     auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) |
                (uint32_t(Statistics) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 2));
@@ -1464,4 +1464,4 @@ PipelineStateStream::Create(
                                            depth_stencil2 ? &*depth_stencil2 : nullptr);
 }
 
-} // namespace dxmt
+} // namespace mullion

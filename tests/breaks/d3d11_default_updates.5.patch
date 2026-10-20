@@ -1,6 +1,6 @@
 # index fetch omits the current storage offset
---- a/src/dxmt/dxmt_context.hpp
-+++ b/src/dxmt/dxmt_context.hpp
+--- a/src/mullion/mullion_context.hpp
++++ b/src/mullion/mullion_context.hpp
 @@ -568,7 +568,7 @@
    currentIndexBuffer() {
      // because of indirect draw, we can't predicate the accessed buffer range

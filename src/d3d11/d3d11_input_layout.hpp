@@ -15,11 +15,11 @@ struct MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC {
   uint32_t InstanceStepRate : 31 = 0;
 };
 
-namespace dxmt {
+namespace mullion {
 class InputLayout;
 class Shader;
 };
-typedef dxmt::InputLayout *ManagedInputLayout;
+typedef mullion::InputLayout *ManagedInputLayout;
 
 DEFINE_COM_INTERFACE("b56c6a99-80cf-4c7f-a756-9e9ceb38730f",
                      IMTLD3D11InputLayout)
@@ -36,11 +36,11 @@ DEFINE_COM_INTERFACE("fd58f76b-7c22-4605-b43c-28048c8b4a64",
   virtual uint32_t STDMETHODCALLTYPE GetStreamOutputElements(
       const SM50_STREAM_OUTPUT_ELEMENT2 **ppElements,
       uint32_t Strides[4]) = 0;
-  virtual dxmt::Sha1Digest &Digest() = 0;
+  virtual mullion::Sha1Digest &Digest() = 0;
   virtual UINT RasterizedStream() = 0;
 };
 
-namespace dxmt {
+namespace mullion {
 
 class InputLayout {
 public:
@@ -56,13 +56,13 @@ HRESULT ExtractMTLInputLayoutElements(
     MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC *pInputLayoutElementOut,
     uint32_t *pNumElementsOut);
 
-} // namespace dxmt
+} // namespace mullion
 
 using MTL_INPUT_LAYOUT_DESC = std::vector<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC>;
 
 // stream output after `GeometryShader`, or after the stage before it when null
 struct MTL_STREAM_OUTPUT_DESC {
-  dxmt::Shader *GeometryShader;
+  mullion::Shader *GeometryShader;
   uint32_t RasterizedStream;
   uint32_t Strides[4];
   std::vector<SM50_STREAM_OUTPUT_ELEMENT2> Elements;
@@ -71,7 +71,7 @@ struct MTL_STREAM_OUTPUT_DESC {
 namespace std {
 template <> struct hash<MTL_INPUT_LAYOUT_DESC> {
   size_t operator()(const MTL_INPUT_LAYOUT_DESC &v) const noexcept {
-    dxmt::HashState state;
+    mullion::HashState state;
     for (auto &element : v) {
       state.add(std::hash<string_view>{}(
           {reinterpret_cast<const char *>(&element), sizeof(element)}));
@@ -94,7 +94,7 @@ template <> struct equal_to<MTL_INPUT_LAYOUT_DESC> {
 
 template <> struct hash<MTL_STREAM_OUTPUT_DESC> {
   size_t operator()(const MTL_STREAM_OUTPUT_DESC &v) const noexcept {
-    dxmt::HashState state;
+    mullion::HashState state;
     state.add(std::hash<const void *>{}(v.GeometryShader));
     state.add(v.RasterizedStream);
     state.add(v.Strides[0]);

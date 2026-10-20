@@ -16,8 +16,8 @@
 // each case changes only one buffer. the shader copies its VB/CB/SRV values into separate integer channels; expected
 // pixels come from the supplied data. bindings stay set through all maps. row 0 is drawn before and after an append,
 // then the middle and last rows; row 1 remains unused for an immediate append after list execution. sizes double
-// across the allocator's minimum, then straddle DXMT_PAGE_SIZE (meson.build). page / buffer size + 2 discards exceed
-// its suballocation count even without the allocation minimum (dxmt_buffer.cpp); no reads or flushes separate them.
+// across the allocator's minimum, then straddle MULLION_PAGE_SIZE (meson.build). page / buffer size + 2 discards exceed
+// its suballocation count even without the allocation minimum (mullion_buffer.cpp); no reads or flushes separate them.
 // a deferred list is recorded before an immediate overwrite, then replayed after readback and immediate reuse.
 // discarded contents, write-only mapped contents, pointer identity and the time work takes are never asserted.
 #include "d3d11_test.hpp"
@@ -68,16 +68,16 @@ main() {
   CHECK(device->CreateInputLayout(&element, 1, vs_code->GetBufferPointer(), vs_code->GetBufferSize(), &layout));
 
   std::vector<UINT> sizes;
-  for (UINT bytes = 4 * sizeof(Row); bytes < DXMT_PAGE_SIZE; bytes *= 2)
+  for (UINT bytes = 4 * sizeof(Row); bytes < MULLION_PAGE_SIZE; bytes *= 2)
     sizes.push_back(bytes);
-  sizes.insert(sizes.end(), {DXMT_PAGE_SIZE - sizeof(Row), DXMT_PAGE_SIZE, DXMT_PAGE_SIZE + sizeof(Row)});
+  sizes.insert(sizes.end(), {MULLION_PAGE_SIZE - sizeof(Row), MULLION_PAGE_SIZE, MULLION_PAGE_SIZE + sizeof(Row)});
   const UINT binds[] = {D3D11_BIND_VERTEX_BUFFER, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE};
   const char *names[] = {"VB", "CB", "SRV"};
   for (UINT bytes : sizes)
     for (UINT active = 0; active < std::size(binds); active++)
       for (bool recorded : {false, true}) {
         step("%s %s, %u bytes: initial-data control", recorded ? "deferred" : "immediate", names[active], bytes);
-        const UINT rows = bytes / sizeof(Row), generations = DXMT_PAGE_SIZE / bytes + 2;
+        const UINT rows = bytes / sizeof(Row), generations = MULLION_PAGE_SIZE / bytes + 2;
         const UINT probes[] = {0, rows / 2, rows - 1}, aftermath[] = {rows - 1, 1};
         auto data = [&](UINT version) {
           std::vector<Row> out(rows);

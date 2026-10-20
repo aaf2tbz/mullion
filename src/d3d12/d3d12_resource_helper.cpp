@@ -19,7 +19,7 @@
 #include "d3d12_device.hpp"
 #include "util_bit.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 template <>
 HRESULT
@@ -485,4 +485,4 @@ IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds) {
   return true;
 }
 
-} // namespace dxmt
+} // namespace mullion

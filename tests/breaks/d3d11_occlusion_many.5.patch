@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_context.cpp
-+++ b/src/dxmt/dxmt_context.cpp
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
 @@ -1461,13 +1461,2 @@
 -      if (r0->use_visibility_result) {
 -        // a render pass begins with visibility disabled (MTLRenderCommandEncoder::setVisibilityResultMode)

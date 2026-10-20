@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_format.cpp
-+++ b/src/dxmt/dxmt_format.cpp
+--- a/src/mullion/mullion_format.cpp
++++ b/src/mullion/mullion_format.cpp
 @@ -1488,7 +1488,7 @@
      WMT::Device device, uint32_t Format, const std::function<FormatCapability(WMTPixelFormat)> &GetMTLPixelFormatCapability,
      uint32_t &Support1, uint32_t &Support2

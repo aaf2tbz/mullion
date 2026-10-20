@@ -31,7 +31,7 @@ const GUID kWKPDID_D3DDebugObjectNameW = {0x4cca5fd8, 0x921f, 0x42c8, 0x85, 0x66
 
 #endif
 
-namespace dxmt {
+namespace mullion {
 template <typename... Base> class MTLD3D12Object : public Base... {
 public:
   MTLD3D12Object() {}
@@ -57,7 +57,7 @@ public:
   RegisterDestructionCallback(PFN_DESTRUCTION_CALLBACK function, void *data, UINT *id) override {
     if (!function)
       return DXGI_ERROR_INVALID_CALL;
-    std::lock_guard<dxmt::mutex> lock(callback_mutex_);
+    std::lock_guard<mullion::mutex> lock(callback_mutex_);
     if (id && next_callback_ == std::numeric_limits<UINT>::max())
       return E_OUTOFMEMORY;
     UINT assigned = id ? next_callback_ + 1 : 0;
@@ -75,7 +75,7 @@ public:
   UnregisterDestructionCallback(UINT id) override {
     if (!id)
       return DXGI_ERROR_NOT_FOUND;
-    std::lock_guard<dxmt::mutex> lock(callback_mutex_);
+    std::lock_guard<mullion::mutex> lock(callback_mutex_);
     return std::erase_if(callbacks_, [id](auto &callback) { return callback.id == id; }) ? S_OK : DXGI_ERROR_NOT_FOUND;
   }
 
@@ -106,7 +106,7 @@ private:
   ConcurrentComPrivateData private_data_;
   struct Callback { PFN_DESTRUCTION_CALLBACK function; void *data; UINT id; };
   std::vector<Callback> callbacks_;
-  dxmt::mutex callback_mutex_;
+  mullion::mutex callback_mutex_;
   UINT next_callback_ = 0;
 };
 
@@ -130,4 +130,4 @@ protected:
   MTLD3D12Device *device_;
 };
 
-} // namespace dxmt
+} // namespace mullion

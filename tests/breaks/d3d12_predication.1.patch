@@ -1,6 +1,6 @@
 # statistics count the recorded work even when its predicate skips it
---- a/src/dxmt/dxmt_command.metal
-+++ b/src/dxmt/dxmt_command.metal
+--- a/src/mullion/mullion_command.metal
++++ b/src/mullion/mullion_command.metal
 @@ -915,7 +915,7 @@
        result[10] += dispatches[k].counts[c];
    for (uint k = sum.first_predicated; k < sum.first_predicated + sum.predicated_count; k++) {

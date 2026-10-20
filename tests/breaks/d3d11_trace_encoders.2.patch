@@ -1,7 +1,7 @@
 # omit standalone resolve traces
-diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
---- a/src/dxmt/dxmt_context.cpp
-+++ b/src/dxmt/dxmt_context.cpp
+diff --git a/src/mullion/mullion_context.cpp b/src/mullion/mullion_context.cpp
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
 @@ -1411,7 +1411,7 @@
                                              : cmdbuf.renderCommandEncoder(info);
          encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));

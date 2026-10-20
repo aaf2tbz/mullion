@@ -21,15 +21,15 @@
 #include "d3d11_device.hpp"
 #include "d3d11_enumerable.hpp"
 #include "d3d11_view.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
+#include "mullion_dynamic.hpp"
+#include "mullion_staging.hpp"
+#include "mullion_texture.hpp"
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 
 #include <limits>
 
-namespace dxmt {
+namespace mullion {
 
 #pragma region DeviceTexture
 
@@ -407,7 +407,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     texture->chroma = new Texture(chroma_info, pDevice->GetMTLDevice());
   }
 
-  auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
+  auto &initializer = pDevice->GetMullionDevice().queue().initializer;
 
   auto initialize = [&](Rc<TextureAllocation> &&allocation) -> HRESULT {
     if (!allocation->texture())
@@ -824,4 +824,4 @@ ImportSharedTextureByName(
 
 #pragma endregion
 
-} // namespace dxmt
+} // namespace mullion

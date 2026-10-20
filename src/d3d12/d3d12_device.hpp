@@ -24,14 +24,14 @@
 #include "dxgi1_2.h"
 #include "dxgi_interfaces.h"
 #include "airconv_public.h"
-#include "dxmt_buffer.hpp"
-#include "dxmt_command.hpp"
-#include "dxmt_diag.hpp"
-#include "dxmt_fence.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_info.hpp"
-#include "dxmt_presenter.hpp"
-#include "dxmt_texture.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_command.hpp"
+#include "mullion_diag.hpp"
+#include "mullion_fence.hpp"
+#include "mullion_format.hpp"
+#include "mullion_info.hpp"
+#include "mullion_presenter.hpp"
+#include "mullion_texture.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include <atomic>
@@ -85,7 +85,7 @@ struct D3D12_DEPTH_STENCIL_DESC2 {
 };
 #endif
 
-namespace dxmt {
+namespace mullion {
 
 bool ExperimentalShaderModelsEnabled();
 HRESULT DeserializeLibraryRootSignature(const void *Library, SIZE_T Size, LPCWSTR Name, REFIID riid, void **Deserializer);
@@ -172,7 +172,7 @@ public:
   // which of a reserved texture's tiles are mapped, as D3D12 numbers them (MTLD3D12CommandQueue::Settle)
   std::vector<bool> mapped_tiles;
   // a sampler feedback map's description as its application gave it: `texture` has one R32_UINT texel per mip region
-  // (TranscodeFeedback in dxmt_command_feedback.hpp)
+  // (TranscodeFeedback in mullion_command_feedback.hpp)
   std::optional<D3D12_RESOURCE_DESC1> feedback;
 
   HRESULT STDMETHODCALLTYPE
@@ -286,7 +286,7 @@ struct Reached {
   void
   Reach(uint64_t reached) {
     decltype(waiting_) done; // ends after the lock: what a waiter kept alive may come back in here as it goes
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     value = reached;
     std::erase_if(waiting_, [&](auto &wait) {
       return wait.first <= reached && (wait.second(), done.push_back(std::move(wait)), true);
@@ -295,7 +295,7 @@ struct Reached {
 
   void
   Expect(uint64_t expected, std::function<void()> &&reached) {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     expected <= value ? reached() : (void)waiting_.emplace_back(expected, std::move(reached));
   }
 
@@ -311,7 +311,7 @@ struct Reached {
   }
 
 private:
-  dxmt::mutex mutex_;
+  mullion::mutex mutex_;
   std::vector<std::pair<uint64_t, std::function<void()>>> waiting_;
 };
 
@@ -394,7 +394,7 @@ class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
   UINT IsComputePipelineState;
   Sha1Digest library_key;
-  dxmt::mutex shader_mutex;
+  mullion::mutex shader_mutex;
   PipelineShaderCache cached_shaders;
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
@@ -492,7 +492,7 @@ public:
     uint64_t address = 0;
     // blocks of `arguments` nothing writes: the zeros an indirect draw's indices past their view read
     std::optional<RecordingArena::Run> zeros;
-    dxmt::mutex mutex;
+    mullion::mutex mutex;
   } recording;
 
   // the width of the GPU's SIMD groups, which run D3D12's waves
@@ -619,7 +619,7 @@ CreateClosedCommandList(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, R
 struct D3D12SwapChainBufferRefs {
   IDXGISwapChain4 *swapchain;
   uint32_t referenced_buffers = 0;
-  dxmt::mutex mutex;
+  mullion::mutex mutex;
 };
 
 HRESULT CreateCommittedTexture(
@@ -694,7 +694,7 @@ bool PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_S
 
 inline std::tuple<MTLD3D12RenderTargetDescriptorHeap *, UINT>
 GetRenderTargetHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12RenderTargetDescriptorHeap>(), (UINT)impl.Descriptor};
 #else
@@ -705,7 +705,7 @@ GetRenderTargetHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle)
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetRenderTargetDescriptor(MTLD3D12RenderTargetDescriptorHeap *pHeap, UINT Index) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
 #else
   IMPLEMENT_ME
@@ -715,7 +715,7 @@ GetRenderTargetDescriptor(MTLD3D12RenderTargetDescriptorHeap *pHeap, UINT Index)
 
 inline std::tuple<MTLD3D12DescriptorHeap *, UINT>
 GetShaderVisibleDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12DescriptorHeap>(), (UINT)impl.Descriptor};
 #else
@@ -726,7 +726,7 @@ GetShaderVisibleDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HAN
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetShaderVisibleDescriptor(MTLD3D12DescriptorHeap *pHeap, UINT Index) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
 #else
   IMPLEMENT_ME
@@ -737,7 +737,7 @@ GetShaderVisibleDescriptor(MTLD3D12DescriptorHeap *pHeap, UINT Index) {
 
 inline std::tuple<MTLD3D12SamplerDescriptorHeap *, UINT>
 GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12SamplerDescriptorHeap>(), (UINT)impl.Descriptor};
 #else
@@ -748,7 +748,7 @@ GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Ha
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetSamplerDescriptor(MTLD3D12SamplerDescriptorHeap *pHeap, UINT Index) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
 #else
   IMPLEMENT_ME
@@ -783,4 +783,4 @@ bool ShaderContainerHolds(const void *container, size_t size);
 
 bool IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds);
 
-} // namespace dxmt
+} // namespace mullion

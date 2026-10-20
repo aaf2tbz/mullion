@@ -4,7 +4,7 @@
 
 using namespace llvm;
 
-namespace dxmt::metallib {
+namespace mullion::metallib {
 
 template <typename T> std::string_view value(const T &value) {
   return std::string_view((const char *)(&value), sizeof(T));
@@ -412,4 +412,4 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
   OS << bitcode;
 }
 
-} // namespace dxmt::metallib
+} // namespace mullion::metallib

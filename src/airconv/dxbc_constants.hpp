@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 enum class RegisterComponentType : uint32_t {
   Unknown,
@@ -34,4 +34,4 @@ widened(RegisterComponentType type) {
 
 /* anything in CAPITAL is not handled properly yet (rename in progress) */
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

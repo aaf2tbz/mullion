@@ -76,7 +76,7 @@ def install(wine, prefix, unix, pe):
 
 
 # what the library and Metal say when the GPU's work went wrong under a test: a command buffer that failed
-# (src/d3d12/d3d12_command_queue.cpp, src/dxmt/dxmt_command_queue.cpp), a rule of Metal's validation broken
+# (src/d3d12/d3d12_command_queue.cpp, src/mullion/mullion_command_queue.cpp), a rule of Metal's validation broken
 # (Metal's debug layer), a message to an Objective-C object that was freed (ZOMBIES)
 FAULTS = ("Device error", "failed assertion", "message sent to deallocated instance")
 

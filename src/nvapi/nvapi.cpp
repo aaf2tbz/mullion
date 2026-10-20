@@ -13,14 +13,14 @@
 #include "nvShaderExtnEnums.h"
 #undef __NVAPI_EMPTY_SAL
 
-namespace dxmt {
+namespace mullion {
 Logger Logger::s_instance("nvapi.log");
 
 static std::atomic_uint32_t s_initialization_count = 0;
 
 NVAPI_INTERFACE
 NvAPI_Initialize() {
-  if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
+  if (FAILED(DXGIGetDebugInterface1(0, MULLION_NVEXT_GUID, nullptr))) {
     return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
   }
   s_initialization_count++;
@@ -913,4 +913,4 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   return nullptr;
 }
 
-}; // namespace dxmt
+}; // namespace mullion

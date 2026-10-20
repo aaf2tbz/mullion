@@ -211,8 +211,8 @@ exercise(UINT seed, UINT only) {
             ComPtr<IDXGIResource1> dxgi;
             CHECK(resource.As(&dxgi));
             if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
-              for (UINT dynamic_width : {width, DXMT_PAGE_SIZE / word_bytes - 1, DXMT_PAGE_SIZE / word_bytes,
-                                         DXMT_PAGE_SIZE / word_bytes + 1}) {
+              for (UINT dynamic_width : {width, MULLION_PAGE_SIZE / word_bytes - 1, MULLION_PAGE_SIZE / word_bytes,
+                                         MULLION_PAGE_SIZE / word_bytes + 1}) {
                 ComPtr<ID3D11Buffer> dynamic;
                 if (via10) {
                   D3D10_BUFFER_DESC desc{dynamic_width * word_bytes, D3D10_USAGE_DYNAMIC, D3D10_BIND_VERTEX_BUFFER,

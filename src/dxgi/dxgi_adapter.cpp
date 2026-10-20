@@ -12,7 +12,7 @@
 #include "d3d10_1.h"
 #include "Metal.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 const GUID kWineDXGIAdapterUUID = {0x17399d75,
                                    0x964e,
@@ -330,4 +330,4 @@ Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
       new MTLDXGIAdapter(Device, pFactory, config));
 }
 
-} // namespace dxmt
+} // namespace mullion

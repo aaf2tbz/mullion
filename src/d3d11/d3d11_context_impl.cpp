@@ -24,7 +24,7 @@
 #include <d3d12.h>
 #include <deque>
 #include "d3d11_annotation.hpp"
-#include "dxmt_geometry.hpp"
+#include "mullion_geometry.hpp"
 #include "d3d11_context.hpp"
 #include "d3d11_device_child.hpp"
 #include "d3d11_enumerable.hpp"
@@ -34,19 +34,19 @@
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_query.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_context.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_info.hpp"
-#include "dxmt_ring_bump_allocator.hpp"
-#include "dxmt_staging.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_context.hpp"
+#include "mullion_format.hpp"
+#include "mullion_info.hpp"
+#include "mullion_ring_bump_allocator.hpp"
+#include "mullion_staging.hpp"
 #include "d3d11_resource.hpp"
-#include "dxmt_texture.hpp"
+#include "mullion_texture.hpp"
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
 
-namespace dxmt {
+namespace mullion {
 
 template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj);
 
@@ -576,14 +576,14 @@ public:
   }
 };
 
-struct DXMT_DRAW_ARGUMENTS {
+struct MULLION_DRAW_ARGUMENTS {
   uint32_t VertexCount;
   uint32_t InstanceCount;
   uint32_t StartVertex;
   uint32_t StartInstance;
 };
 
-struct DXMT_DRAW_INDEXED_ARGUMENTS {
+struct MULLION_DRAW_INDEXED_ARGUMENTS {
   uint32_t IndexCount;
   uint32_t InstanceCount;
   uint32_t StartIndex;
@@ -591,7 +591,7 @@ struct DXMT_DRAW_INDEXED_ARGUMENTS {
   uint32_t StartInstance;
 };
 
-struct DXMT_DISPATCH_ARGUMENTS {
+struct MULLION_DISPATCH_ARGUMENTS {
   uint32_t X;
   uint32_t Y;
   uint32_t Z;
@@ -1540,10 +1540,10 @@ public:
       UINT NumControlPoint, UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
       UINT StartInstanceLocation
   ) {
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(MULLION_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
+      MULLION_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<MULLION_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_argument->StartVertex = StartVertexLocation;
       draw_argument->VertexCount = VertexCountPerInstance;
       draw_argument->InstanceCount = InstanceCount;
@@ -1566,8 +1566,8 @@ public:
         enc.countPipelineStatistics(VertexCountPerInstance, InstanceCount, std::pair{NumControlPoint, NumControlPoint});
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
-      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-      cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
+      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw>();
+      cmd.type = WMTRenderCommandMullionTessellationMeshDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
       cmd.instance_count = InstanceCount;
       cmd.threads_per_patch = ThreadsPerPatch;
@@ -1602,10 +1602,10 @@ public:
       UINT InstanceCount, UINT BaseInstance
   ) {
     auto IndexBuffer = MeshIndexBuffer();
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     EmitOP([=](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
+      MULLION_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<MULLION_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_argument->BaseVertex = BaseVertexLocation;
       draw_argument->IndexCount = IndexCountPerInstance;
       draw_argument->StartIndex = StartIndexLocation;
@@ -1633,8 +1633,8 @@ public:
                                     index_stride, index_buffer_offset, StartIndexLocation);
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
-      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-      cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indexed>();
+      cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
       cmd.instance_count = InstanceCount;
       cmd.threads_per_patch = ThreadsPerPatch;
@@ -1651,12 +1651,12 @@ public:
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
       UINT StartInstanceLocation
   ) {
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(MULLION_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     auto mesh_budget = mesh_bytes_per_draw_;
     auto vertex_registers = GetManagedShader<PipelineStage::Vertex>()->reflection().NumOutputElement;
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
+      MULLION_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<MULLION_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_argument->StartVertex = StartVertexLocation;
       draw_argument->VertexCount = VertexCountPerInstance;
       draw_argument->InstanceCount = InstanceCount;
@@ -1683,8 +1683,8 @@ public:
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto draw = [&] {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-        cmd.type = WMTRenderCommandDXMTGeometryDraw;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_geometry_draw>();
+        cmd.type = WMTRenderCommandMullionGeometryDraw;
         cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
         cmd.instance_count = InstanceCount;
         cmd.warp_count = warp_count;
@@ -1705,12 +1705,12 @@ public:
       UINT InstanceCount, UINT BaseInstance
   ) {
     auto IndexBuffer = MeshIndexBuffer();
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
     auto mesh_budget = mesh_bytes_per_draw_;
     auto vertex_registers = GetManagedShader<PipelineStage::Vertex>()->reflection().NumOutputElement;
     EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
+      MULLION_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<MULLION_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_argument->BaseVertex = BaseVertexLocation;
       draw_argument->IndexCount = IndexCountPerInstance;
       draw_argument->StartIndex = StartIndexLocation;
@@ -1740,8 +1740,8 @@ public:
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto draw = [&] {
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
-        cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_geometry_draw_indexed>();
+        cmd.type = WMTRenderCommandMullionGeometryDrawIndexed;
         cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
         cmd.instance_count = InstanceCount;
         cmd.warp_count = warp_count;
@@ -1788,7 +1788,7 @@ public:
       EmitOP([IndexType, IndexBufferOffset, Primitive, ArgBuffer = bindable->buffer(),
               AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
         if (enc.pipelineStatisticsActive())
@@ -1836,7 +1836,7 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([Primitive, ArgBuffer = bindable->buffer(), AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
         );
         if (enc.pipelineStatisticsActive())
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive), 0, 0, 0,
@@ -1862,7 +1862,7 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
         );
         auto encoder = enc.currentRenderEncoder();
         auto max_part = get_gs_max_object_threadgroups(
@@ -1872,7 +1872,7 @@ public:
         uint32_t invocations = vertex_per_warp * encoder->so_geometry_instances;
         // each part's origin (8 bytes), then each part's grid
         auto parts = indirect_geometry_parts(max_part, enc.indirectGeometryBound(encoder->so_count_pso ? invocations : 0));
-        auto dispatch_arg = enc.allocateTempBuffer1(parts * (8 + sizeof(DXMT_DISPATCH_ARGUMENTS)), 8);
+        auto dispatch_arg = enc.allocateTempBuffer1(parts * (8 + sizeof(MULLION_DISPATCH_ARGUMENTS)), 8);
         auto grids = dispatch_arg.offset + parts * 8;
 
         // not one primitive fits an object threadgroup's payload
@@ -1885,8 +1885,8 @@ public:
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto draw = [&] {
-          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
-          cmd.type = WMTRenderCommandDXMTGeometryDrawIndirect;
+          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_geometry_draw_indirect>();
+          cmd.type = WMTRenderCommandMullionGeometryDrawIndirect;
           cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
           cmd.dispatch_args_offset = grids;
           cmd.vertex_per_warp = vertex_per_warp;
@@ -1923,7 +1923,7 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
         auto encoder = enc.currentRenderEncoder();
         auto max_part = get_gs_max_object_threadgroups(
@@ -1933,7 +1933,7 @@ public:
         uint32_t invocations = vertex_per_warp * encoder->so_geometry_instances;
         // each part's origin (8 bytes), then each part's grid
         auto parts = indirect_geometry_parts(max_part, enc.indirectGeometryBound(encoder->so_count_pso ? invocations : 0));
-        auto dispatch_arg = enc.allocateTempBuffer1(parts * (8 + sizeof(DXMT_DISPATCH_ARGUMENTS)), 8);
+        auto dispatch_arg = enc.allocateTempBuffer1(parts * (8 + sizeof(MULLION_DISPATCH_ARGUMENTS)), 8);
         auto grids = dispatch_arg.offset + parts * 8;
 
         // not one primitive fits an object threadgroup's payload
@@ -1947,8 +1947,8 @@ public:
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto draw = [&] {
-          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
-          cmd.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
+          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_geometry_draw_indexed_indirect>();
+          cmd.type = WMTRenderCommandMullionGeometryDrawIndexedIndirect;
           cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
           cmd.dispatch_args_offset = grids;
           cmd.vertex_per_warp = vertex_per_warp;
@@ -1983,9 +1983,9 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
         );
-        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(MULLION_DISPATCH_ARGUMENTS), 4);
 
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
@@ -2000,8 +2000,8 @@ public:
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indirect>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indirect>();
+        cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.patch_per_group = PatchPerGroup;
@@ -2023,9 +2023,9 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
-        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(MULLION_DISPATCH_ARGUMENTS), 4);
 
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
@@ -2042,8 +2042,8 @@ public:
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect>();
+        cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.patch_per_group = PatchPerGroup;
@@ -2095,7 +2095,7 @@ public:
             vertices = slot.Buffer->buffer(),
             filled = slot.Buffer->streamOutputFilled()](ArgumentEncodingContext &enc) {
       auto encoder = enc.currentRenderEncoder();
-      auto arguments = enc.draw_auto_arguments = enc.allocateTempBuffer1(sizeof(DXMT_DRAW_ARGUMENTS), 16);
+      auto arguments = enc.draw_auto_arguments = enc.allocateTempBuffer1(sizeof(MULLION_DRAW_ARGUMENTS), 16);
       // a draw that does not stream out has no use for its object threadgroup count
       auto unused = enc.allocateTempBuffer1(sizeof(uint32_t), 4);
       DrawAutoArgumentsMarshal task{};
@@ -2127,7 +2127,7 @@ public:
         );
         // each part's origin (8 bytes), then each part's grid
         auto parts = indirect_geometry_parts(max_part, std::max(max_warps, 1u));
-        auto dispatch = enc.allocateTempBuffer1(parts * (8 + sizeof(DXMT_DISPATCH_ARGUMENTS)), 8);
+        auto dispatch = enc.allocateTempBuffer1(parts * (8 + sizeof(MULLION_DISPATCH_ARGUMENTS)), 8);
         auto grids = dispatch.offset + parts * 8;
         task.vertex_count_per_warp = vertex_increment_per_warp;
         enc.encodeGSDispatchArgumentsMarshal(
@@ -2135,8 +2135,8 @@ public:
             dispatch.gpu_buffer, dispatch.gpu_address, grids, max_part, parts, dispatch.gpu_address + dispatch.offset
         );
         auto draw = [&] {
-          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
-          cmd.type = WMTRenderCommandDXMTGeometryDrawIndirect;
+          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_geometry_draw_indirect>();
+          cmd.type = WMTRenderCommandMullionGeometryDrawIndirect;
           cmd.dispatch_args_buffer = dispatch.gpu_buffer;
           cmd.dispatch_args_offset = grids;
           cmd.vertex_per_warp = vertex_per_warp;
@@ -2156,14 +2156,14 @@ public:
           draw();
         }
       } else if (status == DrawCallStatus::Tessellation) {
-        auto dispatch = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch = enc.allocateTempBuffer1(sizeof(MULLION_DISPATCH_ARGUMENTS), 4);
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         enc.encodeTSDispatchArgumentsMarshal(
             arguments.gpu_buffer, arguments.gpu_address, arguments.offset, ControlPointCount, PatchPerGroup, enc.tess_parts,
             dispatch.gpu_buffer, dispatch.gpu_address, dispatch.offset, max_object_threadgroups
         );
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indirect>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indirect>();
+        cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndirect;
         cmd.dispatch_args_buffer = dispatch.gpu_buffer;
         cmd.dispatch_args_offset = dispatch.offset;
         cmd.patch_per_group = PatchPerGroup;
@@ -5837,8 +5837,8 @@ public:
     default_blend_state->Release();
     default_depth_stencil_state->Release();
 
-    max_object_threadgroups_ = m_parent->GetDXMTDevice().maxObjectThreadgroups();
-    mesh_bytes_per_draw_ = MeshBytesPerDraw(m_parent->GetDXMTDevice().device());
+    max_object_threadgroups_ = m_parent->GetMullionDevice().maxObjectThreadgroups();
+    mesh_bytes_per_draw_ = MeshBytesPerDraw(m_parent->GetMullionDevice().device());
   }
 };
 
@@ -6100,7 +6100,7 @@ public:
 
   void
   Reset() {
-    auto current_seq_id = m_parent->GetDXMTDevice().queue().CurrentSeqId();
+    auto current_seq_id = m_parent->GetMullionDevice().queue().CurrentSeqId();
 
     while (!used_dynamic_buffers.empty()) {
       auto &buffer = used_dynamic_buffers.back();
@@ -6226,8 +6226,8 @@ private:
   MTLD3D11CommandListPoolBase *cmdlist_pool;
 
   RingBumpState<StagingBufferBlockAllocator, kStagingBlockSizeForDeferredContext> staging_allocator;
-  RingBumpState<HostBufferBlockAllocator, kStagingBlockSizeForDeferredContext, dxmt::null_mutex> cpu_command_allocator; 
+  RingBumpState<HostBufferBlockAllocator, kStagingBlockSizeForDeferredContext, mullion::null_mutex> cpu_command_allocator; 
 
 };
 
-} // namespace dxmt
+} // namespace mullion

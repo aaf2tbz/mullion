@@ -6,14 +6,14 @@
 #include "d3d11_1.h"
 #include "dxgi1_2.h"
 
-namespace dxmt {
+namespace mullion {
 
 // a resource's own surface shares its COM identity; CreateSubresourceSurface makes an independent object that
 // holds the resource (IDXGIResource1::CreateSubresourceSurface; Wine's test_subresource_surface)
 class MTLD3D11Surface final : public ComObject<IDXGISurface2> {
 public:
   struct GDIState {
-    dxmt::mutex mutex;
+    mullion::mutex mutex;
     HDC dc = nullptr;
     HGDIOBJ old = nullptr;
     void *bits = nullptr;
@@ -244,4 +244,4 @@ private:
   ComPrivateData private_data_;
 };
 
-} // namespace dxmt
+} // namespace mullion

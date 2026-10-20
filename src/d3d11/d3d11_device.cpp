@@ -16,9 +16,9 @@
 #include "d3d11_state_object.hpp"
 #include "dxgi_interfaces.h"
 #include "../d3d10/d3d10_device.hpp"
-#include "dxmt_command_queue.hpp"
-#include "dxmt_device.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_command_queue.hpp"
+#include "mullion_device.hpp"
+#include "mullion_format.hpp"
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_enumerable.hpp"
@@ -32,7 +32,7 @@
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
 
-namespace dxmt {
+namespace mullion {
 
 const GUID kRenderdocUUID = {0xa7aa6116,
                              0x9c8d,
@@ -445,11 +445,11 @@ public:
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:
       case D3D11_USAGE_DYNAMIC:
-        return ppBuffer ? dxmt::CreateBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
+        return ppBuffer ? mullion::CreateBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
       case D3D11_USAGE_STAGING:
         return ppBuffer ? CreateStagingBuffer(this, &desc, pInitialData, ppBuffer) : S_FALSE;
       default:
-        DXMT_UNREACHABLE
+        MULLION_UNREACHABLE
       }
     } catch (const MTLD3DError &err) {
       ERR(err.message());
@@ -1320,7 +1320,7 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     if (ContextFlags)
       return E_INVALIDARG;
-    *ppDeferredContext = std::move(dxmt::CreateDeferredContext(this, ContextFlags));
+    *ppDeferredContext = std::move(mullion::CreateDeferredContext(this, ContextFlags));
     return S_OK;
   }
 
@@ -1377,7 +1377,7 @@ public:
     return S_OK;
   };
 
-  Device &GetDXMTDevice() override { return device_; };
+  Device &GetMullionDevice() override { return device_; };
 
   void CreateCommandList(ID3D11CommandList** pCommandList) final {
     commandlist_pool_->CreateCommandList(pCommandList);
@@ -1415,7 +1415,7 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE OpenSharedFence(HANDLE Handle, REFIID riid,
                                                     void **ppFence) final {
-    return dxmt::OpenSharedFence(this, Handle, riid, ppFence);
+    return mullion::OpenSharedFence(this, Handle, riid, ppFence);
   };
 
   virtual HRESULT STDMETHODCALLTYPE CreateFence(UINT64 InitialValue,
@@ -1423,7 +1423,7 @@ public:
                                                 REFIID riid, void **ppFence) final {
     if (feature_flags_ & D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
       return E_FAIL;
-    return dxmt::CreateFence(this, InitialValue, Flags, riid, ppFence);
+    return mullion::CreateFence(this, InitialValue, Flags, riid, ppFence);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1431,7 +1431,7 @@ public:
       IDXGIFactory1 *pFactory, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain
   ) override {
-    return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+    return mullion::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
 private:
@@ -1627,7 +1627,7 @@ public:
     if (!ppResources || !pResidency)
       return E_INVALIDARG;
 
-    // Basically in DXMT D3D11 implementation, all resources are assumed to be resident.
+    // Basically in Mullion D3D11 implementation, all resources are assumed to be resident.
     for (uint32_t i = 0; i < ResourceCount; i++)
       pResidency[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
     return S_OK;
@@ -1690,7 +1690,7 @@ public:
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
       IDXGISwapChain1 **ppSwapChain) override {
 
-    return dxmt::CreateSwapChain(pFactory, &d3d11_device_, hWnd, pDesc, pFullscreenDesc,
+    return mullion::CreateSwapChain(pFactory, &d3d11_device_, hWnd, pDesc, pFullscreenDesc,
                                  ppSwapChain);
   }
 
@@ -1711,4 +1711,4 @@ Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,
   return Com<IMTLDXGIDevice>::transfer(new MTLD3D11DXGIDevice(
       std::move(device), adapter, feature_level, feature_flags));
 };
-} // namespace dxmt
+} // namespace mullion

@@ -10,4 +10,4 @@
 -    if (hWnd == GetDesktopWindow())
 +    if (pDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD && hWnd == GetDesktopWindow())
        return E_ACCESSDENIED;
-     return dxmt::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+     return mullion::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);

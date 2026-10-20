@@ -1253,18 +1253,18 @@ enum WMTRenderCommandType : uint16_t {
   Unused0,
   Unused1,
   Unused2,
-  WMTRenderCommandDXMTGeometryDraw,
-  WMTRenderCommandDXMTGeometryDrawIndexed,
-  WMTRenderCommandDXMTGeometryDrawIndirect,
-  WMTRenderCommandDXMTGeometryDrawIndexedIndirect,
+  WMTRenderCommandMullionGeometryDraw,
+  WMTRenderCommandMullionGeometryDrawIndexed,
+  WMTRenderCommandMullionGeometryDrawIndirect,
+  WMTRenderCommandMullionGeometryDrawIndexedIndirect,
   WMTRenderCommandWaitForFence,
   WMTRenderCommandUpdateFence,
   WMTRenderCommandSetViewport,
   WMTRenderCommandSetScissorRect,
-  WMTRenderCommandDXMTTessellationMeshDraw,
-  WMTRenderCommandDXMTTessellationMeshDrawIndexed,
-  WMTRenderCommandDXMTTessellationMeshDrawIndirect,
-  WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
+  WMTRenderCommandMullionTessellationMeshDraw,
+  WMTRenderCommandMullionTessellationMeshDrawIndexed,
+  WMTRenderCommandMullionTessellationMeshDrawIndirect,
+  WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect,
   WMTRenderCommandDispatchThreadsPerTile,
   WMTRenderCommandExecuteCommandsInBuffer,
   WMTRenderCommandSetBlendFactor,
@@ -1558,7 +1558,7 @@ struct wmtcmd_render_setdepthtestbounds {
   float max;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw {
+struct wmtcmd_render_mullion_geometry_draw {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1570,7 +1570,7 @@ struct wmtcmd_render_dxmt_geometry_draw {
   uint32_t max_object_threadgroups;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw_indexed {
+struct wmtcmd_render_mullion_geometry_draw_indexed {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1584,7 +1584,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indexed {
   uint32_t max_object_threadgroups;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw_indirect {
+struct wmtcmd_render_mullion_geometry_draw_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1600,7 +1600,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indirect {
   uint64_t origins_offset;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect {
+struct wmtcmd_render_mullion_geometry_draw_indexed_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1626,7 +1626,7 @@ struct wmtcmd_render_fence_op {
   enum WMTRenderStages stages;
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw {
+struct wmtcmd_render_mullion_tessellation_mesh_draw {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1638,7 +1638,7 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw {
   uint32_t parts; /* the object threadgroups that share a patch group's mesh threadgroups */
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed {
+struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1652,7 +1652,7 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed {
   uint32_t parts; /* the object threadgroups that share a patch group's mesh threadgroups */
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect {
+struct wmtcmd_render_mullion_tessellation_mesh_draw_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1665,7 +1665,7 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect {
   uint32_t patch_per_group;
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect {
+struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;

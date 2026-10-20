@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_texture.cpp
-+++ b/src/dxmt/dxmt_texture.cpp
+--- a/src/mullion/mullion_texture.cpp
++++ b/src/mullion/mullion_texture.cpp
 @@ -332,8 +332,2 @@
  Texture::rename(Rc<TextureAllocation> &&newAllocation, std::vector<TextureViewRef> &retiredViews) {
 -  // view indices belong to this texture; encoded commands retain the old views until the chunk completes

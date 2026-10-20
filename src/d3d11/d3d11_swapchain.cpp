@@ -1,5 +1,5 @@
-#include "dxmt_diag.hpp"
-#include "dxmt_window.hpp"
+#include "mullion_diag.hpp"
+#include "mullion_window.hpp"
 #include "d3d11_swapchain.hpp"
 #include "com/com_guid.hpp"
 #include "config/config.hpp"
@@ -8,11 +8,11 @@
 #include "dxgi_object.hpp"
 #include "dxgi_output.hpp"
 #include "d3d11_context.hpp"
-#include "dxmt_context.hpp"
-#include "dxmt_hud_state.hpp"
-#include "dxmt_statistics.hpp"
-#include "dxmt_presenter.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_context.hpp"
+#include "mullion_hud_state.hpp"
+#include "mullion_statistics.hpp"
+#include "mullion_presenter.hpp"
+#include "mullion_format.hpp"
 #include "dxgi_swapchain_settings.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
@@ -25,8 +25,8 @@
 #include "wsi_monitor.hpp"
 #include "wsi_platform_win32.hpp"
 #include "wsi_window.hpp"
-#include "dxmt_info.hpp"
-#include "dxmt_presenter.hpp"
+#include "mullion_info.hpp"
+#include "mullion_presenter.hpp"
 #include <atomic>
 #include <cfloat>
 #include <format>
@@ -38,7 +38,7 @@ This value is 1 by default.
 */
 constexpr size_t kSwapchainLatency = 1;
 
-namespace dxmt {
+namespace mullion {
 
 WMTColorSpace ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
   switch (color_space) {
@@ -135,7 +135,7 @@ public:
     }
 
     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
-                                 pDevice->GetDXMTDevice().queue().cmd_library,
+                                 pDevice->GetMullionDevice().queue().cmd_library,
                                  scale_factor, desc_.SampleDesc.Count, hWnd));
 
     frame_latency = kSwapchainLatency;
@@ -230,7 +230,7 @@ public:
     return factory_->QueryInterface(riid, parent);
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present(UINT sync_interval, UINT flags) final {
@@ -246,7 +246,7 @@ public:
     return backbuffers_[buffer_idx]->QueryInterface(riid, surface);
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
@@ -322,7 +322,7 @@ public:
       ERR("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     fullscreen_desc_.Windowed = FALSE;
     static_cast<MTLDXGIOutput *>(output.ptr())->SetFullscreen(true);
     monitor_ = desc.Monitor;
@@ -342,7 +342,7 @@ public:
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
     auto monitor = wsi::getWindowMonitor(hWnd);
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     fullscreen_desc_.Windowed = TRUE;
     static_cast<MTLDXGIOutput *>(target_.ptr())->SetFullscreen(false);
     target_ = nullptr;
@@ -452,7 +452,7 @@ public:
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format,
@@ -510,7 +510,7 @@ public:
     std::vector<Com<D3D11ResourceCommon, false>> backbuffers(sequential ? desc.BufferCount : 1);
     for (UINT i = 0; i < backbuffers.size(); i++) {
       Com<D3D11ResourceCommon> buffer;
-      HRESULT hr = dxmt::CreateDeviceTexture2D(
+      HRESULT hr = mullion::CreateDeviceTexture2D(
           device_, &backbuffer_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer)
       );
       if (FAILED(hr))
@@ -525,7 +525,7 @@ public:
       D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc;
       upscaled_desc_.Height *= scale_factor;
       upscaled_desc_.Width *= scale_factor;
-      HRESULT hr = dxmt::CreateDeviceTexture2D(
+      HRESULT hr = mullion::CreateDeviceTexture2D(
           device_, &upscaled_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled)
       );
       if (FAILED(hr))
@@ -552,7 +552,7 @@ public:
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeTarget(const DXGI_MODE_DESC *pDesc) final {
@@ -596,7 +596,7 @@ public:
         return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
       window_state_ = state;
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     if (pDesc->RefreshRate.Numerator != 0)
       fullscreen_desc_.RefreshRate = pDesc->RefreshRate;
     fullscreen_desc_.ScanlineOrdering = pDesc->ScanlineOrdering;
@@ -759,7 +759,7 @@ public:
     return SyncFrameState();
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags,
@@ -803,7 +803,7 @@ public:
                                                : init_refresh_rate_),
                  preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
 
-    auto &cmd_queue = device_->GetDXMTDevice().queue();
+    auto &cmd_queue = device_->GetMullionDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
     if (!native_view_)
@@ -1035,7 +1035,7 @@ public:
     return 0;
   }
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
                          DXGI_FORMAT Format, UINT SwapChainFlags,
                          const UINT *pCreationNodeMask,
@@ -1089,7 +1089,7 @@ private:
   HWND hWnd;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
-  wsi::DXMTWindowState window_state_;
+  wsi::MullionWindowState window_state_;
   uint32_t frame_latency;
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   double init_refresh_rate_ = DBL_MAX;
@@ -1097,7 +1097,7 @@ private:
   HUDState hud;
   Rc<Presenter> presenter;
   ModeSetGuard modeset_guard_;
-  dxmt::mutex mutex_;
+  mullion::mutex mutex_;
 
   bool handle_alt_tab_;
 
@@ -1163,4 +1163,4 @@ CreateSwapChain(
   return S_OK;
 };
 
-} // namespace dxmt
+} // namespace mullion

@@ -166,7 +166,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD="" \
             -DLLVM_BUILD_TOOLS=Off \
             -DBUG_REPORT_URL="https://github.com/dttdrv/mullion" \
-            -DPACKAGE_VENDOR="DXMT" \
+            -DPACKAGE_VENDOR="Mullion" \
             -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
             -G Ninja
           cmake --build ./toolchains/llvm-darwin-build
@@ -222,7 +222,7 @@ jobs:
             -DCMAKE_SYSROOT="$(pwd)/toolchains/${{ env.LLVM_MINGW_DIR }}" \
             -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
             -DBUG_REPORT_URL="https://github.com/dttdrv/mullion" \
-            -DPACKAGE_VENDOR="DXMT" \
+            -DPACKAGE_VENDOR="Mullion" \
             -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
             -G Ninja
           cmake --build ./toolchains/llvm-build
@@ -270,7 +270,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD="" \
             -DLLVM_BUILD_TOOLS=Off \
             -DBUG_REPORT_URL="https://github.com/dttdrv/mullion" \
-            -DPACKAGE_VENDOR="DXMT" \
+            -DPACKAGE_VENDOR="Mullion" \
             -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
             -G Ninja
           cmake --build ./toolchains/llvm-darwin-arm64-build
@@ -716,16 +716,16 @@ jobs:
           path: ./combined/${{ env.PACKAGE_TAG }}
 
       - name: Create Tarball
-        run: tar -czf dxmt-${{ env.PACKAGE_TAG }}.tar.gz -C ./combined --exclude='*.a' ${{ env.PACKAGE_TAG }}
+        run: tar -czf mullion-${{ env.PACKAGE_TAG }}.tar.gz -C ./combined --exclude='*.a' ${{ env.PACKAGE_TAG }}
 
       - name: Generate Artifact Attestation
         uses: actions/attest-build-provenance@v1
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          subject-path: dxmt-${{ env.PACKAGE_TAG }}.tar.gz
+          subject-path: mullion-${{ env.PACKAGE_TAG }}.tar.gz
 
       - name: Upload Combined Artifact
         uses: actions/upload-artifact@v6
         with:
-          name: dxmt-${{ env.PACKAGE_TAG }}
-          path: dxmt-${{ env.PACKAGE_TAG }}.tar.gz
+          name: mullion-${{ env.PACKAGE_TAG }}
+          path: mullion-${{ env.PACKAGE_TAG }}.tar.gz

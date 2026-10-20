@@ -303,7 +303,7 @@ struct tri_patch {
 void generate_workload_quad(
     int patch_index, thread int *out_next, object_data int *out_buffer, int capacity, int partition,
     float in0, float in1, float out0, float out1, float out2, float out3
-) asm("dxmt.generate_workload.quad");
+) asm("mullion.generate_workload.quad");
 
 void
 generate_workload_quad(
@@ -346,7 +346,7 @@ generate_workload_quad(
 void generate_workload_triangle(
     int patch_index, thread int *out_next, object_data int *out_buffer, int capacity, int partition,
     float in, float out0, float out1, float out2
-) asm("dxmt.generate_workload.triangle");
+) asm("mullion.generate_workload.triangle");
 
 void
 generate_workload_triangle(
@@ -383,7 +383,7 @@ generate_workload_triangle(
 void generate_workload_isoline(
     int patch_index, thread int *out_next, object_data int *out_buffer, int capacity, int partition,
     float density, float detail
-) asm("dxmt.generate_workload.isoline");
+) asm("mullion.generate_workload.isoline");
 
 void
 generate_workload_isoline(
@@ -429,7 +429,7 @@ point(tess_edge edge, int i) {
   return float2(uv) / 65536.0f;
 }
 
-int get_domain_patch_index(int workload_index, object_data int *data) asm("dxmt.get_domain_patch_index");
+int get_domain_patch_index(int workload_index, object_data int *data) asm("mullion.get_domain_patch_index");
 
 int
 get_domain_patch_index(int workload_index, object_data int *data) {
@@ -458,7 +458,7 @@ workload_vertex(object_data tess_workload &workload, int index) {
 }
 
 domain_location get_domain_location(int workload_index, int thread_index, object_data int *data) asm(
-    "dxmt.get_domain_location"
+    "mullion.get_domain_location"
 );
 
 domain_location
@@ -583,7 +583,7 @@ generate_triangles(int workload_index, object_data int *data, Mesh mesh, threadg
 }
 
 void generatePrimitiveTriangle(int workload_index, object_data int *data, Mesh mesh, threadgroup uint *behind) asm(
-    "dxmt.domain_generate_primitives.triangle"
+    "mullion.domain_generate_primitives.triangle"
 );
 
 void
@@ -592,7 +592,7 @@ generatePrimitiveTriangle(int workload_index, object_data int *data, Mesh mesh, 
 }
 
 void generatePrimitiveTriangleCCW(int workload_index, object_data int *data, Mesh mesh, threadgroup uint *behind) asm(
-    "dxmt.domain_generate_primitives.triangle_ccw"
+    "mullion.domain_generate_primitives.triangle_ccw"
 );
 
 void
@@ -601,7 +601,7 @@ generatePrimitiveTriangleCCW(int workload_index, object_data int *data, Mesh mes
 }
 
 void generatePrimitiveLine(int workload_index, object_data int *data, Mesh mesh, threadgroup uint *behind) asm(
-    "dxmt.domain_generate_primitives.line"
+    "mullion.domain_generate_primitives.line"
 );
 
 void
@@ -621,7 +621,7 @@ generatePrimitiveLine(int workload_index, object_data int *data, Mesh mesh, thre
 }
 
 void generatePrimitivePoint(int workload_index, object_data int *data, Mesh mesh, threadgroup uint *behind) asm(
-    "dxmt.domain_generate_primitives.point"
+    "mullion.domain_generate_primitives.point"
 );
 
 void
@@ -663,7 +663,7 @@ primitive_vertex(object_data tess_workload &workload, int n, int corner, int ver
 
 domain_location get_domain_primitive_location(
     int workload_index, int primitive, int corner, int vertices, int ccw, object_data int *data
-) asm("dxmt.get_domain_primitive_location");
+) asm("mullion.get_domain_primitive_location");
 
 // counter-clockwise triangles have their second and third vertices exchanged, as generate_triangles does
 domain_location
@@ -678,7 +678,7 @@ get_domain_primitive_location(
 // of its own: a thread's is a corner of one
 domain_location get_domain_piece_location(
     int workload_index, int first, int thread_index, int count, int vertices, int ccw, object_data int *data
-) asm("dxmt.get_domain_piece_location");
+) asm("mullion.get_domain_piece_location");
 
 domain_location
 get_domain_piece_location(
@@ -699,7 +699,7 @@ get_domain_piece_location(
 
 void generate_piece(
     int workload_index, int first, int count, int vertices, object_data int *data, Mesh mesh, threadgroup uint *behind
-) asm("dxmt.domain_generate_piece");
+) asm("mullion.domain_generate_piece");
 
 void
 generate_piece(

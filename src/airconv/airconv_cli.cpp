@@ -113,7 +113,7 @@ struct LLVMDisDiagnosticHandler : public DiagnosticHandler {
 };
 } // namespace
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 llvm::Error convertDXBC(
   sm50_shader_t pShader, const char *name, llvm::LLVMContext &context,
   llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
     auto bytes = MemRef.getBuffer();
     unsigned libraries = 0;
     for (size_t at = bytes.find("MTLB"); at != StringRef::npos; at = bytes.find("MTLB", at)) {
-      dxmt::metallib::MTLBHeader header;
+      mullion::metallib::MTLBHeader header;
       if (bytes.size() - at < sizeof(header)) {
         errs() << "Truncated Metal library header at " << at << '\n';
         return 1;
@@ -238,7 +238,7 @@ int main(int argc, char **argv) {
   }
 
   Module M("default", Context);
-  dxmt::initializeModule(M);
+  mullion::initializeModule(M);
 
   sm50_shader_t sm50;
   sm50_error_t err;
@@ -278,9 +278,9 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_hull, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
+    if (auto err = mullion::dxbc::convert_dxbc_tesselator_domain_shader(
+          (mullion::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+          (mullion::dxbc::SM50ShaderInternal *)sm50_hull, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
       return 1;
@@ -306,8 +306,8 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_vertex, (dxmt::dxbc::SM50ShaderInternal *)sm50,
+    if (auto err = mullion::dxbc::convert_dxbc_vertex_hull_shader(
+          (mullion::dxbc::SM50ShaderInternal *)sm50_vertex, (mullion::dxbc::SM50ShaderInternal *)sm50,
           "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
@@ -334,8 +334,8 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, (dxmt::dxbc::SM50ShaderInternal *)sm50_hull,
+    if (auto err = mullion::dxbc::convert_dxbc_vertex_hull_shader(
+          (mullion::dxbc::SM50ShaderInternal *)sm50, (mullion::dxbc::SM50ShaderInternal *)sm50_hull,
           "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
@@ -362,9 +362,9 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_geometry_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_vertex, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
+    if (auto err = mullion::dxbc::convert_dxbc_geometry_shader(
+          (mullion::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+          (mullion::dxbc::SM50ShaderInternal *)sm50_vertex, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
       return 1;
@@ -390,16 +390,16 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_geometry, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
+    if (auto err = mullion::dxbc::convert_dxbc_vertex_for_geometry_shader(
+          (mullion::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+          (mullion::dxbc::SM50ShaderInternal *)sm50_geometry, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
       return 1;
     }
   } else {
     if (auto err =
-          dxmt::dxbc::convertDXBC(sm50, "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data)) {
+          mullion::dxbc::convertDXBC(sm50, "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data)) {
       errs() << err << '\n';
       return 1;
     }
@@ -410,13 +410,13 @@ int main(int argc, char **argv) {
   if (OptLevelO0) {
     // do nothing
   } else {
-    if (!dxmt::runOptimizationPasses(M, errs()))
+    if (!mullion::runOptimizationPasses(M, errs()))
       return 1;
   }
 
-  dxmt::linkMSAD(M);
-  dxmt::linkSamplePos(M);
-  dxmt::linkTessellation(M);
+  mullion::linkMSAD(M);
+  mullion::linkSamplePos(M);
+  mullion::linkTessellation(M);
 
   std::error_code EC;
   std::unique_ptr<ToolOutputFile> Out(new ToolOutputFile(
@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
   if (EmitLLVM) {
     M.print(Out->os(), nullptr, PreserveAssemblyUseListOrder);
   } else if (EmitMetallib) {
-    dxmt::metallib::MetallibWriter writer;
+    mullion::metallib::MetallibWriter writer;
     writer.Write(M, Out->os());
   } else {
     WriteBitcodeToFile(

@@ -20,12 +20,12 @@
 #include "dxbc_converter.hpp"
 #include "dxbc_root_signature.hpp"
 #include "shader_common.hpp"
-#include "../dxmt/dxmt_command_constants.hpp"
+#include "../mullion/mullion_command_constants.hpp"
 #include "llvm/IR/DerivedTypes.h"
 #include <algorithm>
 #include <cassert>
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 using namespace llvm::air;
 
@@ -368,9 +368,9 @@ setup_binding_rootsig(
     uint32_t root_sig_slot, uint32_t static_sampler_slot, bool local
 ) {
   using namespace microsoft;
-  using namespace dxmt::dxbc;
-  using namespace dxmt::air;
-  using namespace dxmt::shader::common;
+  using namespace mullion::dxbc;
+  using namespace mullion::air;
+  using namespace mullion::shader::common;
 
   auto binding_map = std::make_unique<RootSignatureBindingMap>();
   binding_map->SparseBufferMappingsIndex = func_signature.DefineInput(air::ArgumentBindingBuffer{
@@ -801,4 +801,4 @@ combine_bindings(std::unique_ptr<BindingMap> first, std::unique_ptr<BindingMap> 
   return combined;
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

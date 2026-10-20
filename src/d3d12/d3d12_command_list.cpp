@@ -21,13 +21,13 @@
 #include "d3d12_acceleration_structure.hpp"
 #include "airconv_ray.h"
 #include "com/com_pointer.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_geometry.hpp"
-#include "dxmt_command.hpp"
+#include "mullion_format.hpp"
+#include "mullion_geometry.hpp"
+#include "mullion_command.hpp"
 #include <span>
 #include "util_env.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 enum class DirtyState {
   VertexBuffer,
@@ -1036,8 +1036,8 @@ public:
         SM50_BINDING_INDEX_PATCH_SIZE
     );
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset + sizeof(inputs), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
-    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-    cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
+    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw>();
+    cmd.type = WMTRenderCommandMullionTessellationMeshDraw;
     cmd.draw_arguments_offset = Offset + sizeof(inputs);
     cmd.instance_count = Args.InstanceCount;
     cmd.threads_per_patch = pso_graphics_->threads_per_patch;
@@ -1129,8 +1129,8 @@ public:
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, SM50_BINDING_INDEX_INDEX_BUFFER);
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset + sizeof(View), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
     auto draw = [&] {
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-      cmd.type = WMTRenderCommandDXMTGeometryDraw;
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_mullion_geometry_draw>();
+      cmd.type = WMTRenderCommandMullionGeometryDraw;
       cmd.draw_arguments_offset = Offset + sizeof(View);
       cmd.warp_count = warps;
       cmd.instance_count = Args.InstanceCount;
@@ -3568,7 +3568,7 @@ public:
       pso.type = WMTComputeCommandSetPSO;
       pso.pso = device_->acceleration_structure_instances;
       pso.threadgroup_size = {device_->GetSIMDWidth(), 1, 1};
-      // DXMTInstanceConversion
+      // MullionInstanceConversion
       struct {
         uint64_t instances, kept;
         uint32_t pointers, count;
@@ -3808,7 +3808,7 @@ public:
   }
 
   // the state object's kernel runs a thread per ray generation shader invocation, with the compute root signature's
-  // arguments as the global ones (dispatch_rays in dxmt_command.metal)
+  // arguments as the global ones (dispatch_rays in mullion_command.metal)
   void STDMETHODCALLTYPE
   DispatchRays(const D3D12_DISPATCH_RAYS_DESC *pDesc) {
     SM50_RAY_DISPATCH dispatch{
@@ -3942,4 +3942,4 @@ CreateClosedCommandList(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, R
   return cmd_list->QueryInterface(riid, ppCommandList);
 }
 
-}; // namespace dxmt
+}; // namespace mullion

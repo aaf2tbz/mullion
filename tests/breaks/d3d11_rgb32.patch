@@ -1,6 +1,6 @@
 # restores the 20-of-60-byte RGB32 FLOAT upload
---- a/src/dxmt/dxmt_format.cpp
-+++ b/src/dxmt/dxmt_format.cpp
+--- a/src/mullion/mullion_format.cpp
++++ b/src/mullion/mullion_format.cpp
 @@ -565,11 +565,10 @@
      break;
    }

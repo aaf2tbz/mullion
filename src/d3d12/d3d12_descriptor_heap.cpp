@@ -21,10 +21,10 @@
 #include "d3d12_pageable.hpp"
 #include "com/com_pointer.hpp"
 #include "airconv_public.h"
-#include "dxmt_sampler.hpp"
+#include "mullion_sampler.hpp"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 struct SRVTextureGPUStorage {
   uint64_t resource_id;
@@ -689,4 +689,4 @@ CreateDescriptorHeap(
   return E_INVALIDARG;
 }
 
-} // namespace dxmt
+} // namespace mullion

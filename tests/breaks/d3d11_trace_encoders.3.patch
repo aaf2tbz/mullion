@@ -1,7 +1,7 @@
 # omit present traces
-diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
---- a/src/dxmt/dxmt_presenter.cpp
-+++ b/src/dxmt/dxmt_presenter.cpp
+diff --git a/src/mullion/mullion_presenter.cpp b/src/mullion/mullion_presenter.cpp
+--- a/src/mullion/mullion_presenter.cpp
++++ b/src/mullion/mullion_presenter.cpp
 @@ -189,7 +189,7 @@
    auto encoder = cmdbuf.renderCommandEncoder(info);
    if (encoder_count) {

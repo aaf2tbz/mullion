@@ -5,7 +5,7 @@
 #include "llvm/IR/Function.h"
 #include <memory>
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 using namespace llvm::air;
 
@@ -200,4 +200,4 @@ setup_binding_table2(
   return binding_map;
 };
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

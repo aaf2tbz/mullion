@@ -2,7 +2,7 @@
 
 #include "config/config.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 /**
  * \brief DXGI options
@@ -22,4 +22,4 @@ struct DxgiOptions {
   bool forceSDR;
 };
 
-} // namespace dxmt
+} // namespace mullion

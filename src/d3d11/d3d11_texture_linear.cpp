@@ -1,13 +1,13 @@
 #include "d3d11_private.h"
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
+#include "mullion_dynamic.hpp"
+#include "mullion_format.hpp"
+#include "mullion_staging.hpp"
+#include "mullion_texture.hpp"
 #include "d3d11_resource.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 #pragma region DynamicLinearTexture
 
@@ -207,4 +207,4 @@ CreateDynamicLinearTexture1D(
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace mullion

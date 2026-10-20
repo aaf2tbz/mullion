@@ -1,6 +1,6 @@
 # the GS dispatch marshal zeroes the filled sizes of an indirect stream output draw and no total
---- a/src/dxmt/dxmt_command.metal
-+++ b/src/dxmt/dxmt_command.metal
+--- a/src/mullion/mullion_command.metal
++++ b/src/mullion/mullion_command.metal
 @@ -624,7 +624,7 @@
          }
        } else if (runs) {

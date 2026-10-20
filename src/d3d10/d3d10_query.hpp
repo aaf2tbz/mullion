@@ -2,7 +2,7 @@
 
 #include "d3d10_util.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 // Direct3D 10's face of a query, and of one that is a predicate
 class MTLD3D10Query final : public ID3D10Predicate {
@@ -94,4 +94,4 @@ public:
   }
 };
 
-}; // namespace dxmt
+}; // namespace mullion

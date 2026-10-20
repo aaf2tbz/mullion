@@ -1,8 +1,8 @@
 # drop non-indexed draw counts
-diff --git a/src/dxmt/dxmt_diag.hpp b/src/dxmt/dxmt_diag.hpp
+diff --git a/src/mullion/mullion_diag.hpp b/src/mullion/mullion_diag.hpp
 index 1055177..f3ef520 100644
---- a/src/dxmt/dxmt_diag.hpp
-+++ b/src/dxmt/dxmt_diag.hpp
+--- a/src/mullion/mullion_diag.hpp
++++ b/src/mullion/mullion_diag.hpp
 @@ -117,7 +117,7 @@ PipelineRuns(Head head, Name name) {
          break;
        case WMTRenderCommandDraw: {

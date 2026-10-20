@@ -90,10 +90,10 @@ denorm_binary(uint a, uint b) {
   return denorm_pack(value, exponent, sign);
 }
 
-uint denorm_add(uint x, uint y) asm("dxmt.denorm.fadd");
-uint denorm_sub(uint x, uint y) asm("dxmt.denorm.fsub");
-uint denorm_mul(uint x, uint y) asm("dxmt.denorm.fmul");
-uint denorm_div(uint x, uint y) asm("dxmt.denorm.fdiv");
+uint denorm_add(uint x, uint y) asm("mullion.denorm.fadd");
+uint denorm_sub(uint x, uint y) asm("mullion.denorm.fsub");
+uint denorm_mul(uint x, uint y) asm("mullion.denorm.fmul");
+uint denorm_div(uint x, uint y) asm("mullion.denorm.fdiv");
 uint denorm_add(uint x, uint y) { return denorm_binary<denorm_op::add>(x, y); }
 uint denorm_sub(uint x, uint y) { return denorm_binary<denorm_op::sub>(x, y); }
 uint denorm_mul(uint x, uint y) { return denorm_binary<denorm_op::mul>(x, y); }

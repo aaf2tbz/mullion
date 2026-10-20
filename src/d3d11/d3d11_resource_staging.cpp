@@ -1,9 +1,9 @@
 #include "d3d11_private.h"
 #include "d3d11_enumerable.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
+#include "mullion_dynamic.hpp"
+#include "mullion_staging.hpp"
 #include "d3d11_resource.hpp"
-namespace dxmt {
+namespace mullion {
 
 #pragma region StagingBuffer
 
@@ -169,4 +169,4 @@ CreateStagingTexture3D(MTLD3D11Device *pDevice,
                                                       pInitialData, ppTexture);
 }
 
-} // namespace dxmt
+} // namespace mullion

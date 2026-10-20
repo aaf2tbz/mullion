@@ -1,14 +1,14 @@
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_texture.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_dynamic.hpp"
+#include "mullion_staging.hpp"
+#include "mullion_texture.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_enumerable.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 #pragma region DynamicTexture
 
@@ -171,7 +171,7 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
     if (pInitialData)
       for (auto sub : EnumerateSubresources(finalDesc)) {
         auto &data = pInitialData[sub.SubresourceId];
-        pDevice->GetDXMTDevice().queue().initializer.initWithData(
+        pDevice->GetMullionDevice().queue().initializer.initWithData(
             texture->chroma.ptr(), texture->chroma->current(), sub.ArraySlice, sub.MipLevel,
             ptr_add(data.pSysMem, std::uintptr_t(data.SysMemPitch) * texture->height()), data.SysMemPitch, 0, 0
         );
@@ -182,7 +182,7 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
     if (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
       for (auto sub : EnumerateSubresources(finalDesc)) {
         auto &data = pInitialData[sub.SubresourceId];
-        pDevice->GetDXMTDevice().queue().initializer.initWithData(
+        pDevice->GetMullionDevice().queue().initializer.initWithData(
             texture.ptr(), default_allocation.ptr(), sub.ArraySlice, sub.MipLevel, data.pSysMem,
             data.SysMemPitch, data.SysMemSlicePitch, format.Flag
         );
@@ -231,4 +231,4 @@ CreateDynamicTexture3D(MTLD3D11Device *pDevice,
 
 #pragma endregion
 
-} // namespace dxmt
+} // namespace mullion

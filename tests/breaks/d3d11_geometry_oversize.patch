@@ -1,6 +1,6 @@
 # the CPU collects and clears the warning before its command buffer executes
---- a/src/dxmt/dxmt_command_queue.cpp
-+++ b/src/dxmt/dxmt_command_queue.cpp
+--- a/src/mullion/mullion_command_queue.cpp
++++ b/src/mullion/mullion_command_queue.cpp
 @@ -267,6 +267,17 @@
      diag::Write(diag::Line("span", "encode", seq, GetCurrentThreadId(), began, diag::Now() - began));
    if (profile_)

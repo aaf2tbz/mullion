@@ -6,7 +6,7 @@
 
 using namespace llvm;
 
-namespace dxmt::air {
+namespace mullion::air {
 
 llvm::StructType *
 get_or_create_struct(llvm::LLVMContext &Ctx, llvm::StringRef Name) {
@@ -50,19 +50,19 @@ AirType::AirType(LLVMContext &context) : context(context) {
   _float2 = FixedVectorType::get(_float, 2);
   _char2 = FixedVectorType::get(_byte, 2);
 
-  _dxmt_vertex_buffer_entry = StructType::create(
+  _mullion_vertex_buffer_entry = StructType::create(
     context,
     {
       _byte->getPointerTo((uint32_t)AddressSpace::device),
       _int, // stride
       _int, // length
     },
-    "dxmt_vertex_buffer_entry"
+    "mullion_vertex_buffer_entry"
   );
   
 
 
-  _dxmt_draw_arguments = StructType::create(
+  _mullion_draw_arguments = StructType::create(
     context,
     {
       _int, // vertex count
@@ -70,10 +70,10 @@ AirType::AirType(LLVMContext &context) : context(context) {
       _int, // start vertex
       _int, // start instance
     },
-    "dxmt_draw_arguments"
+    "mullion_draw_arguments"
   );
 
-  _dxmt_draw_indexed_arguments = StructType::create(
+  _mullion_draw_indexed_arguments = StructType::create(
     context,
     {
       _int, // index count
@@ -82,7 +82,7 @@ AirType::AirType(LLVMContext &context) : context(context) {
       _int, // base vertex
       _int, // base instance
     },
-    "dxmt_draw_indexed_arguments"
+    "mullion_draw_indexed_arguments"
   );
 
   auto tyOpaque = get_or_create_struct(context, "opaque");
@@ -137,4 +137,4 @@ Type *AirType::getTypeByMetalTypeName(const std::string &name) {
   return typeContext[name];
 }
 
-} // namespace dxmt::air
+} // namespace mullion::air

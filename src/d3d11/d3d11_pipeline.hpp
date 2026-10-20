@@ -62,7 +62,7 @@ struct MTL_COMPILED_TESSELLATION_MESH_PIPELINE {
 namespace std {
 template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
   size_t operator()(const MTL_GRAPHICS_PIPELINE_DESC &v) const noexcept {
-    dxmt::HashState state;
+    mullion::HashState state;
     state.add((size_t)v.VertexShader);
     state.add((size_t)v.PixelShader);
     state.add((size_t)v.HullShader);
@@ -157,7 +157,7 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
 };
 } // namespace std
 
-namespace dxmt {
+namespace mullion {
 
 class MTLCompiledGraphicsPipeline : public ThreadpoolWork {
 public:
@@ -196,4 +196,4 @@ CreateGeometryPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDes
 std::unique_ptr<MTLCompiledTessellationMeshPipeline>
 CreateTessellationMeshPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);
 
-}; // namespace dxmt
+}; // namespace mullion

@@ -3,7 +3,7 @@
 // the Apple7 and Apple8 GPU families." WWDC22 10162, 8:50: "payload size can't exceed the limit of 16 kilobytes."
 // and 11:54: "The total size of metal::mesh cannot exceed 16 kilobytes." each object reserves one payload and a
 // mesh for each primitive and geometry instance; if that allocation fits once, at least one group must fit.
-#include "../../src/dxmt/dxmt_geometry.hpp"
+#include "../../src/mullion/mullion_geometry.hpp"
 #include <cstdio>
 #include <vector>
 
@@ -24,11 +24,11 @@ main() {
     // all register counts through a payload full of float4s cross every warp sizing boundary, including no room
     for (uint32_t registers = 0; registers <= SM50_GEOMETRY_PAYLOAD_SIZE / sizeof(float[4]) + 1; registers++)
       for (uint32_t instances : {0u, 1u, 32u}) {
-        auto warp = dxmt::get_gs_warp(topology, registers);
+        auto warp = mullion::get_gs_warp(topology, registers);
         uint64_t allocation = payload_bytes + uint64_t(warp.primitives) * instances * mesh_bytes;
         for (uint64_t budget : {uint64_t(0), allocation - 1, allocation, allocation + 1, draw_bytes})
           for (uint64_t grid : {uint64_t(1), uint64_t(UINT32_MAX)}) {
-            auto groups = dxmt::get_gs_max_object_threadgroups(topology, registers, instances, grid, budget);
+            auto groups = mullion::get_gs_max_object_threadgroups(topology, registers, instances, grid, budget);
             checked++;
             if (groups > grid || groups * allocation > budget || (budget >= allocation && !groups)) {
               if (wrong++ < 16)

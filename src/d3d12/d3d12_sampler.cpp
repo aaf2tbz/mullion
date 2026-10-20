@@ -19,7 +19,7 @@
 #include "Metal.hpp"
 #include "d3d12_device.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 constexpr WMTCompareFunction kCompareFunctionMap[] = {
     WMTCompareFunctionNever, // padding 0
@@ -203,4 +203,4 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_SAMPLE
   return custom;
 }
 
-} // namespace dxmt
+} // namespace mullion

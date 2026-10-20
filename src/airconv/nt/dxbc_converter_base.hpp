@@ -31,7 +31,7 @@
 #include "tl/generator.hpp"
 #include "ftl.hpp"
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 using mask_t = uint32_t;
 
@@ -707,4 +707,4 @@ private:
   io_binding_map &res;
 };
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

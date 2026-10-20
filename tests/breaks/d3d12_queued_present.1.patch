@@ -7,6 +7,6 @@
        // a queued Present can release the queue's last reference on the thread its destructor joins
 -      if (held_thread_id_ == GetCurrentThreadId())
 +      if (false)
-         dxmt::thread([this] { ReleasePrivate(); }).detach();
+         mullion::thread([this] { ReleasePrivate(); }).detach();
        else
          ReleasePrivate();

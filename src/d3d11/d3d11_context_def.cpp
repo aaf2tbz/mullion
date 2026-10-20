@@ -1,12 +1,12 @@
 #include "d3d11_device.hpp"
 #include "d3d11_private.h"
 #include "d3d11_context_impl.cpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_command_queue.hpp"
-#include "dxmt_dynamic.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_command_queue.hpp"
+#include "mullion_dynamic.hpp"
 #include <unordered_set>
 
-namespace dxmt {
+namespace mullion {
 
 struct DynamicBufferAllocation {
   BufferAllocation * allocation;
@@ -107,7 +107,7 @@ class MTLD3D11DeferredContext : public DeferredContextBase {
 public:
   MTLD3D11DeferredContext(MTLD3D11Device *pDevice, UINT ContextFlags) :
       DeferredContextBase(pDevice, ctx_state, mutex),
-      ctx_state({pDevice->GetDXMTDevice().queue(), {}}),
+      ctx_state({pDevice->GetMullionDevice().queue(), {}}),
       context_flag(ContextFlags) {
     device->CreateCommandList((ID3D11CommandList **)&ctx_state.current_cmdlist);
   }
@@ -544,13 +544,13 @@ public:
 
   void
   RecycleCommandList(ID3D11CommandList *cmdlist) override {
-    std::unique_lock<dxmt::mutex> lock(mutex);
+    std::unique_lock<mullion::mutex> lock(mutex);
     free_commandlist.push_back((MTLD3D11CommandList *)cmdlist);
   };
 
   void
   CreateCommandList(ID3D11CommandList **ppCommandList) override {
-    std::unique_lock<dxmt::mutex> lock(mutex);
+    std::unique_lock<mullion::mutex> lock(mutex);
     if (!free_commandlist.empty()) {
       free_commandlist.back()->QueryInterface(IID_PPV_ARGS(ppCommandList));
       free_commandlist.pop_back();
@@ -566,7 +566,7 @@ private:
   std::vector<MTLD3D11CommandList *> free_commandlist;
   std::vector<std::unique_ptr<MTLD3D11CommandList>> instances;
   MTLD3D11Device *device;
-  dxmt::mutex mutex;
+  mullion::mutex mutex;
 };
 
 std::unique_ptr<MTLD3D11CommandListPoolBase>
@@ -574,4 +574,4 @@ InitializeCommandListPool(MTLD3D11Device *device) {
   return std::make_unique<MTLD3D11CommandListPool>(device);
 }
 
-}; // namespace dxmt
+}; // namespace mullion

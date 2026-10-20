@@ -1,12 +1,12 @@
 #pragma once
 #include "com/com_guid.hpp"
 #include "d3d11_device_child.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_occlusion_query.hpp"
+#include "mullion_buffer.hpp"
+#include "mullion_query.hpp"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_query.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 /**
 
@@ -205,4 +205,4 @@ HRESULT CreateStreamOutputQuery(MTLD3D11Device *pDevice,
                                 const D3D11_QUERY_DESC1 *pDesc,
                                 ID3D11Query1 **ppQuery);
 
-} // namespace dxmt
+} // namespace mullion

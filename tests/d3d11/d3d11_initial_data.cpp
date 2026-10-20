@@ -46,7 +46,7 @@ main() {
                     device->CreateBuffer(&zero, nullptr, nullptr)) == E_INVALIDARG,
            "zero ByteWidth returned success");
     for (UINT use = D3D11_USAGE_DEFAULT; use <= D3D11_USAGE_STAGING; use++)
-      for (UINT boundary = 2; boundary <= 2 * DXMT_PAGE_SIZE; boundary *= 2)
+      for (UINT boundary = 2; boundary <= 2 * MULLION_PAGE_SIZE; boundary *= 2)
         for (UINT size : {boundary - 1, boundary, boundary + 1})
           for (UINT row_pitch : {0u, ~size})
             for (UINT slice_pitch : {0u, ~size}) {

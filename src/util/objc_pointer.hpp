@@ -5,7 +5,7 @@
 #include <cassert>
 #include <debugapi.h>
 
-namespace dxmt {
+namespace mullion {
 
 #define __assert(cond)                                                         \
   if (!(cond) && IsDebuggerPresent()) {                                        \
@@ -72,7 +72,7 @@ public:
   void release() = delete;
 
   T *operator->() const {
-#ifdef DXMT_DEBUG
+#ifdef MULLION_DEBUG
     if (m_ptr == nullptr) {
       __builtin_trap();
     }
@@ -129,4 +129,4 @@ template <typename T> inline Obj<T> transfer(T *object) {
   return obj;
 }
 
-} // namespace dxmt
+} // namespace mullion

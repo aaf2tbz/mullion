@@ -19,9 +19,9 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 #include "com/com_pointer.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_format.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
@@ -354,4 +354,4 @@ CreatePlacedBuffer(
   return buffer->QueryInterface(riid, ppResource);
 }
 
-} // namespace dxmt
+} // namespace mullion

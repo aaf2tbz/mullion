@@ -60,7 +60,7 @@ llvm_ld_flags = [
 ]
 
 airconv_forward_dep = declare_dependency(
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ mullion_include_path, include_directories('.') ],
 )
 
 airconv_shaders = [
@@ -85,7 +85,7 @@ if build_airconv_for_windows
 llvm_include_path = include_directories('../../toolchains/llvm/include') # FIXME: in favor of path relative to project
 
 airconv_lib = static_library('airconv', airconv_src,
-  include_directories : [ dxmt_include_path, llvm_include_path ],
+  include_directories : [ mullion_include_path, llvm_include_path ],
   cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
   dependencies        : [ dxbc_parser_dep ],
   link_args           : llvm_ld_flags
@@ -93,14 +93,14 @@ airconv_lib = static_library('airconv', airconv_src,
 
 airconv_dep = declare_dependency(
   link_with           : [ airconv_lib ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ mullion_include_path, include_directories('.') ],
   link_args           : [ llvm_ld_flags, llvm_deps ] # meh
 )
 
 lib_d3dcompiler = cpp.find_library('d3dcompiler_47')
 
 executable('airconv', airconv_src + airconv_cli_src,
-  include_directories : [ dxmt_include_path, llvm_include_path ],
+  include_directories : [ mullion_include_path, llvm_include_path ],
   cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
   dependencies        : [ dxbc_parser_dep, lib_d3dcompiler ],
   link_args           : [ llvm_ld_flags, llvm_deps ]
@@ -108,6 +108,6 @@ executable('airconv', airconv_src + airconv_cli_src,
 
 endif
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
+if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not mullion_crossbuild
   subdir('darwin')
 endif

@@ -3,7 +3,7 @@
 #include "air_builder.hpp"
 #include "llvm/IR/Value.h"
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 struct ConstantBufferDescriptor {
   llvm::Value *Pointer;
@@ -70,4 +70,4 @@ public:
   }
 };
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

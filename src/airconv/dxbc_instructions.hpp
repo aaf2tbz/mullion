@@ -28,7 +28,7 @@
 
 #define DXASSERT_DXBC(x) assert(x);
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 struct Swizzle {
   union {
@@ -878,4 +878,4 @@ BasicBlockCondition readCondition(
   const microsoft::D3D10ShaderBinary::CInstruction &Inst, uint32_t OpIdx,
   uint32_t phase
 );
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

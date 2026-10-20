@@ -8,13 +8,13 @@
 #include "dxgi_interfaces.h"
 #include "dxgi_output.hpp"
 #include "dxgi_options.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_presenter.hpp"
+#include "mullion_format.hpp"
+#include "mullion_presenter.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "wsi_monitor.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 /*
  * \see
@@ -138,20 +138,20 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
 
 // a monitor's gamma ramp is the monitor's, whichever output object set it: the identity until one does
 struct DXGIMonitorState {
-  DXMTGammaRamp gamma;
+  MullionGammaRamp gamma;
   std::atomic_uint fullscreens{0};
 };
 
 static DXGIMonitorState &
 MonitorState(HMONITOR monitor) {
-  static dxmt::mutex mutex;
+  static mullion::mutex mutex;
   static std::map<HMONITOR, DXGIMonitorState> ramps;
-  std::lock_guard<dxmt::mutex> lock(mutex);
+  std::lock_guard<mullion::mutex> lock(mutex);
   auto [ramp, added] = ramps.try_emplace(monitor);
   if (added)
-    for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++)
+    for (uint32_t i = 0; i < MULLION_GAMMA_CP_COUNT; i++)
       ramp->second.gamma.red[i] = ramp->second.gamma.green[i] = ramp->second.gamma.blue[i] =
-          float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
+          float(i) / float(MULLION_GAMMA_CP_COUNT - 1);
   return ramp->second;
 }
 
@@ -167,7 +167,7 @@ public:
 
   ~MTLDXGIOutputImpl() {}
 
-  const DXMTGammaRamp *
+  const MullionGammaRamp *
   STDMETHODCALLTYPE
   GetGammaRamp() override {
     return &monitor_state_.gamma;
@@ -321,9 +321,9 @@ public:
     gamma_caps->ScaleAndOffsetSupported = false;
     gamma_caps->MaxConvertedValue = 1.0f;
     gamma_caps->MinConvertedValue = 0.0f;
-    gamma_caps->NumGammaControlPoints = DXMT_GAMMA_CP_COUNT;
+    gamma_caps->NumGammaControlPoints = MULLION_GAMMA_CP_COUNT;
     for (uint32_t i = 0; i < gamma_caps->NumGammaControlPoints; i++)
-      gamma_caps->ControlPointPositions[i] = float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
+      gamma_caps->ControlPointPositions[i] = float(i) / float(MULLION_GAMMA_CP_COUNT - 1);
     return S_OK;
   }
 
@@ -333,7 +333,7 @@ public:
     if (gamma_control == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
-    for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+    for (uint32_t i = 0; i < MULLION_GAMMA_CP_COUNT; i++) {
       monitor_state_.gamma.red[i] = gamma_control->GammaCurve[i].Red;
       monitor_state_.gamma.green[i] = gamma_control->GammaCurve[i].Green;
       monitor_state_.gamma.blue[i] = gamma_control->GammaCurve[i].Blue;
@@ -350,7 +350,7 @@ public:
 
     gamma_control->Scale = { 1.0f, 1.0f, 1.0f };
     gamma_control->Offset = { 0.0f, 0.0f, 0.0f };
-    for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+    for (uint32_t i = 0; i < MULLION_GAMMA_CP_COUNT; i++) {
       gamma_control->GammaCurve[i].Red = monitor_state_.gamma.red[i];
       gamma_control->GammaCurve[i].Green = monitor_state_.gamma.green[i];
       gamma_control->GammaCurve[i].Blue = monitor_state_.gamma.blue[i];
@@ -667,4 +667,4 @@ Com<IDXGIOutput> CreateOutput(IMTLDXGIAdapter *pAadapter, HMONITOR monitor, Dxgi
   return Com<IDXGIOutput>::transfer(new MTLDXGIOutputImpl(pAadapter, monitor, options));
 };
 
-} // namespace dxmt
+} // namespace mullion

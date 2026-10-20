@@ -3,11 +3,11 @@
 #include "d3d11_device.hpp"
 #include "d3d11_shader.hpp"
 #include "d3d11_pipeline.hpp"
-#include "dxmt_shader_cache.hpp"
-#include "dxmt_stream_output.hpp"
+#include "mullion_shader_cache.hpp"
+#include "mullion_stream_output.hpp"
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/d3d12tokenizedprogramformat.hpp"
-#include "dxmt_tasks.hpp"
+#include "mullion_tasks.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include "util_md5.hpp"
@@ -17,7 +17,7 @@
 #include <cstring>
 #include <shared_mutex>
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D11InputLayout final
     : public MTLD3D11DeviceChild<IMTLD3D11InputLayout> {
@@ -80,7 +80,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
     // a pipeline asks for variants where it is made, and again where it is built
-    dxmt::mutex variants_mutex;
+    mullion::mutex variants_mutex;
 
   public:
     CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
@@ -120,7 +120,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       return arguments_info_buffer + reflection_.NumConstantBuffers;
     };
     virtual CompiledShader *get_shader(ShaderVariant variant) {
-      std::lock_guard<dxmt::mutex> lock(variants_mutex);
+      std::lock_guard<mullion::mutex> lock(variants_mutex);
       auto c = variants.insert({variant, nullptr});
       if (c.second) {
         c.first->second = std::visit(
@@ -134,7 +134,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     }
     virtual const Sha1Digest &sha1() { return sha1_; };
 
-#ifdef DXMT_DEBUG
+#ifdef MULLION_DEBUG
     void *bytecode;
     size_t bytecode_length;
 
@@ -202,26 +202,26 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
 
   std::unordered_map<MTL_INPUT_LAYOUT_DESC, std::unique_ptr<CachedInputLayout>> input_layouts;
-  dxmt::mutex mutex_ia_;
+  mullion::mutex mutex_ia_;
 
   StateObjectCache<MTL_STREAM_OUTPUT_DESC, IMTLD3D11StreamOutputLayout>
       so_layouts;
-  dxmt::mutex mutex_so_;
+  mullion::mutex mutex_so_;
 
   std::unordered_map<Sha1Digest, std::unique_ptr<CachedSM50Shader>> shaders_;
   std::shared_mutex mutex_shares;
 
   std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledGraphicsPipeline>> pipelines_;
-  dxmt::mutex mutex_;
+  mullion::mutex mutex_;
 
   std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledGeometryPipeline>> pipelines_gs_;
-  dxmt::mutex mutex_gs_;
+  mullion::mutex mutex_gs_;
 
   std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledTessellationMeshPipeline>> pipelines_ts_;
-  dxmt::mutex mutex_ts_;
+  mullion::mutex mutex_ts_;
 
   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
-  dxmt::mutex mutex_cs_;
+  mullion::mutex mutex_cs_;
 
   task_scheduler<ThreadpoolWork *> scheduler_;
 
@@ -250,7 +250,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       if (result != shaders_.end()) {
         return shaders_.at(sha1).get();
       }
-#ifdef DXMT_DEBUG
+#ifdef MULLION_DEBUG
       shader->bytecode = malloc(BytecodeLength);
       shader->bytecode_length = BytecodeLength;
       memcpy(shader->bytecode, pBytecode, BytecodeLength);
@@ -389,7 +389,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
                          const D3D11_INPUT_ELEMENT_DESC *pInputElementDesc,
                          UINT NumElements,
                          IMTLD3D11InputLayout **ppInputLayout) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_ia_);
+    std::lock_guard<mullion::mutex> lock(mutex_ia_);
     std::vector<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC> buffer(NumElements);
     uint32_t num_metal_ia_elements;
     HRESULT hr;
@@ -441,7 +441,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         desc.Strides[element.output_slot] =
             std::max<uint32_t>(desc.Strides[element.output_slot], element.offset + sizeof(uint32_t));
     desc.RasterizedStream = RasterizedStream;
-    std::lock_guard<dxmt::mutex> lock(mutex_so_);
+    std::lock_guard<mullion::mutex> lock(mutex_so_);
     return so_layouts.CreateStateObject(&desc, ppSOLayout);
   };
 
@@ -452,7 +452,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   void GetGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
                            MTLCompiledGraphicsPipeline **ppPipeline) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
 
     if (auto iter = pipelines_.find(*pDesc); iter != pipelines_.end()) {
       *ppPipeline = iter->second.get();
@@ -471,7 +471,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   void GetGeometryPipeline(
       MTL_GRAPHICS_PIPELINE_DESC *pDesc,
       MTLCompiledGeometryPipeline **ppPipeline) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_gs_);
+    std::lock_guard<mullion::mutex> lock(mutex_gs_);
 
     if (auto iter = pipelines_gs_.find(*pDesc); iter != pipelines_gs_.end()) {
       *ppPipeline = iter->second.get();
@@ -490,7 +490,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   void GetTessellationPipeline(MTL_GRAPHICS_PIPELINE_DESC * pDesc,
                                    MTLCompiledTessellationMeshPipeline *
                                        *ppPipeline) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_ts_);
+    std::lock_guard<mullion::mutex> lock(mutex_ts_);
 
     if (auto iter = pipelines_ts_.find(*pDesc); iter != pipelines_ts_.end()) {
       *ppPipeline = iter->second.get();
@@ -508,7 +508,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   void GetComputePipeline(MTL_COMPUTE_PIPELINE_DESC *pDesc,
                                   MTLCompiledComputePipeline **ppPipeline) override {
-   std::lock_guard<dxmt::mutex> lock(mutex_cs_);
+   std::lock_guard<mullion::mutex> lock(mutex_cs_);
 
     if (auto iter = pipelines_cs_.find(pDesc->ComputeShader); iter != pipelines_cs_.end()) {
       *ppPipeline = iter->second.get();
@@ -525,7 +525,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
 public:
   PipelineCache(MTLD3D11Device *pDevice) :
-      scache_(ShaderCache::getInstance(pDevice->GetDXMTDevice().metalVersion())),
+      scache_(ShaderCache::getInstance(pDevice->GetMullionDevice().metalVersion())),
       device(pDevice),
       blend_states(pDevice),
       so_layouts(pDevice) {};
@@ -536,4 +536,4 @@ InitializePipelineCache(MTLD3D11Device *device) {
   return std::make_unique<PipelineCache>(device);
 }
 
-}; // namespace dxmt
+}; // namespace mullion

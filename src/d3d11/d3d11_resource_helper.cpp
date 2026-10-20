@@ -1,12 +1,12 @@
 #include "d3d11_device.hpp"
 #include "d3d11_private.h"
-#include "dxmt_format.hpp"
+#include "mullion_format.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_1.h"
 #include "util_math.hpp"
 #include <bit>
 
-namespace dxmt {
+namespace mullion {
 
 template <>
 HRESULT
@@ -806,4 +806,4 @@ void UpgradeResourceDescription<D3D11_TEXTURE3D_DESC, D3D11_TEXTURE3D_DESC1>(
   dst.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
 }
 
-}; // namespace dxmt
+}; // namespace mullion

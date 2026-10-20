@@ -37,9 +37,9 @@ public:
   llvm::SmallVector<char, 0> buf;
 };
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
-inline dxmt::shader::common::ResourceType
+inline mullion::shader::common::ResourceType
 to_shader_resource_type(microsoft::D3D10_SB_RESOURCE_DIMENSION dim) {
   switch (dim) {
   case microsoft::D3D10_SB_RESOURCE_DIMENSION_UNKNOWN:
@@ -69,7 +69,7 @@ to_shader_resource_type(microsoft::D3D10_SB_RESOURCE_DIMENSION dim) {
   assert(0 && "invalid D3D10_SB_RESOURCE_DIMENSION");
 };
 
-inline dxmt::shader::common::ScalerDataType
+inline mullion::shader::common::ScalerDataType
 to_shader_scaler_type(microsoft::D3D10_SB_RESOURCE_RETURN_TYPE type) {
   switch (type) {
 
@@ -927,10 +927,10 @@ llvm::Error convertDXBC(
     return convert_dxil_ray_shader(pShaderInternal, name, context, module, pArgs);
   return llvm::make_error<UnsupportedFeature>("Not supported shader type");
 };
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc
 
-bool CheckGSBBIsPassThrough(dxmt::dxbc::BasicBlock *bb) {
-  using namespace dxmt::dxbc;
+bool CheckGSBBIsPassThrough(mullion::dxbc::BasicBlock *bb) {
+  using namespace mullion::dxbc;
   if (bb->instructions.any(patterns{
         [](InstNop &) { return false; }, [](InstMov &mov) { return false; },
         [](InstEmit &) { return false; }, [](InstCut &) { return false; },
@@ -940,8 +940,8 @@ bool CheckGSBBIsPassThrough(dxmt::dxbc::BasicBlock *bb) {
 
   return std::visit(
     patterns{
-      [](dxmt::dxbc::BasicBlockReturn) { return true; },
-      [](dxmt::dxbc::BasicBlockUnconditionalBranch uncond) {
+      [](mullion::dxbc::BasicBlockReturn) { return true; },
+      [](mullion::dxbc::BasicBlockUnconditionalBranch uncond) {
         return CheckGSBBIsPassThrough(uncond.target);
       },
       [](auto) { return false; }
@@ -1016,9 +1016,9 @@ AIRCONV_API int SM50Initialize(
   MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
 ) {
   using namespace microsoft;
-  using namespace dxmt::dxbc;
-  using namespace dxmt::air;
-  using namespace dxmt::shader::common;
+  using namespace mullion::dxbc;
+  using namespace mullion::air;
+  using namespace mullion::shader::common;
   if (ppError) {
     *ppError = nullptr;
   }
@@ -1392,7 +1392,7 @@ AIRCONV_API void SM50GetArgumentsInfo(
   sm50_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
   struct MTL_SM50_SHADER_ARGUMENT *pArguments
 ) {
-  auto sm50_shader = (dxmt::dxbc::SM50ShaderInternal *)pShader;
+  auto sm50_shader = (mullion::dxbc::SM50ShaderInternal *)pShader;
   if (pConstantBuffers && sm50_shader->args_reflection_cbuffer.size())
     memcpy(
       pConstantBuffers, sm50_shader->args_reflection_cbuffer.data(),
@@ -1410,7 +1410,7 @@ AIRCONV_API void SM50GetArgumentsInfo(
 AIRCONV_API int SM50GetRayShader(
   sm50_shader_t pShader, uint32_t Index, char *pName, size_t NameSize, struct SM50_RAY_SHADER_INFO *pInfo
 ) {
-  auto &shaders = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->ray_shaders;
+  auto &shaders = ((mullion::dxbc::SM50ShaderInternal *)pShader)->ray_shaders;
   if (Index >= shaders.size())
     return 0;
   if (NameSize)
@@ -1420,7 +1420,7 @@ AIRCONV_API int SM50GetRayShader(
 }
 
 AIRCONV_API void SM50Destroy(sm50_shader_t pShader) {
-  delete (dxmt::dxbc::SM50ShaderInternal *)pShader;
+  delete (mullion::dxbc::SM50ShaderInternal *)pShader;
 }
 
 AIRCONV_API int SM50Compile(
@@ -1428,7 +1428,7 @@ AIRCONV_API int SM50Compile(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace mullion;
 
   if (ppError) {
     *ppError = nullptr;
@@ -1446,12 +1446,12 @@ AIRCONV_API int SM50Compile(
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
-  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
+  auto &shader_info = ((mullion::dxbc::SM50ShaderInternal *)pShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = dxmt::dxbc::convertDXBC(
+  if (auto err = mullion::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
       )) {
     int result = SM50_COMPILE_FAILED;
@@ -1495,7 +1495,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace mullion;
 
   if (ppError) {
     *ppError = nullptr;
@@ -1514,12 +1514,12 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info =
-    ((dxmt::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
+    ((mullion::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
+  if (auto err = mullion::dxbc::convert_dxbc_vertex_hull_shader(
         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
         FunctionName, context, *pModule, pHullShaderArgs
       )) {
@@ -1560,7 +1560,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace mullion;
 
   if (ppError) {
     *ppError = nullptr;
@@ -1579,20 +1579,20 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info =
-    ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
+    ((mullion::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
   // with a geometry shader after it the domain shader runs in the geometry shader's function
   SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pDomainShaderArgs, &pso_tess);
+  mullion::dxbc::args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pDomainShaderArgs, &pso_tess);
   auto pGeometryShader = pso_tess ? (dxbc::SM50ShaderInternal *)pso_tess->geometry : nullptr;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = pGeometryShader ? dxmt::dxbc::convert_dxbc_geometry_shader(
+  if (auto err = pGeometryShader ? mullion::dxbc::convert_dxbc_geometry_shader(
                                        pGeometryShader, FunctionName, (dxbc::SM50ShaderInternal *)pDomainShader,
                                        context, *pModule, pDomainShaderArgs, (dxbc::SM50ShaderInternal *)pHullShader
                                    )
-                                 : dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
+                                 : mullion::dxbc::convert_dxbc_tesselator_domain_shader(
                                        (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
                                        (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule, pDomainShaderArgs
                                    )) {
@@ -1633,7 +1633,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace mullion;
 
   if (ppError) {
     *ppError = nullptr;
@@ -1652,12 +1652,12 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   // the vertex shader's own operations; without a geometry shader the pipeline only streams output
-  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pVertexShader)->shader_info;
+  auto &shader_info = ((mullion::dxbc::SM50ShaderInternal *)pVertexShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
+  if (auto err = mullion::dxbc::convert_dxbc_vertex_for_geometry_shader(
         (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
         (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
         pVertexShaderArgs
@@ -1698,7 +1698,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace mullion;
 
   if (ppError) {
     *ppError = nullptr;
@@ -1716,24 +1716,24 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
-  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)(pGeometryShader ? pGeometryShader : pVertexShader))->shader_info;
+  auto &shader_info = ((mullion::dxbc::SM50ShaderInternal *)(pGeometryShader ? pGeometryShader : pVertexShader))->shader_info;
   SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *pso_data = nullptr;
   bool pass_through =
-      dxmt::dxbc::args_get_data<SM50_SHADER_PSO_GEOMETRY_SHADER, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA>(pGeometryShaderArgs, &pso_data) &&
+      mullion::dxbc::args_get_data<SM50_SHADER_PSO_GEOMETRY_SHADER, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA>(pGeometryShaderArgs, &pso_data) &&
       pso_data->pass_through;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = pGeometryShader ? dxmt::dxbc::convert_dxbc_geometry_shader(
+  if (auto err = pGeometryShader ? mullion::dxbc::convert_dxbc_geometry_shader(
                                        (dxbc::SM50ShaderInternal *)pGeometryShader, FunctionName,
                                        (dxbc::SM50ShaderInternal *)pVertexShader, context, *pModule, pGeometryShaderArgs
                                    )
-                 : pass_through ? dxmt::dxbc::convert_pass_through_geometry_shader(
+                 : pass_through ? mullion::dxbc::convert_pass_through_geometry_shader(
                                       (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName, context, *pModule,
                                       pGeometryShaderArgs
                                   )
-                                : dxmt::dxbc::convert_null_geometry_shader(FunctionName, context, *pModule)) {
+                                : mullion::dxbc::convert_null_geometry_shader(FunctionName, context, *pModule)) {
     errorOut << llvm::toString(std::move(err));
     *ppError = (sm50_error_t)errorObj;
     return 1;

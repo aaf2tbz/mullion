@@ -17,7 +17,7 @@
  */
 
 #include "d3d12_acceleration_structure.hpp"
-#include "dxmt_diag.hpp"
+#include "mullion_diag.hpp"
 #include "airconv_ray.h"
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
@@ -26,9 +26,9 @@
 #include "com/com_pointer.hpp"
 #include "com/com_object.hpp"
 #include "dxgi_interfaces.h"
-#include "dxmt_format.hpp"
+#include "mullion_format.hpp"
 #include "util_env.hpp"
-#include "dxmt_info.hpp"
+#include "mullion_info.hpp"
 #include "log/log.hpp"
 #include "config/config.hpp"
 #include <algorithm>
@@ -39,7 +39,7 @@
 #include "d3d10_1.h"
 #include "d3d11_4.h"
 
-namespace dxmt {
+namespace mullion {
 
 // Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 // declarations missing from the toolchain, from DirectX-Headers/include/directx/d3d12.idl
@@ -117,14 +117,14 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
 
   bool advertise_numa_ = false;
 
-  dxmt::mutex residency_lock_;
+  mullion::mutex residency_lock_;
   std::atomic<HRESULT> removed_ = S_OK;
-  dxmt::mutex pass_names_lock_;
+  mullion::mutex pass_names_lock_;
   std::unordered_map<const EncoderData *, std::string> pass_names_;
   std::unordered_map<const EncoderData *, std::unordered_map<obj_handle_t, std::string>> pass_pipelines_;
   uint64_t late_pipelines_ = 0;
   double pipeline_ms_ = 0, longest_pipeline_ms_ = 0;
-  dxmt::mutex acceleration_structure_lock_;
+  mullion::mutex acceleration_structure_lock_;
   std::map<uint64_t, std::shared_ptr<AccelerationStructure>> acceleration_structures_;
   // compacted sizes are uint64s of shared buffers the GPU writes
   std::vector<WMT::Reference<WMT::Buffer>> compacted_size_buffers_;
@@ -365,22 +365,22 @@ public:
       return DXGI_ERROR_DEVICE_REMOVED;
     if (pDesc->Flags)
       WARN("CreateCommandQueue: flags ignored: ", pDesc->Flags);
-    return dxmt::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
+    return mullion::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandAllocator) {
-    return dxmt::CreateCommandAllocator(this, Type, riid, ppCommandAllocator);
+    return mullion::CreateCommandAllocator(this, Type, riid, ppCommandAllocator);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
-    return dxmt::CreateGraphicsPipelineState(this, pDesc, riid, ppPipelineState);
+    return mullion::CreateGraphicsPipelineState(this, pDesc, riid, ppPipelineState);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
-    return dxmt::CreateComputePipelineState(this, pDesc, riid, ppPipelineState);
+    return mullion::CreateComputePipelineState(this, pDesc, riid, ppPipelineState);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -511,7 +511,7 @@ public:
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS *>(pFeatureData);
       out->DoublePrecisionFloatShaderOps = FALSE;
-#ifdef DXMT_NO_PRIVATE_API
+#ifdef MULLION_NO_PRIVATE_API
       out->OutputMergerLogicOp = FALSE;
 #else
       out->OutputMergerLogicOp = TRUE;
@@ -791,7 +791,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc, REFIID riid, void **ppDescriptorHeap) {
-    return dxmt::CreateDescriptorHeap(this, pDesc, riid, ppDescriptorHeap);
+    return mullion::CreateDescriptorHeap(this, pDesc, riid, ppDescriptorHeap);
   };
 
   UINT STDMETHODCALLTYPE
@@ -812,7 +812,7 @@ public:
   CreateRootSignature(
       UINT NodeMask, const void *pBytecode, SIZE_T BytecodeLength, REFIID riid, void **ppRootSignature
   ) {
-    return dxmt::CreateRootSignature(this, NodeMask, pBytecode, BytecodeLength, riid, ppRootSignature);
+    return mullion::CreateRootSignature(this, NodeMask, pBytecode, BytecodeLength, riid, ppRootSignature);
   };
 
   void STDMETHODCALLTYPE
@@ -1027,7 +1027,7 @@ public:
     hr = ValidateHeapProperties(&pDesc->Properties, pDesc->Flags, advertise_numa_);
     if (FAILED(hr))
       return hr;
-    return dxmt::CreateHeap(this, pDesc, riid, ppHeap);
+    return mullion::CreateHeap(this, pDesc, riid, ppHeap);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1120,7 +1120,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateFence(UINT64 InitialValue, D3D12_FENCE_FLAGS Flags, REFIID riid, void **ppFence) {
-    return dxmt::CreateFence(this, InitialValue, Flags, riid, ppFence);
+    return mullion::CreateFence(this, InitialValue, Flags, riid, ppFence);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1261,7 +1261,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *pDesc, REFIID riid, void **ppHeap) {
-    return dxmt::CreateQueryHeap(this, pDesc, riid, ppHeap);
+    return mullion::CreateQueryHeap(this, pDesc, riid, ppHeap);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1274,7 +1274,7 @@ public:
       const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature, REFIID riid,
       void **ppCommandSignature
   ) {
-    return dxmt::CreateCommandSignature(this, pDesc, pRootSignature, riid, ppCommandSignature);
+    return mullion::CreateCommandSignature(this, pDesc, pRootSignature, riid, ppCommandSignature);
   };
 
   void STDMETHODCALLTYPE GetResourceTiling(
@@ -1298,7 +1298,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreatePipelineLibrary(const void *blob, SIZE_T blob_size, REFIID iid, void **lib) {
-    return dxmt::CreatePipelineLibrary(this, blob, blob_size, iid, lib);
+    return mullion::CreatePipelineLibrary(this, blob, blob_size, iid, lib);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1443,7 +1443,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateStateObject(const D3D12_STATE_OBJECT_DESC *pDesc, REFIID riid, void **ppStateObject) {
-    return dxmt::CreateStateObject(this, pDesc, nullptr, riid, ppStateObject);
+    return mullion::CreateStateObject(this, pDesc, nullptr, riid, ppStateObject);
   }
 
   void STDMETHODCALLTYPE
@@ -1497,7 +1497,7 @@ public:
       const D3D12_STATE_OBJECT_DESC *pAddition, ID3D12StateObject *pStateObjectToGrowFrom, REFIID riid,
       void **ppNewStateObject
   ) {
-    return dxmt::CreateStateObject(this, pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
+    return mullion::CreateStateObject(this, pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1786,7 +1786,7 @@ public:
 
   void
   NamePass(const EncoderData *pass, const std::string &pipeline, obj_handle_t metal) {
-    std::lock_guard<dxmt::mutex> lock(pass_names_lock_);
+    std::lock_guard<mullion::mutex> lock(pass_names_lock_);
     auto &name = pass_names_[pass];
     if (diag::profile && !name.empty())
       name += '|';
@@ -1797,7 +1797,7 @@ public:
 
   std::string
   PassName(const EncoderData *pass, bool consume, obj_handle_t metal) {
-    std::lock_guard<dxmt::mutex> lock(pass_names_lock_);
+    std::lock_guard<mullion::mutex> lock(pass_names_lock_);
     if (metal) {
       auto pass_name = pass_pipelines_.find(pass);
       if (pass_name == pass_pipelines_.end())
@@ -1820,7 +1820,7 @@ public:
     if (present == std::chrono::steady_clock::time_point() || end < present)
       return;
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
-    std::lock_guard<dxmt::mutex> lock(pass_names_lock_);
+    std::lock_guard<mullion::mutex> lock(pass_names_lock_);
     late_pipelines_++;
     pipeline_ms_ += ms;
     longest_pipeline_ms_ = std::max(longest_pipeline_ms_, ms);
@@ -1830,7 +1830,7 @@ public:
 
   void
   ReportPipelineTotals() {
-    std::lock_guard<dxmt::mutex> lock(pass_names_lock_);
+    std::lock_guard<mullion::mutex> lock(pass_names_lock_);
     Logger::info(str::format("D3D12 pipeline totals: ", late_pipelines_, " after first Present; ",
         std::setprecision(std::numeric_limits<double>::max_digits10), pipeline_ms_, " ms total; ",
         longest_pipeline_ms_, " ms longest"));
@@ -1838,7 +1838,7 @@ public:
 
   HRESULT
   RegisterResidency(WMT::Allocation allocation) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     residency_set_.addAllocations(&allocation, 1);
     residency_set_.commit();
     return S_OK;
@@ -1846,7 +1846,7 @@ public:
 
   HRESULT
   UnregisterResidency(WMT::Allocation allocation) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     residency_set_.removeAllocations(&allocation, 1);
     residency_set_.commit();
     return S_OK;
@@ -1854,7 +1854,7 @@ public:
 
   HRESULT
   RegisterResidencyAndVA(BufferAllocation *allocation) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     interval_map_.emplace(allocation->gpuAddress(), allocation);
     if (allocation->sparse_tile_bytes)
       sparse_buffer_mappings_.emplace(
@@ -1873,10 +1873,10 @@ public:
     // the buffer's acceleration structures, up to the next buffer's address, end with it and after the locks: they
     // give back what they hold
     std::vector<std::shared_ptr<AccelerationStructure>> ended;
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     auto next = interval_map_.upper_bound(allocation->gpuAddress());
     {
-      std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+      std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
       auto first = acceleration_structures_.lower_bound(allocation->gpuAddress());
       auto last = next == interval_map_.end() ? acceleration_structures_.end()
                                               : acceleration_structures_.lower_bound(next->first);
@@ -1896,7 +1896,7 @@ public:
 
   BufferAllocation *
   LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     auto iter = interval_map_.upper_bound(VA);
     if (iter == interval_map_.begin()) {
       *pOffset = 0;
@@ -1909,7 +1909,7 @@ public:
 
   void
   UpdateSparseBufferMappings(BufferAllocation *buffer, const std::vector<WMTSparseBufferMapping> &ranges) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     auto &tiles = sparse_buffer_mappings_.at(buffer->gpuAddress());
     for (auto &range : ranges)
       std::fill_n(tiles.begin() + range.first_tile, range.tile_count, range.mode == WMTSparseMappingModeMap);
@@ -1919,7 +1919,7 @@ public:
   CopySparseBufferMappings(
       BufferAllocation *src, BufferAllocation *dst, const std::vector<WMTSparseBufferMappingCopy> &ranges
   ) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     auto &from = sparse_buffer_mappings_.at(src->gpuAddress());
     auto &to = sparse_buffer_mappings_.at(dst->gpuAddress());
     for (auto &range : ranges)
@@ -1928,7 +1928,7 @@ public:
 
   std::vector<uint64_t>
   SparseBufferMappings() {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     if (sparse_buffer_mappings_.empty())
       return {};
     std::vector<uint64_t> words{sparse_buffer_mappings_.size()};
@@ -1944,14 +1944,14 @@ public:
 
   std::shared_ptr<AccelerationStructure>
   LookupAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+    std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
     auto it = acceleration_structures_.find(VA);
     return it == acceleration_structures_.end() ? nullptr : it->second;
   }
 
   void
   SetAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS VA, std::shared_ptr<AccelerationStructure> Structure) {
-    std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+    std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
     // the one replaced ends after the lock: it gives back what it holds
     std::swap(acceleration_structures_[VA], Structure);
     lock.unlock();
@@ -1959,7 +1959,7 @@ public:
 
   void
   AllocateCompactedSize(CompactedSize &Size) {
-    std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+    std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
     if (Size.value)
       return;
     if (free_compacted_sizes_.empty()) {
@@ -1977,13 +1977,13 @@ public:
 
   void
   FreeCompactedSize(const CompactedSize &Size) {
-    std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+    std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
     free_compacted_sizes_.push_back(Size);
   }
 
   uint32_t
   AllocateRayFunction() {
-    std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+    std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
     if (free_ray_functions_.empty())
       return next_ray_function_++;
     auto slot = free_ray_functions_.back();
@@ -1993,7 +1993,7 @@ public:
 
   void
   FreeRayFunction(uint32_t Slot) {
-    std::unique_lock<dxmt::mutex> lock(acceleration_structure_lock_);
+    std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
     free_ray_functions_.push_back(Slot);
   }
 
@@ -2283,4 +2283,4 @@ CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice) {
   return device->QueryInterface(riid, ppDevice);
 };
 
-} // namespace dxmt
+} // namespace mullion

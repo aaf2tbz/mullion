@@ -1,6 +1,6 @@
 # stop sampling at the first counter buffer boundary
---- a/src/dxmt/dxmt_command_queue.cpp
-+++ b/src/dxmt/dxmt_command_queue.cpp
+--- a/src/mullion/mullion_command_queue.cpp
++++ b/src/mullion/mullion_command_queue.cpp
 @@ -107,7 +107,7 @@
      target("exposure", 0, data->exposure, 0, 0);
    }

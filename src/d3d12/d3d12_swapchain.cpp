@@ -16,16 +16,16 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "dxmt_window.hpp"
+#include "mullion_window.hpp"
 #include "d3d12_device.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
 #include "dxgi_output.hpp"
-#include "dxmt_hud_state.hpp"
-#include "dxmt_presenter.hpp"
-#include "dxmt_format.hpp"
+#include "mullion_hud_state.hpp"
+#include "mullion_presenter.hpp"
+#include "mullion_format.hpp"
 #include "dxgi_swapchain_settings.hpp"
-#include "dxmt_info.hpp"
+#include "mullion_info.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "wsi_window.hpp"
@@ -44,7 +44,7 @@ constexpr size_t kSwapchainLatency = 1;
 TODO: some implementations can be shared with d3d11 swapchain
 */
 
-namespace dxmt {
+namespace mullion {
 
 WMTColorSpace
 ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
@@ -116,7 +116,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   HWND hWnd;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
-  wsi::DXMTWindowState window_state_;
+  wsi::MullionWindowState window_state_;
   ULONG presentation_count_ = 0;
   uint64_t dump_id_ = 0;
   // the back buffer the next Present shows
@@ -138,7 +138,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   double init_refresh_rate_ = DBL_MAX;
   int preferred_max_frame_rate = 0;
   ModeSetGuard modeset_guard_;
-  dxmt::mutex mutex_;
+  mullion::mutex mutex_;
 
   D3D12SwapChainBufferRefs buffer_refs_{this};
   std::vector<Com<MTLD3D12Resource, false>> backbuffers_;
@@ -263,7 +263,7 @@ public:
     return factory_->QueryInterface(riid, parent);
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present(UINT sync_interval, UINT flags) final {
@@ -278,7 +278,7 @@ public:
     return backbuffers_[Buffer]->QueryInterface(riid, ppSurface);
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
@@ -355,7 +355,7 @@ public:
       ERR("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     fullscreen_desc_.Windowed = FALSE;
     static_cast<MTLDXGIOutput *>(output.ptr())->SetFullscreen(true);
     monitor_ = desc.Monitor;
@@ -375,7 +375,7 @@ public:
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
     auto monitor = wsi::getWindowMonitor(hWnd);
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     fullscreen_desc_.Windowed = TRUE;
     static_cast<MTLDXGIOutput *>(target_.ptr())->SetFullscreen(false);
     target_ = nullptr;
@@ -482,13 +482,13 @@ public:
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags) final {
     // held buffers cannot be retired (IDXGISwapChain::ResizeBuffers, Remarks).
     {
-      std::lock_guard<dxmt::mutex> lock(buffer_refs_.mutex);
+      std::lock_guard<mullion::mutex> lock(buffer_refs_.mutex);
       if (buffer_refs_.referenced_buffers)
         return DXGI_ERROR_INVALID_CALL;
     }
@@ -520,7 +520,7 @@ public:
     D3D12_HEAP_PROPERTIES heap_props = device_->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_DEFAULT);
     for (unsigned i = 0; i < desc.BufferCount; i++) {
       Com<ID3D12Resource> backbuffer;
-      if (HRESULT hr = dxmt::CreateCommittedTexture(
+      if (HRESULT hr = mullion::CreateCommittedTexture(
               device_, &heap_props, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, &backbuffer_desc,
               D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&backbuffer), &buffer_refs_
           );
@@ -538,7 +538,7 @@ public:
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeTarget(const DXGI_MODE_DESC *pDesc) final {
@@ -582,7 +582,7 @@ public:
         return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
       window_state_ = state;
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     if (pDesc->RefreshRate.Numerator != 0)
       fullscreen_desc_.RefreshRate = pDesc->RefreshRate;
     fullscreen_desc_.ScanlineOrdering = pDesc->ScanlineOrdering;
@@ -712,7 +712,7 @@ public:
     return E_NOTIMPL;
   };
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
@@ -868,7 +868,7 @@ public:
     return current_buffer_;
   }
 
-  DXMT_HOTPATCHABLE
+  MULLION_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE
   ResizeBuffers1(
       UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT *pCreationNodeMask,
@@ -929,4 +929,4 @@ CreateSwapChain(
   return hr;
 }
 
-}; // namespace dxmt
+}; // namespace mullion

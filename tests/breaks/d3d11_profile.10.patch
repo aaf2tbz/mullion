@@ -1,6 +1,6 @@
 # omit a render stage from sampling
---- a/src/dxmt/dxmt_command_queue.cpp
-+++ b/src/dxmt/dxmt_command_queue.cpp
+--- a/src/mullion/mullion_command_queue.cpp
++++ b/src/mullion/mullion_command_queue.cpp
 @@ -106,7 +106,7 @@
      target("motion", 0, data->motion_vector, 0, 0);
      target("exposure", 0, data->exposure, 0, 0);

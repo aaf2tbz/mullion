@@ -5,13 +5,13 @@ diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_all
 @@ -39,6 +39,7 @@
  };
  struct GPURecordTotals {
-   dxmt::mutex mutex;
+   mullion::mutex mutex;
 +  bool faulted = false;
    std::map<std::string, std::pair<uint64_t, uint64_t>> kinds;
  };
 
 @@ -68,6 +69,22 @@
-   std::lock_guard<dxmt::mutex> lock(Totals->mutex);
+   std::lock_guard<mullion::mutex> lock(Totals->mutex);
    if (std::exchange(Checks->checked, true))
      return;
 +  if (!Totals->faulted) {

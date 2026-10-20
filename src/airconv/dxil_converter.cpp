@@ -39,7 +39,7 @@
 #include <map>
 #include <set>
 
-namespace dxmt::dxbc {
+namespace mullion::dxbc {
 
 using namespace microsoft;
 using namespace llvm;
@@ -598,7 +598,7 @@ parse(const std::string &bitcode, LLVMContext &context) {
   return module;
 }
 
-// a ray tracing shader's context, which its visible function takes: DXMTRayContext in dxmt_command.metal, field for
+// a ray tracing shader's context, which its visible function takes: MullionRayContext in mullion_command.metal, field for
 // field
 enum RayContextField : unsigned {
   RayShaders,
@@ -637,7 +637,7 @@ enum RayContextField : unsigned {
 
 StructType *
 ray_context_type(LLVMContext &ctx) {
-  if (auto ty = StructType::getTypeByName(ctx, "dxmt.ray_context"))
+  if (auto ty = StructType::getTypeByName(ctx, "mullion.ray_context"))
     return ty;
   auto table = StructType::getTypeByName(ctx, "struct._visible_function_table_t");
   if (!table)
@@ -650,7 +650,7 @@ ray_context_type(LLVMContext &ctx) {
        Type::getInt8PtrTy(ctx), ArrayType::get(i32, 3), i32, vector, f32, vector, f32, vector, i32, vector, i32,
        matrix, matrix, i32, i32, i32, i32, f32, i32, i32, i32, i32, i32, i32, i32, ArrayType::get(i32, 8),
        i64->getPointerTo(2)},
-      "dxmt.ray_context"
+      "mullion.ray_context"
   );
 }
 
@@ -1290,7 +1290,7 @@ convert_dxil(
           IRBuilder<> ir(&I);
           auto bits = IntegerType::get(ctx.llvm, I.getType()->getScalarSizeInBits());
           auto callee = (*module)->getOrInsertFunction(
-              std::string("dxmt.denorm.") + I.getOpcodeName(), FunctionType::get(bits, {bits, bits}, false)
+              std::string("mullion.denorm.") + I.getOpcodeName(), FunctionType::get(bits, {bits, bits}, false)
           );
           auto value = ir.CreateCall(
               callee, {ir.CreateBitCast(I.getOperand(0), bits), ir.CreateBitCast(I.getOperand(1), bits)}
@@ -1423,7 +1423,7 @@ convert_dxil(
         calls.push_back(cast<CallInst>(&I));
 
   // a ray tracing shader's system values are fields of its context, and its calls of other shaders go through the
-  // pipeline's function table: the runtime's slots (dxmt_command.metal) or, from there, the shaders'
+  // pipeline's function table: the runtime's slots (mullion_command.metal) or, from there, the shaders'
   auto ray = ctx.resource.ray_context;
   auto ray_ty = ray ? ray_context_type(ctx.llvm) : nullptr;
   auto ray_field = [&](unsigned field) { return ctx.builder.CreateStructGEP(ray_ty, ray, field); };
@@ -4060,8 +4060,8 @@ convert_dxil_ray_shader(
   };
   module.getOrInsertNamedMetadata("air.visible")
       ->addOperand(md({llvm::ValueAsMetadata::get(function), md({}),
-                       md({argument(0, "DXMTRayContext"), argument(1, "void"), argument(2, "void")})}));
+                       md({argument(0, "MullionRayContext"), argument(1, "void"), argument(2, "void")})}));
   return llvm::Error::success();
 }
 
-} // namespace dxmt::dxbc
+} // namespace mullion::dxbc

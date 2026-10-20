@@ -21,7 +21,7 @@
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace mullion {
 
 class MTLD3D12FenceImpl : public MTLD3D12DeviceChild<MTLD3D12Fence> {
   D3D12_FENCE_FLAGS flags_;
@@ -109,4 +109,4 @@ CreateFence(MTLD3D12Device *pDevice, UINT64 InitialValue, D3D12_FENCE_FLAGS Flag
   return fence->QueryInterface(riid, ppFence);
 }
 
-}; // namespace dxmt
+}; // namespace mullion

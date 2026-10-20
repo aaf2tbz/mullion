@@ -1,4 +1,4 @@
-/* what DXR shaders (dxil_converter.cpp), Mullion's runtime for them (dxmt_command.metal) and DispatchRays share.
+/* what DXR shaders (dxil_converter.cpp), Mullion's runtime for them (mullion_command.metal) and DispatchRays share.
    plain C, also read as Metal */
 #pragma once
 

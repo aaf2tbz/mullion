@@ -1,5 +1,5 @@
---- a/src/dxmt/dxmt_context.cpp
-+++ b/src/dxmt/dxmt_context.cpp
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
 @@ -799,4 +799,7 @@
        }
        cmd.offset = (offset - visibility_result_offsets_[render_encoder->visibility_result_window]) * sizeof(uint64_t);

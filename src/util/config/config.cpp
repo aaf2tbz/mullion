@@ -22,7 +22,7 @@
 
 #include "../util_env.hpp"
 
-namespace dxmt {
+namespace mullion {
 
   class SingletonConfig : public Config {
   public:

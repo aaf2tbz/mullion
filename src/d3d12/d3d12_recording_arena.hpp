@@ -7,7 +7,7 @@
 #include <windef.h>
 #include <winbase.h>
 
-namespace dxmt {
+namespace mullion {
 
 // address space a device's command allocators record into, handed out in runs of blocks: a list has room for whatever
 // it records, an allocator holds what its lists recorded and no more, and everything recorded is at an offset into
@@ -45,7 +45,7 @@ public:
   std::optional<Run>
   Acquire(size_t bytes) {
     size_t count = std::max<size_t>(bytes + block_ - 1, block_) / block_;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     for (size_t i = 0, free = 0; i < used_.size(); i++) {
       free = used_[i] ? 0 : free + 1;
       if (free == count) {
@@ -58,14 +58,14 @@ public:
 
   void
   Release(const Run &run) {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<mullion::mutex> lock(mutex_);
     std::fill_n(used_.begin() + run.offset / block_, run.length / block_, false);
   }
 
 private:
   size_t block_ = 0;
   std::vector<bool> used_;
-  dxmt::mutex mutex_;
+  mullion::mutex mutex_;
 };
 
-} // namespace dxmt
+} // namespace mullion

@@ -32,7 +32,7 @@
 #include <variant>
 #include "nt/air_builder.hpp"
 
-namespace dxmt::air {
+namespace mullion::air {
 
 inline llvm::StructType *
 getOrCreateStructType(llvm::StringRef Name, llvm::LLVMContext &Ctx) {
@@ -676,7 +676,7 @@ private:
 };
 
 inline TextureKind to_air_resource_type(
-  dxmt::shader::common::ResourceType type, bool use_depth = false
+  mullion::shader::common::ResourceType type, bool use_depth = false
 ) {
   switch (type) {
   case shader::common::ResourceType::TextureBuffer:
@@ -709,7 +709,7 @@ inline TextureKind to_air_resource_type(
 };
 
 inline MSLScalerType
-to_air_scaler_type(dxmt::shader::common::ScalerDataType type) {
+to_air_scaler_type(mullion::shader::common::ScalerDataType type) {
   switch (type) {
   case shader::common::ScalerDataType::Float:
     return msl_float;
@@ -865,4 +865,4 @@ enum class MTLPixelFormat : uint32_t {
   X24_Stencil8 = 262,
 };
 
-} // namespace dxmt::air
+} // namespace mullion::air

@@ -39,7 +39,7 @@ diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_all
 --- a/src/d3d12/d3d12_command_allocator.cpp
 +++ b/src/d3d12/d3d12_command_allocator.cpp
 @@ -68,6 +68,18 @@
-   std::lock_guard<dxmt::mutex> lock(Totals->mutex);
+   std::lock_guard<mullion::mutex> lock(Totals->mutex);
    if (std::exchange(Checks->checked, true))
      return;
 +  for (auto &snapshot : Checks->snapshots) {
