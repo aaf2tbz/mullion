@@ -12,7 +12,8 @@ subdir('dxgi')
 subdir('d3d11')
 subdir('d3d10')
 
-if get_option('enable_d3d12')
+# Direct3D 12 is 64-bit only on Windows, and its descriptor handles take 64 bits
+if get_option('enable_d3d12') and cpu_family != 'x86'
 subdir('d3d12')
 endif
 
