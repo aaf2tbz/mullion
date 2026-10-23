@@ -264,10 +264,11 @@ MTLD3D12PipelineState::Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders
 
 HRESULT
 MTLD3D12PipelineState::InitializeShader(
-    D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
+    MTLD3D12Device *Device, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
 ) {
   using namespace microsoft;
-  if (!ShaderContainerHolds(Bytecode.pShaderBytecode, Bytecode.BytecodeLength))
+  if (!ShaderContainerHolds(Bytecode.pShaderBytecode, Bytecode.BytecodeLength) ||
+      !ShaderFeaturesSupported(Device, Bytecode.pShaderBytecode, Bytecode.BytecodeLength))
     return E_INVALIDARG;
 
   SM50Error error;
@@ -699,7 +700,7 @@ public:
       SM50Shader shader_vs;
       MTL_SHADER_REFLECTION reflection;
       HRESULT hr;
-      if (SUCCEEDED(InitializeShader({in.vs.data(), in.vs.size()}, &shader_vs, &reflection)))
+      if (SUCCEEDED(InitializeShader(device_, {in.vs.data(), in.vs.size()}, &shader_vs, &reflection)))
         variant = GeometryVariant(
             in, shader_vs, {}, {}, strip, counting,
             in.primitive == D3D_PRIMITIVE_LINE ? D3D_PRIMITIVE_LINE_ADJ : D3D_PRIMITIVE_TRIANGLE_ADJ, true, hr
@@ -980,18 +981,18 @@ public:
     Name({pDesc->VS, pDesc->HS, pDesc->DS, pDesc->GS, pDesc->PS, MS, AS});
 
     if (mesh_shader) {
-      if (FAILED(hr = InitializeShader(MS, &shader_ms, &ref_ms)) ||
-          (AS.pShaderBytecode && FAILED(hr = InitializeShader(AS, &shader_as, &ref_as))))
+      if (FAILED(hr = InitializeShader(device_, MS, &shader_ms, &ref_ms)) ||
+          (AS.pShaderBytecode && FAILED(hr = InitializeShader(device_, AS, &shader_as, &ref_as))))
         return hr;
       std::copy_n(ref_ms.ThreadgroupSize, 3, mesh_threads);
       if (AS.pShaderBytecode)
         std::copy_n(ref_as.ThreadgroupSize, 3, object_threads);
-    } else if (FAILED(hr = InitializeShader(pDesc->VS, &shader_vs, &ref_vs)))
+    } else if (FAILED(hr = InitializeShader(device_, pDesc->VS, &shader_vs, &ref_vs)))
       return hr;
-    if (tessellation && (FAILED(hr = InitializeShader(pDesc->HS, &shader_hs, &ref_hs)) ||
-                         FAILED(hr = InitializeShader(pDesc->DS, &shader_ds, &ref_ds))))
+    if (tessellation && (FAILED(hr = InitializeShader(device_, pDesc->HS, &shader_hs, &ref_hs)) ||
+                         FAILED(hr = InitializeShader(device_, pDesc->DS, &shader_ds, &ref_ds))))
       return hr;
-    if (pDesc->GS.pShaderBytecode && FAILED(hr = InitializeShader(pDesc->GS, &shader_gs, &ref_gs)))
+    if (pDesc->GS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->GS, &shader_gs, &ref_gs)))
       return hr;
     gs_instances = sm50_shader_t(shader_gs) ? ref_gs.GeometryShader.InstanceCount : 1;
     // the stage before stream output and the rasterizer: the geometry shader, or the vertex shader
@@ -1025,7 +1026,7 @@ public:
                           pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
     bool mesh = tessellation || geometry_shader || mesh_shader;
     // the alpha-to-coverage state reads the pixel shader's reflection
-    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(pDesc->PS, &shader_ps, &ref_ps)))
+    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->PS, &shader_ps, &ref_ps)))
       return hr;
 
     SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
@@ -1092,7 +1093,7 @@ public:
             D3D12_SHADER_BYTECODE bytecode{code.data(), code.size()};
             SM50Shader shader;
             MTL_SHADER_REFLECTION reflection;
-            if (FAILED(InitializeShader(bytecode, &shader, &reflection)))
+            if (FAILED(InitializeShader(device_, bytecode, &shader, &reflection)))
               return WMT::Reference<WMT::Function>{};
             data_ps.pipeline_statistics = true;
             data_ps.next = &common;

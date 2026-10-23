@@ -1,0 +1,12 @@
+# a pixel shader's helper lanes take part in its wave operations
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -2201,7 +2201,7 @@
+     // Metal's SIMD-group functions take every active lane, a helper's too: where D3D leaves helpers out, they skip
+     // the operation, and get zero for its undefined result
+     llvm::BasicBlock *skipped = nullptr;
+-    if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves &&
++    if (false && ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves &&
+         ((op >= WaveIsFirstLane && op <= WavePrefixOp && op != WaveGetLaneIndex && op != WaveGetLaneCount) ||
+          op == WaveAllBitCount || op == WavePrefixBitCount || (op >= WaveMatch && op <= WaveMultiPrefixBitCount))) {
+       skipped = ir.GetInsertBlock();

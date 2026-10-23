@@ -503,7 +503,7 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
-      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_6);
+      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_7);
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
