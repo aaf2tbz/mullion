@@ -693,8 +693,6 @@ protected:
     return variant;
   }
 
-  // a fragment function of no outputs that discards the pixels whose squares miss the triangle the mesh stage passes
-  // on in SM50_CONSERVATIVE_VARYINGS, as airconv's conservative pixel shaders do
   // an object function for a conservative mesh shader without an amplification shader: each of its threadgroups, one
   // thread for each of the D3D grid's groups, launches the group's `slices` mesh threadgroups and gives them its ID as
   // the payload (SM50_SHADER_MESH_SHADER_DATA)
@@ -720,6 +718,8 @@ struct Group {
     return library.newFunction("conservative_object");
   }
 
+  // a fragment function of no outputs that discards the pixels whose squares miss the triangle the mesh stage passes
+  // on in SM50_CONSERVATIVE_VARYINGS, as airconv's conservative pixel shaders do
   WMT::Reference<WMT::Function>
   ConservativeFragment() {
     static const char source[] = R"(#include <metal_stdlib>
