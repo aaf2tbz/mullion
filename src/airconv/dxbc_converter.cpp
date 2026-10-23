@@ -618,6 +618,15 @@ llvm::Error convert_dxbc_pixel_shader(
   } else {
     builder.CreateRet(value);
   }
+  // the registers' allocas made after the depth bounds test split the entry block go back to it, where SROA promotes
+  // them
+  auto &entry = function->getEntryBlock();
+  for (auto &block : *function)
+    if (&block != &entry)
+      for (auto &instruction : llvm::make_early_inc_range(block))
+        if (auto alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+            alloca && llvm::isa<llvm::ConstantInt>(alloca->getArraySize()))
+          alloca->moveBefore(&*entry.getFirstInsertionPt());
 
   module.getOrInsertNamedMetadata("air.fragment")
     ->addOperand(function_metadata);
