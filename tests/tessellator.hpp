@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -319,11 +320,19 @@ reference_factors(Domain domain, const Factors &patch) {
   return factors;
 }
 
-// the reference's points of a patch, as (u, v, w) bits, in order
+// the reference's points of a patch, as (u, v, w) bits, in order. each patch's are worked out once: the draws repeat
+// their patches, through every geometry shader, layer and output count, and the reference and its sort are most of
+// the test's time. the factors are kept as bits, since a NaN one equals no other
 using Point = std::array<uint32_t, 3>;
-inline std::vector<Point>
+inline const std::vector<Point> &
 expected_points(Domain domain, Partitioning partitioning, const Factors &patch) {
-  std::vector<Point> out;
+  static std::map<std::tuple<Domain, Partitioning, std::array<uint32_t, 8>>, std::vector<Point>> known;
+  std::array<uint32_t, 8> factor_bits;
+  memcpy(factor_bits.data(), patch.data(), sizeof(factor_bits));
+  auto [at, added] = known.try_emplace({domain, partitioning, factor_bits});
+  if (!added)
+    return at->second;
+  auto &out = at->second;
   for (auto &p : reference::points(domain, partitioning, reference_factors(domain, patch).data())) {
     // a triangle's third coordinate is what the other two leave of 1, which their 16 bits make exact
     float location[3] = {p.u, p.v, domain == reference::triangle ? 1 - p.u - p.v : 0};
