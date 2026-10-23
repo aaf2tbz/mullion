@@ -23,6 +23,9 @@
 
 static constexpr UINT frames = 4, concurrent_frames = 12, width = 8, height = 4, turns = 4096, threads = 32;
 static constexpr UINT indices[] = {0, 1, 2}, instances[] = {1, 2};
+// a counter sample (a stage's or a timestamp query's) is a whole tick of the GPU's timebase, 24 MHz on Apple silicon,
+// and a command buffer's start and end times are not: one sampled at a command buffer's edge reads up to a tick past it
+static constexpr UINT64 counter_tick = 42;
 // how long the first frame's fence is kept from the queue that waits for it, which has that time to encode the
 // frame's two small lists: nothing tells an application that a list is encoded
 static constexpr DWORD held_ms = 200;
@@ -588,7 +591,7 @@ main(int argc, char **argv) {
         const UINT64 rounding =
             UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                              finish)) +
-            1;
+            1 + counter_tick;
         for (size_t i = 7; i + 1 < row.size(); i += 2) {
           auto a = number(row[i]), b = number(row[i + 1]);
           if (a == ~UINT64(0) || b == ~UINT64(0)) {
@@ -658,7 +661,7 @@ main(int argc, char **argv) {
           const UINT64 rounding =
               UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                                finish)) +
-              1;
+              1 + counter_tick;
           expect(query_start + rounding >= number(cmdbuf[5]) && query_end <= finish + rounding,
                  "application queries do not share overflow command buffer");
         }

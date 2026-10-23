@@ -22,6 +22,10 @@
 #include <sstream>
 #include <tuple>
 
+// a counter sample (a stage's) is a whole tick of the GPU's timebase, 24 MHz on Apple silicon, and a command buffer's
+// start and end times are not: one sampled at a command buffer's edge reads up to a tick past it
+static constexpr UINT64 counter_tick = 42;
+
 static constexpr UINT width = 8, height = 4, frames = 40;
 static constexpr UINT indices[] = {0, 1, 2}, direct_instances[] = {1, 2};
 static const char hlsl[] = R"hlsl(
@@ -402,7 +406,7 @@ int main(int argc, char **argv) {
         const UINT64 rounding =
             UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                              finish)) +
-            1;
+            1 + counter_tick;
         for (size_t i = 7; i < row.size(); i += 2) {
           auto start = number(row[i]), end = number(row[i + 1]);
           expect(start != ~UINT64(0) && end >= start && start + rounding >= number(buffer[5]) &&
