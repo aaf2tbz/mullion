@@ -205,6 +205,16 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   WMT::Buffer depth_bounds_samples_{};
   EncoderData *depth_bounds_pass_ = nullptr;
   bool depth_bounds_stale_ = true;
+  // variable rate shading: RSSetShadingRate's rate and combiners, and RSSetShadingRateImage's image, whose bytes a copy
+  // before the pass gives the pixel shader (SM50_BINDING_INDEX_SHADING_RATE_IMAGE)
+  D3D12_SHADING_RATE shading_rate_ = D3D12_SHADING_RATE_1X1;
+  D3D12_SHADING_RATE_COMBINER shading_rate_combiners_[2] = {
+      D3D12_SHADING_RATE_COMBINER_PASSTHROUGH, D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+  };
+  MTLD3D12Resource *shading_rate_image_ = nullptr;
+  WMT::Buffer shading_rate_bytes_{};
+  uint64_t shading_rate_offset_ = 0;
+  EncoderData *shading_rate_pass_ = nullptr;
 
   // occlusion queries: the running ones, each from the first visibility slot it counts in; the slots' GPU addresses,
   // in order; and the sums the ended ones need (sum_occlusion's), made before their results are read
@@ -589,6 +599,10 @@ public:
     stencil_ref_ = back_stencil_ref_ = 0;
     depth_bounds_[0] = 0.0f;
     depth_bounds_[1] = 1.0f;
+    shading_rate_ = D3D12_SHADING_RATE_1X1;
+    shading_rate_combiners_[0] = shading_rate_combiners_[1] = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+    shading_rate_image_ = nullptr;
+    shading_rate_pass_ = nullptr;
 
     rootsig_graphics_ = nullptr;
     memset(rootarg_graphics_staging_, 0, sizeof(rootarg_graphics_staging_));
@@ -768,6 +782,36 @@ public:
     dispatch.size = {dsv.Width, dsv.Height, 1};
   }
 
+  // whether draws shade coarse pixels: some combination of the rates may be coarser than 1x1
+  bool
+  CoarseShading() {
+    return pso_graphics_ && pso_graphics_->pixel_shader && pso_graphics_->coarse_shading &&
+           (shading_rate_ != D3D12_SHADING_RATE_1X1 ||
+            shading_rate_combiners_[0] != D3D12_SHADING_RATE_COMBINER_PASSTHROUGH ||
+            shading_rate_combiners_[1] != D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+  }
+
+  // the shading rate image's bytes, a row of its width after another, for the passes after this one's start
+  void
+  ShadingRateImageBytes() {
+    D3D12_RESOURCE_DESC desc;
+    shading_rate_image_->GetDesc(&desc);
+    uint32_t width = desc.Width, height = desc.Height;
+    PreBlit();
+    std::tie(shading_rate_bytes_, shading_rate_offset_) = allocator_->AllocateTempBuffer(uint64_t(width) * height, 16);
+    auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+    copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+    copy.src = shading_rate_image_->texture->current()->texture();
+    copy.slice = 0;
+    copy.level = 0;
+    copy.origin = {0, 0, 0};
+    copy.size = {width, height, 1};
+    copy.dst = shading_rate_bytes_;
+    copy.offset = shading_rate_offset_;
+    copy.bytes_per_row = width;
+    copy.bytes_per_image = width * height;
+  }
+
   DrawCallStatus
   PreDraw(bool SkipResourceBinding = false) {
     if (!pso_graphics_)
@@ -783,6 +827,13 @@ public:
                           allocator_->encoder_current != depth_bounds_pass_)) {
       DepthBoundsSamples();
       bounds_found = true;
+    }
+    // the shading rate image, which changes only outside passes, copied before the pass of the first coarse draw
+    bool coarse = CoarseShading(), image_copied = false;
+    if (coarse && shading_rate_image_ &&
+        (!allocator_->encoder_current || allocator_->encoder_current != shading_rate_pass_)) {
+      ShadingRateImageBytes();
+      image_copied = true;
     }
     // a draw whose scissors or viewports the pass has no room for starts the next pass
     const UINT count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -895,6 +946,8 @@ public:
         depth_bounds_pass_ = allocator_->encoder_current;
         depth_bounds_stale_ = false;
       }
+      if (image_copied)
+        shading_rate_pass_ = allocator_->encoder_current;
       if (!active_queries_.empty())
         CountVisibility();
     }
@@ -1048,6 +1101,36 @@ public:
         buffer.index = SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES;
       }
     }
+    // coarse shading's rates and combiners, and its image's bytes (or none, but a buffer bound)
+    if (coarse) {
+      D3D12_RESOURCE_DESC desc{};
+      if (shading_rate_image_)
+        shading_rate_image_->GetDesc(&desc);
+      SM50_SHADING_RATE rates{
+          uint32_t(shading_rate_),
+          {uint32_t(shading_rate_combiners_[0]), uint32_t(shading_rate_combiners_[1])},
+          uint32_t(desc.Width),
+          desc.Height
+      };
+      auto &bytes = allocator_->EncodeRenderCommand<wmtcmd_render_setbytes>();
+      bytes.type = WMTRenderCommandSetFragmentBytes;
+      bytes.bytes.set(memcpy(allocator_->AllocateCPUHeap(sizeof(rates), 16), &rates, sizeof(rates)));
+      bytes.length = sizeof(rates);
+      bytes.index = SM50_BINDING_INDEX_SHADING_RATE;
+      if (shading_rate_image_) {
+        auto &buffer = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        buffer.type = WMTRenderCommandSetFragmentBuffer;
+        buffer.buffer = shading_rate_bytes_;
+        buffer.offset = shading_rate_offset_;
+        buffer.index = SM50_BINDING_INDEX_SHADING_RATE_IMAGE;
+      } else {
+        auto &none = allocator_->EncodeRenderCommand<wmtcmd_render_setbytes>();
+        none.type = WMTRenderCommandSetFragmentBytes;
+        none.bytes.set(memset(allocator_->AllocateCPUHeap(16, 16), 0, 16));
+        none.length = 16;
+        none.index = SM50_BINDING_INDEX_SHADING_RATE_IMAGE;
+      }
+    }
     // a draw that writes depth changes which samples are in the bounds
     if (pso_graphics_->writes_depth && dsv.Texture && !(dsv.Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH))
       depth_bounds_stale_ = true;
@@ -1162,7 +1245,7 @@ public:
       if (pass->colors[i].attachment)
         mask |= 1u << i;
     return pso_graphics_->RenderTargets(
-        Pipeline, mask, pass->dsv_planar_flags, !active_statistics_.empty(), !active_queries_.empty()
+        Pipeline, mask, pass->dsv_planar_flags, !active_statistics_.empty(), !active_queries_.empty(), CoarseShading()
     );
   }
 
@@ -3952,13 +4035,27 @@ public:
   }
 
   void STDMETHODCALLTYPE
-  RSSetShadingRate(D3D12_SHADING_RATE, const D3D12_SHADING_RATE_COMBINER *) {
-    ERR("RSSetShadingRate: variable rate shading is not supported yet");
+  RSSetShadingRate(D3D12_SHADING_RATE BaseShadingRate, const D3D12_SHADING_RATE_COMBINER *pCombinerArray) {
+    if (Record([=, combiners = pCombinerArray ? std::array{pCombinerArray[0], pCombinerArray[1]}
+                                              : std::array<D3D12_SHADING_RATE_COMBINER, 2>{}](auto *l) {
+          l->RSSetShadingRate(BaseShadingRate, pCombinerArray ? combiners.data() : nullptr);
+        }))
+      return;
+    shading_rate_ = BaseShadingRate;
+    // a null array is passthrough, passthrough
+    for (unsigned i = 0; i < 2; i++)
+      shading_rate_combiners_[i] = pCombinerArray ? pCombinerArray[i] : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+    // the pipeline's variant may change
+    dirty_state_.set(DirtyState::GraphicsPipelineState);
   }
 
   void STDMETHODCALLTYPE
-  RSSetShadingRateImage(ID3D12Resource *) {
-    ERR("RSSetShadingRateImage: variable rate shading is not supported yet");
+  RSSetShadingRateImage(ID3D12Resource *pShadingRateImage) {
+    if (Record([=](auto *l) { l->RSSetShadingRateImage(pShadingRateImage); }))
+      return;
+    shading_rate_image_ = static_cast<MTLD3D12Resource *>(pShadingRateImage);
+    // a new image is copied before the next coarse draw
+    shading_rate_pass_ = nullptr;
   }
 
   void STDMETHODCALLTYPE

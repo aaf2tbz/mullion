@@ -402,9 +402,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
-      auto &[next, type, mask, dual, depth, unorm, formats, statistics, bounds, late] =
+      auto &[next, type, mask, dual, depth, unorm, formats, statistics, bounds, late, coarse, rate] =
           *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
-      hash(mask, dual, depth, unorm, formats, statistics, bounds, late);
+      hash(mask, dual, depth, unorm, formats, statistics, bounds, late, coarse, rate);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -556,10 +556,11 @@ protected:
   };
   std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
   mullion::mutex render_targets_mutex_;
-  // the pixel shader's variants, made when first drawn: counting pipeline statistics, and with its depth and stencil
-  // tests after it (an occlusion query and the depth bounds test of a GPU without one)
-  std::function<WMT::Reference<WMT::Function>(bool statistics, bool late)> pixel_variant_;
-  WMT::Reference<WMT::Function> pixel_variants_[2][2];
+  // the pixel shader's variants, made when first drawn: counting pipeline statistics, with its depth and stencil
+  // tests after it (an occlusion query and the depth bounds test of a GPU without one), and of coarse pixels (variable
+  // rate shading)
+  std::function<WMT::Reference<WMT::Function>(bool statistics, bool late, bool coarse)> pixel_variant_;
+  WMT::Reference<WMT::Function> pixel_variants_[2][2][2];
 
   template <typename Info>
   WMT::Reference<WMT::RenderPipelineState>
@@ -1112,6 +1113,12 @@ public:
       data_ps.pipeline_statistics = false;
       data_ps.depth_bounds = depth_bounds_emulated;
       data_ps.late_tests = false;
+      data_ps.coarse_shading = false;
+      // the primitive's shading rate, from the stage before the rasterizer: a domain or mesh shader has none
+      data_ps.shading_rate_varying = sm50_shader_t(shader_gs)      ? ref_gs.ShadingRateOutput
+                                     : tessellation || mesh_shader ? 0
+                                                                   : ref_vs.ShadingRateOutput;
+      coarse_shading = !ref_ps.PixelShader.FineShading;
 
       std::array<WMTPixelFormat, std::size(data_ps.pixel_formats)> formats{};
       for (unsigned i = 0; i < pDesc->NumRenderTargets; i++)
@@ -1126,7 +1133,7 @@ public:
       pixel_variant_ =
           [this, code = std::string((const char *)pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength),
            signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common,
-           ps_name](bool statistics, bool late) mutable {
+           ps_name](bool statistics, bool late, bool coarse) mutable {
             D3D12_SHADER_BYTECODE bytecode{code.data(), code.size()};
             SM50Shader shader;
             MTL_SHADER_REFLECTION reflection;
@@ -1134,10 +1141,12 @@ public:
               return WMT::Reference<WMT::Function>{};
             data_ps.pipeline_statistics = statistics;
             data_ps.late_tests = late;
+            data_ps.coarse_shading = coarse;
             data_ps.next = &common;
             SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
             auto arguments = RootSignature(rootsig, signature.ptr(), &data_ps);
-            auto variant = ps_name + (statistics ? "_statistics" : "") + (late ? "_late" : "");
+            auto variant =
+                ps_name + (statistics ? "_statistics" : "") + (late ? "_late" : "") + (coarse ? "_coarse" : "");
             return CompileFunction(device_, this, std::span(&bytecode, 1), arguments, variant.c_str(),
                                    [&shader](auto args, auto name, auto bitcode, auto error) {
                                      return SM50Compile(shader, args, name, bitcode, error);
@@ -1361,21 +1370,25 @@ public:
     return GetCachedPipelineBlob(blob);
   }
 
-  WMT::RenderPipelineState RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar,
-                                         bool Statistics, bool Occluded) override {
+  WMT::RenderPipelineState
+  RenderTargets(
+      WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar, bool Statistics, bool Occluded, bool Coarse
+  ) override {
     Mask &= rtv_mask;
     DSVPlanar &= dsv_mask;
     Statistics &= pixel_shader;
+    Coarse &= pixel_shader && coarse_shading;
     // a pixel shader's discard of the depth bounds test takes its samples out of an occlusion query only before the
     // depth and stencil tests
     bool late = Occluded && depth_bounds_emulated && pixel_shader;
-    if (!Pipeline || (!Statistics && !late && Mask == rtv_mask && DSVPlanar == dsv_mask))
+    if (!Pipeline || (!Statistics && !late && !Coarse && Mask == rtv_mask && DSVPlanar == dsv_mask))
       return Pipeline;
     std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
     auto &descriptor = pipeline_descriptors_.at(Pipeline.handle);
     auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) |
                (uint32_t(Statistics) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 2)) |
-               (uint32_t(late) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 3));
+               (uint32_t(late) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 3)) |
+               (uint32_t(Coarse) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 4));
     auto found = descriptor.variants.find(key);
     if (found != descriptor.variants.end())
       return found->second;
@@ -1384,9 +1397,9 @@ public:
     // Graphics Rendering: Render Command Encoder, Creating and Configuring a Render Pipeline Descriptor)
     auto pipeline = std::visit(
         [&](auto info) {
-          if ((Statistics || late) && info.fragment_function) {
-            auto &variant = pixel_variants_[Statistics][late];
-            if (!variant && !(variant = pixel_variant_(Statistics, late)))
+          if ((Statistics || late || Coarse) && info.fragment_function) {
+            auto &variant = pixel_variants_[Statistics][late][Coarse];
+            if (!variant && !(variant = pixel_variant_(Statistics, late, Coarse)))
               return WMT::Reference<WMT::RenderPipelineState>{};
             info.fragment_function = variant;
           }
@@ -1399,7 +1412,8 @@ public:
             info.stencil_pixel_format = WMTPixelFormatInvalid;
           return device_->GetMTLDevice().newRenderPipelineState(info, error);
         },
-        descriptor.info);
+        descriptor.info
+    );
     if (!pipeline) {
       ERR("Failed to create attachment PSO of shaders ", name, ": ", error.description().getUTF8String());
       return {};
