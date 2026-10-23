@@ -1,11 +1,12 @@
 // contract: conservative rasterization, tier 1. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
 // covers every pixel whose square it overlaps, and no pixel farther than tier 1's uncertainty (half a pixel) from it;
 // such a pixel has all its samples covered (at 4x the test reads the target: Metal runs a 4x pixel's shader more
-// than once, and a discarding run still writes UAVs, with or without conservative rasterization), its pixel shader sees
-// the triangle's attributes extrapolated from their plane, so a pixel whose center is inside sees what it sees without
-// conservative rasterization, and a flat input is the first vertex's. a pipeline without a pixel shader writes depth to
-// the same pixels. the device reports tier 1, and with it feature level 12_1; a pipeline with a geometry shader is made
-// (its triangles rasterize as usual). D3D11.3 functional specification 15.17 (Conservative Rasterization): "any pixel
+// than once, and a discarding run still writes UAVs, with or without conservative rasterization), and each run's
+// SV_Coverage is every sample; its pixel shader sees the triangle's attributes extrapolated from their plane, so a
+// pixel whose center is inside sees what it sees without conservative rasterization, and a flat input is the first
+// vertex's, in perspective however strong. a pipeline without a pixel shader writes depth to the same pixels. a
+// pipeline with a geometry shader is made (its triangles rasterize as usual); the device reports tier 1 once those grow
+// too. D3D11.3 functional specification 15.17 (Conservative Rasterization): "any pixel
 // ... touched by the primitive must be rasterized"; 15.17.2, "Tier 1: 1/2 pixel uncertainty region"; 15.17.5, "the
 // coverage mask ... is full"; 15.17.4, attributes are "extrapolated" for pixels whose centers are outside.
 // https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#15.17%20Conservative%20Rasterization
@@ -26,7 +27,8 @@ V vs(float4 position : POSITION, float perspective : PERSPECTIVE, float screen :
   V v = {position, perspective, screen, flat};
   return v;
 }
-// per pixel: the attributes, then how many times the shader ran there and the samples it covered
+// per pixel: the attributes, then how many times the shader ran there, the samples it covered, and the runs that did
+// not cover every sample
 RWStructuredBuffer<uint4> o : register(u0);
 float ps(V v, uint coverage : SV_Coverage) : SV_Target {
   uint2 p = uint2(v.position.xy);
@@ -34,6 +36,15 @@ float ps(V v, uint coverage : SV_Coverage) : SV_Target {
   o[i].xyz = uint3(asuint(v.perspective), asuint(v.screen), v.flat);
   InterlockedAdd(o[PIXELS + i].x, 1, was);
   InterlockedOr(o[PIXELS + i].y, coverage, was);
+  InterlockedAdd(o[PIXELS + i].z, coverage != (1u << GetRenderTargetSampleCount()) - 1 ? 1 : 0, was);
+  return 1;
+}
+// the perspective input as the shader evaluates it, at the centroid: at 1x, of every sample covered, the center
+float ps_evaluate(V v) : SV_Target {
+  uint2 p = uint2(v.position.xy);
+  uint i = p.y * WIDTH + p.x, was;
+  o[i].x = asuint(EvaluateAttributeCentroid(v.perspective));
+  InterlockedAdd(o[PIXELS + i].x, 1, was);
   return 1;
 }
 float4 vs_depth(float4 position : POSITION) : SV_Position { return position; }
@@ -114,30 +125,20 @@ main(int argc, char **argv) {
   }
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-  unsigned failures = 0;
+  // each step's first few
+  unsigned failures = 0, failures_before = 0;
   auto fail = [&](const char *format, auto... args) {
-    if (failures++ < 24) {
+    if (failures++ - failures_before < 12) {
       printf(format, args...);
       printf("\n");
     }
   };
 
-  D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
-  if (options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_1)
-    fail("conservative rasterization tier %u", options.ConservativeRasterizationTier);
-  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1};
-  D3D12_FEATURE_DATA_FEATURE_LEVELS level{2, levels};
-  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &level, sizeof(level)));
-  if (level.MaxSupportedFeatureLevel != D3D_FEATURE_LEVEL_12_1)
-    fail("feature level %#x of 12_0 and 12_1", level.MaxSupportedFeatureLevel);
-  if (D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_1, __uuidof(ID3D12Device), nullptr) != S_FALSE)
-    fail("no device of feature level 12_1");
-
   std::vector<std::string> defines = {"WIDTH=" + std::to_string(kWidth), "PIXELS=" + std::to_string(kWidth * kHeight)};
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), ps = compiler.compile(hlsl, "ps", "ps", defines),
-       vs_depth = compiler.compile(hlsl, "vs_depth", "vs", defines), gs = compiler.compile(hlsl, "gs", "gs", defines);
-  if (vs.empty() || ps.empty() || vs_depth.empty() || gs.empty()) {
+       vs_depth = compiler.compile(hlsl, "vs_depth", "vs", defines), gs = compiler.compile(hlsl, "gs", "gs", defines),
+       ps_evaluate = compiler.compile(hlsl, "ps_evaluate", "ps", defines);
+  if (vs.empty() || ps.empty() || vs_depth.empty() || gs.empty() || ps_evaluate.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
@@ -153,7 +154,7 @@ main(int argc, char **argv) {
       {"FLAT", 0, DXGI_FORMAT_R32_UINT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
   };
   // by conservative rasterization and sample count
-  ComPtr<ID3D12PipelineState> pso[2][2], depth_pso;
+  ComPtr<ID3D12PipelineState> pso[2][2], depth_pso, evaluate_pso;
   for (int conservative = 0; conservative < 2; conservative++)
     for (int msaa = 0; msaa < 2; msaa++) {
       D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(vs), bytecode(ps)};
@@ -169,6 +170,11 @@ main(int argc, char **argv) {
       desc.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
       desc.SampleDesc = {msaa ? 4u : 1u, 0};
       CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[conservative][msaa])));
+      if (conservative && !msaa) {
+        desc.PS = bytecode(ps_evaluate);
+        CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&evaluate_pso)));
+        desc.PS = bytecode(ps);
+      }
       // a geometry shader's triangles are not dilated yet, but its pipeline is made
       if (conservative && !msaa) {
         desc.GS = bytecode(gs);
@@ -197,6 +203,10 @@ main(int argc, char **argv) {
   const Triangle triangles[] = {
       {"a large triangle", {{4.3f, 5.1f}, {19.6f, 7.4f}, {9.2f, 20.7f}}, {1, 1, 1}},
       {"a triangle inside one pixel, around no center", {{10.1f, 10.1f}, {10.4f, 10.2f}, {10.2f, 10.35f}}, {1, 1, 1}},
+      // whose plane's 1/w is below 0 a pixel away: at (9.1, 9.1), and across the pixel's square, (11, 10.1)
+      {"a triangle inside one pixel in steep perspective",
+       {{10.1f, 10.1f}, {10.4f, 10.2f}, {10.2f, 10.35f}},
+       {1, 4, 0.5f}},
       {"a sliver across pixels", {{3.2f, 12.05f}, {20.8f, 12.2f}, {3.3f, 12.12f}}, {1, 1, 1}},
       {"a needle", {{4.5f, 4.5f}, {20.5f, 19.0f}, {20.2f, 19.3f}}, {1, 1, 1}},
       {"a triangle in perspective", {{5.5f, 6.2f}, {18.7f, 9.9f}, {7.1f, 19.4f}}, {1, 4, 0.5f}},
@@ -386,18 +396,20 @@ main(int argc, char **argv) {
     return S_OK;
   };
 
-  static Pixels normal, conservative, multisampled, depth_only;
+  static Pixels normal, conservative, multisampled, depth_only, evaluated;
   // a pixel inside the viewport and target: what a draw can reach
   auto reachable = [&](int x, int y) {
     return x >= kViewport.TopLeftX && y >= kViewport.TopLeftY && x < kViewport.TopLeftX + kViewport.Width &&
            y < kViewport.TopLeftY + kViewport.Height;
   };
   for (auto &t : triangles) {
+    failures_before = failures;
     step("%s", t.what);
     CHECK(draw(t, pso[0][0].Get(), 0, false, normal));
     CHECK(draw(t, pso[1][0].Get(), 0, false, conservative));
     CHECK(draw(t, pso[1][1].Get(), 1, false, multisampled));
     CHECK(draw(t, depth_pso.Get(), 0, true, depth_only));
+    CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated));
     for (int y = 0; y < (int)kHeight; y++)
       for (int x = 0; x < (int)kWidth; x++) {
         int i = y * kWidth + x;
@@ -423,6 +435,14 @@ main(int argc, char **argv) {
           fail("%s: pixel (%d, %d) at 4x, more than half a pixel away, has %g of its samples", t.what, x, y, samples);
         if (may && samples != 0 && samples != 1)
           fail("%s: pixel (%d, %d) at 4x has %g of its samples, want all or none", t.what, x, y, samples);
+        // every run's SV_Coverage is all of the pixel's samples (15.17.5), the grown triangles' shared edges too
+        if (conservative.runs[i][2] || multisampled.runs[i][2])
+          fail(
+              "%s: pixel (%d, %d) ran its shader with partial coverage %u times at 1x, %u at 4x (covering %#x)", t.what,
+              x, y, conservative.runs[i][2], multisampled.runs[i][2], multisampled.runs[i][1]
+          );
+        if (must && multisampled.runs[i][1] != 0xf)
+          fail("%s: pixel (%d, %d) at 4x saw coverage %#x, want 0xf", t.what, x, y, multisampled.runs[i][1]);
         bool depth_written = depth_only.depth[i] != 1;
         if ((must && !depth_written) || (!may && depth_written))
           fail("%s: pixel (%d, %d) without a pixel shader: depth %g", t.what, x, y, depth_only.depth[i]);
@@ -442,6 +462,17 @@ main(int argc, char **argv) {
                   a ? "noperspective" : "perspective", got, want
               );
           }
+        // and as the shader evaluates it there
+        if (ran && reachable(x, y) && center_inside(t, x, y, 0.05) && normal.runs[i][0]) {
+          float got, want;
+          memcpy(&got, &evaluated.attributes[i][0], 4);
+          memcpy(&want, &normal.attributes[i][0], 4);
+          if (!(std::fabs(got - want) <= 1e-3f * std::max(1.0f, std::fabs(want))))
+            fail(
+                "%s: pixel (%d, %d): perspective evaluated %g, without conservative rasterization %g", t.what, x, y,
+                got, want
+            );
+        }
         // an ordinary rasterizer's pixel is a conservative one's
         if (normal.target[i] == 1 && !ran)
           fail("%s: pixel (%d, %d) is rasterized without conservative rasterization, not with it", t.what, x, y);

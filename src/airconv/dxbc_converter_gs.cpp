@@ -1170,7 +1170,7 @@ convert_pass_through_geometry_shader(
         .arg_name = "viewports",
         .raster_order_group = {}
     });
-    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
       func_signature.DefineMeshVertexOutput(air::OutputMeshData{
           .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = conservative_at + i
       });
@@ -1229,12 +1229,14 @@ convert_pass_through_geometry_shader(
         clip[corner] = builder.CreateInsertElement(clip[corner], real(component(corner, element.reg(), c)), c);
     }
   // what of each of the primitive's corners each emitted vertex has: its own corner's, or for a conservative
-  // rasterizer's polygon the triangle's barycentrics there, perspective-correct and in the window
+  // rasterizer's polygon the triangle's barycentrics there in the window, and those over each corner's w, which are
+  // linear in the window too (of the plane's 1/w, an input over w): the polygon's vertices have a w of 1
   auto source = [&](uint32_t u) { return conservative ? u / 3 : u; };
-  pvalue perspective[9][3], window_linear[9][3];
+  pvalue over_w[9][3], window_linear[9][3], grown[9][2] = {};
   for (uint32_t u = 0; u < emitted; u++)
     for (uint32_t k = 0; k < 3; k++)
-      perspective[u][k] = window_linear[u][k] = air.getFloat(source(u) == k ? 1.0 : 0.0);
+      over_w[u][k] = window_linear[u][k] = air.getFloat(source(u) == k ? 1.0 : 0.0);
+  pvalue viewport = nullptr, expanded = builder.getFalse();
   pvalue window[3][2] = {}, degenerate = builder.getFalse(), in_front = builder.getFalse();
   if (conservative && clip[0]) {
     auto f = [&](double v) { return air.getFloat(v); };
@@ -1245,7 +1247,7 @@ convert_pass_through_geometry_shader(
       if (element.systemValue() == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
         viewport_index = component(0, element.reg(), std::countr_zero(element.mask()));
     viewport_index = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport_index, builder.getInt32(15), false);
-    auto viewport = builder.CreateLoad(
+    viewport = builder.CreateLoad(
         types._float4, builder.CreateGEP(types._float4, function->getArg(viewports_idx), {viewport_index})
     );
     // the corners in the window, where pixels are squares a unit wide; a corner at or behind the eye has none
@@ -1287,7 +1289,7 @@ convert_pass_through_geometry_shader(
     auto turn = builder.CreateSelect(counterclockwise, builder.getInt32(1), builder.getInt32(3));
     // every sample of a pixel whose square the triangle overlaps is then inside, and the pixel shader takes only those
     // pixels; each point is within a pixel of its corner
-    pvalue expanded = builder.CreateAnd(in_front, builder.CreateNot(degenerate));
+    expanded = builder.CreateAnd(in_front, builder.CreateNot(degenerate));
     pvalue weights[9][3], linear[9][3];
     for (uint32_t k = 0; k < 3; k++) {
       uint32_t into = (k + 2) % 3, out = k; // the edges into and out of corner k, whose outward normals are -(a, b)
@@ -1309,23 +1311,19 @@ convert_pass_through_geometry_shader(
         );
         auto oy = builder.CreateSelect(builder.CreateICmpULE(corner, builder.getInt32(1)), f(1), f(-1));
         auto x = builder.CreateFAdd(window[k][0], ox), y = builder.CreateFAdd(window[k][1], oy);
-        // corner j's barycentric there: edge j + 1, the one across from it, at the point over at the corner
-        pvalue sum = f(0), t[3];
+        grown[u][0] = x, grown[u][1] = y;
+        // corner j's barycentric there: edge j + 1, the one across from it, at the point over at the corner. the
+        // plane's 1/w there may be 0 or less, beyond the horizon, which nothing interpolated over it minds
         for (uint32_t j = 0; j < 3; j++) {
           uint32_t across = (j + 1) % 3;
           linear[u][j] = builder.CreateFDiv(edge(across, x, y), edge(across, window[j][0], window[j][1]));
-          t[j] = builder.CreateFDiv(linear[u][j], w[j]);
-          sum = builder.CreateFAdd(sum, t[j]);
+          weights[u][j] = builder.CreateFDiv(linear[u][j], w[j]);
         }
-        for (uint32_t j = 0; j < 3; j++)
-          weights[u][j] = builder.CreateFDiv(t[j], sum);
-        // the plane's point there has a w: Σ λ / w is its reciprocal, so it must be above 0 (and a number)
-        expanded = builder.CreateAnd(expanded, builder.CreateFCmpOGT(sum, f(0)));
       }
     }
     for (uint32_t u = 0; u < emitted; u++)
       for (uint32_t j = 0; j < 3; j++) {
-        perspective[u][j] = builder.CreateSelect(expanded, weights[u][j], perspective[u][j]);
+        over_w[u][j] = builder.CreateSelect(expanded, weights[u][j], over_w[u][j]);
         window_linear[u][j] = builder.CreateSelect(expanded, linear[u][j], window_linear[u][j]);
       }
   }
@@ -1344,11 +1342,27 @@ convert_pass_through_geometry_shader(
     if (clip[corner]) {
       pvalue position = clip[corner];
       if (conservative && clip[0]) {
-        position = nullptr;
-        for (uint32_t k = 0; k < 3; k++) {
-          auto part = builder.CreateFMul(builder.CreateVectorSplat(4, perspective[u][k]), clip[k]);
-          position = position ? builder.CreateFAdd(position, part) : part;
-        }
+        // the point in normalized device coordinates, at the plane's depth there
+        auto f = [&](double v) { return air.getFloat(v); };
+        auto at = [&](pvalue v, uint32_t i) { return builder.CreateExtractElement(v, i); };
+        auto x = builder.CreateFSub(
+            builder.CreateFDiv(
+                builder.CreateFSub(grown[u][0], at(viewport, 0)), builder.CreateFMul(at(viewport, 2), f(0.5))
+            ),
+            f(1)
+        );
+        auto y = builder.CreateFSub(
+            f(1), builder.CreateFDiv(
+                      builder.CreateFSub(grown[u][1], at(viewport, 1)), builder.CreateFMul(at(viewport, 3), f(0.5))
+                  )
+        );
+        auto z = blend(over_w, u, [&](uint32_t k) { return at(clip[k], 2); });
+        pvalue point = llvm::UndefValue::get(types._float4);
+        point = builder.CreateInsertElement(point, x, uint64_t(0));
+        point = builder.CreateInsertElement(point, y, uint64_t(1));
+        point = builder.CreateInsertElement(point, z, uint64_t(2));
+        point = builder.CreateInsertElement(point, f(1), uint64_t(3));
+        position = builder.CreateSelect(expanded, point, position);
       }
       air.CreateSetMeshPosition(vertex, position);
     }
@@ -1361,7 +1375,7 @@ convert_pass_through_geometry_shader(
         bool screen = pso_data->noperspective_inputs >> v.reg & 1;
         air.CreateSetMeshVertexData(
             vertex, builder.getInt32(v.index),
-            blend(screen ? window_linear : perspective, u, [&](uint32_t k) { return component(k, v.reg, v.component); })
+            blend(screen ? window_linear : over_w, u, [&](uint32_t k) { return component(k, v.reg, v.component); })
         );
         continue;
       }
@@ -1371,7 +1385,7 @@ convert_pass_through_geometry_shader(
       auto &d = distance.value();
       air.CreateSetMeshClipDistance(
           vertex, builder.getInt32(distance.index()),
-          conservative && clip[0] ? blend(perspective, u, [&](uint32_t k) { return component(k, d.reg, d.component); })
+          conservative && clip[0] ? blend(over_w, u, [&](uint32_t k) { return component(k, d.reg, d.component); })
                                   : real(component(corner, d.reg, d.component))
       );
     }
@@ -1383,6 +1397,14 @@ convert_pass_through_geometry_shader(
           value = builder.CreateSelect(in_front, value, air.getFloat(NAN));
         air.CreateSetMeshVertexData(vertex, builder.getInt32(conservative_at + i), value);
       }
+    // the plane's 1/w, over w, at each interpolation: 1 where the triangle is not grown
+    if (conservative) {
+      pvalue rcp_w = air.getFloat(1.0);
+      if (clip[0])
+        rcp_w = blend(over_w, u, [&](uint32_t) { return air.getFloat(1.0); });
+      for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
+        air.CreateSetMeshVertexData(vertex, builder.getInt32(conservative_at + SM50_CONSERVATIVE_VARYINGS + i), rcp_w);
+    }
     if (own.count == 1)
       air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
     if (!conservative)

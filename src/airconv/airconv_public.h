@@ -411,13 +411,18 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   uint32_t pixel_formats[8];
   bool pipeline_statistics;
   /* conservative rasterization: the pixel shader runs only where the pixel's square overlaps the primitive the mesh
-     stage passes on in SM50_CONSERVATIVE_VARYINGS (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative) */
+     stage passes on in SM50_CONSERVATIVE_VARYINGS (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), takes every
+     sample as covered, and divides its perspective inputs by SM50_CONSERVATIVE_RCP_W's */
   bool conservative;
 };
 
 /* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the
    primitive's three vertices in window coordinates (x, y each), or NaN in the first for every pixel */
 #define SM50_CONSERVATIVE_VARYINGS 6
+/* then the reciprocal of the primitive's w, "mullion_conservative6" to 9, for the pixel shader's inputs at the center,
+   at the centroid, at the sample and where it evaluates them. the grown triangles' vertices have a w of 1, so what
+   Metal interpolates is linear in the window: their inputs are what is, an input over w, the vertices' own 1/w */
+#define SM50_CONSERVATIVE_RCP_W 4
 /* the viewports a conservative rasterizer's mesh stage reads, by viewport array index: x, y, width, height */
 struct SM50_CONSERVATIVE_VIEWPORTS {
   float viewports[16][4];

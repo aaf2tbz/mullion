@@ -492,9 +492,47 @@ llvm::Error convert_dxbc_pixel_shader(
     coverage = sample < *statistics ? ~0u : func_signature.DefineInput(air::InputInputCoverage{});
   }
 
-  // conservative rasterization: the pixel's position, and the triangle the mesh stage passes on
-  uint32_t conservative_position = ~0u, conservative_window[SM50_CONSERVATIVE_VARYINGS];
+  // conservative rasterization: the pixel's position, and the triangle the mesh stage passes on; the inputs it
+  // interpolates over w, with that 1/w at each place they are interpolated (SM50_CONSERVATIVE_RCP_W), and the coverage,
+  // of every sample (or this one, when the shader runs per sample)
+  uint32_t conservative_position = ~0u, conservative_window[SM50_CONSERVATIVE_VARYINGS],
+           conservative_rcp_w[SM50_CONSERVATIVE_RCP_W], conservative_coverage = ~0u, conservative_sample = ~0u;
+  std::vector<std::pair<uint32_t, uint32_t>> conservative_over_w; // an input, and where it is interpolated
   if (pso_data && pso_data->conservative) {
+    auto &inputs = func_signature.Inputs();
+    for (uint32_t i = 0; i < inputs.size(); i++) {
+      if (auto in = std::get_if<air::InputFragmentStageIn>(&inputs[i])) {
+        using air::Interpolation;
+        uint32_t at = in->pull_mode                                              ? 3
+                      : in->interpolation == Interpolation::center_perspective   ? 0
+                      : in->interpolation == Interpolation::centroid_perspective ? 1
+                      : in->interpolation == Interpolation::sample_perspective   ? 2
+                                                                                 : ~0u;
+        bool perspective = in->interpolation == Interpolation::center_perspective ||
+                           in->interpolation == Interpolation::centroid_perspective ||
+                           in->interpolation == Interpolation::sample_perspective;
+        if (~at && perspective)
+          conservative_over_w.push_back({i, at});
+      }
+      if (std::holds_alternative<air::InputInputCoverage>(inputs[i]))
+        conservative_coverage = i;
+      // the shader's own, not the pipeline statistics' (declared after it)
+      if (std::holds_alternative<air::InputSampleIndex>(inputs[i]) && (!statistics || i < *statistics))
+        conservative_sample = i;
+    }
+    const air::Interpolation rcp_w_at[SM50_CONSERVATIVE_RCP_W] = {
+        air::Interpolation::center_no_perspective, air::Interpolation::centroid_no_perspective,
+        air::Interpolation::sample_no_perspective, air::Interpolation::center_perspective
+    };
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
+      conservative_rcp_w[i] = func_signature.DefineInput(
+          air::InputFragmentStageIn{
+              .user = "mullion_conservative" + std::to_string(SM50_CONSERVATIVE_VARYINGS + i),
+              .type = air::msl_float,
+              .interpolation = rcp_w_at[i],
+              .pull_mode = i == 3
+          }
+      );
     conservative_position =
         func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
     for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
@@ -532,11 +570,41 @@ llvm::Error convert_dxbc_pixel_shader(
 
   setup_metal_version(module, metal_version);
 
+  std::vector<std::pair<llvm::Argument *, llvm::Value *>> conservative_inputs;
+  llvm::SmallPtrSet<llvm::Instruction *, 32> conservative_own;
   if (conservative_position != ~0u) {
     pvalue window[SM50_CONSERVATIVE_VARYINGS];
     for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
       window[i] = function->getArg(conservative_window[i]);
     auto position = function->getArg(conservative_position);
+    // what reads the inputs gets them divided by the 1/w Metal interpolates with them, and the position's w over it
+    auto rcp_w = [&](uint32_t at) { return function->getArg(conservative_rcp_w[at]); };
+    for (auto [index, at] : conservative_over_w) {
+      auto input = function->getArg(index);
+      if (at == 3)
+        continue; // at each evaluation instead
+      auto vector = llvm::dyn_cast<llvm::FixedVectorType>(input->getType());
+      conservative_inputs.push_back(
+          {input, builder.CreateFDiv(
+                      input, vector ? builder.CreateVectorSplat(vector->getNumElements(), rcp_w(at)) : rcp_w(at)
+                  )}
+      );
+    }
+    conservative_inputs.push_back(
+        {position,
+         builder.CreateInsertElement(
+             position, builder.CreateFMul(builder.CreateExtractElement(position, uint64_t(3)), rcp_w(0)), uint64_t(3)
+         )}
+    );
+    // the grown triangles share the pixels on their edges, each with some of their samples
+    if (~conservative_coverage) {
+      auto all =
+          builder.CreateSub(builder.CreateShl(builder.getInt32(1), air.CreateGetNumSamples()), builder.getInt32(1));
+      conservative_inputs.push_back(
+          {function->getArg(conservative_coverage),
+           ~conservative_sample ? builder.CreateShl(builder.getInt32(1), function->getArg(conservative_sample)) : all}
+      );
+    }
     auto culled = conservative_overlap(builder, air, position, window);
     auto discard = llvm::BasicBlock::Create(context, "conservative_discard", function, epilogue_bb);
     auto live = llvm::BasicBlock::Create(context, "conservative_live", function, epilogue_bb);
@@ -545,6 +613,9 @@ llvm::Error convert_dxbc_pixel_shader(
     air.CreateDiscard();
     builder.CreateBr(live);
     builder.SetInsertPoint(live);
+    for (auto &block : *function)
+      for (auto &instruction : block)
+        conservative_own.insert(&instruction);
   }
 
   if (statistics) {
@@ -618,6 +689,29 @@ llvm::Error convert_dxbc_pixel_shader(
     builder.CreateRetVoid();
   } else {
     builder.CreateRet(value);
+  }
+  // the shader reads the conservative rasterizer's inputs, and divides what it evaluates of one over w by 1/w's there
+  for (auto [input, value] : conservative_inputs)
+    input->replaceUsesWithIf(value, [&](llvm::Use &use) {
+      auto user = llvm::dyn_cast<llvm::Instruction>(use.getUser());
+      return user && !conservative_own.contains(user);
+    });
+  for (auto [index, at] : conservative_over_w) {
+    if (at != 3)
+      continue;
+    std::vector<llvm::CallInst *> evaluations;
+    for (auto user : function->getArg(index)->users())
+      if (auto call = llvm::dyn_cast<llvm::CallInst>(user);
+          call && call->getCalledFunction() && call->getCalledFunction()->getName().startswith("air.interpolate_"))
+        evaluations.push_back(call);
+    for (auto call : evaluations) {
+      auto rcp_w = llvm::cast<llvm::CallInst>(call->clone());
+      rcp_w->setArgOperand(0, function->getArg(conservative_rcp_w[3]));
+      rcp_w->insertAfter(call);
+      builder.SetInsertPoint(rcp_w->getNextNode());
+      auto divided = builder.CreateFDiv(call, rcp_w);
+      call->replaceUsesWithIf(divided, [&](llvm::Use &use) { return use.getUser() != divided; });
+    }
   }
 
   module.getOrInsertNamedMetadata("air.fragment")
