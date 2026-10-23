@@ -21,6 +21,8 @@
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
 #include "d3d11_device.hpp"
+#include "d3d11_on12.hpp"
+#include <bit>
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "mullion_capture.hpp"
@@ -55,20 +57,11 @@ GetMaxFeatureLevel(WMT::Device device) {
   return maxFeatureLevel;
 }
 
-extern "C" HRESULT WINAPI
-D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
-                      UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels,
-                      UINT FeatureLevels, ID3D11Device **ppDevice) {
-  InitReturnPtr(ppDevice);
-
-  Com<IMTLDXGIAdapter> dxgi_adapter;
-
-  // Try to find the corresponding Metal device for the DXGI adapter
-  if (FAILED(pAdapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
-    ERR("Not a Mullion adapter");
-    return E_INVALIDARG;
-  }
-
+// the first of the feature levels asked for (or D3D11's default ones) that the device has
+static HRESULT
+SelectFeatureLevel(
+    WMT::Device device, const D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels, D3D_FEATURE_LEVEL &devFeatureLevel
+) {
   // Feature levels to probe if the
   // application does not specify any.
   std::array<D3D_FEATURE_LEVEL, 6> defaultFeatureLevels = {
@@ -81,9 +74,9 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
     FeatureLevels = defaultFeatureLevels.size();
   }
 
-  D3D_FEATURE_LEVEL maxFeatureLevel = GetMaxFeatureLevel(dxgi_adapter->GetMTLDevice());
+  D3D_FEATURE_LEVEL maxFeatureLevel = GetMaxFeatureLevel(device);
   D3D_FEATURE_LEVEL minFeatureLevel = D3D_FEATURE_LEVEL();
-  D3D_FEATURE_LEVEL devFeatureLevel = D3D_FEATURE_LEVEL();
+  devFeatureLevel = D3D_FEATURE_LEVEL();
 
   Logger::info(
       str::format("Maximum supported feature level: ", maxFeatureLevel));
@@ -115,6 +108,28 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
                             " not supported"));
     return DXGI_ERROR_UNSUPPORTED;
   }
+
+  return S_OK;
+}
+
+extern "C" HRESULT WINAPI
+D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
+                      UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels,
+                      UINT FeatureLevels, ID3D11Device **ppDevice) {
+  InitReturnPtr(ppDevice);
+
+  Com<IMTLDXGIAdapter> dxgi_adapter;
+
+  // Try to find the corresponding Metal device for the DXGI adapter
+  if (FAILED(pAdapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
+    ERR("Not a Mullion adapter");
+    return E_INVALIDARG;
+  }
+
+  D3D_FEATURE_LEVEL devFeatureLevel;
+  if (HRESULT hr = SelectFeatureLevel(dxgi_adapter->GetMTLDevice(), pFeatureLevels, FeatureLevels, devFeatureLevel);
+      FAILED(hr))
+    return hr;
 
   try {
     Logger::info(str::format("Using feature level ", devFeatureLevel));
@@ -247,7 +262,73 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
     D3D_FEATURE_LEVEL *pChosenFeatureLevel) {
   InitReturnPtr(ppDevice);
   InitReturnPtr(ppImmediateContext);
-  return E_NOTIMPL;
+  if (pChosenFeatureLevel)
+    *pChosenFeatureLevel = D3D_FEATURE_LEVEL();
+
+  if (!pDevice || !ppCommandQueues || !NumQueues || !pFeatureLevels != !FeatureLevels)
+    return E_INVALIDARG;
+
+  Com<IMTLD3D11On12Source> source;
+  Com<ID3D12Device> d3d12;
+  Com<ID3D12CommandQueue> queue;
+  if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&source))) || FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&d3d12)))) {
+    ERR("D3D11On12CreateDevice: not a Mullion D3D12 device");
+    return E_INVALIDARG;
+  }
+  if (NodeMask && ((NodeMask & (NodeMask - 1)) || std::countr_zero(NodeMask) >= d3d12->GetNodeCount()))
+    return E_INVALIDARG;
+  std::vector<Com<ID3D12CommandQueue>> queues;
+  for (UINT i = 0; i < NumQueues; i++) {
+    Com<ID3D12CommandQueue> candidate;
+    Com<ID3D12Device> owner;
+    if (!ppCommandQueues[i] || FAILED(ppCommandQueues[i]->QueryInterface(IID_PPV_ARGS(&candidate))) ||
+        candidate->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        FAILED(candidate->GetDevice(IID_PPV_ARGS(&owner))) || owner != d3d12 ||
+        std::find(queues.begin(), queues.end(), candidate) != queues.end())
+      return E_INVALIDARG;
+    queues.push_back(std::move(candidate));
+  }
+  queue = queues.front();
+
+  // with none asked for, the D3D12 device's feature level, as far as D3D11 has it
+  D3D_FEATURE_LEVEL d3d12FeatureLevel[1];
+  if (!pFeatureLevels || !FeatureLevels) {
+    static const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+    D3D12_FEATURE_DATA_FEATURE_LEVELS query = {std::size(levels), levels};
+    if (FAILED(d3d12->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &query, sizeof(query))))
+      return E_INVALIDARG;
+    d3d12FeatureLevel[0] = std::min(query.MaxSupportedFeatureLevel, GetMaxFeatureLevel(source->GetMTLDevice()));
+    pFeatureLevels = d3d12FeatureLevel;
+    FeatureLevels = 1;
+  }
+
+  D3D_FEATURE_LEVEL devFeatureLevel;
+  if (HRESULT hr = SelectFeatureLevel(source->GetMTLDevice(), pFeatureLevels, FeatureLevels, devFeatureLevel);
+      FAILED(hr))
+    return hr;
+
+  try {
+    Logger::info(str::format("D3D11On12: using feature level ", devFeatureLevel));
+    Com<ID3D11Device> device;
+    if (HRESULT hr = CreateD3D11On12Device(source.ptr(), d3d12.ptr(), queue.ptr(), devFeatureLevel, Flags, &device);
+        FAILED(hr))
+      return hr;
+    if (pChosenFeatureLevel)
+      *pChosenFeatureLevel = devFeatureLevel;
+    if (ppImmediateContext)
+      device->GetImmediateContext(ppImmediateContext);
+    if (ppDevice)
+      *ppDevice = device.ref();
+    return ppDevice || ppImmediateContext ? S_OK : S_FALSE;
+  } catch (const MTLD3DError &e) {
+    Logger::err("D3D11On12CreateDevice: Failed to create D3D11 device");
+    return E_FAIL;
+  } catch (const std::bad_alloc &) {
+    return E_OUTOFMEMORY;
+  }
 }
 
 } // namespace mullion

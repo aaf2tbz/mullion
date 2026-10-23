@@ -105,6 +105,92 @@ NotSupportedOnNode(void *pFeatureData, UINT DataSize) {
   return S_OK;
 }
 
+// what D3D11On12 needs of the device (IMTLDXGIDevice's IMTLD3D11On12Source), as a part of the device: its own
+// reference count is the device's. D3D12 fences are reached on the CPU, after the GPU's work; a D3D11 context waits
+// for and signals Metal shared events, so the two meet in callbacks that move one to the other
+class D3D11On12Source final : public IMTLD3D11On12Source {
+public:
+  explicit D3D11On12Source(MTLD3D12Device *device) : device_(device) {}
+
+  HRESULT STDMETHODCALLTYPE
+  QueryInterface(REFIID riid, void **ppvObject) final {
+    return device_->QueryInterface(riid, ppvObject);
+  }
+  ULONG STDMETHODCALLTYPE
+  AddRef() final {
+    return device_->AddRef();
+  }
+  ULONG STDMETHODCALLTYPE
+  Release() final {
+    return device_->Release();
+  }
+
+  WMT::Device STDMETHODCALLTYPE
+  GetMTLDevice() final {
+    return device_->GetMTLDevice();
+  }
+  HRESULT STDMETHODCALLTYPE
+  GetAdapter(REFIID riid, void **ppAdapter) final {
+    return device_->GetAdapter(riid, ppAdapter);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  GetResourceObjects(ID3D12Resource *pResource, MullionMetalResource *pInfo) final {
+    *pInfo = {};
+    if (!pResource || !Owns(pResource))
+      return E_INVALIDARG;
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    if (resource->feedback || !resource->mapped_tiles.empty())
+      return E_INVALIDARG;
+    if (resource->texture && resource->texture->current()) {
+      auto allocation = resource->texture->current();
+      pInfo->texture = allocation->texture().handle;
+      pInfo->texture_info = resource->texture->info();
+      pInfo->texture_info.gpu_resource_id = allocation->gpuResourceID;
+      pInfo->flags = allocation->flags().raw();
+      NSObject_retain(pInfo->texture);
+      return S_OK;
+    }
+    if (resource->buffer && resource->buffer->current()) {
+      auto allocation = resource->buffer->current();
+      pInfo->buffer = allocation->buffer().handle;
+      pInfo->buffer_info = allocation->info();
+      pInfo->flags = allocation->flags().raw();
+      NSObject_retain(pInfo->buffer);
+      return S_OK;
+    }
+    return E_INVALIDARG;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateResourceOfMetal(const D3D12_RESOURCE_DESC *desc, const MullionMetalResource *info,
+                        REFIID riid, void **resource) final {
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    return CreateCommittedTexture(device_, &heap, D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COMMON,
+                                  nullptr, riid, resource, nullptr, info);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SignalEventAtFence(ID3D12Fence *pFence, UINT64 FenceValue, WMT::SharedEvent Event, UINT64 Value) final {
+    if (!pFence || !Owns(pFence))
+      return E_INVALIDARG;
+    static_cast<MTLD3D12Fence *>(pFence)->Expect(FenceValue, [event = WMT::Reference<WMT::SharedEvent>(Event), Value]() mutable {
+      event.signalValue(Value);
+    });
+    return S_OK;
+  }
+
+private:
+  // whether an object is a child of this device, and so one of Mullion's
+  bool
+  Owns(ID3D12DeviceChild *child) {
+    Com<ID3D12Device> parent;
+    return SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&parent))) && parent.ptr() == static_cast<ID3D12Device *>(device_);
+  }
+
+  MTLD3D12Device *device_;
+};
+
 class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DDestructionNotifier, ID3D12DeviceConfiguration1>> {
   bool experimental_shader_models_ = ExperimentalShaderModelsEnabled();
   uint32_t simd_width_ = 0, total_lanes_ = 0;
@@ -114,6 +200,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   WMTSparsePageSize sparse_page_size_ = {};
 
   Com<IMTLDXGIAdapter> adapter_;
+  D3D11On12Source on12_source_{this};
 
   bool advertise_numa_ = false;
 
@@ -302,6 +389,11 @@ public:
 
     if (riid == __uuidof(ID3D12DeviceConfiguration) || riid == __uuidof(ID3D12DeviceConfiguration1)) {
       *ppvObject = ref(static_cast<ID3D12DeviceConfiguration1 *>(this));
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IMTLD3D11On12Source)) {
+      *ppvObject = ref(&on12_source_);
       return S_OK;
     }
 

@@ -3,6 +3,7 @@
 #include "d3d11_input_layout.hpp"
 #include "d3d11_interfaces.hpp"
 #include "d3d11_multithread.hpp"
+#include "d3d11_on12.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_class_linkage.hpp"
 #include "d3d11_inspection.hpp"
@@ -1329,7 +1330,13 @@ public:
       ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox, const void *pSrcData,
       UINT SrcRowPitch, UINT SrcDepthPitch
   ) override {
-    // default textures are not mapped (MapOnDefaultTextures is not offered), which these two are for
+    if (pDstResource && GetResourceCommon(pDstResource)->wrapped_resource &&
+        GetResourceCommon(pDstResource)->CanMap(DstSubresource, D3D11_MAP_WRITE, 0, D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
+      if (FAILED(GetResourceCommon(pDstResource)->wrapped_resource->WriteToSubresource(
+              DstSubresource, reinterpret_cast<const D3D12_BOX *>(pDstBox), pSrcData, SrcRowPitch, SrcDepthPitch)))
+        ERR("WriteToSubresource: invalid wrapped resource write");
+      return;
+    }
     ERR("WriteToSubresource: the device does not map default textures");
   }
 
@@ -1338,6 +1345,13 @@ public:
       void *pDstData, UINT DstRowPitch, UINT DstDepthPitch, ID3D11Resource *SrcResource, UINT SrcSubresource,
       const D3D11_BOX *pSrcBox
   ) override {
+    if (SrcResource && GetResourceCommon(SrcResource)->wrapped_resource &&
+        GetResourceCommon(SrcResource)->CanMap(SrcSubresource, D3D11_MAP_READ, 0, D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
+      if (FAILED(GetResourceCommon(SrcResource)->wrapped_resource->ReadFromSubresource(
+              pDstData, DstRowPitch, DstDepthPitch, SrcSubresource, reinterpret_cast<const D3D12_BOX *>(pSrcBox))))
+        ERR("ReadFromSubresource: invalid wrapped resource read");
+      return;
+    }
     ERR("ReadFromSubresource: the device does not map default textures");
   }
 
@@ -1506,6 +1520,9 @@ public:
   }
 
   ~MTLD3D11DXGIDevice() {
+    // submitted work can still be consumed through the D3D12 device
+    if (on12_)
+      cmd_queue_.Drain();
     // queued command lists must release their private references before their pool is destroyed
     cmd_queue_.Shutdown();
     if (local_kmt_) {
@@ -1542,6 +1559,14 @@ public:
       if (!d3d11_device_.d3d10_interfaces_)
         return E_NOINTERFACE;
       *ppvObject = ref_and_cast<ID3D10Device>(d3d11_device_.d3d10_.get());
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D11On12Device) || riid == __uuidof(ID3D11On12Device1) ||
+        riid == __uuidof(ID3D11On12Device2)) {
+      if (!on12_)
+        return E_NOINTERFACE;
+      *ppvObject = ref(on12_.get());
       return S_OK;
     }
 
@@ -1696,12 +1721,23 @@ public:
 
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
 
+  // makes this a device D3D11On12CreateDevice made on a D3D12 device
+  void
+  AttachD3D11On12(IMTLD3D11On12Source *source, ID3D12Device *d3d12, ID3D12CommandQueue *queue) {
+    d3d11_device_.shares_with_d3d12 = true;
+    on12_ = std::make_unique<D3D11On12Device>(
+        static_cast<IMTLDXGIDevice *>(this), &d3d11_device_, d3d12, source, queue
+    );
+  }
+
 private:
   Com<IMTLDXGIAdapter> adapter_;
   D3DKMT_HANDLE local_kmt_ = 0;
   std::unique_ptr<Device> device;
   CommandQueue &cmd_queue_;
   MTLD3D11DeviceImpl d3d11_device_;
+  // last, so it goes first: it holds the D3D12 device and queue
+  std::unique_ptr<D3D11On12Device> on12_;
 };
 
 Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,
@@ -1711,4 +1747,18 @@ Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,
   return Com<IMTLDXGIDevice>::transfer(new MTLD3D11DXGIDevice(
       std::move(device), adapter, feature_level, feature_flags));
 };
+
+HRESULT
+CreateD3D11On12Device(
+    IMTLD3D11On12Source *source, ID3D12Device *d3d12, ID3D12CommandQueue *queue, D3D_FEATURE_LEVEL feature_level,
+    UINT flags, ID3D11Device **ppDevice
+) {
+  Com<IMTLDXGIAdapter> adapter;
+  if (FAILED(source->GetAdapter(IID_PPV_ARGS(&adapter))))
+    return E_INVALIDARG;
+  auto device = Com<MTLD3D11DXGIDevice>::transfer(new MTLD3D11DXGIDevice(
+      CreateMullionDevice({.device = source->GetMTLDevice()}), adapter.ptr(), feature_level, flags));
+  device->AttachD3D11On12(source, d3d12, queue);
+  return device->QueryInterface(IID_PPV_ARGS(ppDevice));
+}
 } // namespace mullion

@@ -23,6 +23,7 @@
 #include "Metal.hpp"
 #include <d3d12.h>
 #include <deque>
+#include <span>
 #include "d3d11_annotation.hpp"
 #include "mullion_geometry.hpp"
 #include "d3d11_context.hpp"
@@ -670,9 +671,12 @@ public:
   Map(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) final {
     std::lock_guard<mutex_t> lock(mutex);
-    if (unlikely(!pResource || !pMappedResource))
+    if (unlikely(!pResource))
       return E_INVALIDARG;
-    pMappedResource->pData = nullptr;
+    if (pMappedResource)
+      *pMappedResource = {};
+    else if (!GetResourceCommon(pResource)->wrapped_resource || !GetTexture(pResource))
+      return E_INVALIDARG;
     if (!GetResourceCommon(pResource)->CanMap(Subresource, MapType, MapFlags, GetType()))
       return E_INVALIDARG;
     return MapResource(pResource, Subresource, MapType, MapFlags, pMappedResource);
@@ -704,8 +708,10 @@ public:
   void
   STDMETHODCALLTYPE
   ClearUnorderedAccessViewUint(D3D11UnorderedAccessView *pUAV, const UINT Values[4]) {
+    PrepareTextureUse({pUAV->texture()});
     InvalidateCurrentPass(true);
     SwitchToComputeEncoder();
+    UseWrappedView(pUAV, true);
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
     pUAV->GetDesc(&desc);
     if (desc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER)
@@ -781,8 +787,10 @@ public:
   void
   STDMETHODCALLTYPE
   ClearUnorderedAccessViewFloat(D3D11UnorderedAccessView *pUAV, const FLOAT Values[4])  {
+    PrepareTextureUse({pUAV->texture()});
     InvalidateCurrentPass(true);
     SwitchToComputeEncoder();
+    UseWrappedView(pUAV, true);
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
     pUAV->GetDesc(&desc);
     if (desc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER)
@@ -849,6 +857,12 @@ public:
     if (!pView)
       return;
 
+    if (device->shares_with_d3d12) {
+      Com<ID3D11Resource> resource;
+      pView->GetResource(&resource);
+      PrepareTextureUse({GetTexture(resource.ptr())});
+    }
+
     auto color = std::array<float, 4>({Color[0], Color[1], Color[2], Color[3]});
 
     while (auto expected = com_cast<ID3D11RenderTargetView>(pView)) {
@@ -871,6 +885,7 @@ public:
         return ClearRenderTargetView(rtv, Color);
       }
       InvalidateCurrentPass(true);
+      UseWrappedView(rtv, true);
       EmitST([texture = rtv->texture(), view = rtv->viewId(),
               plane = rtv->description().DepthPlane](ArgumentEncodingContext &enc) {
         if (texture->render_buffer)
@@ -915,6 +930,7 @@ public:
         return ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, color[0], 0);
       }
       InvalidateCurrentPass(true);
+      UseWrappedView(dsv, true);
       EmitST([texture = dsv->texture(), view = dsv->viewId()](ArgumentEncodingContext &enc) {
         enc.clear_rt_cmd.begin(texture, view, 0, D3D11_CLEAR_DEPTH);
       });
@@ -943,6 +959,7 @@ public:
       if (desc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D)
         return;
       InvalidateCurrentPass(true);
+      UseWrappedView(uav, true);
       UINT first_element = 0, element_stride = 1;
       UINT width, height;
       if (desc.ViewDimension != D3D11_UAV_DIMENSION_BUFFER) {
@@ -1002,7 +1019,9 @@ public:
       if (desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
         return;
       }
+      PrepareTextureUse({srv->texture()});
       SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+      UseWrappedView(srv, true);
       EmitOP([tex = srv->texture(), viewId = srv->viewId()](ArgumentEncodingContext &enc) {
         // workaround: mipmap generation of a8unorm is borked, so use a r8unorm view
         auto fixedViewId = viewId;
@@ -1058,7 +1077,10 @@ public:
       ERR("ResolveSubresource: invalid format ", Format);
       return;
     }
+    PrepareTextureUse({GetTexture(pSrcResource), GetTexture(pDstResource)});
     InvalidateCurrentPass();
+    UseWrappedSubresource(pSrcResource, SrcSubresource, false);
+    UseWrappedSubresource(pDstResource, DstSubresource, true);
     EmitOP([src = static_cast<D3D11ResourceCommon *>(pSrcResource)->texture(),
             dst = static_cast<D3D11ResourceCommon *>(pDstResource)->texture(),
             dst_level = DstSubresource % Dst.Texture2DDesc.MipLevels,
@@ -1212,6 +1234,7 @@ public:
         });
       } else if (auto dst_bind = GetResourceCommon(pDstBuffer)) {
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseWrappedResource(dst_bind, {}, true);
         EmitOP([=, dst = dst_bind->buffer(), counter = uav->counter(),
                 uav_buffer = uav->buffer()](ArgumentEncodingContext &enc) {
           auto [dst_buffer, dst_offset] = enc.access(dst, DstAlignedByteOffset, 4, ResourceAccess::Write);
@@ -1290,6 +1313,7 @@ public:
         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
         staging_buffer.updateContents(offset, pSrcData, copy_len);
         SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        UseWrappedSubresource(pDstResource, DstSubresource, true);
         EmitOP([staging_buffer, offset, dst = std::move(dst), copy_offset, copy_len](ArgumentEncodingContext &enc) {
           auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, ResourceAccess::Write);
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
@@ -1785,6 +1809,7 @@ public:
         state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([IndexType, IndexBufferOffset, Primitive, ArgBuffer = bindable->buffer(),
               AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
@@ -1834,6 +1859,7 @@ public:
       return TessellationDrawIndirect(ControlPointCount, pBufferForArgs, AlignedByteOffsetForArgs);
     }
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([Primitive, ArgBuffer = bindable->buffer(), AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
@@ -1860,6 +1886,7 @@ public:
     auto mesh_budget = mesh_bytes_per_draw_;
     auto vertex_registers = GetManagedShader<PipelineStage::Vertex>()->reflection().NumOutputElement;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
@@ -1921,6 +1948,7 @@ public:
     auto vertex_registers = GetManagedShader<PipelineStage::Vertex>()->reflection().NumOutputElement;
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
@@ -1981,6 +2009,7 @@ public:
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
@@ -2021,6 +2050,7 @@ public:
     auto max_object_threadgroups = max_object_threadgroups_;
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
@@ -2214,6 +2244,7 @@ public:
     if (!PreDispatch())
       return;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      UseWrappedResource(bindable, {}, false);
       EmitOP([AlignedByteOffsetForArgs, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 12, ResourceAccess::Read);
         enc.resolveComputePassBarrier();
@@ -3682,6 +3713,63 @@ public:
   std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment);
   void UseCopyDestination(Rc<StagingResource> &);
   void UseCopySource(Rc<StagingResource> &);
+  void RecordWrappedUse(D3D11ResourceCommon *, const ResourceSubsetState &, bool write);
+
+  void UseWrappedResource(D3D11ResourceCommon *resource, const ResourceSubsetState &subset, bool write) {
+    if (resource && resource->wrapped_state && !resource->wrapped_state->uses.empty())
+      RecordWrappedUse(resource, subset, write);
+  }
+
+  void UseWrappedSubresource(ID3D11Resource *resource, UINT subresource, bool write) {
+    auto common = GetResourceCommon(resource);
+    if (common->wrapped_state && subresource < common->wrapped_state->uses.size())
+      RecordWrappedUse(common, common->wrapped_state->uses[subresource].subset, write);
+  }
+
+  template <typename View> void UseWrappedView(View *view, bool write) {
+    if (view)
+      UseWrappedResource(view->resource_.ptr(), view->subset_, write);
+  }
+  void PrepareTextureUse(std::span<const Rc<Texture>> textures);
+  void PrepareTextureUse(std::initializer_list<Rc<Texture>> textures) {
+    PrepareTextureUse(std::span(textures.begin(), textures.size()));
+  }
+
+  void PrepareShaderTextureUse(bool compute) {
+    if (!device->shares_with_d3d12)
+      return;
+    std::vector<Rc<Texture>> textures;
+    for (unsigned i = 0; i < state_.ShaderStages.size(); i++) {
+      auto stage = PipelineStage(i);
+      if ((stage == PipelineStage::Compute) != compute)
+        continue;
+      auto &bindings = state_.ShaderStages[stage];
+      auto shader = bindings.Shader ? bindings.Shader->GetManagedShader() : nullptr;
+      if (!shader)
+        continue;
+      const auto &reflection = shader->reflection();
+      constexpr auto bits = std::numeric_limits<decltype(reflection.SRVSlotMaskLo)>::digits;
+      for (const auto &[slot, entry] : bindings.SRVs) {
+        auto mask = slot < bits ? reflection.SRVSlotMaskLo : reflection.SRVSlotMaskHi;
+        if ((mask >> (slot % bits)) & 1)
+          if (auto texture = entry.SRV->texture())
+            textures.push_back(std::move(texture));
+      }
+      auto &uavs = compute ? state_.ComputeStageUAV.UAVs : state_.OutputMerger.UAVs;
+      for (const auto &[slot, entry] : uavs)
+        if (reflection.UAVSlotMask & (uint64_t(1) << slot))
+          if (auto texture = entry.View->texture())
+            textures.push_back(std::move(texture));
+    }
+    if (!compute) {
+      for (unsigned i = 0; i < state_.OutputMerger.NumRTVs; i++)
+        if (auto &rtv = state_.OutputMerger.RTVs[i])
+          textures.push_back(rtv->texture());
+      if (auto &dsv = state_.OutputMerger.DSV)
+        textures.push_back(dsv->texture());
+    }
+    PrepareTextureUse(textures);
+  }
 
   std::pair<BufferAllocation *, uint32_t>
   GetDynamicBufferAllocation(Rc<DynamicBuffer> &dynamic);
@@ -3710,6 +3798,21 @@ public:
     if (!managed_shader)
       return;
     const MTL_SHADER_REFLECTION *reflection = &managed_shader->reflection();
+
+    if (device->shares_with_d3d12) {
+      for (const auto &[slot, entry] : ShaderStage.ConstantBuffers)
+        if ((uint64_t(reflection->ConstantBufferSlotMask) >> slot) & 1)
+          UseWrappedResource(entry.Buffer.ptr(), {}, false);
+      constexpr auto bits = std::numeric_limits<decltype(reflection->SRVSlotMaskLo)>::digits;
+      for (const auto &[slot, entry] : ShaderStage.SRVs) {
+        auto mask = slot < bits ? reflection->SRVSlotMaskLo : reflection->SRVSlotMaskHi;
+        if ((mask >> (slot % bits)) & 1)
+          UseWrappedView(entry.SRV.ptr(), false);
+      }
+      for (const auto &[slot, entry] : UAVBindingSet)
+        if ((reflection->UAVSlotMask >> slot) & 1)
+          UseWrappedView(entry.View.ptr(), true);
+    }
 
     bool dirty_cbuffer = ShaderStage.ConstantBuffers.any_dirty_masked(reflection->ConstantBufferSlotMask);
     bool dirty_sampler = ShaderStage.Samplers.any_dirty_masked(reflection->SamplerSlotMask);
@@ -4309,12 +4412,15 @@ public:
     } else {
       UNREACHABLE
     }
+    UseWrappedSubresource(pSrcResource, SrcSubresource, false);
+    UseWrappedSubresource(pDstResource, DstSubresource, true);
   }
 
   void
   CopyTexture(TextureCopyCommand &&cmd) {
     if (cmd.Invalid)
       return;
+    PrepareTextureUse({GetTexture(cmd.pSrc, cmd.Plane), GetTexture(cmd.pDst, cmd.Plane)});
     auto src_type = DXGIFormatType(cmd.Src.Format), dst_type = DXGIFormatType(cmd.Dst.Format);
     bool src_bc = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC, dst_bc = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC;
     auto linear_type = src_bc ? dst_type : src_type;
@@ -4406,6 +4512,7 @@ public:
       } else if (auto src = GetTexture(cmd.pSrc, cmd.Plane)) {
         if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
           InvalidateCurrentPass(true);
+          UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
           UseCopyDestination(staging_dst);
           EmitOP([src_ = std::move(src), dst_ = std::move(staging_dst),
                   cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
@@ -4418,6 +4525,7 @@ public:
           return;
         }
         SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+        UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
         UseCopyDestination(staging_dst);
         EmitOP([=, src_ = std::move(src), dst_ = std::move(staging_dst),
               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
@@ -4458,6 +4566,7 @@ public:
       if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
         if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
           InvalidateCurrentPass(true);
+          UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
           UseCopySource(staging_src);
           EmitOP([dst_ = std::move(dst), src_ = std::move(staging_src),
                   cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
@@ -4470,6 +4579,7 @@ public:
         }
         // copy from staging to default
         SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
         UseCopySource(staging_src);
         EmitOP([=, dst_ = std::move(dst), src_ =std::move(staging_src),
               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
@@ -4506,6 +4616,8 @@ public:
       } else if (auto src = GetTexture(cmd.pSrc, cmd.Plane)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
+        UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
         EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto src_format = src_->pixelFormat();
           auto dst_format = dst_->pixelFormat();
@@ -4580,6 +4692,8 @@ public:
       if (auto src = GetTexture(cmd.pSrc)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
+        UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
         EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
@@ -4626,6 +4740,8 @@ public:
       if (auto src = GetTexture(cmd.pSrc)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
+        UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
         EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
@@ -4697,6 +4813,7 @@ public:
 
     std::lock_guard<mutex_t> lock(mutex);
 
+    PrepareTextureUse({GetTexture(cmd.pDst, cmd.Plane)});
     auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource);
     if (auto dst = GetTexture(cmd.pDst, cmd.Plane); dst || staging_dst) {
       auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
@@ -4741,6 +4858,7 @@ public:
         });
         return;
       }
+      UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
       EmitOP([staging_buffer, offset, dst = std::move(dst), cmd = std::move(cmd),
             bytes_per_depth_slice](ArgumentEncodingContext &enc) {
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
@@ -4799,9 +4917,11 @@ public:
 
     std::lock_guard<mutex_t> lock(mutex);
 
+    PrepareTextureUse({GetTexture(cmd.pDst, cmd.Plane)});
     if (auto dst = GetTexture(cmd.pDst, cmd.Plane)) {
 
       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+      UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
         auto [src_buffer, src_offset] = enc.access(src, 0, src->length(), ResourceAccess::Read);
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
@@ -4969,7 +5089,9 @@ public:
 
   void
   ClearRenderTargetView(D3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) {
+    PrepareTextureUse({pRenderTargetView->texture()});
     InvalidateCurrentPass();
+    UseWrappedView(pRenderTargetView, true);
     auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
     auto &props = pRenderTargetView->description();
 
@@ -4982,10 +5104,12 @@ public:
 
   void
   ClearDepthStencilView(D3D11DepthStencilView *pDepthStencilView, UINT ClearFlags, FLOAT Depth, UINT8 Stencil) {
+    PrepareTextureUse({pDepthStencilView->texture()});
     ClearFlags &= DepthStencilPlanarFlags(pDepthStencilView->pixelFormat());
     if (ClearFlags == 0)
       return;
     InvalidateCurrentPass();
+    UseWrappedView(pDepthStencilView, true);
     auto &props = pDepthStencilView->description();
 
     EmitOP([texture = pDepthStencilView->texture(), view = pDepthStencilView->viewId(),
@@ -5517,6 +5641,7 @@ public:
   template <bool IndexedDraw>
   DrawCallStatus
   PreDraw() {
+    PrepareShaderTextureUse(false);
     // a draw whose scissors or viewports the pass has no room for starts the next pass
     const UINT rectangles = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     if ((dirty_state.any(DirtyState::Scissors) && pass_scissors_ + rectangles > WMT::kPassRectangles) ||
@@ -5525,6 +5650,23 @@ public:
     DrawCallStatus status;
     if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
       return status;
+    }
+    if (device->shares_with_d3d12) {
+      if constexpr (IndexedDraw)
+        UseWrappedResource(state_.InputAssembler.IndexBuffer.ptr(), {}, false);
+      if (state_.InputAssembler.InputLayout) {
+        auto mask = state_.InputAssembler.InputLayout->GetManagedInputLayout()->input_slot_mask();
+        for (const auto &[slot, entry] : state_.InputAssembler.VertexBuffers)
+          if ((mask >> slot) & 1)
+            UseWrappedResource(entry.Buffer.ptr(), {}, false);
+      }
+      if (!so_raster_pass_ && StreamOutputLayout())
+        for (const auto &[slot, entry] : state_.StreamOutput.Targets)
+          UseWrappedResource(entry.Buffer.ptr(), {}, true);
+      for (const auto &rtv : state_.OutputMerger.RTVs)
+        UseWrappedView(rtv.ptr(), true);
+      if (auto dsv = state_.OutputMerger.DSV.ptr())
+        UseWrappedView(dsv, dsv->readonlyFlags() != DepthStencilPlanarFlags(dsv->pixelFormat()));
     }
     UpdateVertexBuffer();
     if (dirty_state.any(DirtyState::DepthStencilState)) {
@@ -5675,6 +5817,7 @@ public:
 
   bool
   PreDispatch() {
+    PrepareShaderTextureUse(true);
     if (!FinalizeCurrentComputePipeline()) {
       return false;
     }
@@ -5982,7 +6125,14 @@ public:
       // as they are not expected to be created frequently
     }
 
+    ctx_->PrepareTextureUse({input, output, depth, motion_vector, exposure});
     ctx_->InvalidateCurrentPass();
+    ctx_->UseWrappedSubresource(pDesc->Color, 0, false);
+    ctx_->UseWrappedSubresource(pDesc->Output, 0, true);
+    ctx_->UseWrappedSubresource(pDesc->Depth, 0, false);
+    ctx_->UseWrappedSubresource(pDesc->MotionVector, 0, false);
+    if (pDesc->ExposureTexture)
+      ctx_->UseWrappedSubresource(pDesc->ExposureTexture, 0, false);
     ctx_->EmitOP([input = std::move(input), output = std::move(output),
                   depth = std::move(depth),
                   motion_vector = std::move(motion_vector),
@@ -6112,8 +6262,6 @@ public:
       texture.texture->recycle(current_seq_id, std::move(texture.allocation));
       used_dynamic_lineartextures.pop_back();
     }
-    read_staging_resources.clear();
-    written_staging_resources.clear();
     issued_visibility_query.clear();
     ended_queries.clear();
     regions.clear();
@@ -6196,8 +6344,6 @@ public:
 
   std::vector<used_dynamic_buffer> used_dynamic_buffers;
   std::vector<used_dynamic_lineartexture> used_dynamic_lineartextures;
-  std::vector<Rc<StagingResource>> read_staging_resources;
-  std::vector<Rc<StagingResource>> written_staging_resources;
   // private references: a list queued on the immediate context does not keep the device alive
   std::vector<std::pair<Com<MTLD3D11OcclusionQuery, false>, bool>> issued_visibility_query;
   // the queries the immediate context ends as it executes the list
@@ -6207,6 +6353,10 @@ public:
   // predicate may get its data from the regions before
   struct Region {
     CommandList<ArgumentEncodingContext> list;
+    std::vector<Rc<Texture>> textures;
+    std::vector<Rc<StagingResource>> read_staging_resources;
+    std::vector<Rc<StagingResource>> written_staging_resources;
+    std::vector<std::tuple<Com<D3D11ResourceCommon, false>, ResourceSubsetState, bool>> wrapped_uses;
     D3D11_QUERY_DATA_PIPELINE_STATISTICS pipeline_counts{};
     // a query boundary after this region's draws, including when its predicate skips them
     Com<MTLD3D11OcclusionQuery, false> pipeline_query;

@@ -167,6 +167,17 @@ CommandQueue::~CommandQueue() {
 }
 
 void
+CommandQueue::Drain() {
+  drain_last_seq_ = CurrentSeqId() - 1;
+  draining_.store(true, std::memory_order_release);
+  ready_for_encode.fetch_add(1, std::memory_order_release);
+  ready_for_encode.notify_one();
+  encodeThread.join();
+  // only committed work has completion callbacks; the blocked chunk and its tail are abandoned
+  WaitCPUFence(ready_for_commit.load(std::memory_order_acquire) - 1);
+}
+
+void
 CommandQueue::Shutdown() {
   if (stopped.exchange(true))
     return;
@@ -176,7 +187,8 @@ CommandQueue::Shutdown() {
   ready_for_commit++;
   ready_for_commit.notify_one();
   SharedEventListener_destroy(shared_event_listener);
-  encodeThread.join();
+  if (encodeThread.joinable())
+    encodeThread.join();
   finishThread.join();
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
@@ -262,7 +274,9 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
     cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
   }
   auto began = profile_ ? diag::Now() : 0;
-  chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
+  chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx, encoding_cancelled_);
+  if (encoding_cancelled_ || stopped.load(std::memory_order_acquire))
+    return;
   if (profile_)
     diag::Write(diag::Line("span", "encode", seq, GetCurrentThreadId(), began, diag::Now() - began));
   if (profile_) {
@@ -284,11 +298,13 @@ CommandQueue::EncodingThread() {
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
     ready_for_encode.wait(internal_seq, std::memory_order_acquire);
-    if (stopped.load())
+    if (stopped.load() || (draining_.load(std::memory_order_acquire) && internal_seq > drain_last_seq_))
       break;
     // perform...
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
     CommitChunkInternal(chunk, internal_seq);
+    if (encoding_cancelled_)
+      break;
     internal_seq++;
   }
   TRACE("encoder thread gracefully terminates");

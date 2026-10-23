@@ -332,6 +332,8 @@ public:
   virtual HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
       override {
+    if (this->wrapped_resource)
+      return TResourceBase<tag_texture, IMTLMinLODClampable>::CreateSharedHandle(Attributes, Access, pName, pNTHandle);
     InitReturnPtr(pNTHandle);
     if (!local_kmt_ || !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
       return E_INVALIDARG;
@@ -391,7 +393,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     return E_INVALIDARG;
   }
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
-                            !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+                            !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && !pDevice->shares_with_d3d12;
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
 
   MTL_DXGI_FORMAT_DESC format_desc;
@@ -612,6 +614,61 @@ ImportSharedTextureInternal(
       new DeviceTexture<tag>(&finalDesc, std::move(texture), hResource, hGlobalShare, std::move(keyed_mutex), pDevice);
   hResource = 0;
   return device_texture->QueryInterface(riid, ppTexture);
+}
+
+// a texture over a Metal texture another API made (D3D11On12's CreateWrappedResource): the description must make
+// the same Metal texture, which its format and size check
+template <typename tag>
+static HRESULT
+WrapTextureInternal(
+    MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, WMT::Reference<WMT::Texture> &&metal,
+    const MullionMetalResource &Info, REFIID riid, void **ppTexture
+) {
+  WMTTextureInfo info{};
+  typename tag::DESC1 finalDesc;
+  if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info)))
+    return E_INVALIDARG;
+  MTL_DXGI_FORMAT_DESC format;
+  MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format);
+  if (format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    ERR("WrapTexture: planar video formats are not supported");
+    return E_INVALIDARG;
+  }
+  if (metal.pixelFormat() != info.pixel_format || metal.width() != info.width || metal.height() != info.height) {
+    ERR("WrapTexture: the description does not make the texture it wraps");
+    return E_INVALIDARG;
+  }
+  auto texture = Rc<Texture>(new Texture(Info.texture_info, pDevice->GetMTLDevice()));
+  auto allocation = texture->wrap(std::move(metal), Info.texture_info, Info.flags);
+  if (!allocation)
+    return E_INVALIDARG;
+  texture->rename(std::move(allocation));
+  Com<DeviceTexture<tag>> device_texture = new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice);
+  return device_texture->QueryInterface(riid, ppTexture);
+}
+
+HRESULT
+WrapTexture(
+    MTLD3D11Device *pDevice, D3D11_RESOURCE_DIMENSION Dimension, const void *pDesc1, WMT::Reference<WMT::Texture> &&Metal,
+    const MullionMetalResource &Info, REFIID riid, void **ppTexture
+) {
+  InitReturnPtr(ppTexture);
+  switch (Dimension) {
+  case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+    return WrapTextureInternal<tag_texture_1d>(
+        pDevice, static_cast<const D3D11_TEXTURE1D_DESC *>(pDesc1), std::move(Metal), Info, riid, ppTexture
+    );
+  case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    return WrapTextureInternal<tag_texture_2d>(
+        pDevice, static_cast<const D3D11_TEXTURE2D_DESC1 *>(pDesc1), std::move(Metal), Info, riid, ppTexture
+    );
+  case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+    return WrapTextureInternal<tag_texture_3d>(
+        pDevice, static_cast<const D3D11_TEXTURE3D_DESC1 *>(pDesc1), std::move(Metal), Info, riid, ppTexture
+    );
+  default:
+    return E_INVALIDARG;
+  }
 }
 
 HRESULT

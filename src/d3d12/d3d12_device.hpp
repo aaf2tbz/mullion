@@ -628,7 +628,8 @@ struct D3D12SwapChainBufferRefs {
 HRESULT CreateCommittedTexture(
     MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags,
     const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue,
-    REFIID riid, void **ppResource, D3D12SwapChainBufferRefs *pBufferRefs = nullptr
+    REFIID riid, void **ppResource, D3D12SwapChainBufferRefs *pBufferRefs = nullptr,
+    const MullionMetalResource *pTexture = nullptr
 );
 
 HRESULT
