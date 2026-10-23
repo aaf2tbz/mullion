@@ -234,6 +234,22 @@ struct io_binding_map {
   std::vector<uint32_t> mesh_data[2];
   std::vector<std::vector<uint32_t>> mesh_varyings[2];
   llvm::Value *payload = nullptr;
+  // conservative rasterization of a mesh shader's triangles (SM50_SHADER_MESH_SHADER_DATA), null without: the triangles
+  // a mesh threadgroup grows and the slice of the group's it has, the viewports, how the pixel shader interpolates
+  // its registers, where the window coordinates are in the vertex data, and each vertex (0) and primitive (1) varying's
+  // pixel shader register and whether it is an integer
+  struct ConservativeMesh {
+    uint32_t fans;
+    llvm::Value *slice, *viewports;
+    uint32_t flat_inputs, noperspective_inputs;
+    uint32_t at;
+    std::vector<uint32_t> registers[2];
+    std::vector<bool> integers[2];
+  };
+  std::shared_ptr<ConservativeMesh> conservative_mesh;
+  // an amplification shader's: the mesh threadgroups of each its DispatchMesh asks for (a conservative mesh shader's
+  // slices)
+  uint32_t mesh_slices = 1;
 
   // geometry shader ops
   llvm::Value *mesh = nullptr;
@@ -531,6 +547,8 @@ public:
   // its vertex and primitive limits, whether it outputs lines, and the payload's size (an amplification shader's too)
   uint32_t mesh_max_vertices = 0, mesh_max_primitives = 0, payload_size = 0;
   bool mesh_lines = false;
+  // whether it writes resources (UAVs), which a group run more than once would write again
+  bool writes_resources = false;
 
   BasicBlock *entry() const {
     return bbs.front().get();
@@ -701,7 +719,8 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
 
 // conservative rasterization (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), dxbc_converter_gs.cpp
 struct ConservativeFan {
-  pvalue over_w[9][3], linear[9][3];
+  using Weights = pvalue[9][3];
+  Weights over_w, linear;
   pvalue position[9], rcp_w[9];          // each point's, and the plane's 1/w there
   pvalue window[3][2];                   // the corners in the window
   pvalue in_front, degenerate, expanded; // all corners before the eye; no area there; grown

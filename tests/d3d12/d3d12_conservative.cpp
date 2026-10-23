@@ -5,7 +5,9 @@
 // triangle's attributes extrapolated from their plane, so a pixel whose center is inside sees what it sees without
 // conservative rasterization, and a flat input is the first vertex's. a pipeline without a pixel shader writes depth to
 // the same pixels. all of it holds as well for triangles a geometry shader emits, in a strip whose second, odd triangle
-// has no area, for those a tessellator outputs, and for a geometry shader's after a tessellator. D3D11.3 functional
+// has no area, for those a tessellator outputs, for a geometry shader's after a tessellator, and for a mesh shader's
+// (DXIL), with and without an amplification shader: its group outputs the triangle among others without area, past the
+// triangles one Metal mesh grows. the device reports tier 1, and with it feature level 12_1. D3D11.3 functional
 // specification 15.17 (Conservative Rasterization): "any pixel
 // ... touched by the primitive must be rasterized"; 15.17.2, "Tier 1: 1/2 pixel uncertainty region"; 15.17.5, "the
 // coverage mask ... is full"; 15.17.4, attributes are "extrapolated" for pixels whose centers are outside.
@@ -13,7 +15,7 @@
 // D3D12_CONSERVATIVE_RASTERIZATION_TIER: "Tier_1 enforces a maximum 1/2 pixel uncertainty region".
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_conservative_rasterization_tier
 // each run's SV_Coverage is every sample (15.17.5), and the attributes hold in perspective however steep: a triangle
-// whose plane's 1/w is below 0 within a pixel of it. the device reports tier 1 once every pipeline's triangles grow.
+// whose plane's 1/w is below 0 within a pixel of it.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <cmath>
@@ -93,9 +95,43 @@ Factors factors() {
   v.position = b.x * p[0].position + b.y * p[1].position + b.z * p[2].position;
   return v;
 }
+#ifdef MESH
+ByteAddressBuffer corners : register(t0);
+struct Payload {
+  uint unused;
+};
+// the triangle as triangle REAL of TRIANGLES, the others without area
+#define MESH_BODY                                                                                                     \
+  SetMeshOutputCounts(3, TRIANGLES);                                                                                  \
+  if (t < 3) {                                                                                                        \
+    uint o = t * 28;                                                                                                  \
+    v[t].position = asfloat(corners.Load4(o));                                                                        \
+    v[t].perspective = asfloat(corners.Load(o + 16));                                                                 \
+    v[t].screen = asfloat(corners.Load(o + 20));                                                                      \
+    v[t].flat = corners.Load(24);                                                                                     \
+  }                                                                                                                   \
+  for (uint i = t; i < TRIANGLES; i += 32)                                                                            \
+    tris[i] = i == REAL ? uint3(0, 1, 2) : uint3(0, 0, 0);
+[outputtopology("triangle")] [numthreads(32, 1, 1)]
+void ms(uint t : SV_GroupThreadID, out vertices V v[3], out indices uint3 tris[TRIANGLES]) { MESH_BODY }
+[outputtopology("triangle")] [numthreads(32, 1, 1)]
+void ms_amplified(uint t : SV_GroupThreadID, in payload Payload p, out vertices V v[3], out indices uint3 tris[TRIANGLES]) {
+  MESH_BODY
+}
+[numthreads(1, 1, 1)] void as() {
+  Payload p;
+  p.unused = 0;
+  DispatchMesh(1, 1, 1, p);
+}
+#endif
 )hlsl";
 
 static const UINT kWidth = 24, kHeight = 24;
+
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T> struct alignas(void *) Subobject {
+  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+  T data{};
+};
 // the viewport is offset in the target, so window coordinates are not the viewport's
 static const D3D12_VIEWPORT kViewport{2, 3, 20, 20, 0, 1};
 
@@ -184,6 +220,18 @@ main(int argc, char **argv) {
     }
   };
 
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
+  if (options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_1)
+    fail("conservative rasterization tier %u", options.ConservativeRasterizationTier);
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1};
+  D3D12_FEATURE_DATA_FEATURE_LEVELS level{2, levels};
+  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &level, sizeof(level)));
+  if (level.MaxSupportedFeatureLevel != D3D_FEATURE_LEVEL_12_1)
+    fail("feature level %#x of 12_0 and 12_1", level.MaxSupportedFeatureLevel);
+  if (D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_1, __uuidof(ID3D12Device), nullptr) != S_FALSE)
+    fail("no device of feature level 12_1");
+
   std::vector<std::string> defines = {"WIDTH=" + std::to_string(kWidth), "PIXELS=" + std::to_string(kWidth * kHeight)};
   auto ps_evaluate = compiler.compile(hlsl, "ps_evaluate", "ps", defines);
   if (ps_evaluate.empty()) {
@@ -200,10 +248,29 @@ main(int argc, char **argv) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
+  // mesh shaders are DXIL's, on a device that has them
+  ComPtr<ID3D12Device2> device2;
+  CHECK(device.As(&device2));
+  D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
+  device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7));
+  bool meshes = compiler.dxc && options7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+  auto mesh_defines = defines;
+  mesh_defines.insert(mesh_defines.end(), {"MESH", "TRIANGLES=40", "REAL=33"});
+  std::string ms, ms_amplified, as;
+  if (meshes) {
+    ms = compiler.compile(hlsl, "ms", "ms_6_5", mesh_defines);
+    ms_amplified = compiler.compile(hlsl, "ms_amplified", "ms_6_5", mesh_defines);
+    as = compiler.compile(hlsl, "as", "as_6_5", mesh_defines);
+    if (ms.empty() || ms_amplified.empty() || as.empty()) {
+      printf("failed: the mesh shaders did not compile\n");
+      return 1;
+    }
+  }
 
-  D3D12_ROOT_PARAMETER param{D3D12_ROOT_PARAMETER_TYPE_UAV};
+  // the UAV the pixel shader writes, and the corners a mesh shader reads
+  D3D12_ROOT_PARAMETER params[2] = {{D3D12_ROOT_PARAMETER_TYPE_UAV}, {D3D12_ROOT_PARAMETER_TYPE_SRV}};
   auto rs = root_signature(
-      device.Get(), {1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT}
+      device.Get(), {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT}
   );
   const D3D12_INPUT_ELEMENT_DESC elements[] = {
       {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -211,9 +278,41 @@ main(int argc, char **argv) {
       {"SCREEN", 0, DXGI_FORMAT_R32_FLOAT, 0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
       {"FLAT", 0, DXGI_FORMAT_R32_UINT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
   };
-  // the stages before the rasterizer: the vertex shader, then a geometry shader (1), a tessellator (2), or both
-  const int kPaths = 4;
-  auto tessellated = [](int path) { return path & 2; };
+  // the stages before the rasterizer: the vertex shader, then a geometry shader (1), a tessellator (2), or both; or a
+  // mesh shader (4), after an amplification shader (5)
+  const int kPaths = 6;
+  auto tessellated = [](int path) { return path < 4 && (path & 2); };
+  auto meshed = [](int path) { return path >= 4; };
+  struct {
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> rs;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_format;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+  } stream;
+  // a mesh pipeline of the graphics pipeline's state
+  auto mesh_pipeline = [&](int path, const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, ComPtr<ID3D12PipelineState> &out) {
+    stream = {};
+    stream.rs.data = desc.pRootSignature;
+    if (path == 5)
+      stream.as.data = bytecode(as);
+    stream.ms.data = bytecode(path == 5 ? ms_amplified : ms);
+    stream.ps.data = desc.PS;
+    stream.raster.data = desc.RasterizerState;
+    stream.depth.data = desc.DepthStencilState;
+    stream.targets.data.NumRenderTargets = desc.NumRenderTargets;
+    std::copy_n(desc.RTVFormats, 8, stream.targets.data.RTFormats);
+    stream.depth_format.data = desc.DSVFormat;
+    stream.samples.data = desc.SampleDesc;
+    stream.sample_mask.data = desc.SampleMask;
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+    return device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&out));
+  };
   // by the stages, conservative rasterization and sample count
   ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths];
   for (int geometry = 0; geometry < kPaths; geometry++)
@@ -236,6 +335,11 @@ main(int argc, char **argv) {
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
         desc.SampleDesc = {msaa ? 4u : 1u, 0};
+        if (meshed(geometry)) {
+          if (meshes)
+            CHECK(mesh_pipeline(geometry, desc, pso[geometry][conservative][msaa]));
+          continue;
+        }
         CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[geometry][conservative][msaa])));
       }
   for (int geometry = 0; geometry < kPaths; geometry++) {
@@ -257,6 +361,11 @@ main(int argc, char **argv) {
         tessellated(geometry) ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     desc.SampleDesc = {1, 0};
+    if (meshed(geometry)) {
+      if (meshes)
+        CHECK(mesh_pipeline(geometry, desc, depth_pso[geometry]));
+      continue;
+    }
     CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&depth_pso[geometry])));
   }
 
@@ -390,8 +499,8 @@ main(int argc, char **argv) {
     float target[kWidth * kHeight]; // 1x: the shader's 1, 4x: the samples covered, of 1
     float depth[kWidth * kHeight];
   };
-  auto draw = [&](const Triangle &t, ID3D12PipelineState *pipeline, int msaa, bool depth_only, Pixels &out,
-                  bool patch) -> HRESULT {
+  auto draw = [&](const Triangle &t, ID3D12PipelineState *pipeline, int msaa, bool depth_only, Pixels &out, bool patch,
+                  bool mesh = false) -> HRESULT {
     Vertex *v;
     HRESULT hr;
     if (FAILED(hr = vertices->Map(0, nullptr, (void **)&v)))
@@ -422,9 +531,14 @@ main(int argc, char **argv) {
     list->IASetPrimitiveTopology(
         patch ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
     );
+    list->SetGraphicsRootShaderResourceView(1, vertices->GetGPUVirtualAddress());
     D3D12_VERTEX_BUFFER_VIEW view{vertices->GetGPUVirtualAddress(), sizeof(Vertex) * 3, sizeof(Vertex)};
     list->IASetVertexBuffers(0, 1, &view);
-    list->DrawInstanced(3, 1, 0, 0);
+    ComPtr<ID3D12GraphicsCommandList6> list6;
+    if (mesh && SUCCEEDED(list.As(&list6)))
+      list6->DispatchMesh(1, 1, 1);
+    else
+      list->DrawInstanced(3, 1, 0, 0);
     transition(list.Get(), uav.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, uav.Get(), 0, uav_bytes);
     transition(list.Get(), uav.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -481,20 +595,28 @@ main(int argc, char **argv) {
            y < kViewport.TopLeftY + kViewport.Height;
   };
   const char *paths[kPaths] = {
-      "", ", from a geometry shader", ", from a tessellator", ", from a geometry shader after a tessellator"
+      "",
+      ", from a geometry shader",
+      ", from a tessellator",
+      ", from a geometry shader after a tessellator",
+      ", from a mesh shader",
+      ", from a mesh shader after an amplification shader"
   };
   for (int geometry = 0; geometry < kPaths; geometry++)
     for (auto &shape : triangles) {
+      if (meshed(geometry) && !meshes)
+        continue;
       auto t = shape;
       std::string what = std::string(shape.what) + paths[geometry];
       t.what = what.c_str();
       failures_before = failures;
       step("%s", t.what);
       bool patch = tessellated(geometry);
-      CHECK(draw(t, pso[geometry][0][0].Get(), 0, false, normal, patch));
-      CHECK(draw(t, pso[geometry][1][0].Get(), 0, false, conservative, patch));
-      CHECK(draw(t, pso[geometry][1][1].Get(), 1, false, multisampled, patch));
-      CHECK(draw(t, depth_pso[geometry].Get(), 0, true, depth_only, patch));
+      bool mesh = meshed(geometry);
+      CHECK(draw(t, pso[geometry][0][0].Get(), 0, false, normal, patch, mesh));
+      CHECK(draw(t, pso[geometry][1][0].Get(), 0, false, conservative, patch, mesh));
+      CHECK(draw(t, pso[geometry][1][1].Get(), 1, false, multisampled, patch, mesh));
+      CHECK(draw(t, depth_pso[geometry].Get(), 0, true, depth_only, patch, mesh));
       if (!geometry)
         CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated, false));
       for (int y = 0; y < (int)kHeight; y++)

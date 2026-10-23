@@ -2368,7 +2368,7 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_MESH_SHADER: {
       // next, type, then the pixel shader's bytecode
       uint32_t *src = (void *)args32;
-      struct SM50_SHADER_MESH_SHADER_DATA *data = malloc(sizeof(struct SM50_SHADER_MESH_SHADER_DATA));
+      struct SM50_SHADER_MESH_SHADER_DATA *data = calloc(1, sizeof(struct SM50_SHADER_MESH_SHADER_DATA));
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;

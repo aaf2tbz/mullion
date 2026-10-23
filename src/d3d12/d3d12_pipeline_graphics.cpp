@@ -447,8 +447,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
-      auto &[next, type, pixel] = *(SM50_SHADER_MESH_SHADER_DATA *)arg;
-      hash(bool(pixel));
+      auto &[next, type, pixel, conservative, amplified, fans, slices, flat, noperspective] =
+          *(SM50_SHADER_MESH_SHADER_DATA *)arg;
+      hash(bool(pixel), conservative, amplified, fans, slices, flat, noperspective);
       break;
     }
     default:
@@ -694,6 +695,31 @@ protected:
 
   // a fragment function of no outputs that discards the pixels whose squares miss the triangle the mesh stage passes
   // on in SM50_CONSERVATIVE_VARYINGS, as airconv's conservative pixel shaders do
+  // an object function for a conservative mesh shader without an amplification shader: each of its threadgroups, one
+  // thread for each of the D3D grid's groups, launches the group's `slices` mesh threadgroups and gives them its ID as
+  // the payload (SM50_SHADER_MESH_SHADER_DATA)
+  WMT::Reference<WMT::Function>
+  ConservativeObject(uint32_t slices) {
+    auto source = std::string(R"(#include <metal_stdlib>
+using namespace metal;
+struct Group {
+  uint3 id;
+};
+[[object]] void conservative_object(uint3 group [[threadgroup_position_in_grid]], object_data Group &payload [[payload]],
+                                    mesh_grid_properties grid) {
+  payload.id = group;
+  grid.set_threadgroups_per_grid(uint3()") + std::to_string(slices) + R"(, 1, 1));
+}
+)";
+    WMT::Reference<WMT::Error> err;
+    auto library = device_->GetMTLDevice().newLibraryWithSource(source, err);
+    if (!library) {
+      ERR("Failed to compile the conservative rasterizer's object function: ", err.description().getUTF8String());
+      return {};
+    }
+    return library.newFunction("conservative_object");
+  }
+
   WMT::Reference<WMT::Function>
   ConservativeFragment() {
     static const char source[] = R"(#include <metal_stdlib>
@@ -1078,6 +1104,9 @@ public:
     // triangles in pieces of their workloads, when a fan of its vertices fits one; after a mesh shader, or where the
     // fans do not fit, those triangles rasterize as usual for now
     bool geometry_grows = !mesh_shader && pDesc->GS.pShaderBytecode && ref_gs.GeometryShader.ConservativeFits;
+    // a mesh shader's triangles in slices of its groups' (SM50_SHADER_MESH_SHADER_DATA), when the shader writes no
+    // resources and its outputs fit
+    bool mesh_grows = mesh_shader && ref_ms.MeshConservativeFans;
     auto tessellated = microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(tessellation ? ref_hs.Tessellator.OutputPrimitive : 0);
     bool domain_grows = tessellation && !pDesc->GS.pShaderBytecode &&
                         (tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
@@ -1087,17 +1116,18 @@ public:
                             ref_ds.PostTessellator.MeshVertexSize, true
                         ).primitives;
     // points and lines rasterize as usual, a geometry shader's or a tessellator's too
-    bool triangles = pDesc->GS.pShaderBytecode ? ref_gs.GeometryShader.ConservativeFits || mesh_shader
+    bool triangles = mesh_shader                ? true
+                     : pDesc->GS.pShaderBytecode ? ref_gs.GeometryShader.ConservativeFits
                      : tessellation          ? tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
                                          tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW
                                              : true;
     if (conservative && !plain && !triangles)
       conservative = false;
-    if (conservative && !plain && !geometry_grows && !domain_grows) {
+    if (conservative && !plain && !geometry_grows && !domain_grows && !mesh_grows) {
       static std::once_flag warned;
       std::call_once(warned, [] {
-        WARN("CreatePipelineState: conservative rasterization after a mesh shader, or of primitives too large to grow, "
-             "is not implemented yet; those pipelines rasterize as usual");
+        WARN("CreatePipelineState: conservative rasterization of primitives too large to grow, or after a mesh shader "
+             "that writes resources, is not implemented yet; those pipelines rasterize as usual");
       });
       conservative = false;
     }
@@ -1224,11 +1254,25 @@ public:
       };
       // the mesh shader names its outputs as the pixel shader's inputs
       SM50_SHADER_MESH_SHADER_DATA link{&common, SM50_SHADER_MESH_SHADER, pDesc->PS.pShaderBytecode};
+      if (conservative) {
+        link.conservative = true;
+        link.amplified = AS.pShaderBytecode;
+        link.fans = ref_ms.MeshConservativeFans;
+        link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.fans - 1) / link.fans;
+        link.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
+        link.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
+      }
+      // the amplification shader asks for a conservative mesh shader's slices
+      SM50_SHADER_MESH_SHADER_DATA amplified = link;
+      amplified.pixel_shader_bytecode = nullptr;
       WMT::Reference<WMT::Function> as_func, ms_func = compile(shader_ms, MS, &link, "ms_main", pDesc->PS);
-      if (!ms_func || (AS.pShaderBytecode && !(as_func = compile(shader_as, AS, &common, "as_main")))) {
+      if (!ms_func ||
+          (AS.pShaderBytecode && !(as_func = compile(shader_as, AS, conservative ? (void *)&amplified : &common, "as_main")))) {
         DumpShaders({AS, MS});
         return E_INVALIDARG;
       }
+      if (conservative && !AS.pShaderBytecode && !(as_func = ConservativeObject(link.slices)))
+        return E_FAIL;
       mesh_info.object_function = as_func.handle;
       mesh_info.mesh_function = ms_func.handle;
       mesh_info.fragment_function = ps_func.handle;

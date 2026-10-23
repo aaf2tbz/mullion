@@ -156,6 +156,11 @@ struct MTL_SHADER_REFLECTION {
   /* a compute shader with 64-bit atomics on resources, whose emulation's locks wait for the threadgroups that hold
      them: on a GPU without native 64-bit min and max its dispatch is made in parts as GroupsWorkTogether's */
   uint32_t DeviceAtomics64;
+  /* a mesh shader's triangles a Metal mesh can grow for conservative rasterization (SM50_SHADER_MESH_SHADER_DATA's
+     fans), 0 where it cannot: lines, a shader that writes resources (its group runs once a slice), or outputs too
+     large; and the most primitives it outputs */
+  uint32_t MeshConservativeFans;
+  uint32_t MeshMaxPrimitives;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -262,6 +267,17 @@ struct SM50_SHADER_MESH_SHADER_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   const void *pixel_shader_bytecode;
+  /* conservative rasterization of the mesh shader's triangles (as SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's): a D3D
+     group's mesh is made by `slices` Metal mesh threadgroups, each growing `fans` of its triangles into fans of nine
+     vertices and seven triangles (MTL_SHADER_REFLECTION's MeshConservativeFans). with an amplification shader
+     (`amplified`), its grid's x has `slices` threadgroups for each of the D3D grid's; without one the pipeline's object
+     function launches them, and gives the group's ID as the payload (ConservativeObject) */
+  bool conservative;
+  bool amplified;
+  uint32_t fans;
+  uint32_t slices;
+  uint32_t flat_inputs;
+  uint32_t noperspective_inputs;
 };
 
 /* a DXIL library compiles one function at a time: its ray tracing shader `name`, as a visible function of a ray

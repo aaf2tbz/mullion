@@ -1480,6 +1480,27 @@ AIRCONV_API int SM50Initialize(
     }
     pRefl->GroupsWorkTogether = sm50_shader->groups_work_together;
     pRefl->DeviceAtomics64 = sm50_shader->device_atomics64;
+    // a mesh shader's conservative fans: its outputs wait in threadgroup memory, 16 KB of it, for a mesh of fans of
+    // its triangles, each vertex its components and the window coordinates, each primitive its own and four words
+    pRefl->MeshMaxPrimitives = sm50_shader->mesh_max_primitives;
+    pRefl->MeshConservativeFans = 0;
+    if (sm50_shader->shader_type == microsoft::D3D12_SB_MESH_SHADER && !sm50_shader->mesh_lines &&
+        !sm50_shader->writes_resources) {
+      uint32_t components[2] = {};
+      for (uint32_t primitive = 0; primitive < 2; primitive++)
+        for (auto &e : sm50_shader->mesh_outputs[primitive])
+          components[primitive] += e.rows * e.cols;
+      uint32_t staged = sm50_shader->mesh_max_vertices * (components[0] + 1) * 4 +
+                        sm50_shader->mesh_max_primitives * (components[1] * 4 + 8);
+      uint32_t vertex_size = (components[0] + SM50_CONSERVATIVE_VARYINGS) * 4;
+      uint32_t fans = staged <= mullion::dxbc::conservative_stash_limit
+                          ? std::min({256u / 9, 512u / 7, std::max(sm50_shader->mesh_max_primitives, 1u)})
+                          : 0;
+      while (fans && mullion::dxbc::mesh_size(9 * fans, vertex_size, 7 * fans * (4 + components[1])) >
+                         mullion::dxbc::mesh_size_limit)
+        fans--;
+      pRefl->MeshConservativeFans = fans;
+    }
     if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER) {
       auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
       if (threads_per_patch > 32) {
