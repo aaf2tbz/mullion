@@ -538,6 +538,11 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA {
      maxTotalThreadgroupsPerMeshGrid); 0 while not known, when the pipeline is built to tell it */
   uint32_t max_mesh_threadgroups;
   sm50_shader_t geometry;
+  /* conservative rasterization of the triangles the tessellator outputs, as SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's:
+     every mesh threadgroup makes a piece of its workload's (tessellation_pieces), each triangle a fan */
+  bool conservative;
+  uint32_t flat_inputs;
+  uint32_t noperspective_inputs;
 };
 
 /* the libraries whose functions a library's shader may call: those of its state object */

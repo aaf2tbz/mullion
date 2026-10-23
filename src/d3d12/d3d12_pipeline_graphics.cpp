@@ -423,8 +423,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
-      auto &[next, type, factor, size, groups, geometry] = *(SM50_SHADER_PSO_TESSELLATOR_DATA *)arg;
-      hash(factor, size, groups, bool(geometry));
+      auto &[next, type, factor, size, groups, geometry, conservative, flat, noperspective] =
+          *(SM50_SHADER_PSO_TESSELLATOR_DATA *)arg;
+      hash(factor, size, groups, bool(geometry), conservative, flat, noperspective);
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:
@@ -1071,16 +1072,32 @@ public:
     bool plain = !mesh_shader && !tessellation && !pDesc->GS.pShaderBytecode;
     // conservative rasterization dilates a vertex shader's triangles in the mesh stage, which passes them on
     // (D3D12_CONSERVATIVE_RASTERIZATION_TIER_1); it does not apply to points and lines (D3D11.3 15.17)
-    conservative = pDesc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON &&
-                   pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    // a geometry shader's triangles are grown where it emits them, when their fans fit a mesh; after a hull or mesh
-    // shader, or a geometry shader whose fans do not fit, those triangles rasterize as usual for now
-    bool geometry = !mesh_shader && !tessellation && pDesc->GS.pShaderBytecode;
-    if (conservative && !plain && !(geometry && ref_gs.GeometryShader.ConservativeFits)) {
+    bool requested = pDesc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+    conservative = requested && (!plain || pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    // a geometry shader's triangles are grown where it emits them, when their fans fit a mesh; a domain shader's
+    // triangles in pieces of their workloads, when a fan of its vertices fits one; after a mesh shader, or where the
+    // fans do not fit, those triangles rasterize as usual for now
+    bool geometry_grows = !mesh_shader && pDesc->GS.pShaderBytecode && ref_gs.GeometryShader.ConservativeFits;
+    auto tessellated = microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(tessellation ? ref_hs.Tessellator.OutputPrimitive : 0);
+    bool domain_grows = tessellation && !pDesc->GS.pShaderBytecode &&
+                        (tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
+                         tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW) &&
+                        dxbc::tessellation_pieces(
+                            1, microsoft::D3D11_SB_TESSELLATOR_DOMAIN(ref_hs.Tessellator.Domain), tessellated,
+                            ref_ds.PostTessellator.MeshVertexSize, true
+                        ).primitives;
+    // points and lines rasterize as usual, a geometry shader's or a tessellator's too
+    bool triangles = pDesc->GS.pShaderBytecode ? ref_gs.GeometryShader.ConservativeFits || mesh_shader
+                     : tessellation          ? tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
+                                         tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW
+                                             : true;
+    if (conservative && !plain && !triangles)
+      conservative = false;
+    if (conservative && !plain && !geometry_grows && !domain_grows) {
       static std::once_flag warned;
       std::call_once(warned, [] {
-        WARN("CreatePipelineState: conservative rasterization after a hull or mesh shader, or a geometry shader that "
-             "emits too much, is not implemented yet; those pipelines rasterize as usual");
+        WARN("CreatePipelineState: conservative rasterization after a mesh shader, or of primitives too large to grow, "
+             "is not implemented yet; those pipelines rasterize as usual");
       });
       conservative = false;
     }
@@ -1281,6 +1298,9 @@ public:
       pso_tess.max_potential_tess_factor = D3D12_TESSELLATOR_MAX_TESSELLATION_FACTOR;
       pso_tess.mesh_vertex_size = ref_ds.PostTessellator.MeshVertexSize;
       pso_tess.geometry = shader_gs;
+      pso_tess.conservative = conservative;
+      pso_tess.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
+      pso_tess.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
       pso_tess.next = &common;
       mesh_info.fragment_function = ps_func.handle;
       mesh_info.rasterization_enabled = true;
@@ -1303,7 +1323,7 @@ public:
                                           : dxbc::tessellation_pieces(
                                                 factor, domain,
                                                 microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(ref_hs.Tessellator.OutputPrimitive),
-                                                pso_tess.mesh_vertex_size
+                                                pso_tess.mesh_vertex_size, pso_tess.conservative
                                             ).count,
                                  geometry ? ref_gs.GeometryShader.InstanceCount : 1, pso_tess.max_mesh_threadgroups
         ).parts;

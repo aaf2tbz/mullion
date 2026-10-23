@@ -2272,6 +2272,9 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA32 {
   uint32_t mesh_vertex_size;
   uint32_t max_mesh_threadgroups;
   sm50_shader_t geometry;
+  bool conservative;
+  uint32_t flat_inputs;
+  uint32_t noperspective_inputs;
 };
 
 struct SM50_SHADER_ROOT_SIGNATURE_DATA32 {
@@ -2409,6 +2412,9 @@ sm50_compilation_argument32_convert(
       data->mesh_vertex_size = src->mesh_vertex_size;
       data->max_mesh_threadgroups = src->max_mesh_threadgroups;
       data->geometry = src->geometry;
+      data->conservative = src->conservative;
+      data->flat_inputs = src->flat_inputs;
+      data->noperspective_inputs = src->noperspective_inputs;
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:

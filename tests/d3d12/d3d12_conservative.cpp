@@ -1,12 +1,12 @@
-// contract: conservative rasterization, tier 1. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
-// covers every pixel whose square it overlaps, and no pixel farther than tier 1's uncertainty (half a pixel) from it;
-// such a pixel has all its samples covered (at 4x the test reads the target: Metal runs a 4x pixel's shader more
-// than once, and a discarding run still writes UAVs, with or without conservative rasterization), its pixel shader sees
-// the triangle's attributes extrapolated from their plane, so a pixel whose center is inside sees what it sees without
+// contract: conservative rasterization, tier 1. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON covers
+// every pixel whose square it overlaps, and no pixel farther than tier 1's uncertainty (half a pixel) from it; such a
+// pixel has all its samples covered (at 4x the test reads the target: Metal runs a 4x pixel's shader more than once,
+// and a discarding run still writes UAVs, with or without conservative rasterization), its pixel shader sees the
+// triangle's attributes extrapolated from their plane, so a pixel whose center is inside sees what it sees without
 // conservative rasterization, and a flat input is the first vertex's. a pipeline without a pixel shader writes depth to
 // the same pixels. all of it holds as well for triangles a geometry shader emits, in a strip whose second, odd triangle
-// has no area. D3D11.3 functional specification 15.17
-// (Conservative Rasterization): "any pixel
+// has no area, for those a tessellator outputs, and for a geometry shader's after a tessellator. D3D11.3 functional
+// specification 15.17 (Conservative Rasterization): "any pixel
 // ... touched by the primitive must be rasterized"; 15.17.2, "Tier 1: 1/2 pixel uncertainty region"; 15.17.5, "the
 // coverage mask ... is full"; 15.17.4, attributes are "extrapolated" for pixels whose centers are outside.
 // https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#15.17%20Conservative%20Rasterization
@@ -67,6 +67,32 @@ struct D {
   s.Append(v[2]);
   s.Append(v[2]);
 }
+// a patch of the triangle tessellated at 1, which makes the triangle; the flat input is one for all its corners
+struct Factors {
+  float edges[3] : SV_TessFactor;
+  float inside : SV_InsideTessFactor;
+};
+Factors factors() {
+  Factors f = {{1, 1, 1}, 1};
+  return f;
+}
+[domain("tri")] [partitioning("integer")] [outputtopology("triangle_cw")] [outputcontrolpoints(3)]
+[patchconstantfunc("factors")] V hs(InputPatch<V, 3> p, uint i : SV_OutputControlPointID) { return p[i]; }
+[domain("tri")] V ds(Factors f, float3 b : SV_DomainLocation, const OutputPatch<V, 3> p) {
+  V v;
+  v.position = b.x * p[0].position + b.y * p[1].position + b.z * p[2].position;
+  v.perspective = b.x * p[0].perspective + b.y * p[1].perspective + b.z * p[2].perspective;
+  v.screen = b.x * p[0].screen + b.y * p[1].screen + b.z * p[2].screen;
+  v.flat = p[0].flat;
+  return v;
+}
+[domain("tri")] [partitioning("integer")] [outputtopology("triangle_cw")] [outputcontrolpoints(3)]
+[patchconstantfunc("factors")] D hs_depth(InputPatch<D, 3> p, uint i : SV_OutputControlPointID) { return p[i]; }
+[domain("tri")] D ds_depth(Factors f, float3 b : SV_DomainLocation, const OutputPatch<D, 3> p) {
+  D v;
+  v.position = b.x * p[0].position + b.y * p[1].position + b.z * p[2].position;
+  return v;
+}
 )hlsl";
 
 static const UINT kWidth = 24, kHeight = 24;
@@ -114,6 +140,16 @@ overlaps(const Triangle &t, int px, int py, double grow) {
   return true;
 }
 
+// the slope in the window of an attribute that is `step` times its corner's index at each corner (the vertices'
+// values), taken as linear there
+static double
+gradient(const Triangle &t, double step) {
+  double x1 = t.window[1][0] - t.window[0][0], y1 = t.window[1][1] - t.window[0][1];
+  double x2 = t.window[2][0] - t.window[0][0], y2 = t.window[2][1] - t.window[0][1];
+  double area = x1 * y2 - x2 * y1, a1 = step, a2 = 2 * step;
+  return std::hypot((a1 * y2 - a2 * y1) / area, (a2 * x1 - a1 * x2) / area);
+}
+
 // whether the pixel's center is inside, as an ordinary rasterizer would take it (away from edges)
 static bool
 center_inside(const Triangle &t, int px, int py, double margin) {
@@ -156,8 +192,11 @@ main(int argc, char **argv) {
   }
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), ps = compiler.compile(hlsl, "ps", "ps", defines),
        vs_depth = compiler.compile(hlsl, "vs_depth", "vs", defines), gs = compiler.compile(hlsl, "gs", "gs", defines),
-       gs_depth = compiler.compile(hlsl, "gs_depth", "gs", defines);
-  if (vs.empty() || ps.empty() || vs_depth.empty() || gs.empty() || gs_depth.empty()) {
+       gs_depth = compiler.compile(hlsl, "gs_depth", "gs", defines), hs = compiler.compile(hlsl, "hs", "hs", defines),
+       ds = compiler.compile(hlsl, "ds", "ds", defines), hs_depth = compiler.compile(hlsl, "hs_depth", "hs", defines),
+       ds_depth = compiler.compile(hlsl, "ds_depth", "ds", defines);
+  if (vs.empty() || ps.empty() || vs_depth.empty() || gs.empty() || gs_depth.empty() || hs.empty() || ds.empty() ||
+      hs_depth.empty() || ds_depth.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
@@ -172,14 +211,19 @@ main(int argc, char **argv) {
       {"SCREEN", 0, DXGI_FORMAT_R32_FLOAT, 0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
       {"FLAT", 0, DXGI_FORMAT_R32_UINT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
   };
-  // by the geometry shader, conservative rasterization and sample count
-  ComPtr<ID3D12PipelineState> pso[2][2][2], depth_pso[2];
-  for (int geometry = 0; geometry < 2; geometry++)
+  // the stages before the rasterizer: the vertex shader, then a geometry shader (1), a tessellator (2), or both
+  const int kPaths = 4;
+  auto tessellated = [](int path) { return path & 2; };
+  // by the stages, conservative rasterization and sample count
+  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths];
+  for (int geometry = 0; geometry < kPaths; geometry++)
     for (int conservative = 0; conservative < 2; conservative++)
       for (int msaa = 0; msaa < 2; msaa++) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(vs), bytecode(ps)};
-        if (geometry)
+        if (geometry & 1)
           desc.GS = bytecode(gs);
+        if (tessellated(geometry))
+          desc.HS = bytecode(hs), desc.DS = bytecode(ds);
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask = ~0u;
         desc.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
@@ -187,17 +231,20 @@ main(int argc, char **argv) {
         desc.RasterizerState.ConservativeRaster =
             conservative ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
         desc.InputLayout = {elements, (UINT)std::size(elements)};
-        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.PrimitiveTopologyType =
+            tessellated(geometry) ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
         desc.SampleDesc = {msaa ? 4u : 1u, 0};
         CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[geometry][conservative][msaa])));
       }
-  for (int geometry = 0; geometry < 2; geometry++) {
+  for (int geometry = 0; geometry < kPaths; geometry++) {
     // depth only, without a pixel shader
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(vs_depth)};
-    if (geometry)
+    if (geometry & 1)
       desc.GS = bytecode(gs_depth);
+    if (tessellated(geometry))
+      desc.HS = bytecode(hs_depth), desc.DS = bytecode(ds_depth);
     desc.SampleMask = ~0u;
     desc.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
     desc.RasterizerState.DepthClipEnable = TRUE;
@@ -206,7 +253,8 @@ main(int argc, char **argv) {
     desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     desc.InputLayout = {elements, 1};
-    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.PrimitiveTopologyType =
+        tessellated(geometry) ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     desc.SampleDesc = {1, 0};
     CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&depth_pso[geometry])));
@@ -342,7 +390,8 @@ main(int argc, char **argv) {
     float target[kWidth * kHeight]; // 1x: the shader's 1, 4x: the samples covered, of 1
     float depth[kWidth * kHeight];
   };
-  auto draw = [&](const Triangle &t, ID3D12PipelineState *pipeline, int msaa, bool depth_only, Pixels &out) -> HRESULT {
+  auto draw = [&](const Triangle &t, ID3D12PipelineState *pipeline, int msaa, bool depth_only, Pixels &out,
+                  bool patch) -> HRESULT {
     Vertex *v;
     HRESULT hr;
     if (FAILED(hr = vertices->Map(0, nullptr, (void **)&v)))
@@ -370,7 +419,9 @@ main(int argc, char **argv) {
       list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
     else
       list->OMSetRenderTargets(1, &rtv[msaa], FALSE, nullptr);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->IASetPrimitiveTopology(
+        patch ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+    );
     D3D12_VERTEX_BUFFER_VIEW view{vertices->GetGPUVirtualAddress(), sizeof(Vertex) * 3, sizeof(Vertex)};
     list->IASetVertexBuffers(0, 1, &view);
     list->DrawInstanced(3, 1, 0, 0);
@@ -429,19 +480,23 @@ main(int argc, char **argv) {
     return x >= kViewport.TopLeftX && y >= kViewport.TopLeftY && x < kViewport.TopLeftX + kViewport.Width &&
            y < kViewport.TopLeftY + kViewport.Height;
   };
-  for (int geometry = 0; geometry < 2; geometry++)
+  const char *paths[kPaths] = {
+      "", ", from a geometry shader", ", from a tessellator", ", from a geometry shader after a tessellator"
+  };
+  for (int geometry = 0; geometry < kPaths; geometry++)
     for (auto &shape : triangles) {
       auto t = shape;
-      std::string what = std::string(shape.what) + (geometry ? ", from a geometry shader" : "");
+      std::string what = std::string(shape.what) + paths[geometry];
       t.what = what.c_str();
       failures_before = failures;
       step("%s", t.what);
-      CHECK(draw(t, pso[geometry][0][0].Get(), 0, false, normal));
-      CHECK(draw(t, pso[geometry][1][0].Get(), 0, false, conservative));
-      CHECK(draw(t, pso[geometry][1][1].Get(), 1, false, multisampled));
-      CHECK(draw(t, depth_pso[geometry].Get(), 0, true, depth_only));
+      bool patch = tessellated(geometry);
+      CHECK(draw(t, pso[geometry][0][0].Get(), 0, false, normal, patch));
+      CHECK(draw(t, pso[geometry][1][0].Get(), 0, false, conservative, patch));
+      CHECK(draw(t, pso[geometry][1][1].Get(), 1, false, multisampled, patch));
+      CHECK(draw(t, depth_pso[geometry].Get(), 0, true, depth_only, patch));
       if (!geometry)
-        CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated));
+        CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated, false));
       for (int y = 0; y < (int)kHeight; y++)
         for (int x = 0; x < (int)kWidth; x++) {
           int i = y * kWidth + x;
@@ -488,7 +543,10 @@ main(int argc, char **argv) {
               float got, want;
               memcpy(&got, &conservative.attributes[i][a], 4);
               memcpy(&want, &normal.attributes[i][a], 4);
-              if (!(std::fabs(got - want) <= 1e-3f * std::max(1.0f, std::fabs(want))))
+              // the rasterizer snaps vertices to a 256th of a pixel, the grown triangle's as well as the triangle's:
+              // a sixty-fourth of a pixel of the attribute's slope in the window, which a needle makes steep
+              double slope = gradient(t, a ? 10.0 : 2.0);
+              if (!(std::fabs(got - want) <= 1e-3f * std::max(1.0f, std::fabs(want)) + slope / 64))
                 fail(
                     "%s: pixel (%d, %d): %s %g, without conservative rasterization %g", t.what, x, y,
                     a ? "noperspective" : "perspective", got, want
@@ -508,6 +566,8 @@ main(int argc, char **argv) {
             fail("%s: pixel (%d, %d) is rasterized without conservative rasterization, not with it", t.what, x, y);
         }
     }
-  printf("%s: %u mismatches over %zu triangles\n", failures ? "failed" : "passed", failures, 2 * std::size(triangles));
+  printf(
+      "%s: %u mismatches over %zu triangles\n", failures ? "failed" : "passed", failures, kPaths * std::size(triangles)
+  );
   return failures != 0;
 }

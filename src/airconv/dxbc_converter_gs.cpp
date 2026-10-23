@@ -135,14 +135,8 @@ stream_output_input(air::FunctionSignatureBuilder &signature, llvm::LLVMContext 
 // points have a w of 1, so what Metal interpolates over them is linear in the window, an input over w and the plane's
 // 1/w itself (SM50_CONSERVATIVE_RCP_W), however far from the triangle that is 0. a triangle with a corner at or behind
 // the eye, or of no area, is not grown: its points are its corners, each of its own w
-struct ConservativeFan {
-  pvalue over_w[9][3], linear[9][3];
-  pvalue position[9], rcp_w[9];          // each point's, and the plane's 1/w there
-  pvalue window[3][2];                   // the corners in the window
-  pvalue in_front, degenerate, expanded; // all corners before the eye; no area there; grown
-};
 
-static ConservativeFan
+ConservativeFan
 conservative_fan(
     llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, air::AirType &types, pvalue const (&clip)[3],
     pvalue viewports, pvalue viewport_index
@@ -254,6 +248,43 @@ conservative_fan(
   return fan;
 }
 
+void
+conservative_point(
+    llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeFan &fan, uint32_t u, const SM50ShaderInternal &stage,
+    uint32_t position_reg, uint32_t flat_inputs, uint32_t noperspective_inputs,
+    const std::function<pvalue(uint32_t corner, uint32_t reg)> &corner, pvalue output
+) {
+  auto registers_type = llvm::ArrayType::get(types._int4, stage.max_output_register);
+  auto real = [&](pvalue bits) { return builder.CreateBitCast(bits, types._float); };
+  for (uint32_t reg = 0; reg < stage.max_output_register; reg++) {
+    auto component_types = stage.register_types(reg, RegisterComponentType::Float);
+    pvalue corners[3];
+    for (uint32_t k = 0; k < 3; k++)
+      corners[k] = corner(k, reg);
+    pvalue value = llvm::UndefValue::get(types._int4);
+    for (uint32_t c = 0; c < 4; c++) {
+      auto at = [&](uint32_t k) { return builder.CreateExtractElement(corners[k], uint64_t(c)); };
+      // a flat register is the first corner's, every triangle of the fan starting there
+      bool flat = reg != position_reg &&
+                  (component_types[c] != RegisterComponentType::Float || (flat_inputs >> reg & 1));
+      pvalue component = at(0);
+      if (reg == position_reg) {
+        component = builder.CreateBitCast(builder.CreateExtractElement(fan.position[u], uint64_t(c)), types._int);
+      } else if (!flat) {
+        auto &parts = noperspective_inputs >> reg & 1 ? fan.linear : fan.over_w;
+        pvalue sum = nullptr;
+        for (uint32_t k = 0; k < 3; k++) {
+          auto part = builder.CreateFMul(parts[u][k], real(at(k)));
+          sum = sum ? builder.CreateFAdd(sum, part) : part;
+        }
+        component = builder.CreateBitCast(sum, types._int);
+      }
+      value = builder.CreateInsertElement(value, component, c);
+    }
+    builder.CreateStore(value, builder.CreateGEP(registers_type, output, {builder.getInt32(0), builder.getInt32(reg)}));
+  }
+}
+
 llvm::Error
 convert_dxbc_geometry_shader(
     SM50ShaderInternal *pShaderInternal, const char *name, SM50ShaderInternal *pVertexStage, llvm::LLVMContext &context,
@@ -360,7 +391,14 @@ convert_dxbc_geometry_shader(
   });
   // conservative rasterization of the triangles the shader emits: each is a fan of its own (conservative_fan), of nine
   // vertices and seven triangles, which the pipeline asks for only where they fit (MTL_GEOMETRY_SHADER_REFLECTION)
-  bool conservative = pso_data && pso_data->conservative && topology == air::MeshOutputTopology::Triangle &&
+  // after a tessellator the pipeline's say comes with the tessellator's arguments
+  SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
+  if (pHullStage)
+    args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess);
+  uint32_t flat_inputs = pso_tess ? pso_tess->flat_inputs : pso_data ? pso_data->flat_inputs : 0;
+  uint32_t noperspective_inputs = pso_tess ? pso_tess->noperspective_inputs : pso_data ? pso_data->noperspective_inputs : 0;
+  bool conservative = (pso_tess ? pso_tess->conservative : pso_data && pso_data->conservative) &&
+                      topology == air::MeshOutputTopology::Triangle &&
                       max_vertex_out >= 3;
   uint32_t fans = conservative ? max_vertex_out - 2 : 0;
   // it's intended to declare a bit more max primitive count
@@ -721,31 +759,11 @@ convert_dxbc_geometry_shader(
       builder.CreateStore(builder.CreateAdd(done, one_const), fans_emitted);
       auto vertex_base = builder.CreateMul(done, builder.getInt32(9)), primitive_base = builder.CreateMul(done, builder.getInt32(7));
       for (uint32_t u = 0; u < 9; u++) {
-        // the registers at this point: a flat one the first corner's, every triangle of the fan starting there
-        for (uint32_t reg = 0; reg < max_output_register; reg++) {
-          auto component_types = pShaderInternal->register_types(reg, RegisterComponentType::Float);
-          pvalue value = llvm::UndefValue::get(types._int4);
-          for (uint32_t c = 0; c < 4; c++) {
-            auto corner = [&](uint32_t k) {
-              return builder.CreateExtractElement(builder.CreateLoad(types._int4, ring_at(slot[k], reg)), uint64_t(c));
-            };
-            bool flat = component_types[c] != RegisterComponentType::Float || (pso_data->flat_inputs >> reg & 1);
-            pvalue component = corner(0);
-            if (!flat && reg != position_reg) {
-              auto &parts = pso_data->noperspective_inputs >> reg & 1 ? fan.linear : fan.over_w;
-              pvalue sum = nullptr;
-              for (uint32_t k = 0; k < 3; k++) {
-                auto part = builder.CreateFMul(parts[u][k], real(corner(k)));
-                sum = sum ? builder.CreateFAdd(sum, part) : part;
-              }
-              component = builder.CreateBitCast(sum, types._int);
-            } else if (reg == position_reg) {
-              component = builder.CreateBitCast(builder.CreateExtractElement(fan.position[u], uint64_t(c)), types._int);
-            }
-            value = builder.CreateInsertElement(value, component, c);
-          }
-          builder.CreateStore(value, output_at(reg));
-        }
+        conservative_point(
+            builder, types, fan, u, *pShaderInternal, position_reg, flat_inputs, noperspective_inputs,
+            [&](uint32_t k, uint32_t reg) { return builder.CreateLoad(types._int4, ring_at(slot[k], reg)); },
+            resource_map.output.ptr_int4
+        );
         auto vertex = builder.CreateAdd(vertex_base, builder.getInt32(u));
         MeshOutputContext gs_out_ctx{vertex, builder.CreateAdd(primitive_base, builder.getInt32(std::min(u, 6u)))};
         for (auto &h : gs_output_handlers)
