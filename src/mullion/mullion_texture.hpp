@@ -295,6 +295,8 @@ public:
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset = 0);
   Rc<TextureAllocation> import(mach_port_t mach_port);
+  // an allocation of a Metal texture another API made, of this texture's description (D3D11On12's wrapped resources)
+  Rc<TextureAllocation> wrap(WMT::Reference<WMT::Texture> &&texture, Flags<TextureAllocationFlag> flags);
 
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);

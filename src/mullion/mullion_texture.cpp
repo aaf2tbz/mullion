@@ -247,6 +247,14 @@ Texture::import(mach_port_t mach_port) {
   return nullptr;
 }
 
+Rc<TextureAllocation>
+Texture::wrap(WMT::Reference<WMT::Texture> &&texture, Flags<TextureAllocationFlag> flags) {
+  if (!texture)
+    return nullptr;
+  flags.set(TextureAllocationFlag::Shared);
+  return new TextureAllocation(this, std::move(texture), info_, flags);
+}
+
 TextureView &
 Texture::view(TextureViewKey key) {
   return view(key, current_.ptr());

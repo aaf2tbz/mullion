@@ -637,6 +637,18 @@ HRESULT CreateDeviceTexture3D(MTLD3D11Device *pDevice,
 
 HRESULT ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture);
 
+// a texture over another API's Metal texture, of the description of its dimension's DESC1 (D3D11On12)
+HRESULT WrapTexture(
+    MTLD3D11Device *pDevice, D3D11_RESOURCE_DIMENSION Dimension, const void *pDesc1, WMT::Reference<WMT::Texture> &&Metal,
+    REFIID riid, void **ppTexture
+);
+
+// a buffer over another API's Metal buffer, at its GPU address and with its CPU mapping or none (D3D11On12)
+HRESULT WrapBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, WMT::Reference<WMT::Buffer> &&Metal, UINT64 GpuAddress,
+    void *pMapped, REFIID riid, void **ppBuffer
+);
+
 HRESULT ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture);
 
 HRESULT ImportSharedTextureByName(

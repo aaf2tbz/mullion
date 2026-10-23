@@ -614,6 +614,65 @@ ImportSharedTextureInternal(
   return device_texture->QueryInterface(riid, ppTexture);
 }
 
+// a texture over a Metal texture another API made (D3D11On12's CreateWrappedResource): the description must make
+// the same Metal texture, which its format and size check
+template <typename tag>
+static HRESULT
+WrapTextureInternal(
+    MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, WMT::Reference<WMT::Texture> &&metal,
+    REFIID riid, void **ppTexture
+) {
+  WMTTextureInfo info{};
+  typename tag::DESC1 finalDesc;
+  if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info)))
+    return E_INVALIDARG;
+  MTL_DXGI_FORMAT_DESC format;
+  MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format);
+  if (format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
+    ERR("WrapTexture: planar video formats are not supported");
+    return E_INVALIDARG;
+  }
+  if (metal.pixelFormat() != info.pixel_format || metal.width() != info.width || metal.height() != info.height) {
+    ERR("WrapTexture: the description does not make the texture it wraps");
+    return E_INVALIDARG;
+  }
+  Flags<TextureAllocationFlag> flags;
+  flags.set(TextureAllocationFlag::GpuPrivate);
+  if (!(finalDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS)))
+    flags.set(TextureAllocationFlag::ShaderReadonly);
+  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
+  auto allocation = texture->wrap(std::move(metal), flags);
+  if (!allocation)
+    return E_INVALIDARG;
+  texture->rename(std::move(allocation));
+  Com<DeviceTexture<tag>> device_texture = new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice);
+  return device_texture->QueryInterface(riid, ppTexture);
+}
+
+HRESULT
+WrapTexture(
+    MTLD3D11Device *pDevice, D3D11_RESOURCE_DIMENSION Dimension, const void *pDesc1, WMT::Reference<WMT::Texture> &&Metal,
+    REFIID riid, void **ppTexture
+) {
+  InitReturnPtr(ppTexture);
+  switch (Dimension) {
+  case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+    return WrapTextureInternal<tag_texture_1d>(
+        pDevice, static_cast<const D3D11_TEXTURE1D_DESC *>(pDesc1), std::move(Metal), riid, ppTexture
+    );
+  case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    return WrapTextureInternal<tag_texture_2d>(
+        pDevice, static_cast<const D3D11_TEXTURE2D_DESC1 *>(pDesc1), std::move(Metal), riid, ppTexture
+    );
+  case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+    return WrapTextureInternal<tag_texture_3d>(
+        pDevice, static_cast<const D3D11_TEXTURE3D_DESC1 *>(pDesc1), std::move(Metal), riid, ppTexture
+    );
+  default:
+    return E_INVALIDARG;
+  }
+}
+
 HRESULT
 ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture) {
   InitReturnPtr(ppTexture);

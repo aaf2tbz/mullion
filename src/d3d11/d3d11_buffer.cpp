@@ -145,6 +145,14 @@ public:
     }
   }
 
+  // a buffer over another API's Metal buffer (WrapBuffer), whose contents it keeps: UpdateSubresource copies on the GPU
+  D3D11Buffer(const tag_buffer::DESC1 *pDesc, Rc<Buffer> &&buffer, MTLD3D11Device *device) :
+      TResourceBase<tag_buffer>(*pDesc, device) {
+    buffer_ = std::move(buffer);
+    structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) override {
@@ -382,6 +390,25 @@ CreateBuffer(
 ) {
   *ppBuffer = reinterpret_cast<ID3D11Buffer *>(ref(new D3D11Buffer(pDesc, pInitialData, pDevice)));
   return S_OK;
+}
+
+HRESULT
+WrapBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, WMT::Reference<WMT::Buffer> &&Metal, UINT64 GpuAddress,
+    void *pMapped, REFIID riid, void **ppBuffer
+) {
+  InitReturnPtr(ppBuffer);
+  if (!pDesc->ByteWidth || pDesc->Usage != D3D11_USAGE_DEFAULT)
+    return E_INVALIDARG;
+  auto buffer = Rc<Buffer>(new Buffer(pDesc->ByteWidth, pDevice->GetMTLDevice()));
+  Flags<BufferAllocationFlag> flags;
+  flags.set(BufferAllocationFlag::GpuPrivate);
+  auto allocation = buffer->wrap(std::move(Metal), flags, GpuAddress, pMapped);
+  if (!allocation)
+    return E_INVALIDARG;
+  buffer->rename(std::move(allocation));
+  Com<D3D11Buffer> wrapped = new D3D11Buffer(pDesc, std::move(buffer), pDevice);
+  return wrapped->QueryInterface(riid, ppBuffer);
 }
 
 } // namespace mullion

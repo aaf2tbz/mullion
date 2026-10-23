@@ -105,6 +105,134 @@ NotSupportedOnNode(void *pFeatureData, UINT DataSize) {
   return S_OK;
 }
 
+// what D3D11On12 needs of the device (IMTLDXGIDevice's IMTLD3D11On12Source), as a part of the device: its own
+// reference count is the device's. D3D12 fences are reached on the CPU, after the GPU's work; a D3D11 context waits
+// for and signals Metal shared events, so the two meet in callbacks that move one to the other
+class D3D11On12Source final : public IMTLD3D11On12Source {
+public:
+  explicit D3D11On12Source(MTLD3D12Device *device) : device_(device) {}
+
+  HRESULT STDMETHODCALLTYPE
+  QueryInterface(REFIID riid, void **ppvObject) final {
+    return device_->QueryInterface(riid, ppvObject);
+  }
+  ULONG STDMETHODCALLTYPE
+  AddRef() final {
+    return device_->AddRef();
+  }
+  ULONG STDMETHODCALLTYPE
+  Release() final {
+    return device_->Release();
+  }
+
+  WMT::Device STDMETHODCALLTYPE
+  GetMTLDevice() final {
+    return device_->GetMTLDevice();
+  }
+  HRESULT STDMETHODCALLTYPE
+  GetAdapter(REFIID riid, void **ppAdapter) final {
+    return device_->GetAdapter(riid, ppAdapter);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  GetResourceObjects(
+      ID3D12Resource *pResource, obj_handle_t *pTexture, obj_handle_t *pBuffer, UINT64 *pGpuAddress, void **ppMapped
+  ) final {
+    *pTexture = *pBuffer = NULL_OBJECT_HANDLE;
+    *pGpuAddress = 0;
+    *ppMapped = nullptr;
+    if (!pResource || !Owns(pResource))
+      return E_INVALIDARG;
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    // a reserved resource's pages come and go, and a feedback map is not the texture it describes
+    if (resource->feedback || !resource->mapped_tiles.empty())
+      return E_INVALIDARG;
+    if (resource->texture && resource->texture->current()) {
+      auto texture = resource->texture->current()->texture();
+      NSObject_retain(texture.handle);
+      *pTexture = texture.handle;
+      return S_OK;
+    }
+    if (resource->buffer && resource->buffer->current()) {
+      auto allocation = resource->buffer->current();
+      auto buffer = allocation->buffer();
+      NSObject_retain(buffer.handle);
+      *pBuffer = buffer.handle;
+      *pGpuAddress = allocation->gpuAddress();
+      *ppMapped = allocation->mappedMemory(0);
+      return S_OK;
+    }
+    return E_INVALIDARG;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SignalEventAfterQueue(ID3D12CommandQueue *pQueue, WMT::SharedEvent Event, UINT64 Value) final {
+    if (!pQueue || !Owns(pQueue))
+      return E_INVALIDARG;
+    Com<ID3D12Fence> fence;
+    HRESULT hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    if (FAILED(hr))
+      return hr;
+    if (FAILED(hr = pQueue->Signal(fence.ptr(), 1)))
+      return hr;
+    // the callback keeps the fence: its last release would reach it early
+    static_cast<MTLD3D12Fence *>(fence.ptr())
+        ->Expect(1, [event = WMT::Reference<WMT::SharedEvent>(Event), Value, fence]() mutable { event.signalValue(Value); });
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  QueueWaitForEvent(ID3D12CommandQueue *pQueue, WMT::SharedEvent Event, UINT64 Value) final {
+    if (!pQueue || !Owns(pQueue))
+      return E_INVALIDARG;
+    Com<ID3D12Fence> fence;
+    HRESULT hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    if (FAILED(hr))
+      return hr;
+    // a pool thread waits for the event and reaches the fence the queue waits for
+    struct Wait {
+      WMT::Reference<WMT::SharedEvent> event;
+      UINT64 value;
+      Com<ID3D12Fence> fence;
+    };
+    auto wait = new Wait{WMT::Reference<WMT::SharedEvent>(Event), Value, fence};
+    if (!QueueUserWorkItem(
+            [](void *context) -> DWORD {
+              std::unique_ptr<Wait> wait(static_cast<Wait *>(context));
+              while (!wait->event.waitUntilSignaledValue(wait->value, 1000)) {
+              }
+              wait->fence->Signal(1);
+              return 0;
+            },
+            wait, WT_EXECUTELONGFUNCTION
+        )) {
+      delete wait;
+      return E_FAIL;
+    }
+    return pQueue->Wait(fence.ptr(), 1);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SignalEventAtFence(ID3D12Fence *pFence, UINT64 FenceValue, WMT::SharedEvent Event, UINT64 Value) final {
+    if (!pFence || !Owns(pFence))
+      return E_INVALIDARG;
+    static_cast<MTLD3D12Fence *>(pFence)->Expect(FenceValue, [event = WMT::Reference<WMT::SharedEvent>(Event), Value]() mutable {
+      event.signalValue(Value);
+    });
+    return S_OK;
+  }
+
+private:
+  // whether an object is a child of this device, and so one of Mullion's
+  bool
+  Owns(ID3D12DeviceChild *child) {
+    Com<ID3D12Device> parent;
+    return SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&parent))) && parent.ptr() == static_cast<ID3D12Device *>(device_);
+  }
+
+  MTLD3D12Device *device_;
+};
+
 class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DDestructionNotifier, ID3D12DeviceConfiguration1>> {
   bool experimental_shader_models_ = ExperimentalShaderModelsEnabled();
   uint32_t simd_width_ = 0, total_lanes_ = 0;
@@ -114,6 +242,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   WMTSparsePageSize sparse_page_size_ = {};
 
   Com<IMTLDXGIAdapter> adapter_;
+  D3D11On12Source on12_source_{this};
 
   bool advertise_numa_ = false;
 
@@ -302,6 +431,11 @@ public:
 
     if (riid == __uuidof(ID3D12DeviceConfiguration) || riid == __uuidof(ID3D12DeviceConfiguration1)) {
       *ppvObject = ref(static_cast<ID3D12DeviceConfiguration1 *>(this));
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IMTLD3D11On12Source)) {
+      *ppvObject = ref(&on12_source_);
       return S_OK;
     }
 

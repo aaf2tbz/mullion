@@ -97,6 +97,19 @@ BufferAllocation::BufferAllocation(
   mappedMemory_ = nullptr;
 }
 
+BufferAllocation::BufferAllocation(
+    WMT::Reference<WMT::Buffer> &&buffer, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags,
+    uint64_t gpu_address, void *mapped
+) :
+    obj_(std::move(buffer)),
+    info_(info),
+    flags_(flags) {
+  suballocation_size_ = info_.length;
+  fenceTrackers.resize(suballocation_count_);
+  gpuAddress_ = gpu_address;
+  mappedMemory_ = mapped;
+}
+
 void
 BufferAllocation::free() {
   if (placed_buffer) {
@@ -242,6 +255,19 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size)
   flags.set(BufferAllocationFlag::CpuInvisible);
   return new BufferAllocation(device_, info, flags, page_size);
 };
+
+Rc<BufferAllocation>
+Buffer::wrap(WMT::Reference<WMT::Buffer> &&buffer, Flags<BufferAllocationFlag> flags, uint64_t gpu_address, void *mapped) {
+  if (!buffer)
+    return nullptr;
+  WMTBufferInfo info;
+  info.memory.set(mapped);
+  info.length = length_;
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  if (!mapped)
+    flags.set(BufferAllocationFlag::CpuInvisible);
+  return new BufferAllocation(std::move(buffer), info, flags, gpu_address, mapped);
+}
 
 Rc<BufferAllocation>
 Buffer::rename(Rc<BufferAllocation> &&newAllocation) {

@@ -162,6 +162,10 @@ private:
   BufferAllocation(
       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size
   );
+  BufferAllocation(
+      WMT::Reference<WMT::Buffer> &&buffer, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags,
+      uint64_t gpu_address, void *mapped
+  );
   void free();
 
   BufferAllocation(const BufferAllocation &) = delete;
@@ -200,6 +204,10 @@ public:
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
   // a placement sparse buffer, whose tiles are mapped to heaps later
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size);
+  // an allocation of a Metal buffer another API made, at its GPU address and with its CPU mapping or none
+  // (D3D11On12's wrapped resources)
+  Rc<BufferAllocation>
+  wrap(WMT::Reference<WMT::Buffer> &&buffer, Flags<BufferAllocationFlag> flags, uint64_t gpu_address, void *mapped);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 
