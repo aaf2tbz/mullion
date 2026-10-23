@@ -147,6 +147,8 @@ PipelineRuns(Head head, Name name) {
       case WMTRenderCommandMullionTessellationMeshDrawIndirect:
       case WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect:
       case WMTRenderCommandExecuteCommandsInBuffer:
+      // ExecuteIndirect's commands, over the range its resolver writes (d3d12_command_allocator.cpp)
+      case WMTRenderCommandExecuteCommandsInBufferIndirect:
         calls++;
         break;
       default:
