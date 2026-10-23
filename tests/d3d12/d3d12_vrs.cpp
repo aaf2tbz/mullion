@@ -19,15 +19,15 @@ struct V {
   float a : A;
   noperspective float n : N;
 };
-// a triangle over the 32x32 target, its corners at (0, 0), (64, 0) and (0, 64) of a 64x64 viewport, of w 1, or 1, 2 and 4
-// (mode 1). Metal clips a triangle that reaches past its guard band, a quarter beyond the viewport, into several. mode 3's
-// corners are at (24.25, 0) and (0, 24.25), its long edge across the target's coarse pixels
+// a triangle over the 32x32 target, its corners at (0, 0), (64, 0) and (0, 64) of a 64x64 viewport, of w 1, or 1, 4 and
+// 16 (mode 1). Metal clips a triangle that reaches past its guard band, a quarter beyond the viewport, into several.
+// mode 3's corners are (40, 40), (8.25, 40) and (40, 8.25): its long edge crosses quads whose first pixel it leaves out
 V vs(uint id : SV_VertexID) {
   float2 uv = float2((id << 1) & 2, id & 2);
-  float w = mode == 1 ? (id == 0 ? 1 : id == 1 ? 2 : 4) : 1;
-  float f = mode == 3 ? 97.0 / 256 : 1;
+  float w = mode == 1 ? (id == 0 ? 1 : id == 1 ? 4 : 16) : 1;
+  float2 p = mode == 3 ? 40 - uv * 15.875 : uv * 32;
   V v;
-  v.position = float4(uv * float2(f, -f) + float2(-1, 1), 0.5, 1) * w;
+  v.position = float4(p.x / 32 - 1, 1 - p.y / 32, 0.5, 1) * w;
   v.a = uv.x * 8 + uv.y * 3;
   v.n = uv.x * 5 + uv.y * 7;
   return v;
@@ -350,11 +350,11 @@ main(int argc, char **argv) {
     return list->Reset(allocator.Get(), nullptr);
   };
 
-  // the triangle's attributes at a point of the target, perspective correct over w of 1, 2 and 4 (mode 1), and the
+  // the triangle's attributes at a point of the target, perspective correct over w of 1, 4 and 16 (mode 1), and the
   // noperspective one
   auto attribute = [](float x, float y, bool perspective) {
     float b1 = x / 64, b2 = y / 64, b0 = 1 - b1 - b2;
-    float w[3] = {1, perspective ? 2.0f : 1.0f, perspective ? 4.0f : 1.0f};
+    float w[3] = {1, perspective ? 4.0f : 1.0f, perspective ? 16.0f : 1.0f};
     float over = b0 / w[0] + b1 / w[1] + b2 / w[2];
     float a = (b1 * 16 / w[1] + b2 * 6 / w[2]) / over;
     return std::pair{a, b1 * 10 + b2 * 14};
@@ -387,9 +387,9 @@ main(int argc, char **argv) {
           report(what, x, y, "SV_Position.x", p.color[0], c.cx);
           report(what, x, y, "SV_Position.y", p.color[1], c.cy);
         }
-        if (std::fabs(p.color[2] - a) > 1e-3f * std::max(1.0f, std::fabs(a)))
+        if (std::fabs(p.color[2] - a) > 1e-4f * std::max(1.0f, std::fabs(a)))
           report(what, x, y, "perspective input", p.color[2], a);
-        if (std::fabs(p.color[3] - n) > 1e-3f * std::max(1.0f, std::fabs(n)))
+        if (std::fabs(p.color[3] - n) > 1e-4f * std::max(1.0f, std::fabs(n)))
           report(what, x, y, "noperspective input", p.color[3], n);
         if (rate_input) {
           if (p.info[0] != rate)
@@ -497,13 +497,13 @@ main(int argc, char **argv) {
   // a triangle's edge: a coarse pixel that is partly covered runs once, its coverage its covered pixels'
   for (UINT i = 1; i < 4; i++) {
     failures_before = failures;
-    step("%s over the edge from (24.25, 0) to (0, 24.25)", names[i]);
+    step("%s over the edge from (8.25, 40) to (40, 8.25)", names[i]);
     CHECK(draw(shaded.Get(), 3, rates[i], pass, pass, false));
     std::vector<uint32_t> want_ran(size * size), want_covered(size * size);
     for (UINT y = 0; y < size; y++)
       for (UINT x = 0; x < size; x++) {
         auto c = coarse(x, y, rates[i]);
-        bool inside = x + y + 1 < 24.25f;
+        bool inside = x + y + 1 > 48.25f;
         float want = inside ? c.cx : -1.0f;
         if (got[y * size + x].color[0] != want)
           report(names[i], x, y, "SV_Position.x", got[y * size + x].color[0], want);
