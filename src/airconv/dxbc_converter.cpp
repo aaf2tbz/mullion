@@ -353,6 +353,52 @@ component_type_from_pixel_format(air::MTLPixelFormat format) {
   return RegisterComponentType::Unknown;
 }
 
+// whether a conservative rasterizer leaves out the pixel at `position`: its square, a unit wide, has no point in the
+// triangle with these window coordinates (SM50_CONSERVATIVE_VARYINGS). the separating axis test: the axes, then each
+// edge's normal. a first coordinate that is NaN takes every pixel
+static llvm::Value *
+conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Value *position, llvm::Value *const *window) {
+  using llvm::air::AIRBuilder;
+  auto f = [&](double v) { return air.getFloat(v); };
+  auto abs = [&](llvm::Value *v) { return air.CreateFPUnOp(AIRBuilder::fabs, v, false); };
+  auto min = [&](llvm::Value *l, llvm::Value *r) { return air.CreateFPBinOp(AIRBuilder::fmin, l, r, false); };
+  auto max = [&](llvm::Value *l, llvm::Value *r) { return air.CreateFPBinOp(AIRBuilder::fmax, l, r, false); };
+  // the pixel's center; a little more than half a pixel around it, the uncertainty tier 1 has room for
+  const double half = 0.5 + 1.0 / 256;
+  llvm::Value *center[2];
+  for (uint32_t axis = 0; axis < 2; axis++)
+    center[axis] = builder.CreateFAdd(
+        air.CreateFPUnOp(AIRBuilder::floor, builder.CreateExtractElement(position, axis), false), f(0.5)
+    );
+  auto at = [&](uint32_t k, uint32_t axis) { return window[2 * k + axis]; };
+  auto x = [&](uint32_t k) { return at(k, 0); };
+  auto y = [&](uint32_t k) { return at(k, 1); };
+  llvm::Value *outside = builder.getFalse();
+  for (uint32_t axis = 0; axis < 2; axis++) {
+    auto of = [&](uint32_t k) { return at(k, axis); };
+    auto low = min(min(of(0), of(1)), of(2)), high = max(max(of(0), of(1)), of(2));
+    outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(center[axis], f(half)), low));
+    outside = builder.CreateOr(outside, builder.CreateFCmpOGT(builder.CreateFSub(center[axis], f(half)), high));
+  }
+  auto area = builder.CreateFSub(
+      builder.CreateFMul(builder.CreateFSub(x(1), x(0)), builder.CreateFSub(y(2), y(0))),
+      builder.CreateFMul(builder.CreateFSub(x(2), x(0)), builder.CreateFSub(y(1), y(0)))
+  );
+  auto inward = builder.CreateSelect(builder.CreateFCmpOGT(area, f(0)), f(-1), f(1));
+  for (uint32_t i = 0; i < 3; i++) {
+    uint32_t n = (i + 1) % 3;
+    auto a = builder.CreateFMul(builder.CreateFSub(y(n), y(i)), inward);
+    auto b = builder.CreateFNeg(builder.CreateFMul(builder.CreateFSub(x(n), x(i)), inward));
+    // the edge's value at the center, against its most at any point of the square
+    auto value = builder.CreateFAdd(
+        builder.CreateFMul(a, builder.CreateFSub(center[0], x(i))), builder.CreateFMul(b, builder.CreateFSub(center[1], y(i)))
+    );
+    auto reach = builder.CreateFMul(builder.CreateFAdd(abs(a), abs(b)), f(half));
+    outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(value, reach), f(0)));
+  }
+  return builder.CreateAnd(outside, builder.CreateNot(air.CreateIsNaN(x(0))));
+}
+
 llvm::Error convert_dxbc_pixel_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   llvm::LLVMContext &context, llvm::Module &module,
@@ -446,6 +492,20 @@ llvm::Error convert_dxbc_pixel_shader(
     coverage = sample < *statistics ? ~0u : func_signature.DefineInput(air::InputInputCoverage{});
   }
 
+  // conservative rasterization: the pixel's position, and the triangle the mesh stage passes on
+  uint32_t conservative_position = ~0u, conservative_window[SM50_CONSERVATIVE_VARYINGS];
+  if (pso_data && pso_data->conservative) {
+    conservative_position =
+        func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+      conservative_window[i] = func_signature.DefineInput(air::InputFragmentStageIn{
+          .user = "mullion_conservative" + std::to_string(i),
+          .type = air::msl_float,
+          .interpolation = air::Interpolation::flat,
+          .pull_mode = false
+      });
+  }
+
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -471,6 +531,21 @@ llvm::Error convert_dxbc_pixel_shader(
   );
 
   setup_metal_version(module, metal_version);
+
+  if (conservative_position != ~0u) {
+    pvalue window[SM50_CONSERVATIVE_VARYINGS];
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+      window[i] = function->getArg(conservative_window[i]);
+    auto position = function->getArg(conservative_position);
+    auto culled = conservative_overlap(builder, air, position, window);
+    auto discard = llvm::BasicBlock::Create(context, "conservative_discard", function, epilogue_bb);
+    auto live = llvm::BasicBlock::Create(context, "conservative_live", function, epilogue_bb);
+    builder.CreateCondBr(culled, discard, live);
+    builder.SetInsertPoint(discard);
+    air.CreateDiscard();
+    builder.CreateBr(live);
+    builder.SetInsertPoint(live);
+  }
 
   if (statistics) {
     // D3D11.3 20.4.7 counts executions even when an output depth fails the test.
@@ -1369,7 +1444,8 @@ AIRCONV_API int SM50Initialize(
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
-      pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0};
+      pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0,
+                            sm50_shader->ps_flat_input_mask, sm50_shader->ps_noperspective_input_mask};
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;
