@@ -561,16 +561,39 @@ public:
       if (!out->NumFeatureLevels)
         return E_INVALIDARG;
       // the highest level the options make up, as D3D12 defines the levels: 11_1 with logic ops, 12_0 with tiled
-      // resources tier 2, binding tier 2 and typed UAV loads, 12_1 with ROVs and conservative rasterization tier 1
+      // resources tier 2, binding tier 2 and typed UAV loads, 12_1 with ROVs and conservative rasterization tier 1,
+      // 12_2 (Direct3D feature level 12_2) with shader model 6.5, ray tracing tier 1.1, variable rate shading tier 2,
+      // mesh shaders, sampler feedback, binding, tiled resources and conservative rasterization tier 3, root
+      // signature 1.1 and the depth bounds test
       D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+      D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2;
+      D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5;
+      D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6;
+      D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7;
+      D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_5};
+      D3D12_FEATURE_DATA_ROOT_SIGNATURE root{D3D_ROOT_SIGNATURE_VERSION_1_1};
       CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+      CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2));
+      CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+      CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6));
+      CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
+      CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+      CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &root, sizeof(root));
+      bool level_12_2 =
+          model.HighestShaderModel >= D3D_SHADER_MODEL_6_5 && o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 &&
+          o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2 &&
+          o7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1 && o7.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_0_9 &&
+          o.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 &&
+          o.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3 &&
+          o.ConservativeRasterizationTier >= D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 &&
+          root.HighestVersion >= D3D_ROOT_SIGNATURE_VERSION_1_1 && o2.DepthBoundsTestSupported;
       auto max_level = !o.OutputMergerLogicOp ? D3D_FEATURE_LEVEL_11_0
                        : o.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2 ||
-                               o.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_2 ||
-                               !o.TypedUAVLoadAdditionalFormats
+                               o.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_2 || !o.TypedUAVLoadAdditionalFormats
                            ? D3D_FEATURE_LEVEL_11_1
                        : !o.ROVsSupported || !o.ConservativeRasterizationTier ? D3D_FEATURE_LEVEL_12_0
-                                                                             : D3D_FEATURE_LEVEL_12_1;
+                       : !level_12_2                                          ? D3D_FEATURE_LEVEL_12_1
+                                                                              : D3D_FEATURE_LEVEL_12_2;
       out->MaxSupportedFeatureLevel = {};
       for (unsigned i = 0; i < out->NumFeatureLevels; i++)
         if (out->pFeatureLevelsRequested[i] <= max_level)
