@@ -464,6 +464,8 @@ public:
   bool depth_bounds = false;
   bool depth_bounds_emulated = false;
   bool writes_depth = false;
+  // conservative rasterization of triangles: the mesh stage reads the viewports (SM50_BINDING_INDEX_VIEWPORTS)
+  bool conservative = false;
 
   // whether its pixel shader has a variant of coarse pixels (MTL_PIXEL_SHADER_REFLECTION's FineShading)
   bool coarse_shading = false;

@@ -193,6 +193,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.late_tests = false;
     data.coarse_shading = false;
     data.shading_rate_varying = 0;
+    data.conservative = false;
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;
