@@ -265,8 +265,11 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
   if (profile_)
     diag::Write(diag::Line("span", "encode", seq, GetCurrentThreadId(), began, diag::Now() - began));
-  if (profile_)
-    profile_->buffers[seq % kCommandChunkCount].committed = diag::Now();
+  if (profile_) {
+    auto &buffer = profile_->buffers[seq % kCommandChunkCount];
+    device.sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
+    buffer.committed = diag::Now();
+  }
   cmdbuf.commit();
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
@@ -318,6 +321,8 @@ CommandQueue::WaitForFinishThread() {
 
     if (profile_) {
       auto &buffer = profile_->buffers[internal_seq % kCommandChunkCount];
+      uint64_t cpu_end, gpu_end;
+      device.sampleTimestamps(cpu_end, gpu_end);
       std::vector<std::vector<uint64_t>> clocks;
       for (auto &samples : buffer.samples) {
         auto &clock = clocks.emplace_back(samples.used, ~uint64_t(0));
@@ -327,6 +332,7 @@ CommandQueue::WaitForFinishThread() {
       auto lines = diag::Line("cmdbuf", profile_->id, internal_seq, buffer.committed, completed,
                               chunk.attached_cmdbuf.gpuStartTime(), chunk.attached_cmdbuf.gpuEndTime(),
                               buffer.submitted, buffer.passes.size(), buffer.presents, buffer.timestamps);
+      lines += diag::Line("calibration", profile_->id, internal_seq, buffer.cpu_begin, buffer.gpu_begin, cpu_end, gpu_end);
       for (auto &pass : buffer.passes) {
         auto line = diag::Line("pass", profile_->id, internal_seq, pass.id, pass.kind, pass.encoding, pass.runs);
         line.pop_back();

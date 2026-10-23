@@ -289,7 +289,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   struct ProfileBuffer {
     uint32_t samples = 0;
-    uint64_t committed = 0;
+    uint64_t committed = 0, cpu_begin = 0, gpu_begin = 0;
     struct Pass {
       const EncoderData *pass;
       uint64_t id;
@@ -407,8 +407,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       if (profile_) {
         auto &buffer = profile_->buffers[internal_seq % kCommandQueueSize];
+        uint64_t cpu_end, gpu_end;
+        device_->GetMTLDevice().sampleTimestamps(cpu_end, gpu_end);
         auto lines = diag::Line("cmdbuf", profile_->id, internal_seq, buffer.committed, completed,
                                 inflight.cmdbuf.gpuStartTime(), inflight.cmdbuf.gpuEndTime());
+        lines += diag::Line("calibration", profile_->id, internal_seq, buffer.cpu_begin, buffer.gpu_begin, cpu_end, gpu_end);
         for (auto &pass : buffer.passes) {
           const char *kind = pass.type == EncoderType::Clear     ? "Clear"
                              : pass.type == EncoderType::Render  ? "Render"
@@ -493,6 +496,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
       pool = WMT::MakeAutoreleasePool();
       inflight->cmdbuf = queue->queue_.commandBuffer();
+      if (queue->profile_) {
+        auto &buffer = queue->profile_->buffers[seq % kCommandQueueSize];
+        queue->device_->GetMTLDevice().sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
+      }
     };
 
     WMT::Reference<WMT::CommandBuffer>

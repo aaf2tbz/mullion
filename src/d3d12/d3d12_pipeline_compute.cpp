@@ -55,7 +55,7 @@ public:
     common.next = &rootsig;
 
     Name({pDesc->CS});
-    if (HRESULT hr = InitializeShader(pDesc->CS, &shader_cs, &ref_cs); FAILED(hr))
+    if (HRESULT hr = InitializeShader(device_, pDesc->CS, &shader_cs, &ref_cs); FAILED(hr))
       return hr;
 
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};

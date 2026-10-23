@@ -326,8 +326,9 @@ reference_factors(Domain domain, const Factors &patch) {
 using Point = std::array<uint32_t, 3>;
 inline const std::vector<Point> &
 expected_points(Domain domain, Partitioning partitioning, const Factors &patch) {
-  static std::map<std::tuple<Domain, Partitioning, std::array<uint32_t, 8>>, std::vector<Point>> known;
-  std::array<uint32_t, 8> factor_bits;
+  using FactorBits = std::array<uint32_t, std::tuple_size_v<Factors>>;
+  static std::map<std::tuple<Domain, Partitioning, FactorBits>, std::vector<Point>> known;
+  FactorBits factor_bits;
   memcpy(factor_bits.data(), patch.data(), sizeof(factor_bits));
   auto [at, added] = known.try_emplace({domain, partitioning, factor_bits});
   if (!added)

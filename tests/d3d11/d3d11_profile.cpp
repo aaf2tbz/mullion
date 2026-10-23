@@ -12,6 +12,7 @@
 #include "d3d11_test.hpp"
 #include "../../src/winemetal/winemetal.h"
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <filesystem>
@@ -21,10 +22,6 @@
 #include <set>
 #include <sstream>
 #include <tuple>
-
-// a counter sample (a stage's) is a whole tick of the GPU's timebase, 24 MHz on Apple silicon, and a command buffer's
-// start and end times are not: one sampled at a command buffer's edge reads up to a tick past it
-static constexpr UINT64 counter_tick = 42;
 
 static constexpr UINT width = 8, height = 4, frames = 40;
 static constexpr UINT indices[] = {0, 1, 2}, direct_instances[] = {1, 2};
@@ -319,6 +316,7 @@ int main(int argc, char **argv) {
     facts.close();
     using Key = std::pair<std::string, UINT64>;
     std::map<Key, std::vector<std::string>> buffers;
+    std::map<Key, std::array<UINT64, 4>> calibrations;
     std::vector<std::vector<std::string>> passes, targets, presented;
     UINT files = 0, presents = 0, submits = 0, present_spans = 0, encodes = 0, resource_buffers = 0;
     UINT64 last_frame = 0;
@@ -343,6 +341,10 @@ int main(int argc, char **argv) {
           const bool work = number(row[8]) || number(row[9]) || number(row[10]);
           expect(work ? start > 0 && end > start : start <= end && (start == 0) == (end == 0),
                  "command buffer GPU time does not match its work");
+        } else if (row[0] == "calibration" && expect(row.size() == 7, "bad calibration row")) {
+          std::array<UINT64, 4> clock{number(row[3]), number(row[4]), number(row[5]), number(row[6])};
+          if (expect(clock[2] > clock[0] && clock[3] > clock[1], "calibration clocks did not advance"))
+            expect(calibrations.emplace(Key{row[1], number(row[2])}, clock).second, "duplicate calibration");
         } else if (row[0] == "pass")
           passes.push_back(row);
         else if (row[0] == "target")
@@ -368,6 +370,19 @@ int main(int argc, char **argv) {
     const bool profiling = setting && !strcmp(setting, "profile");
     expect(files == UINT(profiling), "got %u profile files", files);
     if (profiling) {
+      if (!expect(calibrations.size() == buffers.size() &&
+                      std::all_of(buffers.begin(), buffers.end(), [&](auto &entry) {
+                        return calibrations.count(entry.first);
+                      }),
+                  "command buffer calibration missing"))
+        return verdict();
+      // Apple, Converting GPU timestamps into CPU time: interpolate between paired samples around the work.
+      auto host_time = [&](const Key &key, UINT64 sample) {
+        auto &[cpu0, gpu0, cpu1, gpu1] = calibrations.at(key);
+        auto delta = sample < gpu0 ? -static_cast<long double>(gpu0 - sample)
+                                  : static_cast<long double>(sample - gpu0);
+        return cpu0 + delta * (cpu1 - cpu0) / (gpu1 - gpu0);
+      };
       expect(resource_buffers > 0, "resource buffer creations missing");
       expect(presents == frames && present_spans == frames && submits == buffers.size() && encodes == buffers.size(),
              "missing or extra frames/submissions");
@@ -406,11 +421,11 @@ int main(int argc, char **argv) {
         const UINT64 rounding =
             UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                              finish)) +
-            1 + counter_tick;
+            1;
         for (size_t i = 7; i < row.size(); i += 2) {
           auto start = number(row[i]), end = number(row[i + 1]);
-          expect(start != ~UINT64(0) && end >= start && start + rounding >= number(buffer[5]) &&
-                     end <= finish + rounding,
+          expect(start != ~UINT64(0) && end >= start && host_time(key, start) + rounding >= number(buffer[5]) &&
+                     host_time(key, end) <= finish + rounding,
                  "GPU stage missing or outside command buffer");
           gpu += end - start;
         }

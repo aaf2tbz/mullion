@@ -120,6 +120,23 @@ ShaderContainerHolds(const void *container, size_t size) {
   return hash == md5::DxbcHash::Holds || (hash == md5::DxbcHash::None && experimental_shader_models);
 }
 
+bool
+ShaderFeaturesSupported(MTLD3D12Device *device, const void *container, size_t size) {
+  // DxilConstants.h, ShaderFeatureInfo_AdvancedTextureOps and ShaderFeatureInfo_WriteableMSAATextures (SM 6.7)
+  constexpr uint64_t AdvancedTextureOps = 0x20000000, WriteableMSAATextures = 0x40000000;
+  microsoft::CDXBCParser parser;
+  uint64_t flags = 0;
+  if (FAILED(parser.ReadDXBC(container, size)))
+    return false;
+  auto part = parser.FindNextMatchingBlob((microsoft::DXBCFourCC)MAKEFOURCC('S', 'F', 'I', '0'));
+  if (part != DXBC_BLOB_NOT_FOUND && parser.GetBlobSize(part) >= sizeof(flags))
+    memcpy(&flags, parser.GetBlob(part), sizeof(flags));
+  D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14{};
+  device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &options14, sizeof(options14));
+  return !(flags & AdvancedTextureOps && !options14.AdvancedTextureOpsSupported) &&
+         !(flags & WriteableMSAATextures && !options14.WriteableMSAATexturesSupported);
+}
+
 // features outside the released API, asked for before a device is made and granted all or none
 // (D3D12EnableExperimentalFeatures: "S_OK if successful", E_NOINTERFACE for a feature that is not known). the one
 // that is here is experimental shader models, with which Direct3D takes shaders that carry no hash (INF-0004)

@@ -281,8 +281,47 @@ def d3d11(directory):
     assert tile.draws == 2 and tile.tile_dispatches == 1 and tile.pipelines == ("Tile:45", "Render:123456789")
 
 
+def calibrated(directory):
+    # Apple's Converting GPU timestamps into CPU time interpolates between two paired clock samples. GPU units
+    # here are half a host nanosecond for one queue and one for the other, each with a different epoch.
+    path = directory / "calibrated.diag"
+    path.write_text("calibration\t1\t1\t100\t1000\t600\t2000\n"
+                    "calibration\td3d11:1\t1\t100\t5000\t600\t5500\n"
+                    "cmdbuf\t1\t1\t90\t700\t110\t150\n"
+                    "cmdbuf\td3d11:1\t1\t90\t700\t210\t240\t90\t1\t0\t0\n"
+                    "pass\t1\t1\t1\tCompute\t1\t\t1040\t1080\n"
+                    "pass\td3d11:1\t1\t1\tBlit\t1\t\t5120\t5130\n")
+    record = tool.Record(path)
+    assert [p.stages for p in record.passes] == [[(120, 140)], [(220, 230)]]
+    assert [p.gpu for p in record.passes] == [20, 10]
+    large = 100, tool.NO_SAMPLE - 10000, 600, tool.NO_SAMPLE - 9000
+    assert tool.cpu_time(large[1] + 40, large) == 120 and tool.cpu_time(large[1] - 10, large) == 95
+    for p in record.passes:
+        start, end = record.cmdbufs[p.queue, p.cmdbuf][2:4]
+        assert all(start <= a <= b <= end for a, b in p.stages)
+    text = path.read_text()
+    for bad in (text.replace("100\t1000\t600\t2000", "100\t1000\t100\t2000"),
+                text.replace("100\t1000\t600\t2000", "100\t2000\t600\t1000"),
+                text + "calibration\t1\t1\t100\t1000\t600\t2000\n"):
+        path.write_text(bad)
+        try:
+            tool.Record(path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid or duplicate calibration must be rejected")
+    path.write_text(text.replace("calibration\td3d11:1\t1\t100\t5000\t600\t5500\n", ""))
+    try:
+        tool.Record(path)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("a missing pair must not use uncalibrated timestamps")
+
+
 with tempfile.TemporaryDirectory() as directory:
     profile(Path(directory))
     empty_and_short(Path(directory))
     d3d11(Path(directory))
+    calibrated(Path(directory))
 print("passed: host_diag_profile")

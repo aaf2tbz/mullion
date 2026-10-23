@@ -110,6 +110,7 @@ std::vector<LibrarySubobject> ReadSubobjects(const D3D12_SHADER_BYTECODE &Librar
 constexpr uint64_t kGPUTimestampFrequency = 1'000'000'000;
 
 class MTLD3D12CommandAllocator;
+class MTLD3D12Device;
 
 class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList8 {
 public:
@@ -400,7 +401,9 @@ public:
   virtual void ReleasePrivate() = 0;
 
   static HRESULT
-  InitializeShader(D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl);
+  InitializeShader(
+      MTLD3D12Device *Device, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
+  );
 
   // writes shaders that failed to compile to MULLION_SHADER_DUMP_PATH, when set, as <sha1>.dxbc for airconv's CLI
   static void DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
@@ -780,6 +783,10 @@ bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
 // has none while experimental shader models are on (D3D12EnableExperimentalFeatures). Direct3D checks that before
 // it reads anything else of one, and refuses what is not with E_INVALIDARG
 bool ShaderContainerHolds(const void *container, size_t size);
+
+// whether `device` has the features a shader container requires: the low bits of its feature info part (SFI0,
+// DxilContainer.h), which DxilConstants.h calls feature requirements
+bool ShaderFeaturesSupported(MTLD3D12Device *device, const void *container, size_t size);
 
 bool IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds);
 
