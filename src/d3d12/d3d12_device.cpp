@@ -554,7 +554,7 @@ public:
       if (!out->NumFeatureLevels)
         return E_INVALIDARG;
       // the highest level the options make up, as D3D12 defines the levels: 11_1 with logic ops, 12_0 with tiled
-      // resources tier 2, binding tier 2 and typed UAV loads, 12_1 with ROVs and conservative rasterization tier 1
+      // resources tier 2, binding tier 2 and typed UAV loads, 12_1 with ROVs and conservative rasterization
       D3D12_FEATURE_DATA_D3D12_OPTIONS o;
       CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
       auto max_level = !o.OutputMergerLogicOp ? D3D_FEATURE_LEVEL_11_0
@@ -615,8 +615,7 @@ public:
       out->PSSpecifiedStencilRefSupported = TRUE;
       out->TypedUAVLoadAdditionalFormats = TRUE;
       out->ROVsSupported = TRUE;
-      // emulated: the mesh stage dilates triangles and the pixel shader takes the pixels they overlap (airconv)
-      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_1;
+      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
       out->MaxGPUVirtualAddressBitsPerResource = 48;
       out->StandardSwizzle64KBSupported = FALSE;
       out->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
