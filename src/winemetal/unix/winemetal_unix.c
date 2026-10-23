@@ -2231,6 +2231,8 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool pipeline_statistics;
   bool depth_bounds;
   bool late_tests;
+  bool coarse_shading;
+  uint32_t shading_rate_varying;
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -2318,6 +2320,8 @@ sm50_compilation_argument32_convert(
       data->pipeline_statistics = src->pipeline_statistics;
       data->depth_bounds = src->depth_bounds;
       data->late_tests = src->late_tests;
+      data->coarse_shading = src->coarse_shading;
+      data->shading_rate_varying = src->shading_rate_varying;
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {

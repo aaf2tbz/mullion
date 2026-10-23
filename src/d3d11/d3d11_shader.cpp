@@ -191,6 +191,8 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.pipeline_statistics = variant.pipeline_statistics;
     data.depth_bounds = false;
     data.late_tests = false;
+    data.coarse_shading = false;
+    data.shading_rate_varying = 0;
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;
