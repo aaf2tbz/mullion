@@ -602,7 +602,7 @@ jobs:
       - name: Build
         run: |
           export PATH="$PATH:$GITHUB_WORKSPACE/toolchains/${{ env.LLVM_MINGW_DIR }}/bin"
-          meson setup --cross-file build-arm64ec.txt -Dnative_llvm_path=toolchains/llvm-darwin-arm64 -Dwine_install_path=toolchains/wine build --buildtype debugoptimized --prefix $(pwd)/install
+          meson setup --cross-file build-arm64ec.txt -Denable_tests=true -Dnative_llvm_path=toolchains/llvm-darwin-arm64 -Dwine_install_path=toolchains/wine build --buildtype debugoptimized --prefix $(pwd)/install
           meson compile -C build
           meson install -C build
 

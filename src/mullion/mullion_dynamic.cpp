@@ -30,7 +30,7 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, std::optional<uint32_t> filled
   // a command list's filled allocation, or an immediate one with an older name pending, doubles within a staging block
   // round its stride as BufferAllocation does (D3D11.3 5.6.1: Map pointers are 16-byte aligned)
   auto names = 2ull * filled.value_or(fifo.empty() ? 0 : name_suballocation_ + 1);
-  return buffer->allocate(flags_, std::min(names, kStagingBlockSize / align(name_->suballocation_size_, 16)));
+  return buffer->allocate(flags_, std::min<uint64_t>(names, kStagingBlockSize / align(name_->suballocation_size_, 16)));
 }
 
 void

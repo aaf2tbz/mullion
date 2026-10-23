@@ -244,11 +244,14 @@ def environment(args):
     unix, pe = libraries(builds)
     base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), MULLION_SHADER_CACHE="0", **ZOMBIES)
     base.pop("MULLION_GPU_FAMILY", None)
-    # the build's libraries in place of the Wine's own, the shader compiler the prefix has, and no installer or
+    # the build's libraries in place of the Wine's own, the shader compiler the prefix has (Wine's own when it has
+    # none: winetricks' d3dcompiler_47 is x86 only, so an arm64 Wine's ARM64 tests have no other), and no installer or
     # debugger that asks in a dialog
     own = sorted(path.stem for path in pe.values() if builtin(path))
     native = sorted(path.stem for path in pe.values() if not builtin(path))
-    base["WINEDLLOVERRIDES"] = f"{','.join(native + ['d3dcompiler_47'])}=n;{','.join(own)}=b;mscoree,mshtml,winedbg.exe=d"
+    overrides = [f"{','.join(native)}=n"] if native else []
+    overrides += ["d3dcompiler_47=n,b"] + ([f"{','.join(own)}=b"] if own else []) + ["mscoree,mshtml,winedbg.exe=d"]
+    base["WINEDLLOVERRIDES"] = ";".join(overrides)
     if args.validate:
         base["MTL_DEBUG_LAYER"] = "1"
     binary = wine / "bin" / "wine"
@@ -262,7 +265,7 @@ def environment(args):
         install(wine, prefix, unix, pe)
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
                  files={path.name.lower(): path for path in pe.values()},
-                 symbolizer=Path(shutil.which(compiler(builds)[0])).parent / "llvm-symbolizer")
+                 symbolizer=Path(shutil.which(compiler(builds)[0])).resolve().parent / "llvm-symbolizer")
     return builds, binary, base
 
 

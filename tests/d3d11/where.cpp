@@ -43,6 +43,8 @@ Read(void *argument) {
   frame.AddrPC.Mode = frame.AddrFrame.Mode = frame.AddrStack.Mode = AddrModeFlat;
 #ifdef __i386__
   frame.AddrPC.Offset = context.Eip, frame.AddrFrame.Offset = context.Ebp, frame.AddrStack.Offset = context.Esp;
+#elif defined(__aarch64__) && !defined(__arm64ec__)
+  frame.AddrPC.Offset = context.Pc, frame.AddrFrame.Offset = context.Fp, frame.AddrStack.Offset = context.Sp;
 #else
   frame.AddrPC.Offset = context.Rip, frame.AddrFrame.Offset = context.Rbp, frame.AddrStack.Offset = context.Rsp;
 #endif

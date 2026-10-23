@@ -85,7 +85,8 @@ main(int argc, char **argv) {
   auto made = target->GetDesc();
   expect(made.Dimension == desc.Dimension && made.Width == size && made.Height == size && made.Format == format && made.Flags == desc.Flags,
          "the resource: dimension %u, %llu x %u, format %u, flags %x", made.Dimension, made.Width, made.Height, made.Format, made.Flags);
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint, footprint1{};
+  // both zeroed: memcmp compares the padding after the footprint's last field too, which neither call writes
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}, footprint1{};
   UINT rows, rows1 = 0;
   UINT64 row_bytes, row_bytes1 = 0, bytes, bytes1 = 0;
   device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &bytes);

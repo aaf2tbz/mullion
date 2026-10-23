@@ -147,6 +147,8 @@ PipelineRuns(Head head, Name name) {
       case WMTRenderCommandMullionTessellationMeshDrawIndirect:
       case WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect:
       case WMTRenderCommandExecuteCommandsInBuffer:
+      // ExecuteIndirect's commands, over the range its resolver writes (d3d12_command_allocator.cpp)
+      case WMTRenderCommandExecuteCommandsInBufferIndirect:
         calls++;
         break;
       default:
@@ -183,7 +185,7 @@ struct ProfileBuffer {
     std::string runs, targets;
     uint32_t buffer, first, count;
   };
-  uint64_t submitted = 0, committed = 0;
+  uint64_t submitted = 0, committed = 0, cpu_begin = 0, gpu_begin = 0;
   uint32_t presents = 0, timestamps = 0;
   std::vector<Samples> samples;
   std::vector<Pass> passes;

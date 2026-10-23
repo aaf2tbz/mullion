@@ -2092,21 +2092,27 @@ convert_dxil(
     auto mask = ir.CreateLoad(ir.getInt32Ty(), locks);
     auto lock = ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(ir.CreateAnd(hash, mask), ir.getInt32(1))});
     ir.CreateCondBr(first, spin, next);
+    // a lock word counts its holders: even is free, odd is held, and each release makes it the next even number.
     // the wait is bounded, well inside the GPU's watchdog, so a lock whose holder never runs again cannot hang the GPU:
-    // a lane that gives up raises the table's flag, which removes the device (MTLD3D12Device::CheckAtomicLocks)
+    // a lane gives up once the word has not changed for kSpins tries, and raises the table's flag, which removes the
+    // device (MTLD3D12Device::CheckAtomicLocks). a word that changes is a lock passing between other lanes: under
+    // contention (every thread of a large dispatch on one word) a lane may lose to them many times, and still waits
     constexpr uint32_t kSpins = 1u << 24;
     ir.SetInsertPoint(spin);
-    auto spins = ir.CreatePHI(ir.getInt32Ty(), 2);
+    auto spins = ir.CreatePHI(ir.getInt32Ty(), 2), last = ir.CreatePHI(ir.getInt32Ty(), 2);
     spins->addIncoming(ir.getInt32(0), elected);
-    auto taken = ir.CreateExtractValue(
-        ir.CreateAtomicCmpXchg(lock, ir.getInt32(0), ir.getInt32(1), {}, AtomicOrdering::Monotonic, AtomicOrdering::Monotonic), 1
-    );
-    auto spun = ir.CreateAdd(spins, ir.getInt32(1));
+    last->addIncoming(ir.getInt32(0), elected);
+    auto expected = ir.CreateAnd(last, ir.getInt32(~1u));
+    auto exchange = ir.CreateAtomicCmpXchg(lock, expected, ir.CreateOr(expected, ir.getInt32(1)), {},
+                                           AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
+    auto seen = ir.CreateExtractValue(exchange, 0), taken = ir.CreateExtractValue(exchange, 1);
     auto retry = block("atomic64_retry");
     ir.CreateCondBr(taken, held, retry);
     ir.SetInsertPoint(retry);
+    auto spun = ir.CreateSelect(ir.CreateICmpEQ(seen, last), ir.CreateAdd(spins, ir.getInt32(1)), ir.getInt32(0));
     ir.CreateCondBr(ir.CreateICmpEQ(spun, ir.getInt32(kSpins)), given_up, spin);
     spins->addIncoming(spun, retry);
+    last->addIncoming(seen, retry);
     ir.SetInsertPoint(given_up);
     air.CreateAtomicRMW(AtomicRMWInst::Or, ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(mask, ir.getInt32(2))}), ir.getInt32(1));
     ir.CreateBr(next);
@@ -2115,7 +2121,7 @@ convert_dxil(
     auto value = word.read();
     word.write(update(value));
     air.CreateAtomicFence(word.memory, scope);
-    air.CreateAtomicRMW(AtomicRMWInst::Xchg, lock, ir.getInt32(0));
+    air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
     ir.CreateBr(next);
     ir.SetInsertPoint(next);
     auto still = ir.CreatePHI(ir.getInt1Ty(), 4), got = ir.CreatePHI(ir.getInt64Ty(), 4);

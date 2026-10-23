@@ -2,6 +2,7 @@
 #include "d3d11_fence.hpp"
 #include "d3d11_private.h"
 #include "d3d11_query.hpp"
+#include "d3d11_video_context.hpp"
 #include "mullion_command_queue.hpp"
 #include "d3d11_context_impl.cpp"
 #include "mullion_context.hpp"
@@ -82,7 +83,8 @@ public:
       ImmediateContextBase(pDevice, ctx_state, pDevice->mutex),
       cmd_queue(cmd_queue),
       ctx_state({cmd_queue}),
-      d3dmt_(this, mutex) {
+      d3dmt_(this, mutex),
+      video_(this) {
         ignore_map_flag_no_wait_ = Config::getInstance().getOption<bool>("d3d11.ignoreMapFlagNoWait", false);
       }
 
@@ -96,6 +98,11 @@ public:
 
     if (riid == __uuidof(ID3D11Multithread)) {
       *ppvObject = ref(&d3dmt_);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D11VideoContext)) {
+      *ppvObject = ref(&video_);
       return S_OK;
     }
 
@@ -763,6 +770,7 @@ private:
   ContextInternalState ctx_state;
   std::atomic<uint32_t> refcount = 0;
   D3D11Multithread d3dmt_;
+  D3D11VideoContext video_;
   bool ignore_map_flag_no_wait_;
 };
 

@@ -79,8 +79,11 @@ static LONG CALLBACK breakpoint(EXCEPTION_POINTERS *info) {
   if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
     return EXCEPTION_CONTINUE_SEARCH;
   InterlockedIncrement(&breaks);
-  // the context stands at the breakpoint instruction, one byte long: resume after it
-#ifdef _WIN64
+  // the context stands at the breakpoint instruction: resume after it, one byte on x86 and four on ARM64
+  // (brk #0xf000)
+#if defined(__aarch64__) && !defined(__arm64ec__)
+  info->ContextRecord->Pc += 4;
+#elif defined(_WIN64)
   info->ContextRecord->Rip++;
 #else
   info->ContextRecord->Eip++;
@@ -428,17 +431,19 @@ int main(int argc, char **argv) {
       CHECK(context->GetPrivateData(key, &bytes, &returned));
       expect(bytes == sizeof(value) && returned == value, "video context did not share private data");
       CHECK(video->SetPrivateData(key, 0, nullptr));
+      // an interface comes back as the pointer it was stored as (Wine's d3d11 tests, test_private_data)
       CHECK(video->SetPrivateDataInterface(key, device.Get()));
       ComPtr<IUnknown> stored;
       bytes = sizeof(IUnknown *);
       CHECK(context->GetPrivateData(key, &bytes, stored.GetAddressOf()));
-      ComPtr<IUnknown> identity;
-      CHECK(device.As(&identity));
-      expect(stored == identity, "video context changed the stored interface");
+      expect(stored.Get() == static_cast<IUnknown *>(device.Get()) && bytes == sizeof(IUnknown *),
+             "video context changed the stored interface");
+      // a null interface replaces it: the key then holds a null pointer (test_private_data)
       CHECK(context->SetPrivateDataInterface(key, nullptr));
-      bytes = sizeof(returned);
-      expect(video->GetPrivateData(key, &bytes, &returned) == DXGI_ERROR_NOT_FOUND,
-             "video context retained removed private data");
+      IUnknown *cleared = reinterpret_cast<IUnknown *>(UINT_PTR(0xdeadbeef));
+      bytes = sizeof(cleared);
+      expect(video->GetPrivateData(key, &bytes, &cleared) == S_OK && !cleared && bytes == sizeof(IUnknown *),
+             "video context retained the replaced interface");
     }
     for (UINT dimension = D3D11_RESOURCE_DIMENSION_BUFFER; dimension <= D3D11_RESOURCE_DIMENSION_TEXTURE3D;
          ++dimension) {

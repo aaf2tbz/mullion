@@ -14,6 +14,8 @@ count; an event-only buffer has no encoder and may have zero GPU clocks. the sub
 target records describe binding, slot, Metal texture, width, height, Metal format, mip and slice.
 pipeline identities in D3D11 are process-local Metal handles; Tile runs count tile dispatches.
 indirect vertex/index totals are unavailable.
+calibration records pair Metal's CPU and GPU clocks before and after each command buffer; pass timestamps are
+converted to host nanoseconds with those pairs. older records without calibration retain their nanosecond times.
 bridge totals cover the intervals recorded at presents; the trailing frame has no bridge totals.
 buffer records give creation time, Metal handle and length for each successful BufferAllocation creation, including
 heap and sparse buffers. resource_buffers counts these events in their creation frame, including the trailing one;
@@ -28,6 +30,11 @@ from pathlib import Path
 
 # an unsampled GPU timestamp (Mullion profile record contract, pass)
 NO_SAMPLE = 18446744073709551615
+
+
+def cpu_time(timestamp, calibration):
+    cpu0, gpu0, cpu1, gpu1 = calibration
+    return cpu0 + (timestamp - gpu0) * (cpu1 - cpu0) // (gpu1 - gpu0)
 
 
 def short_name(name):
@@ -71,6 +78,7 @@ class Record:
         self.calls, self.passes, self.cmdbufs, self.frames, self.spans, self.unix = {}, [], {}, [], [], []
         self.targets = defaultdict(list)
         self.resource_buffers = []
+        calibrations = {}
         with self.path.open() as file:
             for line in file:
                 kind, *rest = line.rstrip("\r\n").split("\t")
@@ -79,6 +87,15 @@ class Record:
                 elif kind == "cmdbuf":
                     queue, number, *times = rest
                     self.cmdbufs[queue, int(number)] = tuple(map(int, times))
+                elif kind == "calibration":
+                    queue, number, *clock = rest
+                    cpu0, gpu0, cpu1, gpu1 = map(int, clock)
+                    if cpu1 <= cpu0 or gpu1 <= gpu0:
+                        raise ValueError("calibration clocks did not advance")
+                    key = queue, int(number)
+                    if key in calibrations:
+                        raise ValueError("duplicate command buffer calibration")
+                    calibrations[key] = cpu0, gpu0, cpu1, gpu1
                 elif kind == "pass":
                     self.passes.append(Pass(*rest))
                 elif kind == "target":
@@ -96,6 +113,11 @@ class Record:
                 elif kind == "unix":
                     self.unix.append({int(code): (int(count), int(time))
                                       for code, count, time in (call.split(":") for call in rest)})
+        if calibrations:
+            for p in self.passes:
+                clock = calibrations[p.queue, p.cmdbuf]
+                p.stages = [(cpu_time(a, clock), cpu_time(b, clock)) for a, b in p.stages]
+                p.gpu = sum(b - a for a, b in p.stages)
         self.frames.sort()
 
     def frame_at(self, time):

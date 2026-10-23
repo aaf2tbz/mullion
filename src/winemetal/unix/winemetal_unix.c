@@ -3694,8 +3694,17 @@ _MTLDevice_newLibraryWithSource(void *obj) {
   NSString *source =
       [[NSString alloc] initWithBytes:params->source.ptr length:params->length encoding:NSASCIIStringEncoding];
   NSError *err = NULL;
-  params->ret_library = (obj_handle_t)[device newLibraryWithSource:source options:nil error:&err];
+  // without options Metal compiles for the language version of the SDK the host program was linked against, which
+  // may predate what the source uses (a Wine loader linked against an old SDK gets MSL 2.4, without mesh shaders):
+  // ask for the newest this macOS has
+  MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+  if (@available(macOS 26.0, *))
+    options.languageVersion = MTLLanguageVersion4_0;
+  else
+    options.languageVersion = MTLLanguageVersion3_2;
+  params->ret_library = (obj_handle_t)[device newLibraryWithSource:source options:options error:&err];
   params->ret_error = (obj_handle_t)[err retain];
+  [options release];
   [source release];
   return STATUS_SUCCESS;
 }
