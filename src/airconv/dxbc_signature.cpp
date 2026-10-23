@@ -382,7 +382,7 @@ void handle_signature_ps(
       break;
     }
     case D3D11_SB_OPERAND_TYPE_INNER_COVERAGE:
-      assert(0);
+      // the conservative rasterizer's pixel test has it (conservative_overlap)
       break;
     default:
       assert(0 && "unimplemented vertex input");

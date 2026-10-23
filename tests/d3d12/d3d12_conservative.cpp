@@ -1,18 +1,21 @@
-// contract: conservative rasterization, tier 1. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON covers
-// every pixel whose square it overlaps, and no pixel farther than tier 1's uncertainty (half a pixel) from it; such a
-// pixel has all its samples covered (at 4x the test reads the target: Metal runs a 4x pixel's shader more than once,
-// and a discarding run still writes UAVs, with or without conservative rasterization), its pixel shader sees the
-// triangle's attributes extrapolated from their plane, so a pixel whose center is inside sees what it sees without
-// conservative rasterization, and a flat input is the first vertex's. a pipeline without a pixel shader writes depth to
-// the same pixels. all of it holds as well for triangles a geometry shader emits, in a strip whose second, odd triangle
-// has no area, for those a tessellator outputs, for a geometry shader's after a tessellator, and for a mesh shader's
-// (DXIL), with and without an amplification shader: its group outputs the triangle among others without area, past the
-// triangles one Metal mesh grows. the device reports tier 1, and with it feature level 12_1. D3D11.3 functional
-// specification 15.17 (Conservative Rasterization): "any pixel
-// ... touched by the primitive must be rasterized"; 15.17.2, "Tier 1: 1/2 pixel uncertainty region"; 15.17.5, "the
-// coverage mask ... is full"; 15.17.4, attributes are "extrapolated" for pixels whose centers are outside.
+// contract: conservative rasterization, tier 3. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+// covers every pixel whose square it overlaps, and no pixel farther than tier 2's uncertainty (a 256th of a pixel)
+// from it, a triangle of no area (a segment, a point) as well, which is not culled. such a pixel has all its samples
+// covered (at 4x the test reads the target: Metal runs a 4x pixel's shader more than once, and a discarding run still
+// writes UAVs, with or without conservative rasterization), its pixel shader sees the triangle's attributes
+// extrapolated from their plane, so a pixel whose center is inside sees what it sees without conservative
+// rasterization, a flat input is the first vertex's, and SV_InnerCoverage says whether the square is inside the
+// triangle. a pipeline without a pixel shader writes depth to the same pixels. all of it holds as well for triangles a
+// geometry shader emits, for those a tessellator outputs, for a geometry shader's after a tessellator, and for a mesh
+// shader's (DXIL), with and without an amplification shader: its group outputs the triangle among others without area
+// away from it, past the triangles one Metal mesh grows. the device reports tier 3, and with it feature level 12_1.
+// D3D11.3 functional specification 15.17 (Conservative Rasterization): "any pixel ... touched by the primitive must be
+// rasterized"; 15.17.2, the tiers' uncertainty regions; 15.17.5, "the coverage mask ... is full"; 15.17.4, attributes
+// are "extrapolated" for pixels whose centers are outside; 15.17.8, inner coverage.
 // https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#15.17%20Conservative%20Rasterization
-// D3D12_CONSERVATIVE_RASTERIZATION_TIER: "Tier_1 enforces a maximum 1/2 pixel uncertainty region".
+// D3D12_CONSERVATIVE_RASTERIZATION_TIER: "Tier_2 reduces the maximum uncertainty region to 1/256 and requires
+// post-snap degenerate triangles not be culled"; "Tier_3 maintains a maximum 1/256 uncertainty region and adds support
+// for inner input coverage".
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_conservative_rasterization_tier
 // each run's SV_Coverage is every sample (15.17.5), and the attributes hold in perspective however steep: a triangle
 // whose plane's 1/w is below 0 within a pixel of it.
@@ -44,6 +47,14 @@ float ps(V v, uint coverage : SV_Coverage) : SV_Target {
   InterlockedAdd(o[PIXELS + i].z, coverage != (1u << GetRenderTargetSampleCount()) - 1 ? 1 : 0, was);
   return 1;
 }
+// whether the square is inside, where the attributes' place is
+float ps_inner(V v, uint inner : SV_InnerCoverage) : SV_Target {
+  uint2 p = uint2(v.position.xy);
+  uint i = p.y * WIDTH + p.x, was;
+  o[i].w = inner;
+  InterlockedAdd(o[PIXELS + i].x, 1, was);
+  return 1;
+}
 // the perspective input as the shader evaluates it, at the centroid: at 1x, of every sample covered, the center
 float ps_evaluate(V v) : SV_Target {
   uint2 p = uint2(v.position.xy);
@@ -53,21 +64,30 @@ float ps_evaluate(V v) : SV_Target {
   return 1;
 }
 float4 vs_depth(float4 position : POSITION) : SV_Position { return position; }
-// the triangle, then a second without area: the strip's odd one
-[maxvertexcount(4)] void gs(triangle V v[3], inout TriangleStream<V> s) {
+// the triangle, then a strip of a triangle without area past the viewport's right, which rasterizes nothing there
+[maxvertexcount(6)] void gs(triangle V v[3], inout TriangleStream<V> s) {
   s.Append(v[0]);
   s.Append(v[1]);
   s.Append(v[2]);
-  s.Append(v[2]);
+  s.RestartStrip();
+  V away = v[0];
+  away.position = float4(3, 0, 0.5, 1);
+  s.Append(away);
+  s.Append(away);
+  s.Append(away);
 }
 struct D {
   float4 position : SV_Position;
 };
-[maxvertexcount(4)] void gs_depth(triangle D v[3], inout TriangleStream<D> s) {
+[maxvertexcount(6)] void gs_depth(triangle D v[3], inout TriangleStream<D> s) {
   s.Append(v[0]);
   s.Append(v[1]);
   s.Append(v[2]);
-  s.Append(v[2]);
+  s.RestartStrip();
+  D away = {float4(3, 0, 0.5, 1)};
+  s.Append(away);
+  s.Append(away);
+  s.Append(away);
 }
 // a patch of the triangle tessellated at 1, which makes the triangle; the flat input is one for all its corners
 struct Factors {
@@ -102,7 +122,12 @@ struct Payload {
 };
 // the triangle as triangle REAL of TRIANGLES, the others without area
 #define MESH_BODY                                                                                                     \
-  SetMeshOutputCounts(3, TRIANGLES);                                                                                  \
+  SetMeshOutputCounts(4, TRIANGLES);                                                                                  \
+  if (t == 3) {                                                                                                       \
+    v[t].position = float4(3, 0, 0.5, 1);                                                                             \
+    v[t].perspective = v[t].screen = 0;                                                                               \
+    v[t].flat = 0;                                                                                                    \
+  }                                                                                                                   \
   if (t < 3) {                                                                                                        \
     uint o = t * 28;                                                                                                  \
     v[t].position = asfloat(corners.Load4(o));                                                                        \
@@ -111,11 +136,11 @@ struct Payload {
     v[t].flat = corners.Load(24);                                                                                     \
   }                                                                                                                   \
   for (uint i = t; i < TRIANGLES; i += 32)                                                                            \
-    tris[i] = i == REAL ? uint3(0, 1, 2) : uint3(0, 0, 0);
+    tris[i] = i == REAL ? uint3(0, 1, 2) : uint3(3, 3, 3);
 [outputtopology("triangle")] [numthreads(32, 1, 1)]
-void ms(uint t : SV_GroupThreadID, out vertices V v[3], out indices uint3 tris[TRIANGLES]) { MESH_BODY }
+void ms(uint t : SV_GroupThreadID, out vertices V v[4], out indices uint3 tris[TRIANGLES]) { MESH_BODY }
 [outputtopology("triangle")] [numthreads(32, 1, 1)]
-void ms_amplified(uint t : SV_GroupThreadID, in payload Payload p, out vertices V v[3], out indices uint3 tris[TRIANGLES]) {
+void ms_amplified(uint t : SV_GroupThreadID, in payload Payload p, out vertices V v[4], out indices uint3 tris[TRIANGLES]) {
   MESH_BODY
 }
 [numthreads(1, 1, 1)] void as() {
@@ -186,12 +211,36 @@ gradient(const Triangle &t, double step) {
   return std::hypot((a1 * y2 - a2 * y1) / area, (a2 * x1 - a1 * x2) / area);
 }
 
+static double
+area(const Triangle &t) {
+  return (t.window[1][0] - t.window[0][0]) * (t.window[2][1] - t.window[0][1]) -
+         (t.window[2][0] - t.window[0][0]) * (t.window[1][1] - t.window[0][1]);
+}
+
+// whether the square of pixel (px, py), grown by `grow` on each side, is inside the triangle: every corner of it
+static bool
+contained(const Triangle &t, int px, int py, double grow) {
+  double a = area(t);
+  if (a == 0)
+    return false;
+  for (double x : {px - grow, px + 1 + grow})
+    for (double y : {py - grow, py + 1 + grow})
+      for (int i = 0; i < 3; i++) {
+        auto &p = t.window[i], &q = t.window[(i + 1) % 3];
+        double e = (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0]);
+        if ((a > 0 ? e : -e) < 0)
+          return false;
+      }
+  return true;
+}
+
 // whether the pixel's center is inside, as an ordinary rasterizer would take it (away from edges)
 static bool
 center_inside(const Triangle &t, int px, int py, double margin) {
   double x = px + 0.5, y = py + 0.5;
-  double area = (t.window[1][0] - t.window[0][0]) * (t.window[2][1] - t.window[0][1]) -
-                (t.window[2][0] - t.window[0][0]) * (t.window[1][1] - t.window[0][1]);
+  double area = ::area(t);
+  if (area == 0)
+    return false;
   for (int i = 0; i < 3; i++) {
     auto &a = t.window[i], &b = t.window[(i + 1) % 3];
     double e = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
@@ -222,7 +271,7 @@ main(int argc, char **argv) {
 
   D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
-  if (options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_1)
+  if (options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_3)
     fail("conservative rasterization tier %u", options.ConservativeRasterizationTier);
   const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1};
   D3D12_FEATURE_DATA_FEATURE_LEVELS level{2, levels};
@@ -235,6 +284,11 @@ main(int argc, char **argv) {
   std::vector<std::string> defines = {"WIDTH=" + std::to_string(kWidth), "PIXELS=" + std::to_string(kWidth * kHeight)};
   auto ps_evaluate = compiler.compile(hlsl, "ps_evaluate", "ps", defines);
   if (ps_evaluate.empty()) {
+    printf("failed: HLSL did not compile\n");
+    return 1;
+  }
+  auto ps_inner = compiler.compile(hlsl, "ps_inner", "ps", defines);
+  if (ps_inner.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
@@ -314,7 +368,7 @@ main(int argc, char **argv) {
     return device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&out));
   };
   // by the stages, conservative rasterization and sample count
-  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths];
+  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths], inner_pso[kPaths];
   for (int geometry = 0; geometry < kPaths; geometry++)
     for (int conservative = 0; conservative < 2; conservative++)
       for (int msaa = 0; msaa < 2; msaa++) {
@@ -338,9 +392,18 @@ main(int argc, char **argv) {
         if (meshed(geometry)) {
           if (meshes)
             CHECK(mesh_pipeline(geometry, desc, pso[geometry][conservative][msaa]));
-          continue;
+        } else {
+          CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[geometry][conservative][msaa])));
         }
-        CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[geometry][conservative][msaa])));
+        // and one whose pixel shader reads SV_InnerCoverage
+        if (conservative && !msaa && (!meshed(geometry) || meshes)) {
+          desc.PS = bytecode(ps_inner);
+          if (meshed(geometry)) {
+            CHECK(mesh_pipeline(geometry, desc, inner_pso[geometry]));
+          } else {
+            CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&inner_pso[geometry])));
+          }
+        }
       }
   for (int geometry = 0; geometry < kPaths; geometry++) {
     // depth only, without a pixel shader
@@ -395,6 +458,8 @@ main(int argc, char **argv) {
       {"a needle", {{4.5f, 4.5f}, {20.5f, 19.0f}, {20.2f, 19.3f}}, {1, 1, 1}},
       {"a triangle in perspective", {{5.5f, 6.2f}, {18.7f, 9.9f}, {7.1f, 19.4f}}, {1, 4, 0.5f}},
       {"a triangle past the viewport", {{-6.0f, 8.0f}, {12.0f, 1.0f}, {8.0f, 30.0f}}, {1, 2, 1}},
+      {"a segment, a triangle of no area", {{4.25f, 6.5f}, {10.25f, 9.5f}, {16.25f, 12.5f}}, {1, 1, 1}},
+      {"a point, a triangle of no area", {{9.6f, 14.4f}, {9.6f, 14.4f}, {9.6f, 14.4f}}, {1, 1, 1}},
   };
 
   const UINT64 row = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, pixels = kWidth * kHeight;
@@ -588,7 +653,7 @@ main(int argc, char **argv) {
     return S_OK;
   };
 
-  static Pixels normal, conservative, multisampled, depth_only, evaluated;
+  static Pixels normal, conservative, multisampled, depth_only, evaluated, inner;
   // a pixel inside the viewport and target: what a draw can reach
   auto reachable = [&](int x, int y) {
     return x >= kViewport.TopLeftX && y >= kViewport.TopLeftY && x < kViewport.TopLeftX + kViewport.Width &&
@@ -619,11 +684,13 @@ main(int argc, char **argv) {
       CHECK(draw(t, depth_pso[geometry].Get(), 0, true, depth_only, patch, mesh));
       if (!geometry)
         CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated, false));
+      CHECK(draw(t, inner_pso[geometry].Get(), 0, false, inner, patch, mesh));
       for (int y = 0; y < (int)kHeight; y++)
         for (int x = 0; x < (int)kWidth; x++) {
           int i = y * kWidth + x;
           // certainly overlapped: the square less a sliver; certainly not: farther than the uncertainty region
-          bool must = reachable(x, y) && overlaps(t, x, y, -1.0 / 64), may = reachable(x, y) && overlaps(t, x, y, 0.5);
+          bool must = reachable(x, y) && overlaps(t, x, y, -1.0 / 64),
+               may = reachable(x, y) && overlaps(t, x, y, 1.0 / 128);
           bool ran = conservative.runs[i][0];
           // one primitive runs a pixel's shader once (D3D11.3 16.1); at 4x Metal may run it more than once, each with
           // some of the samples, as it does without conservative rasterization, so there the runs' samples count
@@ -652,6 +719,16 @@ main(int argc, char **argv) {
                  x, y, conservative.runs[i][2], multisampled.runs[i][2], multisampled.runs[i][1]);
           if (must && multisampled.runs[i][1] != 0xf)
             fail("%s: pixel (%d, %d) at 4x saw coverage %#x, want 0xf", t.what, x, y, multisampled.runs[i][1]);
+          // inner coverage: no square that is not inside, and every square inside by more than the uncertainty
+          if (inner.runs[i][0] && inner.attributes[i][3] == 1 && !contained(t, x, y, -1.0 / 128))
+            fail("%s: pixel (%d, %d) has inner coverage, and its square is not inside", t.what, x, y);
+          if (reachable(x, y) && contained(t, x, y, 1.0 / 128) && inner.attributes[i][3] != 1)
+            fail("%s: pixel (%d, %d), inside, has inner coverage %#x", t.what, x, y, inner.attributes[i][3]);
+          if ((inner.runs[i][0] != 0) != ran)
+            fail(
+                "%s: pixel (%d, %d) ran the inner coverage shader %u times, the other %d", t.what, x, y,
+                inner.runs[i][0], ran
+            );
           bool depth_written = depth_only.depth[i] != 1;
           if ((must && !depth_written) || (!may && depth_written))
             fail("%s: pixel (%d, %d) without a pixel shader: depth %g", t.what, x, y, depth_only.depth[i]);

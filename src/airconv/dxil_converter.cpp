@@ -131,6 +131,7 @@ enum Op : uint32_t {
   EvalCentroid = 89,
   SampleIndex = 90,
   Coverage = 91,
+  InnerCoverage = 92,
   ThreadId = 93,
   GroupId = 94,
   ThreadIdInGroup = 95,
@@ -906,6 +907,7 @@ read_dxil(
       {ThreadIdInGroup, D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP},
       {FlattenedThreadIdInGroup, D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED},
       {Coverage, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK},
+      {InnerCoverage, D3D11_SB_OPERAND_TYPE_INNER_COVERAGE},
   };
   std::set<uint32_t> used_ops;
   for (auto &F : M) {
@@ -3277,6 +3279,9 @@ convert_dxil(
     case Coverage:
       ret = attribute(shader::common::InputAttribute::CoverageMask, 0);
       break;
+    case InnerCoverage:
+      ret = attribute(shader::common::InputAttribute::InnerCoverage, 0);
+      break;
     case SampleIndex:
       ret = ctx.function->getArg(shader->func_signature.DefineInput(air::InputSampleIndex{}));
       break;
@@ -3862,7 +3867,7 @@ convert_dxil(
           air.CreateSetMeshVertexData(vertex, ir.getInt32(cm->at + SM50_CONSERVATIVE_VARYINGS + i), fan.rcp_w[u]);
       }
       // a primitive is culled when one distance puts all its vertices out, or when the shader culls it itself
-      Value *culled = fan.degenerate;
+      Value *culled = ir.getFalse();
       if (culls)
         culled = ir.CreateOr(culled, ir.CreateICmpNE(ir.CreateLoad(i8, element_of(staged_culled, {p})), ir.getInt8(0)));
       for (uint32_t distance = 0; distance < cull_distances; distance++) {

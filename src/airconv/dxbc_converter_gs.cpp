@@ -159,6 +159,11 @@ conservative_fan(
     auto x = builder.CreateFDiv(at(clip[k], 0), w[k]), y = builder.CreateFDiv(at(clip[k], 1), w[k]);
     fan.window[k][0] = builder.CreateFAdd(at(viewport, 0), builder.CreateFMul(builder.CreateFAdd(x, f(1)), builder.CreateFMul(at(viewport, 2), f(0.5))));
     fan.window[k][1] = builder.CreateFAdd(at(viewport, 1), builder.CreateFMul(builder.CreateFSub(f(1), y), builder.CreateFMul(at(viewport, 3), f(0.5))));
+    // snapped as a rasterizer snaps them, to a 256th of a pixel: a triangle of no area after that is degenerate
+    for (auto &coordinate : fan.window[k])
+      coordinate = builder.CreateFDiv(
+          air.CreateFPUnOp(llvm::air::AIRBuilder::rint, builder.CreateFMul(coordinate, f(256)), false), f(256)
+      );
   }
   // twice the signed area; a triangle of none may be culled (D3D11.3 15.17.2, after snapping)
   auto dx = [&](uint32_t a, uint32_t b) { return builder.CreateFSub(fan.window[b][0], fan.window[a][0]); };
@@ -244,6 +249,42 @@ conservative_fan(
     point = builder.CreateInsertElement(point, z, uint64_t(2));
     point = builder.CreateInsertElement(point, f(1), uint64_t(3));
     fan.position[u] = builder.CreateSelect(fan.expanded, point, clip[u / 3]);
+  }
+  // a triangle of no area is still rasterized (D3D12_CONSERVATIVE_RASTERIZATION_TIER_2, "post-snap degenerate
+  // triangles are not culled"): the box around its corners grown by a pixel, at the first corner's depth, with its
+  // attributes. the pixel shader takes the pixels its points or segment overlap
+  auto low = [&](uint32_t axis) {
+    return air.CreateFPBinOp(
+        llvm::air::AIRBuilder::fmin, air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, fan.window[0][axis], fan.window[1][axis], false),
+        fan.window[2][axis], false
+    );
+  };
+  auto high = [&](uint32_t axis) {
+    return air.CreateFPBinOp(
+        llvm::air::AIRBuilder::fmax, air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, fan.window[0][axis], fan.window[1][axis], false),
+        fan.window[2][axis], false
+    );
+  };
+  pvalue box[2][2] = {{builder.CreateFSub(low(0), f(1)), builder.CreateFAdd(high(0), f(1))},
+                      {builder.CreateFSub(low(1), f(1)), builder.CreateFAdd(high(1), f(1))}};
+  const uint32_t corners_of_box[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+  auto w0 = at(clip[0], 3);
+  for (uint32_t u = 0; u < 9; u++) {
+    auto &c = corners_of_box[std::min(u, 3u)];
+    auto x = builder.CreateFSub(builder.CreateFDiv(builder.CreateFSub(box[0][c[0]], at(viewport, 0)), builder.CreateFMul(at(viewport, 2), f(0.5))), f(1));
+    auto y = builder.CreateFSub(f(1), builder.CreateFDiv(builder.CreateFSub(box[1][c[1]], at(viewport, 1)), builder.CreateFMul(at(viewport, 3), f(0.5))));
+    pvalue boxed = llvm::UndefValue::get(types._float4);
+    boxed = builder.CreateInsertElement(boxed, builder.CreateFMul(x, w0), uint64_t(0));
+    boxed = builder.CreateInsertElement(boxed, builder.CreateFMul(y, w0), uint64_t(1));
+    boxed = builder.CreateInsertElement(boxed, at(clip[0], 2), uint64_t(2));
+    boxed = builder.CreateInsertElement(boxed, w0, uint64_t(3));
+    fan.position[u] = builder.CreateSelect(fan.degenerate, boxed, fan.position[u]);
+    for (uint32_t j = 0; j < 3; j++) {
+      auto first = air.getFloat(j == 0 ? 1.0 : 0.0);
+      fan.over_w[u][j] = builder.CreateSelect(fan.degenerate, first, fan.over_w[u][j]);
+      fan.linear[u][j] = builder.CreateSelect(fan.degenerate, first, fan.linear[u][j]);
+    }
+    fan.rcp_w[u] = builder.CreateSelect(fan.degenerate, f(1), fan.rcp_w[u]);
   }
   return fan;
 }
@@ -788,7 +829,6 @@ convert_dxbc_geometry_shader(
         }
         culled = builder.CreateOr(culled, behind);
       }
-      culled = builder.CreateOr(culled, fan.degenerate);
       for (uint32_t t = 0; t < 7; t++) {
         auto primitive = builder.CreateAdd(primitive_base, builder.getInt32(t));
         for (uint32_t i = 0; i < 3; i++)
@@ -1560,7 +1600,7 @@ convert_pass_through_geometry_shader(
     }
     for (uint32_t k = 0; k < 3; k++)
       window[k][0] = fan.window[k][0], window[k][1] = fan.window[k][1];
-    in_front = fan.in_front, degenerate = fan.degenerate;
+    in_front = fan.in_front;
   }
   // vertex j's value of what the corners have, `bits` reads them
   auto blend = [&](pvalue(&parts)[9][3], uint32_t j, auto &&bits) {
@@ -1652,7 +1692,7 @@ convert_pass_through_geometry_shader(
   if (pVertexStage->cull_distance_scalars.size())
     for (uint32_t p = 0; p < primitives; p++)
       air.CreateSetMeshPrimitiveCulled(builder.getInt32(p), culled);
-  builder.CreateStore(builder.CreateSelect(degenerate, zero, builder.getInt32(primitives)), count);
+  builder.CreateStore(builder.getInt32(primitives), count);
   builder.CreateBr(done);
 
   builder.SetInsertPoint(done);

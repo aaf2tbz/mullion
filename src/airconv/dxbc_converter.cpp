@@ -355,8 +355,9 @@ component_type_from_pixel_format(air::MTLPixelFormat format) {
 
 // whether a conservative rasterizer leaves out the pixel at `position`: its square, a unit wide, has no point in the
 // triangle with these window coordinates (SM50_CONSERVATIVE_VARYINGS). the separating axis test: the axes, then each
-// edge's normal. a first coordinate that is NaN takes every pixel
-static llvm::Value *
+// edge's normal. a first coordinate that is NaN takes every pixel. and whether the square is inside the triangle,
+// every edge having all of it (SV_InnerCoverage), which a triangle of no area has of no square
+static std::pair<llvm::Value *, llvm::Value *>
 conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Value *position, llvm::Value *const *window) {
   using llvm::air::AIRBuilder;
   auto f = [&](double v) { return air.getFloat(v); };
@@ -385,6 +386,7 @@ conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llv
       builder.CreateFMul(builder.CreateFSub(x(2), x(0)), builder.CreateFSub(y(1), y(0)))
   );
   auto inward = builder.CreateSelect(builder.CreateFCmpOGT(area, f(0)), f(-1), f(1));
+  llvm::Value *inside = builder.CreateFCmpONE(area, f(0));
   for (uint32_t i = 0; i < 3; i++) {
     uint32_t n = (i + 1) % 3;
     auto a = builder.CreateFMul(builder.CreateFSub(y(n), y(i)), inward);
@@ -395,8 +397,9 @@ conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llv
     );
     auto reach = builder.CreateFMul(builder.CreateFAdd(abs(a), abs(b)), f(half));
     outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(value, reach), f(0)));
+    inside = builder.CreateAnd(inside, builder.CreateFCmpOGE(builder.CreateFSub(value, reach), f(0)));
   }
-  return builder.CreateAnd(outside, builder.CreateNot(air.CreateIsNaN(x(0))));
+  return {builder.CreateAnd(outside, builder.CreateNot(air.CreateIsNaN(x(0)))), builder.CreateAnd(inside, builder.CreateNot(air.CreateIsNaN(x(0))))};
 }
 
 llvm::Error convert_dxbc_pixel_shader(
@@ -605,7 +608,8 @@ llvm::Error convert_dxbc_pixel_shader(
            ~conservative_sample ? builder.CreateShl(builder.getInt32(1), function->getArg(conservative_sample)) : all}
       );
     }
-    auto culled = conservative_overlap(builder, air, position, window);
+    auto [culled, inside] = conservative_overlap(builder, air, position, window);
+    resource_map.inner_coverage = builder.CreateZExt(inside, builder.getInt32Ty());
     auto discard = llvm::BasicBlock::Create(context, "conservative_discard", function, epilogue_bb);
     auto live = llvm::BasicBlock::Create(context, "conservative_live", function, epilogue_bb);
     builder.CreateCondBr(culled, discard, live);

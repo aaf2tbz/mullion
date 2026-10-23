@@ -198,6 +198,8 @@ struct io_binding_map {
   llvm::Value *thread_id_in_group_arg = nullptr;
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
   llvm::Value *coverage_mask_arg = nullptr;
+  // a conservative rasterizer's SV_InnerCoverage, 0 or 1; null without one
+  llvm::Value *inner_coverage = nullptr;
 
   llvm::Value *domain = nullptr;
   llvm::Value *patch_id = nullptr;

@@ -615,8 +615,9 @@ public:
       out->PSSpecifiedStencilRefSupported = TRUE;
       out->TypedUAVLoadAdditionalFormats = TRUE;
       out->ROVsSupported = TRUE;
-      // emulated: the mesh stage grows triangles, every pipeline's, and the pixel shader takes the pixels they overlap
-      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_1;
+      // emulated: the mesh stage grows triangles, degenerate ones too, and the pixel shader takes the pixels they
+      // overlap and knows those inside (airconv)
+      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;
       out->MaxGPUVirtualAddressBitsPerResource = 48;
       out->StandardSwizzle64KBSupported = FALSE;
       out->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;

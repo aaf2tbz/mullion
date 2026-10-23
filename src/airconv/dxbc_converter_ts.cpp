@@ -1283,7 +1283,7 @@ convert_dxbc_tesselator_domain_shader(
           air.CreateSetMeshVertexData(vertex, builder.getInt32(conservative_at + SM50_CONSERVATIVE_VARYINGS + i), fan.rcp_w[u]);
       }
       // culled together by a distance all three corners are behind
-      pvalue culled = fan.degenerate;
+      pvalue culled = builder.getFalse();
       for (auto &distance : pShaderInternal->cull_distance_scalars) {
         pvalue all = builder.getTrue();
         for (uint32_t k = 0; k < 3; k++) {
