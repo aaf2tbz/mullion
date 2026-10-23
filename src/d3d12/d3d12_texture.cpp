@@ -226,7 +226,8 @@ public:
   HRESULT
   Initialize(
       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,
-      D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap, UINT64 HeapOffset, bool Reserved = false
+      D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap, UINT64 HeapOffset, bool Reserved = false,
+      const MullionMetalResource *pTexture = nullptr
   ) {
     // TODO: validate and normalize
     desc_ = *pDesc;
@@ -297,8 +298,16 @@ public:
         if (offset > pHeap->GetDesc().SizeInBytes || size_and_align.size > pHeap->GetDesc().SizeInBytes - offset)
           return E_INVALIDARG;
       }
+      if (pTexture) {
+        if (planes != 1)
+          return E_INVALIDARG;
+        texture_info = pTexture->texture_info;
+      }
       Rc<Texture> storage = new Texture(texture_info, device_->GetMTLDevice());
-      storage->rename(pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
+      WMT::Texture adopted;
+      adopted.handle = pTexture ? pTexture->texture : NULL_OBJECT_HANDLE;
+      storage->rename(pTexture ? storage->wrap(WMT::Reference<WMT::Texture>(adopted), texture_info, pTexture->flags)
+                      : pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
       if (!storage->current()->texture())
         return E_OUTOFMEMORY;
       if (!pHeap)
@@ -1096,12 +1105,12 @@ HRESULT
 CreateCommittedTexture(
     MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags,
     const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue,
-    REFIID riid, void **ppResource, D3D12SwapChainBufferRefs *pBufferRefs
+    REFIID riid, void **ppResource, D3D12SwapChainBufferRefs *pBufferRefs, const MullionMetalResource *pTexture
 ) {
   auto texture = Com<MTLD3D12Texture>(
       pBufferRefs ? new MTLD3D12BackBuffer(pDevice, *pBufferRefs) : new MTLD3D12Texture(pDevice)
   );
-  HRESULT hr = texture->Initialize(pHeapProps, HeapFlags, pDesc, InitialState, nullptr, 0);
+  HRESULT hr = texture->Initialize(pHeapProps, HeapFlags, pDesc, InitialState, nullptr, 0, false, pTexture);
   if (FAILED(hr))
     return hr;
   if (!ppResource)

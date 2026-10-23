@@ -70,12 +70,34 @@ DeferredContextBase::AllocateStagingBuffer(size_t size, size_t alignment) {
 
 template <>
 void DeferredContextBase::UseCopyDestination(Rc<StagingResource> &staging) {
-  ctx_state.current_cmdlist->written_staging_resources.push_back(staging);
+  ctx_state.current_cmdlist->regions.back().written_staging_resources.push_back(staging);
 }
 
 template <>
 void DeferredContextBase::UseCopySource(Rc<StagingResource> &staging) {
-  ctx_state.current_cmdlist->read_staging_resources.push_back(staging);
+  ctx_state.current_cmdlist->regions.back().read_staging_resources.push_back(staging);
+}
+
+template <>
+void
+DeferredContextBase::RecordWrappedUse(D3D11ResourceCommon *resource, const ResourceSubsetState &subset, bool write) {
+  ctx_state.current_cmdlist->regions.back().wrapped_uses.emplace_back(resource, subset, write);
+}
+
+template <>
+void
+DeferredContextBase::PrepareTextureUse(std::span<const Rc<Texture>> textures) {
+  if (!device->shares_with_d3d12 || std::none_of(textures.begin(), textures.end(), [](const auto &t) { return bool(t); }))
+    return;
+  // a replay checks waits returned after this list was recorded, before the operation's pass begins
+  InvalidateCurrentPass(true);
+  auto &regions = ctx_state.current_cmdlist->regions;
+  auto predicate = regions.back().predicate;
+  auto value = regions.back().value;
+  auto &region = regions.emplace_back();
+  region.predicate = std::move(predicate);
+  region.value = value;
+  region.textures.assign(textures.begin(), textures.end());
 }
 
 template <>
@@ -504,6 +526,12 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   Wait(ID3D11Fence *pFence, UINT64 Value) override {
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+  HRESULT WaitEvent(WMT::SharedEvent, UINT64, ID3D12Fence *) override { return DXGI_ERROR_INVALID_CALL; }
+  HRESULT SignalFence(ID3D12Fence *, UINT64) override { return DXGI_ERROR_INVALID_CALL; }
+  HRESULT ReturnResource(ID3D11Resource *, std::function<void(ArgumentEncodingContext &)> &&) override {
     return DXGI_ERROR_INVALID_CALL;
   }
 

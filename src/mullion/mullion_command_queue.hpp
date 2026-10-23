@@ -107,7 +107,7 @@ public:
   }
 
   void
-  encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
+  encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc, const bool &cancelled) {
     enc.$$setEncodingContext(
       chunk_id,
       frame_
@@ -115,6 +115,8 @@ public:
     auto& statistics = enc.currentFrameStatistics();
     auto t0 = clock::now();
     list_enc.execute(enc);
+    if (cancelled)
+      return;
     attached_cmdbuf = cmdbuf;
     auto t1 = clock::now();
     readback = diag::profile ? enc.flushCommands<true>(cmdbuf, chunk_id, chunk_event_id)
@@ -170,6 +172,9 @@ private:
   CpuFence cpu_coherent;
   CpuFence frame_latency_fence_;
   std::atomic_bool stopped;
+  std::atomic_bool draining_ = false;
+  uint64_t drain_last_seq_ = 0;
+  bool encoding_cancelled_ = false;
 
   std::array<CommandChunk, kCommandChunkCount> chunks;
   uint64_t encoder_seq = 1;
@@ -221,6 +226,27 @@ public:
   ~CommandQueue();
 
   void Shutdown();
+  void Drain();
+
+  void WaitSharedEvent(WMT::SharedEvent event, uint64_t value) {
+    while (event.signaledValue() < value) {
+      if (stopped.load(std::memory_order_acquire) || draining_.load(std::memory_order_acquire)) {
+        encoding_cancelled_ = true;
+        return;
+      }
+      event.waitUntilSignaledValue(value, 100);
+    }
+  }
+
+  void OnCompletion(uint64_t seq, std::function<void()> &&action) {
+    auto &completed = chunks[seq % kCommandChunkCount].completed;
+    completed = [previous = std::move(completed), action = std::move(action)] {
+      if (previous)
+        previous();
+      action();
+    };
+  }
+
 
   CommandChunk *
   CurrentChunk() {

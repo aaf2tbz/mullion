@@ -13,6 +13,8 @@ struct ContextInternalState {
   using device_mutex_t = d3d11_device_mutex;
   CommandQueue &cmd_queue;
   bool has_dirty_op_since_last_event = false;
+  uint64_t acquired_seq = 0;
+  std::unordered_map<Texture *, std::pair<Com<D3D11ResourceCommon, false>, std::function<void(ArgumentEncodingContext &)>>> returned;
 };
 
 
@@ -69,6 +71,36 @@ template <>
 void
 ImmediateContextBase::UseCopySource(Rc<StagingResource> &staging) {
   staging->useCopySource(ctx_state.cmd_queue.CurrentSeqId());
+}
+
+template <>
+void
+ImmediateContextBase::RecordWrappedUse(D3D11ResourceCommon *resource, const ResourceSubsetState &subset, bool write) {
+  auto seq = ctx_state.cmd_queue.CurrentSeqId();
+  for (auto &use : resource->wrapped_state->uses)
+    if (use.subset.overlapWith(subset))
+      (write ? use.written : use.read) = seq;
+}
+
+template <>
+void
+ImmediateContextBase::PrepareTextureUse(std::span<const Rc<Texture>> textures) {
+  if (ctx_state.returned.empty())
+    return;
+  bool split = false;
+  for (const auto &texture : textures) {
+    auto found = ctx_state.returned.find(texture.ptr());
+    if (found == ctx_state.returned.end())
+      continue;
+    if (!split) {
+      InvalidateCurrentPass(true);
+      Commit();
+      split = true;
+    }
+    found->second.first->wrapped_state->returned_seq = ctx_state.cmd_queue.CurrentSeqId();
+    EmitST([before = std::move(found->second.second)](ArgumentEncodingContext &enc) { before(enc); });
+    ctx_state.returned.erase(found);
+  }
 }
 
 template <>
@@ -149,6 +181,36 @@ public:
   HRESULT
   MapResource(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
               D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    if (auto &wrapped = GetResourceCommon(pResource)->wrapped_resource) {
+      D3D12_RANGE no_read{};
+      HRESULT hr = wrapped->Map(Subresource, MapType == D3D11_MAP_WRITE ? &no_read : nullptr,
+                                pMappedResource ? &pMappedResource->pData : nullptr);
+      if (FAILED(hr))
+        return hr;
+      auto common = GetResourceCommon(pResource);
+      if (ctx_state.returned.contains(GetTexture(pResource).ptr())) {
+        PrepareTextureUse({GetTexture(pResource)});
+      }
+      const auto &use = common->wrapped_state->uses[Subresource];
+      auto seq = std::max({ctx_state.acquired_seq, common->wrapped_state->returned_seq,
+                          MapType == D3D11_MAP_READ ? use.written : std::max(use.read, use.written)});
+      if (seq == cmd_queue.CurrentSeqId()) {
+        InvalidateCurrentPass(true);
+        Commit();
+      }
+      if ((MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT) && cmd_queue.CoherentSeqId() < seq) {
+        wrapped->Unmap(Subresource, nullptr);
+        if (pMappedResource)
+          *pMappedResource = {};
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+      }
+      cmd_queue.WaitCPUFence(seq);
+      if (SUCCEEDED(hr) && pMappedResource) {
+        pMappedResource->RowPitch = wrapped->GetDesc().Width;
+        pMappedResource->DepthPitch = pMappedResource->RowPitch;
+      }
+      return hr;
+    }
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     auto current_seq_id = cmd_queue.CurrentSeqId();
@@ -260,6 +322,10 @@ public:
 
     if (unlikely(!pResource))
       return;
+    if (auto &wrapped = GetResourceCommon(pResource)->wrapped_resource) {
+      wrapped->Unmap(Subresource, nullptr);
+      return;
+    }
     UINT row_pitch = 0;
     UINT depth_pitch = 0;
     if (auto staging = GetStagingResource(pResource, Subresource)) {
@@ -583,14 +649,6 @@ public:
       End(query.ptr());
     }
 
-    for (const auto &staging : cmdlist->read_staging_resources) {
-      staging->useCopySource(seq_id);
-    }
-
-    for (const auto &staging : cmdlist->written_staging_resources) {
-      staging->useCopyDestination(seq_id);
-    }
-
     for (const auto &used_dynamic : cmdlist->used_dynamic_buffers) {
       if (!used_dynamic.latest)
         continue;
@@ -608,13 +666,20 @@ public:
         Execute(nested.ptr());
         continue;
       }
+      bool skips = Skips(cmdlist->regions[region].predicate.ptr(), cmdlist->regions[region].value);
+      PrepareTextureUse(cmdlist->regions[region].textures);
+      for (const auto &staging : cmdlist->regions[region].read_staging_resources)
+        staging->useCopySource(cmd_queue.CurrentSeqId());
+      for (const auto &staging : cmdlist->regions[region].written_staging_resources)
+        staging->useCopyDestination(cmd_queue.CurrentSeqId());
+      for (const auto &[resource, subset, write] : cmdlist->regions[region].wrapped_uses)
+        RecordWrappedUse(resource.ptr(), subset, write);
       std::shared_ptr<std::vector<Rc<TimestampQuery>>> timestamp_queries;
       if (auto &queries = cmdlist->regions[region].issued_timestamp_query; !queries.empty()) {
         timestamp_queries = std::make_shared<std::vector<Rc<TimestampQuery>>>();
         for (const auto &query : queries)
           timestamp_queries->emplace_back(query->End());
       }
-      bool skips = Skips(cmdlist->regions[region].predicate.ptr(), cmdlist->regions[region].value);
       EmitOP([cmdlist, query_list, timestamp_queries, region, skips](ArgumentEncodingContext &enc) {
         // Finished command list should clean up the encoding context
         enc.pushDeferredVisibilityQueries(query_list->data());
@@ -701,14 +766,48 @@ public:
   };
 
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
-    auto fence = static_cast<MTLD3D11Fence *>(pFence);
+    return SignalEvent(static_cast<MTLD3D11Fence *>(pFence)->event, Value);
+  }
 
+  HRESULT SignalEvent(WMT::SharedEvent Event, UINT64 Value) {
     InvalidateCurrentPass();
-    EmitOP([event = fence->event, Value](ArgumentEncodingContext &enc) mutable {
+    EmitOP([event = WMT::Reference<WMT::SharedEvent>(Event), Value](ArgumentEncodingContext &enc) mutable {
       enc.signalEvent(std::move(event), Value);
     });
     Flush();
 
+    return S_OK;
+  }
+
+  HRESULT SignalFence(ID3D12Fence *Fence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+    PrepareFlush();
+    auto &chunk = *cmd_queue.CurrentChunk();
+    chunk.completed = [completed = std::move(chunk.completed), fence = Com<ID3D12Fence>(Fence), Value] {
+      if (completed)
+        completed();
+      fence->Signal(Value);
+    };
+    Commit();
+    return S_OK;
+  }
+
+  HRESULT WaitEvent(WMT::SharedEvent Event, UINT64 Value, ID3D12Fence *Fence) override {
+    Flush();
+    ctx_state.acquired_seq = cmd_queue.CurrentSeqId();
+    EmitOP([event = WMT::Reference<WMT::SharedEvent>(Event), Value, fence = Com<ID3D12Fence>(Fence)](
+               ArgumentEncodingContext &enc) mutable {
+      enc.queue().WaitSharedEvent(event, Value);
+    });
+    return S_OK;
+  }
+
+  HRESULT ReturnResource(ID3D11Resource *Resource, std::function<void(ArgumentEncodingContext &)> &&Before) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+    InvalidateCurrentPass();
+    auto texture = GetTexture(Resource);
+    ctx_state.returned.insert_or_assign(
+        texture.ptr(), std::make_pair(Com<D3D11ResourceCommon, false>(GetResourceCommon(Resource)), std::move(Before)));
     return S_OK;
   }
 

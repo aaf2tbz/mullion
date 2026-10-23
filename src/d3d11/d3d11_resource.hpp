@@ -109,6 +109,17 @@ struct tag_texture_3d {
   static constexpr std::string_view debug_name = "tex3d";
 };
 
+struct WrappedResourceState {
+  Rc<Buffer> buffer;
+  Rc<Texture> texture;
+  struct Use {
+    ResourceSubsetState subset;
+    uint64_t read = 0, written = 0;
+  };
+  std::vector<Use> uses;
+  uint64_t returned_seq = 0;
+};
+
 struct D3D11ResourceCommon : ID3D11Resource {
     /* ID3D11Buffer::GetDesc */
     /* ID3D11Texture1D::GetDesc */
@@ -140,6 +151,8 @@ struct D3D11ResourceCommon : ID3D11Resource {
   virtual Rc<DynamicBuffer> dynamicTexture(UINT Subresource, UINT *pBytesPerRow, UINT *pBytesPerImage) = 0;
   virtual bool CanMap(UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_DEVICE_CONTEXT_TYPE ContextType) = 0;
 
+  Com<ID3D12Resource> wrapped_resource;
+  std::shared_ptr<WrappedResourceState> wrapped_state;
   Rc<Buffer> buffer_{};
   Rc<Texture> texture_{};
   uint32_t bind_flags_{};
@@ -323,7 +336,8 @@ public:
       if (MapType < D3D11_MAP_WRITE_DISCARD ||
           (MapType == D3D11_MAP_WRITE_NO_OVERWRITE && tag::dimension != D3D11_RESOURCE_DIMENSION_BUFFER))
         return false;
-    } else if (desc.Usage != D3D11_USAGE_STAGING || MapType > D3D11_MAP_READ_WRITE) {
+    } else if ((desc.Usage != D3D11_USAGE_STAGING && !this->wrapped_state) ||
+               MapType > D3D11_MAP_READ_WRITE) {
       return false;
     }
     return ((MapType != D3D11_MAP_READ && MapType != D3D11_MAP_READ_WRITE) ||
@@ -426,6 +440,14 @@ public:
   virtual HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
       override {
+    if (this->wrapped_resource && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) {
+      InitReturnPtr(pNTHandle);
+      if (!pNTHandle)
+        return E_INVALIDARG;
+      Com<ID3D12Device> owner;
+      HRESULT hr = this->wrapped_resource->GetDevice(IID_PPV_ARGS(&owner));
+      return FAILED(hr) ? hr : owner->CreateSharedHandle(this->wrapped_resource.ptr(), Attributes, Access, pName, pNTHandle);
+    }
     return E_INVALIDARG;
   }
 
@@ -640,13 +662,13 @@ HRESULT ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID ri
 // a texture over another API's Metal texture, of the description of its dimension's DESC1 (D3D11On12)
 HRESULT WrapTexture(
     MTLD3D11Device *pDevice, D3D11_RESOURCE_DIMENSION Dimension, const void *pDesc1, WMT::Reference<WMT::Texture> &&Metal,
-    REFIID riid, void **ppTexture
+    const MullionMetalResource &Info, REFIID riid, void **ppTexture
 );
 
 // a buffer over another API's Metal buffer, at its GPU address and with its CPU mapping or none (D3D11On12)
 HRESULT WrapBuffer(
-    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, WMT::Reference<WMT::Buffer> &&Metal, UINT64 GpuAddress,
-    void *pMapped, REFIID riid, void **ppBuffer
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, WMT::Reference<WMT::Buffer> &&Metal,
+    const MullionMetalResource &Info, REFIID riid, void **ppBuffer
 );
 
 HRESULT ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture);

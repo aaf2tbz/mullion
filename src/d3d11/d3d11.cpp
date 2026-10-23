@@ -22,6 +22,7 @@
 #include "config/config.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_on12.hpp"
+#include <bit>
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "mullion_capture.hpp"
@@ -264,9 +265,7 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
   if (pChosenFeatureLevel)
     *pChosenFeatureLevel = D3D_FEATURE_LEVEL();
 
-  if (!pDevice || !ppCommandQueues || !NumQueues)
-    return E_INVALIDARG;
-  if (NodeMask & (NodeMask - 1))
+  if (!pDevice || !ppCommandQueues || !NumQueues || !pFeatureLevels != !FeatureLevels)
     return E_INVALIDARG;
 
   Com<IMTLD3D11On12Source> source;
@@ -276,9 +275,20 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
     ERR("D3D11On12CreateDevice: not a Mullion D3D12 device");
     return E_INVALIDARG;
   }
-  // D3D11's work goes to the first queue (one D3D11 context has one place in a queue's order)
-  if (!ppCommandQueues[0] || FAILED(ppCommandQueues[0]->QueryInterface(IID_PPV_ARGS(&queue))))
+  if (NodeMask && ((NodeMask & (NodeMask - 1)) || std::countr_zero(NodeMask) >= d3d12->GetNodeCount()))
     return E_INVALIDARG;
+  std::vector<Com<ID3D12CommandQueue>> queues;
+  for (UINT i = 0; i < NumQueues; i++) {
+    Com<ID3D12CommandQueue> candidate;
+    Com<ID3D12Device> owner;
+    if (!ppCommandQueues[i] || FAILED(ppCommandQueues[i]->QueryInterface(IID_PPV_ARGS(&candidate))) ||
+        candidate->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        FAILED(candidate->GetDevice(IID_PPV_ARGS(&owner))) || owner != d3d12 ||
+        std::find(queues.begin(), queues.end(), candidate) != queues.end())
+      return E_INVALIDARG;
+    queues.push_back(std::move(candidate));
+  }
+  queue = queues.front();
 
   // with none asked for, the D3D12 device's feature level, as far as D3D11 has it
   D3D_FEATURE_LEVEL d3d12FeatureLevel[1];
@@ -312,7 +322,7 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
       device->GetImmediateContext(ppImmediateContext);
     if (ppDevice)
       *ppDevice = device.ref();
-    return S_OK;
+    return ppDevice || ppImmediateContext ? S_OK : S_FALSE;
   } catch (const MTLD3DError &e) {
     Logger::err("D3D11On12CreateDevice: Failed to create D3D11 device");
     return E_FAIL;

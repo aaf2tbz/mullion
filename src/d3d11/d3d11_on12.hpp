@@ -6,6 +6,7 @@
 #include "dxgi_interfaces.h"
 #include "com/com_pointer.hpp"
 #include "com/com_guid.hpp"
+#include <unordered_map>
 
 // ID3D11On12Device1 and 2, which the bundled headers (include/native/directx) predate. as Wine declares them
 // (include/d3d11on12.idl), the same ABI as the Windows SDK's
@@ -29,56 +30,8 @@ DEFINE_COM_INTERFACE("dc90f331-4740-43fa-866e-67f12cb58223", ID3D11On12Device2) 
 
 namespace mullion {
 
-// a Metal shared event in the shape of a D3D11 fence, which the immediate context's Signal and Wait take: they read
-// its event and keep nothing. it is no device's child and holds no reference to one, as a D3D11 fence would
-class D3D11On12Event final : public MTLD3D11Fence {
-public:
-  explicit D3D11On12Event(WMT::Device device) {
-    event = device.newSharedEvent();
-  }
-
-  HRESULT STDMETHODCALLTYPE
-  QueryInterface(REFIID riid, void **ppvObject) final {
-    *ppvObject = nullptr;
-    return E_NOINTERFACE;
-  }
-  ULONG STDMETHODCALLTYPE
-  AddRef() final {
-    return 1;
-  }
-  ULONG STDMETHODCALLTYPE
-  Release() final {
-    return 1;
-  }
-  void STDMETHODCALLTYPE
-  GetDevice(ID3D11Device **ppDevice) final {
-    *ppDevice = nullptr;
-  }
-  HRESULT STDMETHODCALLTYPE
-  GetPrivateData(REFGUID, UINT *, void *) final {
-    return E_NOTIMPL;
-  }
-  HRESULT STDMETHODCALLTYPE
-  SetPrivateData(REFGUID, UINT, const void *) final {
-    return E_NOTIMPL;
-  }
-  HRESULT STDMETHODCALLTYPE
-  SetPrivateDataInterface(REFGUID, const IUnknown *) final {
-    return E_NOTIMPL;
-  }
-  HRESULT STDMETHODCALLTYPE
-  CreateSharedHandle(const SECURITY_ATTRIBUTES *, DWORD, LPCWSTR, HANDLE *) final {
-    return E_NOTIMPL;
-  }
-  UINT64 STDMETHODCALLTYPE
-  GetCompletedValue() final {
-    return event.signaledValue();
-  }
-  HRESULT STDMETHODCALLTYPE
-  SetEventOnCompletion(UINT64, HANDLE) final {
-    return E_NOTIMPL;
-  }
-};
+struct D3D11ResourceCommon;
+struct WrappedResourceState;
 
 // a D3D11 device made by D3D11On12CreateDevice: a Mullion D3D11 device on the Metal device of a Mullion D3D12 one,
 // part of the D3D11 device's object (its reference count is the device's). D3D11's work and a D3D12 queue's meet in
@@ -114,23 +67,18 @@ public:
   ) final;
 
 private:
+  HRESULT ShareResourceState(D3D11ResourceCommon *resource, const D3D12_RESOURCE_DESC &desc, bool cpu_visible);
   // the queue's work so far is done before the D3D11 context's later work starts
   HRESULT ContextAfterQueue(ID3D12CommandQueue *queue);
   // the D3D11 context's work so far is done before the queue's later work starts
   HRESULT QueueAfterContext(ID3D12CommandQueue *queue);
-  Com<ID3D11DeviceContext4> Context();
 
   IUnknown *container_;
   MTLD3D11Device *device_;
   Com<ID3D12Device> d3d12_;
   Com<IMTLD3D11On12Source> source_;
   Com<ID3D12CommandQueue> queue_;
-};
-
-// the private data key under which a wrapped D3D11 resource keeps its D3D12 resource
-// {7c4bf8f6-3b56-4ea4-9a1e-58a3b2c4e9d1}
-static constexpr GUID D3D11On12WrappedResource = {
-    0x7c4bf8f6, 0x3b56, 0x4ea4, {0x9a, 0x1e, 0x58, 0xa3, 0xb2, 0xc4, 0xe9, 0xd1}
+  std::unordered_map<ID3D12Resource *, std::weak_ptr<WrappedResourceState>> resources_;
 };
 
 // the D3D11On12 part of a D3D11 device made on a D3D12 one (d3d11_device.cpp)

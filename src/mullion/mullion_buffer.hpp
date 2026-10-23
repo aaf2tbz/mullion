@@ -112,6 +112,8 @@ public:
     return gpuAddress_;
   }
 
+  const WMTBufferInfo &info() const noexcept { return info_; }
+
   void
   useSuballocation(uint32_t suballocation) noexcept {
     current_suballocation_ = suballocation;
@@ -163,8 +165,7 @@ private:
       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size
   );
   BufferAllocation(
-      WMT::Reference<WMT::Buffer> &&buffer, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags,
-      uint64_t gpu_address, void *mapped
+      WMT::Reference<WMT::Buffer> &&buffer, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags
   );
   void free();
 
@@ -207,7 +208,7 @@ public:
   // an allocation of a Metal buffer another API made, at its GPU address and with its CPU mapping or none
   // (D3D11On12's wrapped resources)
   Rc<BufferAllocation>
-  wrap(WMT::Reference<WMT::Buffer> &&buffer, Flags<BufferAllocationFlag> flags, uint64_t gpu_address, void *mapped);
+  wrap(WMT::Reference<WMT::Buffer> &&buffer, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 

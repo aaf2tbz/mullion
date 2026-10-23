@@ -248,11 +248,12 @@ Texture::import(mach_port_t mach_port) {
 }
 
 Rc<TextureAllocation>
-Texture::wrap(WMT::Reference<WMT::Texture> &&texture, Flags<TextureAllocationFlag> flags) {
+Texture::wrap(WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &info, Flags<TextureAllocationFlag> flags) {
   if (!texture)
     return nullptr;
-  flags.set(TextureAllocationFlag::Shared);
-  return new TextureAllocation(this, std::move(texture), info_, flags);
+  if (!(info.usage & (WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget)))
+    flags.set(TextureAllocationFlag::ShaderReadonly);
+  return new TextureAllocation(this, std::move(texture), info, flags);
 }
 
 TextureView &

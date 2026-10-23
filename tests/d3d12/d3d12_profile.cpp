@@ -23,9 +23,6 @@
 
 static constexpr UINT frames = 4, concurrent_frames = 12, width = 8, height = 4, turns = 4096, threads = 32;
 static constexpr UINT indices[] = {0, 1, 2}, instances[] = {1, 2};
-// a counter sample (a stage's or a timestamp query's) is a whole tick of the GPU's timebase, 24 MHz on Apple silicon,
-// and a command buffer's start and end times are not: one sampled at a command buffer's edge reads up to a tick past it
-static constexpr UINT64 counter_tick = 42;
 // how long the first frame's fence is kept from the queue that waits for it, which has that time to encode the
 // frame's two small lists: nothing tells an application that a list is encoded
 static constexpr DWORD held_ms = 200;
@@ -495,6 +492,7 @@ main(int argc, char **argv) {
     }
     using Key = std::pair<std::string, UINT64>;
     std::map<Key, std::vector<std::string>> buffers;
+    std::map<Key, std::array<UINT64, 4>> calibrations;
     std::vector<std::vector<std::string>> passes, presents;
     std::map<std::string, UINT> frame_counts;
     UINT files = 0, clocks = 0, spans = 0;
@@ -514,6 +512,10 @@ main(int argc, char **argv) {
         if (row[0] == "clock" && expect(row.size() == 3, "malformed clock")) {
           clocks++;
           expect(began <= number(row[1]) && number(row[1]) <= ended && number(row[2]), "clock outside run");
+        } else if (row[0] == "calibration" && expect(row.size() == 7, "malformed calibration")) {
+          std::array<UINT64, 4> clock{number(row[3]), number(row[4]), number(row[5]), number(row[6])};
+          if (expect(clock[2] > clock[0] && clock[3] > clock[1], "calibration clocks did not advance"))
+            expect(calibrations.emplace(Key{row[1], number(row[2])}, clock).second, "duplicate calibration");
         } else if (row[0] == "cmdbuf" && expect(row.size() == 7, "malformed command buffer")) {
           expect(buffers.emplace(Key{row[1], number(row[2])}, row).second, "duplicate command buffer");
           expect(began <= number(row[3]) && number(row[3]) <= number(row[4]) && number(row[4]) <= ended,
@@ -545,6 +547,19 @@ main(int argc, char **argv) {
     }
     expect(files == UINT(profiling), "got %u records, want %u", files, UINT(profiling));
     if (profiling) {
+      if (!expect(calibrations.size() == buffers.size() &&
+                      std::all_of(buffers.begin(), buffers.end(), [&](auto &entry) {
+                        return calibrations.count(entry.first);
+                      }),
+                  "command buffer calibration missing"))
+        return verdict();
+      // Apple, Converting GPU timestamps into CPU time: interpolate between paired samples around the work.
+      auto host_time = [&](const Key &key, UINT64 sample) {
+        auto &[cpu0, gpu0, cpu1, gpu1] = calibrations.at(key);
+        auto delta = sample < gpu0 ? -static_cast<long double>(gpu0 - sample)
+                                  : static_cast<long double>(sample - gpu0);
+        return cpu0 + delta * (cpu1 - cpu0) / (gpu1 - gpu0);
+      };
       expect(clocks == 2, "one clock pair per queue");
       expect(spans == frames + 1 && list_counts[2] == frames && list_counts[1] == 1, "execute spans lost list counts");
       // ID3D12CommandQueue::Wait: "waits until the specified fence reaches or exceeds the specified value": the
@@ -591,14 +606,15 @@ main(int argc, char **argv) {
         const UINT64 rounding =
             UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                              finish)) +
-            1 + counter_tick;
+            1;
         for (size_t i = 7; i + 1 < row.size(); i += 2) {
           auto a = number(row[i]), b = number(row[i + 1]);
           if (a == ~UINT64(0) || b == ~UINT64(0)) {
             expect(a == ~UINT64(0) && b == ~UINT64(0), "partial stage sample");
             unsampled++;
           } else {
-            expect(a <= b && a + rounding >= start && b <= finish + rounding, "stage outside command buffer");
+            expect(a <= b && host_time(key, a) + rounding >= start && host_time(key, b) <= finish + rounding,
+                   "stage outside command buffer");
             gpu += b - a;
           }
         }
@@ -616,7 +632,7 @@ main(int argc, char **argv) {
             auto &times = kernel_times[runs[0]];
             if (runs[0] == compute_runs[1] && times.size() < frames) {
               auto &query = sampled_queries[times.size()];
-              expect(query[0] <= number(row[7]) + rounding && number(row[8]) <= query[1] + rounding,
+              expect(query[0] <= number(row[7]) && number(row[8]) <= query[1],
                      "application query does not bracket the sampled kernel");
               auto at = size_t(&row - passes.data());
               if (expect(at > 0 && at + 1 < passes.size(), "kernel has no surrounding query passes")) {
@@ -661,8 +677,9 @@ main(int argc, char **argv) {
           const UINT64 rounding =
               UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                                finish)) +
-              1 + counter_tick;
-          expect(query_start + rounding >= number(cmdbuf[5]) && query_end <= finish + rounding,
+              1;
+          expect(host_time(key, query_start) + rounding >= number(cmdbuf[5]) &&
+                     host_time(key, query_end) <= finish + rounding,
                  "application queries do not share overflow command buffer");
         }
       expect(overflow_buffers == 1, "no intact overflow command buffer");

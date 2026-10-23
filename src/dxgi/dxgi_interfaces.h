@@ -1,6 +1,7 @@
 #pragma once
 
 #include <dxgi1_6.h>
+#include <d3d12.h>
 #include "util_d3dkmt.h"
 #include "Metal.hpp"
 #include "com/com_guid.hpp"
@@ -30,6 +31,16 @@ DEFINE_COM_INTERFACE("6c030003-460a-4b19-909b-38f97d203e45",
       IDXGISwapChain1 **ppSwapChain) = 0;
 };
 
+// Direct3D 11 on 12 shares resources between modules that each have their own objects: only Metal ones cross, with
+// what the other module needs to make its own around them
+struct MullionMetalResource {
+  obj_handle_t texture, buffer;
+  // how it was made, and its allocation's flags (TextureAllocationFlag or BufferAllocationFlag)
+  WMTTextureInfo texture_info;
+  WMTBufferInfo buffer_info;
+  uint32_t flags;
+};
+
 struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct ID3D12Fence;
@@ -45,15 +56,10 @@ DEFINE_COM_INTERFACE("14d37310-be0f-4275-a5d0-bbff1e87300a", IMTLD3D11On12Source
   // a buffer's GPU address and CPU mapping (null when the CPU can't see it) come with it. E_INVALIDARG for another
   // device's resource or one without a single Metal object (a reserved resource)
   virtual HRESULT STDMETHODCALLTYPE GetResourceObjects(
-      ID3D12Resource * pResource, obj_handle_t * pTexture, obj_handle_t * pBuffer, UINT64 * pGpuAddress,
-      void **ppMapped
+      ID3D12Resource *pResource, MullionMetalResource *pInfo
   ) = 0;
-  // signals `Event` to `Value` once the work the queue has been given so far is done
-  virtual HRESULT STDMETHODCALLTYPE
-  SignalEventAfterQueue(ID3D12CommandQueue * pQueue, WMT::SharedEvent Event, UINT64 Value) = 0;
-  // the queue's later work waits until `Event` reaches `Value`
-  virtual HRESULT STDMETHODCALLTYPE
-  QueueWaitForEvent(ID3D12CommandQueue * pQueue, WMT::SharedEvent Event, UINT64 Value) = 0;
+  virtual HRESULT STDMETHODCALLTYPE CreateResourceOfMetal(
+      const D3D12_RESOURCE_DESC *pDesc, const MullionMetalResource *pInfo, REFIID riid, void **ppResource) = 0;
   // signals `Event` to `Value` once `pFence` reaches `FenceValue`
   virtual HRESULT STDMETHODCALLTYPE
   SignalEventAtFence(ID3D12Fence * pFence, UINT64 FenceValue, WMT::SharedEvent Event, UINT64 Value) = 0;

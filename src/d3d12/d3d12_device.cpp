@@ -135,81 +135,39 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE
-  GetResourceObjects(
-      ID3D12Resource *pResource, obj_handle_t *pTexture, obj_handle_t *pBuffer, UINT64 *pGpuAddress, void **ppMapped
-  ) final {
-    *pTexture = *pBuffer = NULL_OBJECT_HANDLE;
-    *pGpuAddress = 0;
-    *ppMapped = nullptr;
+  GetResourceObjects(ID3D12Resource *pResource, MullionMetalResource *pInfo) final {
+    *pInfo = {};
     if (!pResource || !Owns(pResource))
       return E_INVALIDARG;
     auto resource = static_cast<MTLD3D12Resource *>(pResource);
-    // a reserved resource's pages come and go, and a feedback map is not the texture it describes
     if (resource->feedback || !resource->mapped_tiles.empty())
       return E_INVALIDARG;
     if (resource->texture && resource->texture->current()) {
-      auto texture = resource->texture->current()->texture();
-      NSObject_retain(texture.handle);
-      *pTexture = texture.handle;
+      auto allocation = resource->texture->current();
+      pInfo->texture = allocation->texture().handle;
+      pInfo->texture_info = resource->texture->info();
+      pInfo->texture_info.gpu_resource_id = allocation->gpuResourceID;
+      pInfo->flags = allocation->flags().raw();
+      NSObject_retain(pInfo->texture);
       return S_OK;
     }
     if (resource->buffer && resource->buffer->current()) {
       auto allocation = resource->buffer->current();
-      auto buffer = allocation->buffer();
-      NSObject_retain(buffer.handle);
-      *pBuffer = buffer.handle;
-      *pGpuAddress = allocation->gpuAddress();
-      *ppMapped = allocation->mappedMemory(0);
+      pInfo->buffer = allocation->buffer().handle;
+      pInfo->buffer_info = allocation->info();
+      pInfo->flags = allocation->flags().raw();
+      NSObject_retain(pInfo->buffer);
       return S_OK;
     }
     return E_INVALIDARG;
   }
 
   HRESULT STDMETHODCALLTYPE
-  SignalEventAfterQueue(ID3D12CommandQueue *pQueue, WMT::SharedEvent Event, UINT64 Value) final {
-    if (!pQueue || !Owns(pQueue))
-      return E_INVALIDARG;
-    Com<ID3D12Fence> fence;
-    HRESULT hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-    if (FAILED(hr))
-      return hr;
-    if (FAILED(hr = pQueue->Signal(fence.ptr(), 1)))
-      return hr;
-    // the callback keeps the fence: its last release would reach it early
-    static_cast<MTLD3D12Fence *>(fence.ptr())
-        ->Expect(1, [event = WMT::Reference<WMT::SharedEvent>(Event), Value, fence]() mutable { event.signalValue(Value); });
-    return S_OK;
-  }
-
-  HRESULT STDMETHODCALLTYPE
-  QueueWaitForEvent(ID3D12CommandQueue *pQueue, WMT::SharedEvent Event, UINT64 Value) final {
-    if (!pQueue || !Owns(pQueue))
-      return E_INVALIDARG;
-    Com<ID3D12Fence> fence;
-    HRESULT hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-    if (FAILED(hr))
-      return hr;
-    // a pool thread waits for the event and reaches the fence the queue waits for
-    struct Wait {
-      WMT::Reference<WMT::SharedEvent> event;
-      UINT64 value;
-      Com<ID3D12Fence> fence;
-    };
-    auto wait = new Wait{WMT::Reference<WMT::SharedEvent>(Event), Value, fence};
-    if (!QueueUserWorkItem(
-            [](void *context) -> DWORD {
-              std::unique_ptr<Wait> wait(static_cast<Wait *>(context));
-              while (!wait->event.waitUntilSignaledValue(wait->value, 1000)) {
-              }
-              wait->fence->Signal(1);
-              return 0;
-            },
-            wait, WT_EXECUTELONGFUNCTION
-        )) {
-      delete wait;
-      return E_FAIL;
-    }
-    return pQueue->Wait(fence.ptr(), 1);
+  CreateResourceOfMetal(const D3D12_RESOURCE_DESC *desc, const MullionMetalResource *info,
+                        REFIID riid, void **resource) final {
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    return CreateCommittedTexture(device_, &heap, D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COMMON,
+                                  nullptr, riid, resource, nullptr, info);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -637,7 +595,7 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
-      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_6);
+      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_7);
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {

@@ -18,6 +18,9 @@ DEFINE_COM_INTERFACE("3a3f085a-d0fe-4324-b0ae-fe04de18571c",
   virtual void PrepareFlush() = 0;
   virtual void UnbindResource(ID3D11Resource *pResource) = 0;
   virtual void Commit() = 0;
+  virtual HRESULT WaitEvent(WMT::SharedEvent event, UINT64 value, ID3D12Fence *fence) = 0;
+  virtual HRESULT SignalFence(ID3D12Fence *fence, UINT64 value) = 0;
+  virtual HRESULT ReturnResource(ID3D11Resource *resource, std::function<void(mullion::ArgumentEncodingContext &)> &&before) = 0;
   virtual void SOGetTargetsWithOffsets(UINT NumBuffers, REFIID riid, void ** ppSOTargets, UINT *pOffsets) = 0;
   virtual HRESULT AcquireSync(ID3D11Resource *pResource, UINT64 Key, DWORD dwMilliseconds) = 0;
   virtual HRESULT ReleaseSync(ID3D11Resource *pResource, UINT64 Key) = 0;
@@ -66,6 +69,7 @@ public:
   virtual unsigned int GetDirectXVersion() = 0;
 
   d3d11_device_mutex mutex;
+  bool shares_with_d3d12 = false;
 };
 
 D3D_FEATURE_LEVEL GetMaxFeatureLevel(WMT::Device device);

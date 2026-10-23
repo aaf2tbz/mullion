@@ -332,6 +332,8 @@ public:
   virtual HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
       override {
+    if (this->wrapped_resource)
+      return TResourceBase<tag_texture, IMTLMinLODClampable>::CreateSharedHandle(Attributes, Access, pName, pNTHandle);
     InitReturnPtr(pNTHandle);
     if (!local_kmt_ || !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
       return E_INVALIDARG;
@@ -391,7 +393,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     return E_INVALIDARG;
   }
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
-                            !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+                            !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && !pDevice->shares_with_d3d12;
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
 
   MTL_DXGI_FORMAT_DESC format_desc;
@@ -620,7 +622,7 @@ template <typename tag>
 static HRESULT
 WrapTextureInternal(
     MTLD3D11Device *pDevice, const typename tag::DESC1 *pDescUnchecked, WMT::Reference<WMT::Texture> &&metal,
-    REFIID riid, void **ppTexture
+    const MullionMetalResource &Info, REFIID riid, void **ppTexture
 ) {
   WMTTextureInfo info{};
   typename tag::DESC1 finalDesc;
@@ -636,12 +638,8 @@ WrapTextureInternal(
     ERR("WrapTexture: the description does not make the texture it wraps");
     return E_INVALIDARG;
   }
-  Flags<TextureAllocationFlag> flags;
-  flags.set(TextureAllocationFlag::GpuPrivate);
-  if (!(finalDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS)))
-    flags.set(TextureAllocationFlag::ShaderReadonly);
-  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
-  auto allocation = texture->wrap(std::move(metal), flags);
+  auto texture = Rc<Texture>(new Texture(Info.texture_info, pDevice->GetMTLDevice()));
+  auto allocation = texture->wrap(std::move(metal), Info.texture_info, Info.flags);
   if (!allocation)
     return E_INVALIDARG;
   texture->rename(std::move(allocation));
@@ -652,21 +650,21 @@ WrapTextureInternal(
 HRESULT
 WrapTexture(
     MTLD3D11Device *pDevice, D3D11_RESOURCE_DIMENSION Dimension, const void *pDesc1, WMT::Reference<WMT::Texture> &&Metal,
-    REFIID riid, void **ppTexture
+    const MullionMetalResource &Info, REFIID riid, void **ppTexture
 ) {
   InitReturnPtr(ppTexture);
   switch (Dimension) {
   case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
     return WrapTextureInternal<tag_texture_1d>(
-        pDevice, static_cast<const D3D11_TEXTURE1D_DESC *>(pDesc1), std::move(Metal), riid, ppTexture
+        pDevice, static_cast<const D3D11_TEXTURE1D_DESC *>(pDesc1), std::move(Metal), Info, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     return WrapTextureInternal<tag_texture_2d>(
-        pDevice, static_cast<const D3D11_TEXTURE2D_DESC1 *>(pDesc1), std::move(Metal), riid, ppTexture
+        pDevice, static_cast<const D3D11_TEXTURE2D_DESC1 *>(pDesc1), std::move(Metal), Info, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
     return WrapTextureInternal<tag_texture_3d>(
-        pDevice, static_cast<const D3D11_TEXTURE3D_DESC1 *>(pDesc1), std::move(Metal), riid, ppTexture
+        pDevice, static_cast<const D3D11_TEXTURE3D_DESC1 *>(pDesc1), std::move(Metal), Info, riid, ppTexture
     );
   default:
     return E_INVALIDARG;

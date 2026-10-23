@@ -12,6 +12,14 @@ foreach name : ['geometry_indirect_parts', 'geometry_parts', 'geometry_oversize'
                   dependencies : d3d11_test_deps + d3d11_test_links.get(name, [])),
        env : ['MULLION_SHADER_CACHE=0'], timeout : 600)
 endforeach
+if get_option('enable_d3d12')
+  on12 = executable('d3d11_on12', 'd3d11_on12.cpp',
+                    dependencies : d3d11_test_deps + [cpp.find_library('d3d12')])
+  foreach part : ['creation', 'wrapped', 'wait', 'unwrap', 'swapchain', 'lifetime', 'ordering', 'teardown', 'longwait', 'dimensions', 'cpu', 'flags', 'aliases', 'predication']
+    test(part == 'creation' ? 'd3d11_on12' : 'd3d11_on12_' + part, on12, args : [part],
+         env : ['MULLION_SHADER_CACHE=0'], timeout : 600)
+  endforeach
+endif
 # no test: the runner's way to see where the threads of a test that outlived its time are
 executable('where', ['where.cpp'], dependencies : [cpp.find_library('dbghelp')])
 # 'window' tests present to a real window

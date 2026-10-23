@@ -219,6 +219,7 @@ enum Op : uint32_t {
   Unpack4x8 = 219,
   Pack4x8 = 220,
   IsHelperLane = 221,
+  QuadVote = 222,
 };
 
 // DxilConstants.h SemanticKind values that have their own storage in the DXBC path, or in a Metal mesh
@@ -1179,7 +1180,7 @@ read_dxil(
   info.quads_2d = compute && n[0] % 2 == 0 && n[1] % 2 == 0 &&
                   used(
                       {DerivCoarseX, DerivCoarseY, DerivFineX, DerivFineY, Sample, SampleBias, SampleCmp, CalculateLOD,
-                       QuadOp, QuadReadLaneAt}
+                       QuadOp, QuadReadLaneAt, QuadVote}
                   );
   if (info.quads_2d)
     for (auto type :
@@ -1307,7 +1308,11 @@ convert_dxil(
     }
   }
   // a stage is one function of Metal: what the function calls of its module is inlined
-  if (auto start = (*module)->getFunction(function))
+  auto start = (*module)->getFunction(function);
+  // DXIL.rst, Functions: with 'waveops-include-helper-lanes' (SM 6.7) a pixel shader's helper lanes take part in its
+  // wave operations, which they do not by default
+  bool helper_waves = start && start->hasFnAttribute("waveops-include-helper-lanes");
+  if (start)
     for (bool inlined = true; inlined;) {
       inlined = false;
       for (auto &I : make_early_inc_range(instructions(*start)))
@@ -2190,6 +2195,21 @@ convert_dxil(
     auto op = opcode(call);
     Value *ret = nullptr;
     auto a = [&](unsigned i) { return arg(call, i); };
+    // Metal's SIMD-group functions take every active lane, a helper's too: where D3D leaves helpers out, they skip
+    // the operation, and get zero for its undefined result
+    llvm::BasicBlock *skipped = nullptr;
+    if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves &&
+        ((op >= WaveIsFirstLane && op <= WavePrefixOp && op != WaveGetLaneIndex && op != WaveGetLaneCount) ||
+         op == WaveAllBitCount || op == WavePrefixBitCount || (op >= WaveMatch && op <= WaveMultiPrefixBitCount))) {
+      skipped = ir.GetInsertBlock();
+      auto join = SplitBlock(skipped, call);
+      auto lanes = llvm::BasicBlock::Create(ctx.llvm, "wave_op", ctx.function, join);
+      skipped->getTerminator()->eraseFromParent();
+      ir.SetInsertPoint(skipped);
+      ir.CreateCondBr(simd("simd_is_helper_thread", ir.getInt1Ty(), {}), join, lanes);
+      ir.SetInsertPoint(lanes);
+      ir.SetInsertPoint(ir.CreateBr(join));
+    }
     switch (op) {
     case CreateHandle: {
       auto cls = constant(a(1));
@@ -3412,6 +3432,10 @@ convert_dxil(
       ret =
           ctx.shader_type == D3D10_SB_PIXEL_SHADER ? simd("simd_is_helper_thread", ir.getInt1Ty(), {}) : ir.getFalse();
       break;
+    case QuadVote:
+      // DXIL's QuadVoteOpKind: any 0, all 1. a quad's helpers take part
+      ret = simd(constant(a(2)) ? "quad_all" : "quad_any", ir.getInt1Ty(), {a(1)});
+      break;
     case CheckAccessFullyMapped:
       ret = ir.CreateICmpNE(a(1), ir.getInt32(0));
       break;
@@ -3655,6 +3679,12 @@ convert_dxil(
       }
       break;
     }
+    }
+    if (skipped && ret) {
+      auto phi = PHINode::Create(ty, 2, "", &call->getParent()->front());
+      phi->addIncoming(ret, ir.GetInsertBlock());
+      phi->addIncoming(Constant::getNullValue(ty), skipped);
+      ret = phi;
     }
     if (ret)
       call->replaceAllUsesWith(ret);

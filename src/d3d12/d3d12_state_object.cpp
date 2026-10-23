@@ -257,7 +257,8 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
       const D3D12_DXIL_LIBRARY_DESC &desc, std::vector<std::pair<const RayLibrary *, LibrarySubobject>> &subobjects
   ) {
     auto library = std::make_shared<RayLibrary>();
-    if (!ShaderContainerHolds(desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength))
+    if (!ShaderContainerHolds(desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength) ||
+        !ShaderFeaturesSupported(device_, desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength))
       return E_INVALIDARG;
     SM50Error error;
     if (SM50Initialize(

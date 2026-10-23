@@ -394,16 +394,16 @@ CreateBuffer(
 
 HRESULT
 WrapBuffer(
-    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, WMT::Reference<WMT::Buffer> &&Metal, UINT64 GpuAddress,
-    void *pMapped, REFIID riid, void **ppBuffer
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, WMT::Reference<WMT::Buffer> &&Metal,
+    const MullionMetalResource &Info, REFIID riid, void **ppBuffer
 ) {
   InitReturnPtr(ppBuffer);
   if (!pDesc->ByteWidth || pDesc->Usage != D3D11_USAGE_DEFAULT)
     return E_INVALIDARG;
   auto buffer = Rc<Buffer>(new Buffer(pDesc->ByteWidth, pDevice->GetMTLDevice()));
-  Flags<BufferAllocationFlag> flags;
-  flags.set(BufferAllocationFlag::GpuPrivate);
-  auto allocation = buffer->wrap(std::move(Metal), flags, GpuAddress, pMapped);
+  if (FAILED(pDevice->CreateBuffer(pDesc, nullptr, nullptr)))
+    return E_INVALIDARG;
+  auto allocation = buffer->wrap(std::move(Metal), Info.buffer_info, Info.flags);
   if (!allocation)
     return E_INVALIDARG;
   buffer->rename(std::move(allocation));
