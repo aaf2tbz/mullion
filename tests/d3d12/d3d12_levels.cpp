@@ -49,7 +49,7 @@ main(int argc, char **argv) {
   }
   D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_HIGHEST_SHADER_MODEL};
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)));
-  expect(model.HighestShaderModel == D3D_SHADER_MODEL_6_6, "shader model 6.6 not reported");
+  expect(model.HighestShaderModel == D3D_SHADER_MODEL_6_7, "shader model 6.7 not reported");
   expect(o1.TotalLaneCount && o1.TotalLaneCount % o1.WaveLaneCountMax == 0, "total lanes are not whole waves");
   D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
   D3D12_RESOURCE_DESC swizzled{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},

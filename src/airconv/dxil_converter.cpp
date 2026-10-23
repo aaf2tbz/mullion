@@ -219,6 +219,7 @@ enum Op : uint32_t {
   Unpack4x8 = 219,
   Pack4x8 = 220,
   IsHelperLane = 221,
+  QuadVote = 222,
 };
 
 // DxilConstants.h SemanticKind values that have their own storage in the DXBC path, or in a Metal mesh
@@ -1264,6 +1265,11 @@ convert_dxil(
   if (!module)
     return module.takeError();
   auto entry = read_entry(**module, function); // the signatures, which outlive the module
+  // a pixel shader's helper lanes take part in its wave operations only with [WaveOpsIncludeHelperLanes] (SM 6.7,
+  // DXIL.rst Functions: the entry's 'waveops-include-helper-lanes'). Metal's SIMD functions count them, so without it
+  // each wave operation runs where helpers branch around it, and is undefined on them as D3D has it
+  bool waves_without_helpers = ctx.shader_type == D3D10_SB_PIXEL_SHADER && entry.function &&
+                               !entry.function->hasFnAttribute("waveops-include-helper-lanes");
   // kDxilShaderFlagsTag, whose bit 1 is DisableMathRefactoring: every operation is precise, and none carries the mark
   bool precise = [f = tag(entry.properties, 0)] { return f && (md_uint(*f) & (1u << 1)); }(), denorm = false;
   // a callee can have its own mode; preserve it before inlining (DXIL.rst, Functions; DXC, Denorm Mode)
@@ -2184,12 +2190,43 @@ convert_dxil(
            native_extreme(call);
   });
 
+  // the operations over a wave's active lanes; quad operations always have their helpers
+  auto over_wave = [](uint32_t op) {
+    switch (op) {
+    case WaveIsFirstLane:
+    case WaveAnyTrue:
+    case WaveAllTrue:
+    case WaveActiveAllEqual:
+    case WaveActiveBallot:
+    case WaveReadLaneAt:
+    case WaveReadLaneFirst:
+    case WaveActiveOp:
+    case WaveActiveBit:
+    case WavePrefixOp:
+    case WaveAllBitCount:
+    case WavePrefixBitCount:
+    case WaveMatch:
+    case WaveMultiPrefixOp:
+    case WaveMultiPrefixBitCount:
+      return true;
+    default:
+      return false;
+    }
+  };
+
   for (auto call : calls) {
     ir.SetInsertPoint(call);
     auto ty = call->getType();
     auto op = opcode(call);
     Value *ret = nullptr;
     auto a = [&](unsigned i) { return arg(call, i); };
+    // live lanes only: the operation is lowered in a block helpers branch around, and joins them after it
+    llvm::BasicBlock *around = nullptr;
+    if (waves_without_helpers && over_wave(op)) {
+      around = call->getParent();
+      auto live = ir.CreateNot(simd("simd_is_helper_thread", ir.getInt1Ty(), {}));
+      ir.SetInsertPoint(SplitBlockAndInsertIfThen(live, call, false));
+    }
     switch (op) {
     case CreateHandle: {
       auto cls = constant(a(1));
@@ -2324,6 +2361,10 @@ convert_dxil(
       break;
     case QuadReadLaneAt:
       ret = move("quad_shuffle", a(1), {i16(a(2))});
+      break;
+    case QuadVote:
+      // QuadVoteOpKind: any 0, all 1, over the quad's active lanes (helpers included, as in QuadReadLaneAt)
+      ret = simd(constant(a(2)) ? "quad_all" : "quad_any", ir.getInt1Ty(), {a(1)});
       break;
     case QuadOp:
       // across X, Y or the diagonal: the lane whose quad index differs in bit 0, bit 1, or both
@@ -3655,6 +3696,14 @@ convert_dxil(
       }
       break;
     }
+    }
+    if (around && ret) {
+      auto lowered = ir.GetInsertBlock();
+      ir.SetInsertPoint(call);
+      auto joined = ir.CreatePHI(ret->getType(), 2);
+      joined->addIncoming(ret, lowered);
+      joined->addIncoming(UndefValue::get(ret->getType()), around);
+      ret = joined;
     }
     if (ret)
       call->replaceAllUsesWith(ret);
