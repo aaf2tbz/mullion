@@ -103,6 +103,9 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
   };
   uint32_t Primitive;
   uint32_t InstanceCount;
+  /* whether a conservative rasterizer can grow the triangles it emits: a fan of nine vertices for each, as many as its
+     strip of the most vertices has, fits a mesh (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative) */
+  uint32_t ConservativeFits;
 };
 
 struct MTL_POST_TESSELLATOR_REFLECTION {

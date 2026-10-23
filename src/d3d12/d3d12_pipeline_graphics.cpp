@@ -642,7 +642,7 @@ protected:
     pso_gs.strip_cut_index = in.strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF ? 0xffff : ~0u;
     pso_gs.input_primitive = primitive;
     pso_gs.pass_through = pass_through && !counting;
-    pso_gs.conservative = pso_gs.pass_through && in.conservative;
+    pso_gs.conservative = in.conservative && !counting && (shader_gs || pass_through);
     pso_gs.flat_inputs = in.flat_inputs;
     pso_gs.noperspective_inputs = in.noperspective_inputs;
     pso_gs.next = &in.common;
@@ -1073,12 +1073,14 @@ public:
     // (D3D12_CONSERVATIVE_RASTERIZATION_TIER_1); it does not apply to points and lines (D3D11.3 15.17)
     conservative = pDesc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON &&
                    pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    // after a geometry, hull or mesh shader the mesh stage is theirs: those triangles rasterize as usual for now
-    if (conservative && !plain) {
+    // a geometry shader's triangles are grown where it emits them, when their fans fit a mesh; after a hull or mesh
+    // shader, or a geometry shader whose fans do not fit, those triangles rasterize as usual for now
+    bool geometry = !mesh_shader && !tessellation && pDesc->GS.pShaderBytecode;
+    if (conservative && !plain && !(geometry && ref_gs.GeometryShader.ConservativeFits)) {
       static std::once_flag warned;
       std::call_once(warned, [] {
-        WARN("CreatePipelineState: conservative rasterization after a geometry, hull or mesh shader is not "
-             "implemented yet; those pipelines rasterize as usual");
+        WARN("CreatePipelineState: conservative rasterization after a hull or mesh shader, or a geometry shader that "
+             "emits too much, is not implemented yet; those pipelines rasterize as usual");
       });
       conservative = false;
     }

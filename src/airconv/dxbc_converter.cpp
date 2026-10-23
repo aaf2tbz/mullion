@@ -1536,6 +1536,15 @@ AIRCONV_API int SM50Initialize(
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
+      // a fan's vertex: the position, the varyings and the window coordinates, and clip distances; its triangles
+      // carry what Metal's primitives may, counted as four words each. Metal has 256 vertices and 512 primitives
+      uint32_t fans = sm50_shader->gs_max_vertex_output >= 3 ? sm50_shader->gs_max_vertex_output - 2 : 0;
+      uint32_t vertex_size = sizeof(float[4]) + (sm50_shader->num_mesh_vertex_data + SM50_CONSERVATIVE_VARYINGS) * 4 +
+                             sm50_shader->clip_distance_scalars.size() * sizeof(float);
+      pRefl->GeometryShader.ConservativeFits =
+          sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && fans &&
+          9 * fans <= 256 && 7 * fans <= 512 &&
+          mullion::dxbc::mesh_size(9 * fans, vertex_size, 7 * fans * 4) <= mullion::dxbc::mesh_size_limit;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
       pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0,
