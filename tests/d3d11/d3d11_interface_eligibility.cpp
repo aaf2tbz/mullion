@@ -79,8 +79,11 @@ static LONG CALLBACK breakpoint(EXCEPTION_POINTERS *info) {
   if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
     return EXCEPTION_CONTINUE_SEARCH;
   InterlockedIncrement(&breaks);
-  // the context stands at the breakpoint instruction, one byte long: resume after it
-#ifdef _WIN64
+  // the context stands at the breakpoint instruction: resume after it, one byte on x86 and four on ARM64
+  // (brk #0xf000)
+#if defined(__aarch64__) && !defined(__arm64ec__)
+  info->ContextRecord->Pc += 4;
+#elif defined(_WIN64)
   info->ContextRecord->Rip++;
 #else
   info->ContextRecord->Eip++;
