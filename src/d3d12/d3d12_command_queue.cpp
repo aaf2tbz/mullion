@@ -44,6 +44,35 @@ namespace mullion {
 constexpr auto kCommandQueueSize = 32u;
 const auto dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES");
 
+// a pass whose every dispatch waits for the one before (a UAV barrier between each two) runs serially, where Metal
+// orders the dispatches itself and a barrier costs nothing: a concurrent encoder's barriers take longer than that.
+// a pass with two dispatches that may overlap, or an indirect command buffer's, stays concurrent
+static bool
+DispatchesOverlap(const wmtcmd_base *cmd) {
+  bool unordered = false; // a dispatch since the last barrier
+  for (; cmd; cmd = static_cast<const wmtcmd_base *>(cmd->next.ptr)) {
+    switch (cmd->type) {
+    case WMTComputeCommandDispatch:
+    case WMTComputeCommandDispatchIndirect:
+    case WMTComputeCommandDispatchThreads:
+      if (unordered)
+        return true;
+      unordered = true;
+      break;
+    case WMTComputeCommandMemoryBarrier:
+      unordered = false;
+      break;
+    case WMTComputeCommandExecuteCommandsInBuffer:
+    case WMTComputeCommandExecuteCommandsInBufferIndirect:
+    case WMTComputeCommandDispatchPart:
+      return true;
+    default:
+      break;
+    }
+  }
+  return false;
+}
+
 const GUID kD3D12CommandQueueDownlevelUUID = {
     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
 };
@@ -1100,8 +1129,9 @@ public:
         }
         case EncoderType::Compute: {
           auto data = static_cast<ComputeEncoderData *>(current);
-          auto encoder =
-              attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true) : cmdbuf.computeCommandEncoder(true);
+          bool concurrent = DispatchesOverlap(reinterpret_cast<const wmtcmd_base *>(&data->cmd_head));
+          auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, concurrent)
+                                                  : cmdbuf.computeCommandEncoder(concurrent);
           if (record_totals_) {
             auto label = "compute " + device_->PassName(current, !profile_);
             SnapshotGPURecords(records, current, label, scope.inflight->records);
