@@ -1,0 +1,21 @@
+# the conservative rasterizer's fragment function writes no depth
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -726,7 +726,7 @@
+     std::string source = "#include <metal_stdlib>\nusing namespace metal;\nstruct Polygon {\n  float4 position [[position]];\n";
+     for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+       source += "  float v" + std::to_string(i) + " [[user(mullion_conservative" + std::to_string(i) + "), flat]];\n";
+-    source += "};\nstruct Depth {\n  float z [[depth(any)]];\n};\nfragment Depth conservative_fragment(Polygon in [[stage_in]]) {\n  float2 v[] = {";
++    source += "};\nstruct Depth {\n  float z [[depth(any)]];\n};\nfragment void conservative_fragment(Polygon in [[stage_in]]) {\n  float2 v[] = {";
+     for (uint32_t k = 0; k < SM50_CONSERVATIVE_CORNERS; k++)
+       source += "{in.v" + std::to_string(2 * k) + ", in.v" + std::to_string(2 * k + 1) + "}, ";
+     source += R"(};
+@@ -746,7 +746,7 @@
+   }
+   if (outside)
+     discard_fragment();
+-  return {in.position.z};
++  return;
+ }
+ )";
+     WMT::Reference<WMT::Error> err;

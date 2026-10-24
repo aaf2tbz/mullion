@@ -618,7 +618,8 @@ llvm::Error convert_dxbc_pixel_shader(
              position, builder.CreateFMul(builder.CreateExtractElement(position, uint64_t(3)), rcp_w(0)), uint64_t(3)
          )}
     );
-    // the grown triangles share the pixels on their edges, each with some of their samples
+    // a covered pixel has all its samples (D3D11.3 15.17.5), where Metal gives a shader that writes memory, which it
+    // runs once a sample, that sample's alone
     if (~conservative_coverage) {
       auto all =
           builder.CreateSub(builder.CreateShl(builder.getInt32(1), air.CreateGetNumSamples()), builder.getInt32(1));

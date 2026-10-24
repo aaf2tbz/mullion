@@ -1,0 +1,12 @@
+# a triangle of no area takes the second corner's inputs
+--- a/src/airconv/dxbc_converter_gs.cpp
++++ b/src/airconv/dxbc_converter_gs.cpp
+@@ -295,7 +295,7 @@
+       z = add(z, mul(weight[j], at(clip[j], 2)));
+     }
+     for (uint32_t j = 0; j < 3; j++) {
+-      auto first = f(j == 0 ? 1.0 : 0.0);
++      auto first = f(j == 1 ? 1.0 : 0.0);
+       out.over_w[u][j] = builder.CreateSelect(degenerate, first, weight[j]);
+       out.linear[u][j] = builder.CreateSelect(degenerate, first, mul(weight[j], at(clip[j], 3)));
+     }

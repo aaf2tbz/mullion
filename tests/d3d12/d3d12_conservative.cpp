@@ -1,17 +1,17 @@
-// contract: conservative rasterization, tier 3. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
-// covers every pixel whose square it overlaps, and no pixel farther than tier 2's uncertainty (a 256th of a pixel)
-// from it, a triangle of no area (a segment, a point) as well, which is not culled. such a pixel has all its samples
-// covered and its shader runs once (at 4x the test reads the target, as Metal runs a shader that writes memory once a
-// sample), its pixel shader sees the triangle's attributes extrapolated from their plane, so
-// a pixel whose center is inside sees what it sees without conservative rasterization, a triangle of no area has its
-// leading vertex's (after a tessellator one corner's) and faces back, a flat input is the first vertex's, and
-// SV_InnerCoverage says whether the square is
-// inside the triangle. a pipeline without a pixel shader writes the plane's depth, clamped to the viewport's range,
-// to the same pixels. all of it holds of what is left of a triangle clipped by the near and far planes or by the eye,
-// as an ordinary rasterizer clips it, and without depth clipping of all of a triangle before the eye; and for triangles
-// a geometry shader emits, for those a tessellator outputs, for a geometry shader's after a tessellator, and for a mesh
-// shader's (DXIL), with and without an amplification shader: its group outputs the triangle among others without area
-// away from it, past the triangles one Metal mesh grows. the device reports tier 3, and with it feature level 12_1.
+// contract: conservative rasterization, tier 3. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON covers
+// every pixel whose square it overlaps, and no pixel farther than tier 2's uncertainty (a 256th of a pixel) from it, a
+// triangle of no area (a segment, a point) as well, which is not culled. such a pixel has all its samples covered and
+// its shader runs once (at 4x the test reads the target, as Metal runs a shader that writes memory once a sample), its
+// pixel shader sees the triangle's attributes extrapolated from their plane, so a pixel whose center is inside sees
+// what it sees without conservative rasterization, a triangle of no area has its leading vertex's (after a tessellator
+// one corner's) and faces back, a flat input is the first vertex's, and SV_InnerCoverage says whether the square is
+// inside the triangle. a pipeline with a pixel shader or without writes the plane's depth, clamped to the viewport's
+// range, to the same pixels. all of it holds of what is left of a triangle clipped by the near and far planes or by the
+// eye, as an ordinary rasterizer clips it, and without depth clipping of all of a triangle before the eye; and for
+// triangles a geometry shader emits, for those a tessellator outputs, for a geometry shader's after a tessellator, and
+// for a mesh shader's (DXIL), with and without an amplification shader: its group outputs the triangle among others
+// without area away from it, past the triangles one Metal mesh grows. the device reports tier 3, and with it feature
+// level 12_1.
 // D3D11.3 functional specification 15.17 (Conservative Rasterization): "any pixel ... touched by the primitive must be
 // rasterized"; 15.17.2, the tiers' uncertainty regions; 15.17.5, "the coverage mask ... is full"; 15.17.4, attributes
 // are "extrapolated" for pixels whose centers are outside; 15.17.8, inner coverage. 15.4, clipping to "0 <= z <= w",
@@ -62,6 +62,8 @@ float ps_inner(V v, uint inner : SV_InnerCoverage) : SV_Target {
   InterlockedAdd(o[PIXELS + i].x, 1, was);
   return 1;
 }
+// one that writes no memory, which Metal clamps the depth of otherwise than one that does
+float ps_plain(V v) : SV_Target { return v.perspective; }
 // the perspective input as the shader evaluates it, at the centroid: at 1x, of every sample covered, the center
 float ps_evaluate(V v, bool front : SV_IsFrontFace) : SV_Target {
   uint2 p = uint2(v.position.xy);
@@ -391,8 +393,9 @@ main(int argc, char **argv) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
-  auto ps_inner = compiler.compile(hlsl, "ps_inner", "ps", defines);
-  if (ps_inner.empty()) {
+  auto ps_inner = compiler.compile(hlsl, "ps_inner", "ps", defines),
+       ps_plain = compiler.compile(hlsl, "ps_plain", "ps", defines);
+  if (ps_inner.empty() || ps_plain.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
@@ -412,8 +415,10 @@ main(int argc, char **argv) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7));
   bool meshes = compiler.dxc && options7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+  // a group of the most primitives a mesh shader outputs, 256 (D3D12 mesh shader specification), more than one Metal
+  // mesh of 256 vertices holds at three for each, the triangle in a later one
   auto mesh_defines = defines;
-  mesh_defines.insert(mesh_defines.end(), {"MESH", "TRIANGLES=40", "REAL=33"});
+  mesh_defines.insert(mesh_defines.end(), {"MESH", "TRIANGLES=256", "REAL=200"});
   auto small_defines = defines;
   small_defines.insert(small_defines.end(), {"MESH", "TRIANGLES=4", "REAL=1"});
   std::string ms, ms_amplified, ms_writes, as;
@@ -475,7 +480,8 @@ main(int argc, char **argv) {
     return device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&out));
   };
   // by the stages, conservative rasterization and sample count
-  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths], inner_pso[kPaths], unclipped_pso;
+  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths], inner_pso[kPaths], unclipped_pso, shaded_pso[kPaths],
+      shaded_unclipped_pso;
   for (int geometry = 0; geometry < kPaths; geometry++)
     for (int conservative = 0; conservative < 2; conservative++)
       for (int msaa = 0; msaa < 2; msaa++) {
@@ -502,8 +508,26 @@ main(int argc, char **argv) {
         } else {
           CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[geometry][conservative][msaa])));
         }
-        // and one whose pixel shader reads SV_InnerCoverage
+        // one that writes depth too, with depth clipped and (of the vertex shader's) without, and one whose pixel
+        // shader reads SV_InnerCoverage
         if (conservative && !msaa && (!meshed(geometry) || meshes)) {
+          auto shaded = desc;
+          shaded.PS = bytecode(ps_plain);
+          shaded.NumRenderTargets = 0;
+          shaded.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+          shaded.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+          shaded.DepthStencilState.DepthEnable = TRUE;
+          shaded.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+          shaded.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+          if (meshed(geometry)) {
+            CHECK(mesh_pipeline(geometry, shaded, shaded_pso[geometry]));
+          } else {
+            CHECK(device->CreateGraphicsPipelineState(&shaded, IID_PPV_ARGS(&shaded_pso[geometry])));
+          }
+          if (!geometry) {
+            shaded.RasterizerState.DepthClipEnable = FALSE;
+            CHECK(device->CreateGraphicsPipelineState(&shaded, IID_PPV_ARGS(&shaded_unclipped_pso)));
+          }
           desc.PS = bytecode(ps_inner);
           if (meshed(geometry)) {
             CHECK(mesh_pipeline(geometry, desc, inner_pso[geometry]));
@@ -573,6 +597,8 @@ main(int argc, char **argv) {
       {"a triangle past the viewport", {{-6.0f, 8.0f}, {12.0f, 1.0f}, {8.0f, 30.0f}}, {1, 2, 1}},
       {"a segment, a triangle of no area", {{4.25f, 6.5f}, {10.25f, 9.5f}, {16.25f, 12.5f}}, {1, 1, 1}},
       {"a point, a triangle of no area", {{9.6f, 14.4f}, {9.6f, 14.4f}, {9.6f, 14.4f}}, {1, 1, 1}},
+      // a 1024th of a pixel off the segment's line, which snapping to a 256th (15.16) puts on it
+      {"a sliver of no area once snapped", {{4.25f, 6.5f}, {10.25f, 9.5f + 1.0f / 1024}, {16.25f, 12.5f}}, {1, 1, 1}},
       // clipped to a quadrilateral, to a pentagon, past both its edges into the window, and to nothing
       {"a triangle across the near plane", {{4.0f, 6.0f}, {19.0f, 9.0f}, {8.0f, 20.0f}}, {1, 1, 1},
        {0.5f, -0.6f, 0.7f}},
@@ -775,7 +801,7 @@ main(int argc, char **argv) {
     return S_OK;
   };
 
-  static Pixels normal, conservative, multisampled, depth_only, unclipped, evaluated, inner;
+  static Pixels normal, conservative, multisampled, depth_only, unclipped, evaluated, inner, shaded, shaded_unclipped;
   // a pixel inside the viewport and target: what a draw can reach
   auto reachable = [&](int x, int y) {
     return x >= kViewport.TopLeftX && y >= kViewport.TopLeftY && x < kViewport.TopLeftX + kViewport.Width &&
@@ -811,8 +837,11 @@ main(int argc, char **argv) {
       if (!geometry)
         CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated, false));
       CHECK(draw(t, inner_pso[geometry].Get(), 0, false, inner, patch, mesh));
-      if (!geometry && unclippable)
+      CHECK(draw(t, shaded_pso[geometry].Get(), 0, true, shaded, patch, mesh));
+      if (!geometry && unclippable) {
         CHECK(draw(t, unclipped_pso.Get(), 0, true, unclipped, false));
+        CHECK(draw(t, shaded_unclipped_pso.Get(), 0, true, shaded_unclipped, false));
+      }
       // what reaches the window, and whether it has no area there, which turns it back (15.11.1, 15.12) and gives it
       // its leading vertex's attributes: after a tessellator any one corner, the same for the whole triangle (11.7.9),
       // so it is the one the first pixel shows
@@ -878,25 +907,27 @@ main(int argc, char **argv) {
                 "%s: pixel (%d, %d) ran the inner coverage shader %u times, the other %d", t.what, x, y,
                 inner.runs[i][0], ran
             );
-          // without a pixel shader, the same pixels and their depth, with depth clipped and without
-          // depth: the plane's z at the center, or the first corner's where it has no area, clamped to the viewport's
-          // range (17.10)
+          // the same pixels and their depth, without a pixel shader and with one, with depth clipped and without
+          // depth: the plane's z at the center, or the leading corner's where it has no area, clamped to the
+          // viewport's range (17.10)
           auto check_depth = [&](const Pixels &got, const Shape &p, const char *how) {
             bool written = got.depth[i] != 1, must = reachable(x, y) && overlaps(p, x, y, -1.0 / 64),
                  may = reachable(x, y) && overlaps(p, x, y, 1.0 / 128), no_area = flat(p);
             if ((must && !written) || (!may && written))
-              fail("%s: pixel (%d, %d) without a pixel shader%s: depth %g", t.what, x, y, how, got.depth[i]);
+              fail("%s: pixel (%d, %d)%s: depth %g", t.what, x, y, how, got.depth[i]);
             double range = kViewport.MaxDepth - kViewport.MinDepth,
                    z = no_area ? t.z[leading] : plane(t, x + 0.5, y + 0.5)[2],
                    want = kViewport.MinDepth + std::clamp(z, 0.0, 1.0) * range,
                    error = 1e-3 + (no_area ? 0 : moves(t, 2, x + 0.5, y + 0.5) * range);
             if (written && !(std::fabs(got.depth[i] - want) <= error))
-              fail("%s: pixel (%d, %d) without a pixel shader%s: depth %g, want %g", t.what, x, y, how, got.depth[i],
-                   want);
+              fail("%s: pixel (%d, %d)%s: depth %g, want %g", t.what, x, y, how, got.depth[i], want);
           };
-          check_depth(depth_only, polygon, "");
-          if (!geometry && unclippable)
-            check_depth(unclipped, whole, " or depth clipping");
+          check_depth(depth_only, polygon, " without a pixel shader");
+          check_depth(shaded, polygon, " with a pixel shader");
+          if (!geometry && unclippable) {
+            check_depth(unclipped, whole, " without a pixel shader or depth clipping");
+            check_depth(shaded_unclipped, whole, " with a pixel shader, without depth clipping");
+          }
           if (ran && conservative.attributes[i][2] != 7)
             fail("%s: pixel (%d, %d): flat %u, want the first vertex's 7", t.what, x, y, conservative.attributes[i][2]);
           // the attributes are their plane's at the center, inside or not (15.17.4), the leading vertex's where the
