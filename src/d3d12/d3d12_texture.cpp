@@ -284,6 +284,10 @@ public:
       if (plane && FAILED(PopulateWMTTextureInfo(device_, texture_info, desc_, plane)))
         return E_INVALIDARG;
       Flags<TextureAllocationFlag> flags = {};
+      // a committed texture the CPU never reaches is private: Metal keeps its contents compressed from the start, where
+      // a shared texture is so only once the GPU writes it (a placed texture has its heap's storage mode)
+      if (!pHeap && !pTexture && !IsCpuVisibleHeap(pHeapProps))
+        flags.set(TextureAllocationFlag::CpuInvisible);
       if (Reserved) {
         if (planes > 1)
           return E_INVALIDARG;
