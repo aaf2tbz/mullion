@@ -200,6 +200,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // OMSetDepthBounds' range, NaN as 0; the pass has a range set when depth_bounds_set_
   FLOAT depth_bounds_[2];
   bool depth_bounds_set_ = false;
+  // the last render pass a draw of a pipeline that uses UAVs was in: a UAV barrier orders nothing inside another
+  EncoderData *uav_draw_pass_ = nullptr;
 
   // occlusion queries: the running ones, each from the first visibility slot it counts in; the slots' GPU addresses,
   // in order; and the sums the ended ones need (sum_occlusion's), made before their results are read
@@ -987,6 +989,8 @@ public:
     }
     dirty_state_.clr(DirtyState::DepthBounds);
 
+    if (pso_graphics_->uses_uav)
+      uav_draw_pass_ = allocator_->encoder_current;
     return DrawCallStatus::Ordinary;
   }
 
@@ -2098,6 +2102,14 @@ public:
       return;
     }
     for (auto &barrier : std::span(barriers, Count)) {
+      // a UAV barrier orders UAV accesses alone: a render pass whose draws used none keeps going, as a dispatch's would
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && allocator_->encoder_current &&
+          allocator_->encoder_current->type == EncoderType::Render &&
+          allocator_->encoder_current != uav_draw_pass_) {
+        if (Order(false, true))
+          return;
+        continue;
+      }
       bool other = barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
       auto &states = barrier.Transition;
       if (Order(other || (states.StateBefore & draw_writes), other || ((states.StateBefore | states.StateAfter) & uav)))
