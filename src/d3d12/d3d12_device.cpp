@@ -362,9 +362,15 @@ public:
     return adapter_->GetMTLDevice();
   };
 
+  // the highest level the device supports, as D3D12_FEATURE_FEATURE_LEVELS answers it (the HUD shows it)
   D3D_FEATURE_LEVEL
   GetFeatureLevel() {
-    return D3D_FEATURE_LEVEL_11_0; // FIXME
+    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+                                               D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS data{ARRAYSIZE(levels), levels, D3D_FEATURE_LEVEL_11_0};
+    if (FAILED(CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &data, sizeof(data))))
+      return D3D_FEATURE_LEVEL_11_0;
+    return data.MaxSupportedFeatureLevel;
   };
 
   HRESULT
