@@ -123,6 +123,8 @@ struct RenderEncoderData : EncoderData {
   uint32_t scissors = 0, viewports = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
+  // a clear pass's: what another clear needs to join it (JoinableClear)
+  uint8_t clear_sample_count = 0;
 };
 
 struct BlitEncoderData : EncoderData {
