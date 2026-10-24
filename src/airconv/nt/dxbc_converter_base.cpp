@@ -1040,10 +1040,14 @@ Converter::FirstBit(IntegerUnaryOp Op, llvm::Value *Value) {
 
 llvm::Value *
 Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
-  // Metal's fast sine and cosine are both 0 from 2^23 radians on and of an infinity, where D3D's are in [-1, 1] and
-  // NaN (D3D11.3 22.10.20), and a tangent made of them is 0 / 0. the precise ones are right for every other value:
-  // sine and tangent of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3
-  // 22.10.20; DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
+  // Sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time: D3D asks for its
+  // accuracy only in [-100 pi, 100 pi] and otherwise for a value in [-1, 1] (D3D11.3 22.10.20), which the fast ones'
+  // 0 from 2^23 radians on is; only an infinity's or a NaN's sine and cosine, which D3D makes NaN and the fast ones 0,
+  // need fixing up. A tangent stays precise: Metal's fast one is NaN for large finite values, and one made of the fast
+  // sine and cosine would be 0 / 0. Sine and tangent of a zero are that zero, sign included, and a 32-bit denormal
+  // counts as its sign's zero (D3D11.3 22.10.20; DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a
+  // half zero's sign
+  const bool Fast = Op != llvm::air::AIRBuilder::tan;
   auto Type = Value->getType();
   llvm::Value *Result;
   if (Type->getScalarType()->isHalfTy()) {
@@ -1051,17 +1055,25 @@ Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
     auto Wide = Type->isVectorTy()
                     ? llvm::VectorType::get(ir.getFloatTy(), llvm::cast<llvm::VectorType>(Type)->getElementCount())
                     : ir.getFloatTy();
-    Result = ir.CreateFPTrunc(air.CreateFPUnOp(Op, ir.CreateFPExt(Value, Wide), false), Type);
+    Result = ir.CreateFPTrunc(air.CreateFPUnOp(Op, ir.CreateFPExt(Value, Wide), Fast), Type);
   } else
-    Result = air.CreateFPUnOp(Op, Value, false);
-  if (Op == llvm::air::AIRBuilder::cos)
-    return Result;
+    Result = air.CreateFPUnOp(Op, Value, Fast);
   auto Scalar = Value->getType()->getScalarType();
   auto Width = Scalar->getScalarSizeInBits();
   auto Bits = ir.CreateBitCast(Value, Value->getType()->getWithNewType(ir.getIntNTy(Width)));
+  auto Inf = llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt();
+  if (Fast) {
+    // an infinity's or a NaN's is NaN: integer selection, which fast math can't fold away
+    auto NonFinite = ir.CreateICmpEQ(ir.CreateAnd(Bits, llvm::ConstantInt::get(Bits->getType(), Inf)),
+                                     llvm::ConstantInt::get(Bits->getType(), Inf));
+    auto NaN = llvm::APFloat::getQNaN(Scalar->getFltSemantics()).bitcastToAPInt();
+    Result = ir.CreateSelect(NonFinite, ir.CreateBitCast(llvm::ConstantInt::get(Bits->getType(), NaN), Type), Result);
+  }
+  if (Op == llvm::air::AIRBuilder::cos)
+    return Result;
   auto Sign = llvm::APInt::getSignMask(Width);
   // a 32-bit denormal has no exponent bits; 16-bit denormals are kept (D3D11.3 3.1.5), so there only a zero counts
-  auto Counted = Scalar->isFloatTy() ? llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt() : ~Sign;
+  auto Counted = Scalar->isFloatTy() ? Inf : ~Sign;
   auto Zero = ir.CreateICmpEQ(ir.CreateAnd(Bits, Counted), llvm::ConstantInt::get(Bits->getType(), 0));
   return ir.CreateSelect(Zero, ir.CreateBitCast(ir.CreateAnd(Bits, Sign), Value->getType()), Result);
 }
