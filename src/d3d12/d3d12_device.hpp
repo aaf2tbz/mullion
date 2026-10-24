@@ -523,6 +523,8 @@ public:
   virtual HRESULT GetAdapter(REFIID riid, void **ppAdapter) = 0;
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
+  // commits the global residency set's changes; queues call it before committing a command buffer
+  virtual void CommitResidency() = 0;
   // MULLION_D3D12_GPU_ERRORS: passes carry the names of their pipelines to Metal, whose report of a command buffer
   // the GPU failed then says which pass it was. `NamePass` adds a pipeline to a pass's name, `PassName` takes it
   virtual bool NamesPasses() = 0;

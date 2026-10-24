@@ -72,6 +72,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::atomic<bool> closed;
     bool cancelled = false;
     std::vector<std::pair<WMT::Reference<WMT::CommandBuffer>, uint64_t *>> buffers;
+    // the device, whose residency set changes are committed before each command buffer
+    MTLD3D12Device *device = nullptr;
 
     void
     Commit(WMT::CommandBuffer buffer, uint64_t *committed) {
@@ -96,6 +98,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         return;
       if (committed)
         *committed = diag::Now();
+      if (device)
+        device->CommitResidency();
       buffer.commit();
     }
   };
@@ -193,6 +197,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       Trace("tile mappings: waits for the work before");
       if (!scope.Settle())
         return;
+      // the heaps it maps from must be resident by now, as for a command buffer
+      device_->CommitResidency();
       update(mapping_queue_);
       mapping_queue_.signalEvent(mapped_->sharedEvent(), ++mapping_value_);
       Trace("tile mappings: waits for mapping ", mapping_value_);
@@ -602,6 +608,7 @@ public:
     if (!queue_)
       return E_FAIL;
     queue_.addResidencySet(device_->GetGlobalResidencySet());
+    gate_->device = device_;
 
     fence_ = metal_device.newFence();
     if (profile_) {
