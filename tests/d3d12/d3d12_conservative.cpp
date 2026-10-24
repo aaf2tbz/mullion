@@ -1,17 +1,22 @@
 // contract: conservative rasterization, tier 3. a triangle drawn with D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
 // covers every pixel whose square it overlaps, and no pixel farther than tier 2's uncertainty (a 256th of a pixel)
 // from it, a triangle of no area (a segment, a point) as well, which is not culled. such a pixel has all its samples
-// covered (at 4x the test reads the target: Metal runs a 4x pixel's shader more than once, and a discarding run still
-// writes UAVs, with or without conservative rasterization), its pixel shader sees the triangle's attributes
-// extrapolated from their plane, so a pixel whose center is inside sees what it sees without conservative
-// rasterization, a flat input is the first vertex's, and SV_InnerCoverage says whether the square is inside the
-// triangle. a pipeline without a pixel shader writes depth to the same pixels. all of it holds as well for triangles a
-// geometry shader emits, for those a tessellator outputs, for a geometry shader's after a tessellator, and for a mesh
+// covered and its shader runs once (at 4x the test reads the target, as Metal runs a shader that writes memory once a
+// sample), its pixel shader sees the triangle's attributes extrapolated from their plane, so
+// a pixel whose center is inside sees what it sees without conservative rasterization, a triangle of no area has its
+// leading vertex's (after a tessellator one corner's) and faces back, a flat input is the first vertex's, and
+// SV_InnerCoverage says whether the square is
+// inside the triangle. a pipeline without a pixel shader writes the plane's depth, clamped to the viewport's range,
+// to the same pixels. all of it holds of what is left of a triangle clipped by the near and far planes or by the eye,
+// as an ordinary rasterizer clips it, and without depth clipping of all of a triangle before the eye; and for triangles
+// a geometry shader emits, for those a tessellator outputs, for a geometry shader's after a tessellator, and for a mesh
 // shader's (DXIL), with and without an amplification shader: its group outputs the triangle among others without area
 // away from it, past the triangles one Metal mesh grows. the device reports tier 3, and with it feature level 12_1.
 // D3D11.3 functional specification 15.17 (Conservative Rasterization): "any pixel ... touched by the primitive must be
 // rasterized"; 15.17.2, the tiers' uncertainty regions; 15.17.5, "the coverage mask ... is full"; 15.17.4, attributes
-// are "extrapolated" for pixels whose centers are outside; 15.17.8, inner coverage.
+// are "extrapolated" for pixels whose centers are outside; 15.17.8, inner coverage. 15.4, clipping to "0 <= z <= w",
+// and without it "only w > 0"; 15.11.1, "zero area geometry is considered back facing"; 16.2, the shader "is invoked
+// once per covered pixel"; 17.10, depth "always clamped" to the viewport's MinDepth and MaxDepth.
 // https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#15.17%20Conservative%20Rasterization
 // D3D12_CONSERVATIVE_RASTERIZATION_TIER: "Tier_2 reduces the maximum uncertainty region to 1/256 and requires
 // post-snap degenerate triangles not be culled"; "Tier_3 maintains a maximum 1/256 uncertainty region and adds support
@@ -21,6 +26,7 @@
 // whose plane's 1/w is below 0 within a pixel of it.
 #include "d3d12_test.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string>
 
@@ -35,16 +41,17 @@ V vs(float4 position : POSITION, float perspective : PERSPECTIVE, float screen :
   V v = {position, perspective, screen, flat};
   return v;
 }
-// per pixel: the attributes, then how many times the shader ran there, the samples it covered, and the runs that did
-// not cover every sample
+// per pixel: the attributes, then how many times the shader ran there, the samples it covered, the runs that did not
+// cover every sample, and the faces they saw (1 back, 2 front)
 RWStructuredBuffer<uint4> o : register(u0);
-float ps(V v, uint coverage : SV_Coverage) : SV_Target {
+float ps(V v, uint coverage : SV_Coverage, bool front : SV_IsFrontFace) : SV_Target {
   uint2 p = uint2(v.position.xy);
   uint i = p.y * WIDTH + p.x, was;
   o[i].xyz = uint3(asuint(v.perspective), asuint(v.screen), v.flat);
   InterlockedAdd(o[PIXELS + i].x, 1, was);
   InterlockedOr(o[PIXELS + i].y, coverage, was);
   InterlockedAdd(o[PIXELS + i].z, coverage != (1u << GetRenderTargetSampleCount()) - 1 ? 1 : 0, was);
+  InterlockedOr(o[PIXELS + i].w, front ? 2 : 1, was);
   return 1;
 }
 // whether the square is inside, where the attributes' place is
@@ -56,11 +63,12 @@ float ps_inner(V v, uint inner : SV_InnerCoverage) : SV_Target {
   return 1;
 }
 // the perspective input as the shader evaluates it, at the centroid: at 1x, of every sample covered, the center
-float ps_evaluate(V v) : SV_Target {
+float ps_evaluate(V v, bool front : SV_IsFrontFace) : SV_Target {
   uint2 p = uint2(v.position.xy);
   uint i = p.y * WIDTH + p.x, was;
   o[i].x = asuint(EvaluateAttributeCentroid(v.perspective));
   InterlockedAdd(o[PIXELS + i].x, 1, was);
+  InterlockedOr(o[PIXELS + i].w, front ? 2 : 1, was);
   return 1;
 }
 float4 vs_depth(float4 position : POSITION) : SV_Position { return position; }
@@ -143,6 +151,14 @@ void ms(uint t : SV_GroupThreadID, out vertices V v[4], out indices uint3 tris[T
 void ms_amplified(uint t : SV_GroupThreadID, in payload Payload p, out vertices V v[4], out indices uint3 tris[TRIANGLES]) {
   MESH_BODY
 }
+// a group small enough for one mesh, which counts its runs in the last pixel's, which nothing reaches
+[outputtopology("triangle")] [numthreads(32, 1, 1)]
+void ms_writes(uint t : SV_GroupThreadID, out vertices V v[4], out indices uint3 tris[TRIANGLES]) {
+  MESH_BODY
+  uint was;
+  if (t == 0)
+    InterlockedAdd(o[2 * PIXELS - 1].w, 1, was);
+}
 [numthreads(1, 1, 1)] void as() {
   Payload p;
   p.unused = 0;
@@ -157,8 +173,9 @@ template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T> struct alignas(v
   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
   T data{};
 };
-// the viewport is offset in the target, so window coordinates are not the viewport's
-static const D3D12_VIEWPORT kViewport{2, 3, 20, 20, 0, 1};
+// the viewport is offset in the target, so window coordinates are not the viewport's, and its depth range is not 0
+// to 1, which a clamp shows
+static const D3D12_VIEWPORT kViewport{2, 3, 20, 20, 0, 0.75f};
 
 struct Vertex {
   float position[4];
@@ -168,88 +185,175 @@ struct Vertex {
 
 struct Triangle {
   const char *what;
-  float window[3][2]; // in the target's pixels
-  float w[3];         // the corners' clip w: perspective
+  float window[3][2];              // the corners in the target's pixels; behind the eye, mirrored through it
+  float w[3];                      // the corners' clip w: perspective
+  float z[3] = {0.5f, 0.5f, 0.5f}; // and their z over w
 };
 
-// whether the square of pixel (px, py), grown by `grow` on each side, has a point in the triangle: the separating
+using Point = std::array<double, 2>;
+using Shape = std::vector<Point>;
+
+static std::array<double, 4>
+clip(const Triangle &t, int k) {
+  double x = (t.window[k][0] - kViewport.TopLeftX) / kViewport.Width * 2 - 1;
+  double y = 1 - (t.window[k][1] - kViewport.TopLeftY) / kViewport.Height * 2;
+  return {x * t.w[k], y * t.w[k], t.z[k] * t.w[k], t.w[k]};
+}
+
+// what of the triangle reaches the window: what is in 0 <= z <= w where depth clips, all of it where it does not
+// (asked only of triangles before the eye) (15.4)
+static Shape
+drawn(const Triangle &t, bool depth_clips) {
+  std::vector<std::array<double, 4>> p = {clip(t, 0), clip(t, 1), clip(t, 2)};
+  for (int plane = 0; plane < 2 * depth_clips; plane++) {
+    auto inside = [&](auto &v) { return plane ? v[3] - v[2] : v[2]; };
+    std::vector<std::array<double, 4>> kept;
+    for (size_t k = 0; k < p.size(); k++) {
+      auto &a = p[k], &b = p[(k + 1) % p.size()];
+      double da = inside(a), db = inside(b);
+      if (da >= 0)
+        kept.push_back(a);
+      if ((da >= 0) != (db >= 0)) {
+        std::array<double, 4> m;
+        for (int c = 0; c < 4; c++)
+          m[c] = a[c] + da / (da - db) * (b[c] - a[c]);
+        kept.push_back(m);
+      }
+    }
+    p = kept;
+  }
+  Shape out;
+  for (auto &v : p)
+    out.push_back(
+        {kViewport.TopLeftX + (v[0] / v[3] + 1) * kViewport.Width / 2,
+         kViewport.TopLeftY + (1 - v[1] / v[3]) * kViewport.Height / 2}
+    );
+  return out;
+}
+
+// twice the signed area, positive turning clockwise in the window
+static double
+area(const Shape &p) {
+  double sum = 0;
+  for (size_t k = 0; k < p.size(); k++)
+    sum += p[k][0] * p[(k + 1) % p.size()][1] - p[(k + 1) % p.size()][0] * p[k][1];
+  return sum;
+}
+
+// the polygon snapped as a rasterizer snaps it, to a 256th of a pixel (15.16), and whether it has no area then
+static Shape
+snap(Shape p) {
+  for (auto &corner : p)
+    for (auto &c : corner)
+      c = std::nearbyint(c * 256) / 256;
+  return p;
+}
+
+static bool
+flat(const Shape &p) {
+  return area(snap(p)) == 0;
+}
+
+// the edges' normals into the polygon; around one of no area, both of each side's
+static std::vector<std::pair<Point, Point>>
+edges(const Shape &p) {
+  std::vector<std::pair<Point, Point>> out;
+  double inward = area(p) > 0 ? -1 : 1;
+  for (size_t k = 0; k < p.size(); k++) {
+    auto &a = p[k], &b = p[(k + 1) % p.size()];
+    out.push_back({a, {(b[1] - a[1]) * inward, (a[0] - b[0]) * inward}});
+  }
+  return out;
+}
+
+// whether the square of pixel (px, py), grown by `grow` on each side, has a point in the polygon: the separating
 // axis test, the square's axes, then the edges' normals
 static bool
-overlaps(const Triangle &t, int px, int py, double grow) {
+overlaps(const Shape &p, int px, int py, double grow) {
+  if (p.empty())
+    return false;
   double lo[2] = {px - grow, py - grow}, hi[2] = {px + 1 + grow, py + 1 + grow};
   for (int axis = 0; axis < 2; axis++) {
     double tmin = 1e30, tmax = -1e30;
-    for (auto &v : t.window)
-      tmin = std::min<double>(tmin, v[axis]), tmax = std::max<double>(tmax, v[axis]);
+    for (auto &v : p)
+      tmin = std::min(tmin, v[axis]), tmax = std::max(tmax, v[axis]);
     if (tmax < lo[axis] || tmin > hi[axis])
       return false;
   }
-  for (int i = 0; i < 3; i++) {
-    auto &a = t.window[i], &b = t.window[(i + 1) % 3], &c = t.window[(i + 2) % 3];
-    double nx = b[1] - a[1], ny = a[0] - b[0];
-    double side = nx * (c[0] - a[0]) + ny * (c[1] - a[1]);
-    if (side < 0)
-      nx = -nx, ny = -ny;
+  for (auto &[a, n] : edges(p)) {
     // the square's corner farthest inside
     double best = -1e30;
     for (double x : {lo[0], hi[0]})
       for (double y : {lo[1], hi[1]})
-        best = std::max(best, nx * (x - a[0]) + ny * (y - a[1]));
+        best = std::max(best, n[0] * (x - a[0]) + n[1] * (y - a[1]));
     if (best < 0)
       return false;
   }
   return true;
 }
 
-// the slope in the window of an attribute that is `step` times its corner's index at each corner (the vertices'
-// values), taken as linear there
-static double
-gradient(const Triangle &t, double step) {
-  double x1 = t.window[1][0] - t.window[0][0], y1 = t.window[1][1] - t.window[0][1];
-  double x2 = t.window[2][0] - t.window[0][0], y2 = t.window[2][1] - t.window[0][1];
-  double area = x1 * y2 - x2 * y1, a1 = step, a2 = 2 * step;
-  return std::hypot((a1 * y2 - a2 * y1) / area, (a2 * x1 - a1 * x2) / area);
-}
-
-static double
-area(const Triangle &t) {
-  return (t.window[1][0] - t.window[0][0]) * (t.window[2][1] - t.window[0][1]) -
-         (t.window[2][0] - t.window[0][0]) * (t.window[1][1] - t.window[0][1]);
-}
-
-// whether the square of pixel (px, py), grown by `grow` on each side, is inside the triangle: every corner of it
+// whether the box's corners are inside the polygon by `margin`, times the edge's length
 static bool
-contained(const Triangle &t, int px, int py, double grow) {
-  double a = area(t);
-  if (a == 0)
+inside(const Shape &p, double x0, double y0, double x1, double y1, double margin) {
+  if (area(p) == 0)
     return false;
-  for (double x : {px - grow, px + 1 + grow})
-    for (double y : {py - grow, py + 1 + grow})
-      for (int i = 0; i < 3; i++) {
-        auto &p = t.window[i], &q = t.window[(i + 1) % 3];
-        double e = (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0]);
-        if ((a > 0 ? e : -e) < 0)
+  for (auto &[a, n] : edges(p))
+    for (double x : {x0, x1})
+      for (double y : {y0, y1})
+        if (n[0] * (x - a[0]) + n[1] * (y - a[1]) < margin * std::hypot(n[0], n[1]))
           return false;
-      }
   return true;
+}
+
+static bool
+contained(const Shape &p, int px, int py, double grow) {
+  return inside(p, px - grow, py - grow, px + 1 + grow, py + 1 + grow, 0);
 }
 
 // whether the pixel's center is inside, as an ordinary rasterizer would take it (away from edges)
 static bool
-center_inside(const Triangle &t, int px, int py, double margin) {
-  double x = px + 0.5, y = py + 0.5;
-  double area = ::area(t);
-  if (area == 0)
-    return false;
-  for (int i = 0; i < 3; i++) {
-    auto &a = t.window[i], &b = t.window[(i + 1) % 3];
-    double e = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
-    double len = std::hypot(b[0] - a[0], b[1] - a[1]);
-    if ((area > 0 ? e : -e) < margin * len)
-      return false;
-  }
-  return true;
+center_inside(const Shape &p, int px, int py, double margin) {
+  return inside(p, px + 0.5, py + 0.5, px + 0.5, py + 0.5, margin);
 }
+
+// the triangle's plane at a point of the window, from the corners' homogeneous barycentrics (Olano and Greer, by
+// Cramer's rule): the perspective input (1, 3, 5 at the corners, NaN where the plane is behind the eye), the
+// noperspective one (0, 10, 20) and z over w
+static std::array<double, 3>
+plane(const Triangle &t, double x, double y) {
+  double m[3][3], p[3] = {(x - kViewport.TopLeftX) / kViewport.Width * 2 - 1,
+                          1 - (y - kViewport.TopLeftY) / kViewport.Height * 2, 1};
+  for (int k = 0; k < 3; k++) {
+    auto c = clip(t, k);
+    m[0][k] = c[0], m[1][k] = c[1], m[2][k] = c[3];
+  }
+  auto det = [](const double (&a)[3][3]) {
+    return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+           a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+  };
+  double u[3], rcp_w = 0, over_w = 0, screen = 0, z = 0;
+  for (int j = 0; j < 3; j++) {
+    double mj[3][3];
+    for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+        mj[r][c] = c == j ? p[r] : m[r][c];
+    u[j] = det(mj) / det(m);
+    rcp_w += u[j], over_w += u[j] * (1 + 2 * j), screen += u[j] * t.w[j] * 10 * j, z += u[j] * t.w[j] * t.z[j];
+  }
+  return {rcp_w > 0 ? over_w / rcp_w : NAN, screen, z};
+}
+
+// how far the plane's `a` moves within a 64th of a pixel of a point: snapping the corners to a 256th of a pixel, the
+// grown triangle's as well as the triangle's, moves the plane that much, which a needle makes steep
+static double
+moves(const Triangle &t, int a, double x, double y) {
+  double here = plane(t, x, y)[a], most = 0;
+  for (double dx : {-1.0 / 64, 1.0 / 64})
+    for (double dy : {-1.0 / 64, 1.0 / 64})
+      most = std::max(most, std::fabs(plane(t, x + dx, y + dy)[a] - here));
+  return most;
+}
+
 
 int
 main(int argc, char **argv) {
@@ -310,12 +414,15 @@ main(int argc, char **argv) {
   bool meshes = compiler.dxc && options7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
   auto mesh_defines = defines;
   mesh_defines.insert(mesh_defines.end(), {"MESH", "TRIANGLES=40", "REAL=33"});
-  std::string ms, ms_amplified, as;
+  auto small_defines = defines;
+  small_defines.insert(small_defines.end(), {"MESH", "TRIANGLES=4", "REAL=1"});
+  std::string ms, ms_amplified, ms_writes, as;
   if (meshes) {
     ms = compiler.compile(hlsl, "ms", "ms_6_5", mesh_defines);
     ms_amplified = compiler.compile(hlsl, "ms_amplified", "ms_6_5", mesh_defines);
+    ms_writes = compiler.compile(hlsl, "ms_writes", "ms_6_5", small_defines);
     as = compiler.compile(hlsl, "as", "as_6_5", mesh_defines);
-    if (ms.empty() || ms_amplified.empty() || as.empty()) {
+    if (ms.empty() || ms_amplified.empty() || ms_writes.empty() || as.empty()) {
       printf("failed: the mesh shaders did not compile\n");
       return 1;
     }
@@ -333,8 +440,8 @@ main(int argc, char **argv) {
       {"FLAT", 0, DXGI_FORMAT_R32_UINT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
   };
   // the stages before the rasterizer: the vertex shader, then a geometry shader (1), a tessellator (2), or both; or a
-  // mesh shader (4), after an amplification shader (5)
-  const int kPaths = 6;
+  // mesh shader (4), after an amplification shader (5), or one that writes resources (6)
+  const int kPaths = 7;
   auto tessellated = [](int path) { return path < 4 && (path & 2); };
   auto meshed = [](int path) { return path >= 4; };
   struct {
@@ -355,7 +462,7 @@ main(int argc, char **argv) {
     stream.rs.data = desc.pRootSignature;
     if (path == 5)
       stream.as.data = bytecode(as);
-    stream.ms.data = bytecode(path == 5 ? ms_amplified : ms);
+    stream.ms.data = bytecode(path == 5 ? ms_amplified : path == 6 ? ms_writes : ms);
     stream.ps.data = desc.PS;
     stream.raster.data = desc.RasterizerState;
     stream.depth.data = desc.DepthStencilState;
@@ -368,7 +475,7 @@ main(int argc, char **argv) {
     return device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&out));
   };
   // by the stages, conservative rasterization and sample count
-  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths], inner_pso[kPaths];
+  ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths], inner_pso[kPaths], unclipped_pso;
   for (int geometry = 0; geometry < kPaths; geometry++)
     for (int conservative = 0; conservative < 2; conservative++)
       for (int msaa = 0; msaa < 2; msaa++) {
@@ -430,9 +537,14 @@ main(int argc, char **argv) {
       continue;
     }
     CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&depth_pso[geometry])));
+    // and the vertex shader's without depth clipping
+    if (!geometry) {
+      desc.RasterizerState.DepthClipEnable = FALSE;
+      CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&unclipped_pso)));
+    }
   }
 
-  // and one of the vertex shader's triangles that evaluates the perspective input
+  // and one of the vertex shader's triangles that evaluates the perspective input, its front turning counterclockwise
   ComPtr<ID3D12PipelineState> evaluate_pso;
   {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(vs), bytecode(ps_evaluate)};
@@ -441,6 +553,7 @@ main(int argc, char **argv) {
     desc.RasterizerState = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
     desc.RasterizerState.DepthClipEnable = TRUE;
     desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+    desc.RasterizerState.FrontCounterClockwise = TRUE;
     desc.InputLayout = {elements, (UINT)std::size(elements)};
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1;
@@ -460,6 +573,16 @@ main(int argc, char **argv) {
       {"a triangle past the viewport", {{-6.0f, 8.0f}, {12.0f, 1.0f}, {8.0f, 30.0f}}, {1, 2, 1}},
       {"a segment, a triangle of no area", {{4.25f, 6.5f}, {10.25f, 9.5f}, {16.25f, 12.5f}}, {1, 1, 1}},
       {"a point, a triangle of no area", {{9.6f, 14.4f}, {9.6f, 14.4f}, {9.6f, 14.4f}}, {1, 1, 1}},
+      // clipped to a quadrilateral, to a pentagon, past both its edges into the window, and to nothing
+      {"a triangle across the near plane", {{4.0f, 6.0f}, {19.0f, 9.0f}, {8.0f, 20.0f}}, {1, 1, 1},
+       {0.5f, -0.6f, 0.7f}},
+      {"a triangle across the near and far planes in perspective", {{3.5f, 5.0f}, {20.0f, 12.0f}, {6.0f, 21.0f}},
+       {1, 2, 1.5f}, {-0.4f, 0.5f, 1.6f}},
+      // whose edges leave the near plane at w 0.5, (8, 2), and 0.8, (23, 20)
+      {"a triangle with a corner behind the eye", {{6.0f, 6.0f}, {2.0f, 14.0f}, {16.0f, 18.0f}}, {1, -1, 2},
+       {0.5f, 1.5f, 0.5f}},
+      {"a triangle before the near plane", {{5.0f, 5.0f}, {18.0f, 8.0f}, {9.0f, 19.0f}}, {1, 1, 1},
+       {-0.5f, -0.2f, -0.9f}},
   };
 
   const UINT64 row = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, pixels = kWidth * kHeight;
@@ -571,9 +694,8 @@ main(int argc, char **argv) {
     if (FAILED(hr = vertices->Map(0, nullptr, (void **)&v)))
       return hr;
     for (int k = 0; k < 3; k++) {
-      float x = (t.window[k][0] - kViewport.TopLeftX) / kViewport.Width * 2 - 1;
-      float y = 1 - (t.window[k][1] - kViewport.TopLeftY) / kViewport.Height * 2;
-      v[k] = {{x * t.w[k], y * t.w[k], 0.5f * t.w[k], t.w[k]}, 1.0f + 2 * k, 10.0f * k, 7u + k};
+      auto c = clip(t, k);
+      v[k] = {{(float)c[0], (float)c[1], (float)c[2], (float)c[3]}, 1.0f + 2 * k, 10.0f * k, 7u + k};
     }
     vertices->Unmap(0, nullptr);
     allocator->Reset();
@@ -653,7 +775,7 @@ main(int argc, char **argv) {
     return S_OK;
   };
 
-  static Pixels normal, conservative, multisampled, depth_only, evaluated, inner;
+  static Pixels normal, conservative, multisampled, depth_only, unclipped, evaluated, inner;
   // a pixel inside the viewport and target: what a draw can reach
   auto reachable = [&](int x, int y) {
     return x >= kViewport.TopLeftX && y >= kViewport.TopLeftY && x < kViewport.TopLeftX + kViewport.Width &&
@@ -665,7 +787,8 @@ main(int argc, char **argv) {
       ", from a tessellator",
       ", from a geometry shader after a tessellator",
       ", from a mesh shader",
-      ", from a mesh shader after an amplification shader"
+      ", from a mesh shader after an amplification shader",
+      ", from a mesh shader that writes resources"
   };
   for (int geometry = 0; geometry < kPaths; geometry++)
     for (auto &shape : triangles) {
@@ -678,6 +801,9 @@ main(int argc, char **argv) {
       step("%s", t.what);
       bool patch = tessellated(geometry);
       bool mesh = meshed(geometry);
+      // without depth clipping, only of triangles before the eye: the rest is still clipped to w above 0 (15.4), which
+      // reaches past any window
+      bool unclippable = std::all_of(std::begin(t.w), std::end(t.w), [](float w) { return w > 0; });
       CHECK(draw(t, pso[geometry][0][0].Get(), 0, false, normal, patch, mesh));
       CHECK(draw(t, pso[geometry][1][0].Get(), 0, false, conservative, patch, mesh));
       CHECK(draw(t, pso[geometry][1][1].Get(), 1, false, multisampled, patch, mesh));
@@ -685,15 +811,32 @@ main(int argc, char **argv) {
       if (!geometry)
         CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated, false));
       CHECK(draw(t, inner_pso[geometry].Get(), 0, false, inner, patch, mesh));
+      if (!geometry && unclippable)
+        CHECK(draw(t, unclipped_pso.Get(), 0, true, unclipped, false));
+      // what reaches the window, and whether it has no area there, which turns it back (15.11.1, 15.12) and gives it
+      // its leading vertex's attributes: after a tessellator any one corner, the same for the whole triangle (11.7.9),
+      // so it is the one the first pixel shows
+      auto polygon = drawn(t, true), whole = drawn(t, false);
+      bool degenerate = flat(polygon), front = area(snap(polygon)) > 0;
+      int leading = 0, shown = 0;
+      while (patch && degenerate && shown < (int)(kWidth * kHeight) && !conservative.runs[shown][0])
+        shown++;
+      for (int k = 0; k < 3 && shown < (int)(kWidth * kHeight) && patch && degenerate; k++) {
+        float got;
+        memcpy(&got, &conservative.attributes[shown][0], 4);
+        if (std::fabs(got - (1.0 + 2 * k)) <= 1e-3 * (1.0 + 2 * k))
+          leading = k;
+      }
       for (int y = 0; y < (int)kHeight; y++)
         for (int x = 0; x < (int)kWidth; x++) {
           int i = y * kWidth + x;
           // certainly overlapped: the square less a sliver; certainly not: farther than the uncertainty region
-          bool must = reachable(x, y) && overlaps(t, x, y, -1.0 / 64),
-               may = reachable(x, y) && overlaps(t, x, y, 1.0 / 128);
+          bool must = reachable(x, y) && overlaps(polygon, x, y, -1.0 / 64),
+               may = reachable(x, y) && overlaps(polygon, x, y, 1.0 / 128);
           bool ran = conservative.runs[i][0];
-          // one primitive runs a pixel's shader once (D3D11.3 16.1); at 4x Metal may run it more than once, each with
-          // some of the samples, as it does without conservative rasterization, so there the runs' samples count
+          // one primitive runs a pixel's shader once (D3D11.3 16.2). at 4x Metal runs a shader that writes memory
+          // once a covered sample, and a run that discards still writes it, with or without conservative
+          // rasterization (probe-4x-runs.m): there the target tells
           if (conservative.runs[i][0] > 1)
             fail("%s: pixel (%d, %d) ran its shader %u times", t.what, x, y, conservative.runs[i][0]);
           if ((conservative.target[i] == 1) != ran)
@@ -704,8 +847,6 @@ main(int argc, char **argv) {
             fail("%s: pixel (%d, %d), which the triangle overlaps, was not rasterized", t.what, x, y);
           if (!may && ran)
             fail("%s: pixel (%d, %d), more than half a pixel away, was rasterized", t.what, x, y);
-          // at 4x, what reached the target: Metal may run a pixel's shader more than once there, and a run that
-          // discards still writes UAVs, with or without conservative rasterization
           float samples = multisampled.target[i];
           if (must && samples != 1)
             fail("%s: pixel (%d, %d) at 4x has %g of its samples, want all", t.what, x, y, samples);
@@ -719,44 +860,69 @@ main(int argc, char **argv) {
                  x, y, conservative.runs[i][2], multisampled.runs[i][2], multisampled.runs[i][1]);
           if (must && multisampled.runs[i][1] != 0xf)
             fail("%s: pixel (%d, %d) at 4x saw coverage %#x, want 0xf", t.what, x, y, multisampled.runs[i][1]);
+          // the face, as the ordinary rasterizer sees it, and turned by the state
+          UINT face = front && !degenerate ? 2 : 1, turned = !front && !degenerate ? 2 : 1;
+          if ((ran && conservative.runs[i][3] != face) || (normal.runs[i][0] && normal.runs[i][3] != face))
+            fail("%s: pixel (%d, %d) saw faces %u, without conservative rasterization %u, want %u", t.what, x, y,
+                 conservative.runs[i][3], normal.runs[i][3], face);
+          if (!geometry && evaluated.runs[i][0] && evaluated.runs[i][3] != turned)
+            fail("%s: pixel (%d, %d), its front counterclockwise, saw faces %u, want %u", t.what, x, y,
+                 evaluated.runs[i][3], turned);
           // inner coverage: no square that is not inside, and every square inside by more than the uncertainty
-          if (inner.runs[i][0] && inner.attributes[i][3] == 1 && !contained(t, x, y, -1.0 / 128))
+          if (inner.runs[i][0] && inner.attributes[i][3] == 1 && !contained(polygon, x, y, -1.0 / 128))
             fail("%s: pixel (%d, %d) has inner coverage, and its square is not inside", t.what, x, y);
-          if (reachable(x, y) && contained(t, x, y, 1.0 / 128) && inner.attributes[i][3] != 1)
+          if (reachable(x, y) && contained(polygon, x, y, 1.0 / 128) && inner.attributes[i][3] != 1)
             fail("%s: pixel (%d, %d), inside, has inner coverage %#x", t.what, x, y, inner.attributes[i][3]);
           if ((inner.runs[i][0] != 0) != ran)
             fail(
                 "%s: pixel (%d, %d) ran the inner coverage shader %u times, the other %d", t.what, x, y,
                 inner.runs[i][0], ran
             );
-          bool depth_written = depth_only.depth[i] != 1;
-          if ((must && !depth_written) || (!may && depth_written))
-            fail("%s: pixel (%d, %d) without a pixel shader: depth %g", t.what, x, y, depth_only.depth[i]);
-          if (depth_written && std::fabs(depth_only.depth[i] - 0.5f) > 1e-3f)
-            fail("%s: pixel (%d, %d) without a pixel shader: depth %g, want 0.5", t.what, x, y, depth_only.depth[i]);
+          // without a pixel shader, the same pixels and their depth, with depth clipped and without
+          // depth: the plane's z at the center, or the first corner's where it has no area, clamped to the viewport's
+          // range (17.10)
+          auto check_depth = [&](const Pixels &got, const Shape &p, const char *how) {
+            bool written = got.depth[i] != 1, must = reachable(x, y) && overlaps(p, x, y, -1.0 / 64),
+                 may = reachable(x, y) && overlaps(p, x, y, 1.0 / 128), no_area = flat(p);
+            if ((must && !written) || (!may && written))
+              fail("%s: pixel (%d, %d) without a pixel shader%s: depth %g", t.what, x, y, how, got.depth[i]);
+            double range = kViewport.MaxDepth - kViewport.MinDepth,
+                   z = no_area ? t.z[leading] : plane(t, x + 0.5, y + 0.5)[2],
+                   want = kViewport.MinDepth + std::clamp(z, 0.0, 1.0) * range,
+                   error = 1e-3 + (no_area ? 0 : moves(t, 2, x + 0.5, y + 0.5) * range);
+            if (written && !(std::fabs(got.depth[i] - want) <= error))
+              fail("%s: pixel (%d, %d) without a pixel shader%s: depth %g, want %g", t.what, x, y, how, got.depth[i],
+                   want);
+          };
+          check_depth(depth_only, polygon, "");
+          if (!geometry && unclippable)
+            check_depth(unclipped, whole, " or depth clipping");
           if (ran && conservative.attributes[i][2] != 7)
             fail("%s: pixel (%d, %d): flat %u, want the first vertex's 7", t.what, x, y, conservative.attributes[i][2]);
-          // inside, the attributes are the ordinary rasterizer's
-          if (ran && reachable(x, y) && center_inside(t, x, y, 0.05) && normal.runs[i][0])
-            for (int a = 0; a < 2; a++) {
-              float got, want;
-              memcpy(&got, &conservative.attributes[i][a], 4);
-              memcpy(&want, &normal.attributes[i][a], 4);
-              // the rasterizer snaps vertices to a 256th of a pixel, the grown triangle's as well as the triangle's:
-              // a sixty-fourth of a pixel of the attribute's slope in the window, which a needle makes steep
-              double slope = gradient(t, a ? 10.0 : 2.0);
-              if (!(std::fabs(got - want) <= 1e-3f * std::max(1.0f, std::fabs(want)) + slope / 64))
-                fail(
-                    "%s: pixel (%d, %d): %s %g, without conservative rasterization %g", t.what, x, y,
-                    a ? "noperspective" : "perspective", got, want
-                );
-            }
+          // the attributes are their plane's at the center, inside or not (15.17.4), the leading vertex's where the
+          // triangle has no area; noperspective ones are taken of a triangle before the eye. inside, they are the
+          // ordinary rasterizer's
+          for (int a = 0; a < 2 && ran; a++) {
+            float got;
+            memcpy(&got, &conservative.attributes[i][a], 4);
+            double want = degenerate ? (a ? 10.0 * leading : 1.0 + 2 * leading) : plane(t, x + 0.5, y + 0.5)[a],
+                   error = 1e-3 * std::max(1.0, std::fabs(want)) + (degenerate ? 0 : moves(t, a, x + 0.5, y + 0.5));
+            const char *name = a ? "noperspective" : "perspective";
+            if (!std::isnan(want) && (!a || unclippable) && !(std::fabs(got - want) <= error))
+              fail("%s: pixel (%d, %d): %s %g, want %g", t.what, x, y, name, got, want);
+            float normal_got;
+            memcpy(&normal_got, &normal.attributes[i][a], 4);
+            if ((!a || unclippable) && reachable(x, y) && center_inside(polygon, x, y, 0.05) && normal.runs[i][0] &&
+                !(std::fabs(got - normal_got) <= error))
+              fail("%s: pixel (%d, %d): %s %g, without conservative rasterization %g", t.what, x, y, name, got,
+                   normal_got);
+          }
           // and as the shader evaluates it there
-          if (!geometry && ran && reachable(x, y) && center_inside(t, x, y, 0.05) && normal.runs[i][0]) {
+          if (!geometry && ran && reachable(x, y) && center_inside(polygon, x, y, 0.05) && normal.runs[i][0]) {
             float got, want;
             memcpy(&got, &evaluated.attributes[i][0], 4);
             memcpy(&want, &normal.attributes[i][0], 4);
-            if (!(std::fabs(got - want) <= 1e-3f * std::max(1.0f, std::fabs(want))))
+            if (!(std::fabs(got - want) <= 1e-3f * std::max(1.0f, std::fabs(want)) + moves(t, 0, x + 0.5, y + 0.5)))
               fail("%s: pixel (%d, %d): perspective evaluated %g, without conservative rasterization %g", t.what, x, y, got,
                    want);
           }
@@ -764,6 +930,8 @@ main(int argc, char **argv) {
           if (normal.target[i] == 1 && !ran)
             fail("%s: pixel (%d, %d) is rasterized without conservative rasterization, not with it", t.what, x, y);
         }
+      if (geometry == 6 && conservative.runs[pixels - 1][3] != 1)
+        fail("%s: the mesh shader ran %u times, want once", t.what, conservative.runs[pixels - 1][3]);
     }
   printf(
       "%s: %u mismatches over %zu triangles\n", failures ? "failed" : "passed", failures, kPaths * std::size(triangles)

@@ -241,7 +241,7 @@ struct io_binding_map {
   // its registers, where the window coordinates are in the vertex data, and each vertex (0) and primitive (1) varying's
   // pixel shader register and whether it is an integer
   struct ConservativeMesh {
-    uint32_t fans;
+    uint32_t triangles;
     llvm::Value *slice, *viewports;
     uint32_t flat_inputs, noperspective_inputs;
     uint32_t at;
@@ -719,24 +719,29 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
 }
 
 
-// conservative rasterization (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), dxbc_converter_gs.cpp
-struct ConservativeFan {
-  using Weights = pvalue[9][3];
-  Weights over_w, linear;
-  pvalue position[9], rcp_w[9];          // each point's, and the plane's 1/w there
-  pvalue window[3][2];                   // the corners in the window
-  pvalue in_front, degenerate, expanded; // all corners before the eye; no area there; grown
+// conservative rasterization (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), dxbc_converter_gs.cpp: the
+// triangle Metal rasterizes for one of the pipeline's
+struct ConservativeTriangle {
+  using Weights = pvalue[3][3];
+  Weights over_w, linear;                      // each point's weights of the corners
+  pvalue position[3], rcp_w[3];                // each point's, and the plane's 1/w there
+  pvalue window[SM50_CONSERVATIVE_CORNERS][2]; // the polygon the pixel shader tests pixels against
+  pvalue culled;                               // nothing of it is drawn
 };
 
-// conservative_fan's comment, at its definition
-ConservativeFan conservative_fan(
+// conservative_triangle's comment, at its definition
+ConservativeTriangle conservative_triangle(
     llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, air::AirType &types, pvalue const (&clip)[3],
     pvalue viewports, pvalue viewport_index
 );
-// the output registers (`output`, int4s) of the fan's point `u`, from the corners' (`corner`): blended as the pixel
-// shader interpolates them (over w, or in the window), the position the fan's, flat and integer ones the first corner's
+// the varyings of point `u` the pixel shader tests and divides by (SM50_CONSERVATIVE_VARYINGS, SM50_CONSERVATIVE_RCP_W),
+// from mesh vertex data `at` on
+void conservative_varyings(llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at);
+// the output registers (`output`, int4s) of the triangle's point `u`, from the corners' (`corner`): blended as the
+// pixel shader interpolates them (over w, or in the window), the position the triangle's, flat and integer ones the
+// first corner's
 void conservative_point(
-    llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeFan &fan, uint32_t u, const SM50ShaderInternal &stage,
+    llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeTriangle &triangle, uint32_t u, const SM50ShaderInternal &stage,
     uint32_t position_reg, uint32_t flat_inputs, uint32_t noperspective_inputs,
     const std::function<pvalue(uint32_t corner, uint32_t reg)> &corner, pvalue output
 );

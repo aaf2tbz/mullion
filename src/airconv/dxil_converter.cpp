@@ -1613,12 +1613,12 @@ convert_dxil(
   auto i8 = ir.getInt8Ty();
   uint32_t corners = shader->mesh_lines ? 2 : 3;
   GlobalVariable *staged_position = nullptr, *staged_distance = nullptr, *staged_index = nullptr, *staged_culled = nullptr;
-  // conservative rasterization keeps every output for the group's fans (io_binding_map::ConservativeMesh): a vertex's
+  // conservative rasterization keeps every output for the group's triangles (io_binding_map::ConservativeMesh): a vertex's
   // varyings, position and clip distances, a primitive's varyings, ID, layer and viewport, as 32-bit words
   auto cm = ctx.resource.conservative_mesh.get();
   GlobalVariable *conservative_vertices = nullptr, *conservative_primitives = nullptr;
   uint32_t clip_count = 0, vertex_columns = 0, primitive_columns = 0;
-  bool primitive_outputs[4] = {}; // ID, layer, viewport, culled
+  bool primitive_outputs[3] = {}; // ID, layer, viewport
   if (cm) {
     for (auto &e : shader->mesh_outputs[0])
       if (e.semantic == SemanticClipDistance)
@@ -1628,7 +1628,6 @@ convert_dxil(
       primitive_outputs[1] |= e.semantic == SemanticRenderTargetArrayIndex;
       primitive_outputs[2] |= e.semantic == SemanticViewportArrayIndex;
     }
-    primitive_outputs[3] = culls || cull_distances;
     vertex_columns = cm->registers[0].size() + 4 + clip_count;
     primitive_columns = cm->registers[1].size() + 3;
   }
@@ -2496,7 +2495,7 @@ convert_dxil(
       break;
     }
     case SetMeshOutputCounts:
-      // Metal counts the vertices itself; a conservative mesh's are its fans', set at the end
+      // Metal counts the vertices itself; a conservative mesh's are its triangles', set at the end
       if (cm) {
         for (unsigned i = 0; i < 2; i++)
           ir.CreateStore(a(1 + i), mesh_counts[i]);
@@ -2569,7 +2568,7 @@ convert_dxil(
       v = ir.CreateBitCast(v, e.type == RegisterComponentType::Float ? ir.getFloatTy() : ir.getInt32Ty());
       mesh_row(call, e.rows, [&](uint32_t row) {
         auto component = row * e.cols + column;
-        // a conservative mesh's wait for its fans; cull distances as before
+        // a conservative mesh's wait for its triangles; cull distances as before
         if (cm) {
           auto bits = ir.CreateBitCast(v, ir.getInt32Ty());
           auto keep = [&](uint32_t at) {
@@ -3789,17 +3788,17 @@ convert_dxil(
   }
   if (cm) {
     // every path of the function ends here first: each thread grows the group's triangles of this slice a group's size
-    // apart from its own index, of those the shader set and never more than it declares (conservative_fan)
+    // apart from its own index, of those the shader set and never more than it declares (conservative_triangle)
     auto exported = llvm::BasicBlock::Create(ctx.llvm, "export_conservative_mesh", ctx.function, epilogue);
     epilogue->replaceAllUsesWith(exported);
     ir.SetInsertPoint(exported);
     air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
     auto &n = shader->threadgroup_size;
-    auto fans = ir.getInt32(cm->fans);
+    auto triangles = ir.getInt32(cm->triangles);
     auto count = air.CreateIntBinOp(
         llvm::air::AIRBuilder::min, ir.CreateLoad(ir.getInt32Ty(), mesh_counts[1]), ir.getInt32(shader->mesh_max_primitives)
     );
-    auto first = ir.CreateMul(cm->slice, fans);
+    auto first = ir.CreateMul(cm->slice, triangles);
     auto from = ir.GetInsertBlock();
     auto head = llvm::BasicBlock::Create(ctx.llvm, "", ctx.function, epilogue);
     auto body = llvm::BasicBlock::Create(ctx.llvm, "", ctx.function, epilogue);
@@ -3810,7 +3809,7 @@ convert_dxil(
     ir.SetInsertPoint(head);
     auto f = ir.CreatePHI(ir.getInt32Ty(), 2);
     f->addIncoming(ctx.resource.thread_id_in_group_flat_arg, from);
-    ir.CreateCondBr(ir.CreateICmpULT(f, fans), body, done);
+    ir.CreateCondBr(ir.CreateICmpULT(f, triangles), body, done);
     ir.SetInsertPoint(body);
     auto p = ir.CreateAdd(first, f);
     ir.CreateCondBr(ir.CreateICmpULT(p, count), grow, next);
@@ -3832,8 +3831,8 @@ convert_dxil(
       }
       Value *viewport = primitive_outputs[2] ? (Value *)word(conservative_primitives, p, cm->registers[1].size() + 2) : ir.getInt32(0);
       viewport = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport, ir.getInt32(15), false);
-      auto fan = conservative_fan(ir, air, ctx.types, clip, cm->viewports, viewport);
-      auto blend = [&](const ConservativeFan::Weights &parts, uint32_t u, uint32_t column) {
+      auto triangle = conservative_triangle(ir, air, ctx.types, clip, cm->viewports, viewport);
+      auto blend = [&](const ConservativeTriangle::Weights &parts, uint32_t u, uint32_t column) {
         Value *sum = nullptr;
         for (uint32_t k = 0; k < 3; k++) {
           auto part = ir.CreateFMul(parts[u][k], real(word(conservative_vertices, corner[k], column)));
@@ -3841,33 +3840,28 @@ convert_dxil(
         }
         return sum;
       };
-      auto vertex_base = ir.CreateMul(f, ir.getInt32(9)), primitive_base = ir.CreateMul(f, ir.getInt32(7));
-      for (uint32_t u = 0; u < 9; u++) {
+      Value *vertex_base = ir.CreateMul(f, ir.getInt32(3)), *primitive = f;
+      for (uint32_t u = 0; u < 3; u++) {
         auto vertex = ir.CreateAdd(vertex_base, ir.getInt32(u));
-        air.CreateSetMeshPosition(vertex, fan.position[u]);
-        // a flat varying is the first corner's, every triangle of the fan starting there
+        air.CreateSetMeshPosition(vertex, triangle.position[u]);
+        // a flat varying is the first corner's
         for (uint32_t i = 0; i < cm->registers[0].size(); i++) {
           auto reg = cm->registers[0][i];
           bool integer = cm->integers[0][i], flat = integer || (cm->flat_inputs >> reg & 1);
           Value *value = flat ? word(conservative_vertices, corner[0], i)
-                              : blend(cm->noperspective_inputs >> reg & 1 ? fan.linear : fan.over_w, u, i);
+                              : blend(cm->noperspective_inputs >> reg & 1 ? triangle.linear : triangle.over_w, u, i);
           if (flat && !integer)
             value = real(value);
           air.CreateSetMeshVertexData(vertex, ir.getInt32(i), value);
         }
         for (uint32_t i = 0; i < clip_count; i++)
-          air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(fan.over_w, u, position_at + 4 + i));
-        for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++) {
-          Value *window = fan.window[i / 2][i % 2];
-          if (i == 0)
-            window = ir.CreateSelect(fan.in_front, window, air.getFloat(NAN));
-          air.CreateSetMeshVertexData(vertex, ir.getInt32(cm->at + i), window);
-        }
-        for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
-          air.CreateSetMeshVertexData(vertex, ir.getInt32(cm->at + SM50_CONSERVATIVE_VARYINGS + i), fan.rcp_w[u]);
+          air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(triangle.over_w, u, position_at + 4 + i));
+        conservative_varyings(air, triangle, u, vertex, cm->at);
+        air.CreateSetMeshIndex(ir.CreateAdd(vertex_base, ir.getInt32(u)), ir.CreateTrunc(vertex, i8));
       }
-      // a primitive is culled when one distance puts all its vertices out, or when the shader culls it itself
-      Value *culled = ir.getFalse();
+      // a primitive is culled when one distance puts all its vertices out, when the shader culls it itself, or when
+      // clipping leaves nothing of it
+      Value *culled = triangle.culled;
       if (culls)
         culled = ir.CreateOr(culled, ir.CreateICmpNE(ir.CreateLoad(i8, element_of(staged_culled, {p})), ir.getInt8(0)));
       for (uint32_t distance = 0; distance < cull_distances; distance++) {
@@ -3876,13 +3870,7 @@ convert_dxil(
           out = ir.CreateAnd(out, ir.CreateLoad(i8, element_of(staged_distance, {corner[k], ir.getInt32(distance)})));
         culled = ir.CreateOr(culled, ir.CreateICmpNE(out, ir.getInt8(0)));
       }
-      for (uint32_t t = 0; t < 7; t++) {
-        auto primitive = ir.CreateAdd(primitive_base, ir.getInt32(t));
-        for (uint32_t i = 0; i < 3; i++)
-          air.CreateSetMeshIndex(
-              ir.CreateAdd(ir.CreateMul(primitive, ir.getInt32(3)), ir.getInt32(i)),
-              ir.CreateTrunc(ir.CreateAdd(vertex_base, ir.getInt32(i ? t + i : 0)), i8)
-          );
+      {
         for (uint32_t i = 0; i < cm->registers[1].size(); i++) {
           Value *value = word(conservative_primitives, p, i);
           air.CreateSetMeshPrimitiveData(primitive, ir.getInt32(i), cm->integers[1][i] ? value : real(value));
@@ -3894,8 +3882,7 @@ convert_dxil(
           air.CreateSetMeshRenderTargetArrayIndex(primitive, system(1));
         if (primitive_outputs[2])
           air.CreateSetMeshViewportArrayIndex(primitive, system(2));
-        if (primitive_outputs[3])
-          air.CreateSetMeshPrimitiveCulled(primitive, culled);
+        air.CreateSetMeshPrimitiveCulled(primitive, culled);
       }
     }
     ir.CreateBr(next);
@@ -3903,12 +3890,12 @@ convert_dxil(
     f->addIncoming(ir.CreateAdd(f, ir.getInt32(n[0] * n[1] * n[2])), next);
     ir.CreateBr(head);
     ir.SetInsertPoint(done);
-    // this slice's fans
+    // this slice's triangles
     auto mine = air.CreateIntBinOp(
         llvm::air::AIRBuilder::min,
-        ir.CreateSelect(ir.CreateICmpUGT(count, first), ir.CreateSub(count, first), ir.getInt32(0)), fans, false
+        ir.CreateSelect(ir.CreateICmpUGT(count, first), ir.CreateSub(count, first), ir.getInt32(0)), triangles, false
     );
-    air.CreateSetMeshPrimitiveCount(ir.CreateMul(mine, ir.getInt32(7)));
+    air.CreateSetMeshPrimitiveCount(mine);
     ir.CreateBr(epilogue);
   } else if (staged_position || staged_distance) {
     // every path of the function ends here first
@@ -4038,11 +4025,11 @@ convert_dxil_mesh_stage(
   air::AirType types(context);
 
   // conservative rasterization: a slice of the group's triangles grown in each Metal mesh threadgroup
-  bool conservative = mesh && link && link->conservative && link->fans && !pShaderInternal->mesh_lines;
+  bool conservative = mesh && link && link->conservative && link->triangles && !pShaderInternal->mesh_lines;
   uint32_t slices = link && link->conservative ? std::max(link->slices, 1u) : 1;
   if (conservative) {
     resource_map.conservative_mesh = std::make_shared<io_binding_map::ConservativeMesh>();
-    resource_map.conservative_mesh->fans = link->fans;
+    resource_map.conservative_mesh->triangles = link->triangles;
     resource_map.conservative_mesh->flat_inputs = link->flat_inputs;
     resource_map.conservative_mesh->noperspective_inputs = link->noperspective_inputs;
   }
@@ -4057,14 +4044,15 @@ convert_dxil_mesh_stage(
   });
   auto &threads = pShaderInternal->threadgroup_size;
   if (mesh) {
-    auto fans = conservative ? link->fans : 0;
+    auto triangles = conservative ? link->triangles : 0;
     func_signature.DefineInput(air::InputMesh{
-        conservative ? 9 * fans : pShaderInternal->mesh_max_vertices,
-        conservative ? 7 * fans : pShaderInternal->mesh_max_primitives,
+        conservative ? 3 * triangles : pShaderInternal->mesh_max_vertices,
+        conservative ? triangles : pShaderInternal->mesh_max_primitives,
         pShaderInternal->mesh_lines ? air::MeshOutputTopology::Line : air::MeshOutputTopology::Triangle
     });
     func_signature.UseMaxMeshWorkgroupSize(threads[0] * threads[1] * threads[2]);
     uint32_t clip_distances = 0, cull_distances = 0;
+    bool culled = false;
     for (bool primitive : {false, true}) {
       uint32_t attributes = 0;
       for (auto &e : pShaderInternal->mesh_outputs[primitive]) {
@@ -4092,6 +4080,7 @@ convert_dxil_mesh_stage(
           break;
         case SemanticCullPrimitive:
           func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
+          culled = true;
           break;
         default:
           break;
@@ -4125,8 +4114,9 @@ convert_dxil_mesh_stage(
     }
     if (clip_distances)
       func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = clip_distances});
-    // Metal culls by primitive: the group derives it from the vertices' cull distances
-    if (cull_distances)
+    // Metal culls by primitive: the group derives it from the vertices' cull distances, and a conservative rasterizer
+    // from its clipping
+    if ((cull_distances || conservative) && !culled)
       func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
     // and the window coordinates the pixel shader tests against, after the vertices' varyings
     if (conservative) {

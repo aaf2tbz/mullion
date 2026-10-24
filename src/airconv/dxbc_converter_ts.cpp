@@ -958,8 +958,8 @@ convert_dxbc_tesselator_domain_shader(
   SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
   args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess);
   uint32_t corners = get_primitive_vertices(pHullStage->tessellator_output_primitive);
-  // conservative rasterization of its triangles: each a fan of its own (conservative_fan), from corners that wait in
-  // threadgroup memory for every thread of the piece
+  // conservative rasterization of its triangles: each one Metal triangle of its own (conservative_triangle), from
+  // corners that wait in threadgroup memory for every thread of the piece
   bool conservative = pso_tess && pso_tess->conservative && !pso_tess->geometry && corners == 3;
   auto pieces = tessellation_pieces(
       factor_int, pHullStage->tessellation_domain, pHullStage->tessellator_output_primitive,
@@ -967,9 +967,9 @@ convert_dxbc_tesselator_domain_shader(
   );
   if (conservative && !pieces.primitives)
     return llvm::make_error<UnsupportedFeature>("conservative rasterization of a domain shader of vertices too large");
-  uint32_t mesh_vertices = pieces.primitives ? pieces.primitives * (conservative ? 9 : corners)
+  uint32_t mesh_vertices = pieces.primitives ? pieces.primitives * corners
                                              : get_max_workload_vertices(factor_int, pHullStage->tessellation_domain);
-  uint32_t mesh_primitives = pieces.primitives ? pieces.primitives * (conservative ? 7 : 1) : mesh_vertices;
+  uint32_t mesh_primitives = pieces.primitives ? pieces.primitives : mesh_vertices;
   switch (pHullStage->tessellator_output_primitive) {
   case microsoft::D3D11_SB_TESSELLATOR_OUTPUT_POINT: {
     func_signature.DefineInput(air::InputMesh{mesh_vertices, mesh_primitives, air::MeshOutputTopology::Point});
@@ -989,7 +989,7 @@ convert_dxbc_tesselator_domain_shader(
   // 15.4.2): the group's threads say what each vertex is behind, a bit for each distance, and the thread that makes
   // the primitives culls them
   llvm::GlobalVariable *behind = nullptr;
-  if (pShaderInternal->cull_distance_scalars.size())
+  if (pShaderInternal->cull_distance_scalars.size() || conservative)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
   if (pShaderInternal->cull_distance_scalars.size() && !conservative) {
     auto type = llvm::ArrayType::get(types._int, mesh_vertices);
@@ -1252,15 +1252,15 @@ convert_dxbc_tesselator_domain_shader(
       if (viewport_reg != ~0u)
         viewport_index = builder.CreateExtractElement(corner_at(p, 0, viewport_reg), uint64_t(viewport_component));
       viewport_index = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport_index, builder.getInt32(15), false);
-      auto fan = conservative_fan(builder, air, types, clip, function->getArg(viewports_idx), viewport_index);
-      auto vertex_base = builder.CreateMul(p, builder.getInt32(9)), primitive_base = builder.CreateMul(p, builder.getInt32(7));
-      for (uint32_t u = 0; u < 9; u++) {
+      auto triangle = conservative_triangle(builder, air, types, clip, function->getArg(viewports_idx), viewport_index);
+      auto vertex_base = builder.CreateMul(p, builder.getInt32(3));
+      for (uint32_t u = 0; u < 3; u++) {
         conservative_point(
-            builder, types, fan, u, *pShaderInternal, position_reg, pso_tess->flat_inputs, pso_tess->noperspective_inputs,
+            builder, types, triangle, u, *pShaderInternal, position_reg, pso_tess->flat_inputs, pso_tess->noperspective_inputs,
             [&](uint32_t k, uint32_t reg) { return corner_at(p, k, reg); }, resource_map.output.ptr_int4
         );
         auto vertex = builder.CreateAdd(vertex_base, builder.getInt32(u));
-        MeshOutputContext out{vertex, builder.CreateAdd(primitive_base, builder.getInt32(std::min(u, 6u)))};
+        MeshOutputContext out{vertex, p};
         for (auto &h : ds_output_handlers)
           if (auto err = h(out).build(ctx).takeError())
             return err;
@@ -1273,17 +1273,11 @@ convert_dxbc_tesselator_domain_shader(
           );
           air.CreateSetMeshClipDistance(vertex, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr));
         }
-        for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++) {
-          pvalue window = fan.window[i / 2][i % 2];
-          if (i == 0)
-            window = builder.CreateSelect(fan.in_front, window, air.getFloat(NAN));
-          air.CreateSetMeshVertexData(vertex, builder.getInt32(conservative_at + i), window);
-        }
-        for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
-          air.CreateSetMeshVertexData(vertex, builder.getInt32(conservative_at + SM50_CONSERVATIVE_VARYINGS + i), fan.rcp_w[u]);
+        conservative_varyings(air, triangle, u, vertex, conservative_at);
+        air.CreateSetMeshIndex(vertex, vertex);
       }
-      // culled together by a distance all three corners are behind
-      pvalue culled = builder.getFalse();
+      // culled by a distance all three corners are behind, or by clipping
+      pvalue culled = triangle.culled;
       for (auto &distance : pShaderInternal->cull_distance_scalars) {
         pvalue all = builder.getTrue();
         for (uint32_t k = 0; k < 3; k++) {
@@ -1294,17 +1288,8 @@ convert_dxbc_tesselator_domain_shader(
         }
         culled = builder.CreateOr(culled, all);
       }
-      for (uint32_t t = 0; t < 7; t++) {
-        auto primitive = builder.CreateAdd(primitive_base, builder.getInt32(t));
-        for (uint32_t i = 0; i < 3; i++)
-          air.CreateSetMeshIndex(
-              builder.CreateAdd(builder.CreateMul(primitive, builder.getInt32(3)), builder.getInt32(i)),
-              builder.CreateAdd(vertex_base, builder.getInt32(i ? t + i : 0))
-          );
-        air.CreateSetMeshPrimitiveID(primitive, resource_map.patch_id);
-        if (pShaderInternal->cull_distance_scalars.size())
-          air.CreateSetMeshPrimitiveCulled(primitive, culled);
-      }
+      air.CreateSetMeshPrimitiveID(p, resource_map.patch_id);
+      air.CreateSetMeshPrimitiveCulled(p, culled);
     }
     builder.CreateBr(count);
     builder.SetInsertPoint(count);
@@ -1320,7 +1305,7 @@ convert_dxbc_tesselator_domain_shader(
                           types._int
                       )
       );
-    air.CreateSetMeshPrimitiveCount(builder.CreateMul(primitives, builder.getInt32(7)));
+    air.CreateSetMeshPrimitiveCount(primitives);
     builder.CreateBr(real_return);
     builder.SetInsertPoint(generate_primitive);
     builder.CreateBr(real_return);

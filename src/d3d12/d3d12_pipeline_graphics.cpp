@@ -447,9 +447,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
-      auto &[next, type, pixel, conservative, amplified, fans, slices, flat, noperspective] =
+      auto &[next, type, pixel, conservative, amplified, triangles, slices, flat, noperspective] =
           *(SM50_SHADER_MESH_SHADER_DATA *)arg;
-      hash(bool(pixel), conservative, amplified, fans, slices, flat, noperspective);
+      hash(bool(pixel), conservative, amplified, triangles, slices, flat, noperspective);
       break;
     }
     default:
@@ -718,41 +718,39 @@ struct Group {
     return library.newFunction("conservative_object");
   }
 
-  // a fragment function of no outputs that discards the pixels whose squares miss the triangle the mesh stage passes
-  // on in SM50_CONSERVATIVE_VARYINGS, as airconv's conservative pixel shaders do
+  // a fragment function that discards the pixels whose squares miss the polygon the mesh stage passes on in
+  // SM50_CONSERVATIVE_VARYINGS, as airconv's conservative pixel shaders do, and writes the depth they write
   WMT::Reference<WMT::Function>
   ConservativeFragment() {
-    static const char source[] = R"(#include <metal_stdlib>
-using namespace metal;
-struct Triangle {
-  float4 position [[position]];
-  float x0 [[user(mullion_conservative0), flat]];
-  float y0 [[user(mullion_conservative1), flat]];
-  float x1 [[user(mullion_conservative2), flat]];
-  float y1 [[user(mullion_conservative3), flat]];
-  float x2 [[user(mullion_conservative4), flat]];
-  float y2 [[user(mullion_conservative5), flat]];
-};
-fragment void conservative_fragment(Triangle in [[stage_in]]) {
-  if (isnan(in.x0))
-    return;
+    auto corners = std::to_string(SM50_CONSERVATIVE_CORNERS);
+    std::string source = "#include <metal_stdlib>\nusing namespace metal;\nstruct Polygon {\n  float4 position [[position]];\n";
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+      source += "  float v" + std::to_string(i) + " [[user(mullion_conservative" + std::to_string(i) + "), flat]];\n";
+    source += "};\nstruct Depth {\n  float z [[depth(any)]];\n};\nfragment Depth conservative_fragment(Polygon in [[stage_in]]) {\n  float2 v[] = {";
+    for (uint32_t k = 0; k < SM50_CONSERVATIVE_CORNERS; k++)
+      source += "{in.v" + std::to_string(2 * k) + ", in.v" + std::to_string(2 * k + 1) + "}, ";
+    source += R"(};
   const float half_pixel = 0.5 + 1.0 / 256;
-  float2 center = floor(in.position.xy) + 0.5, v[3] = {{in.x0, in.y0}, {in.x1, in.y1}, {in.x2, in.y2}};
-  float2 low = min(min(v[0], v[1]), v[2]), high = max(max(v[0], v[1]), v[2]);
+  float2 center = floor(in.position.xy) + 0.5, low = v[0], high = v[0];
+  float area = 0;
+  for (int k = 0; k < )" + corners + R"(; k++) {
+    float2 a = v[k], b = v[(k + 1) % )" + corners + R"(];
+    low = min(low, a), high = max(high, a), area += a.x * b.y - b.x * a.y;
+  }
   bool outside = any(center + half_pixel < low) || any(center - half_pixel > high);
-  float area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y);
-  float inward = area > 0 ? -1 : 1;
-  for (int i = 0; i < 3; i++) {
-    float2 a = v[i], b = v[(i + 1) % 3];
-    float2 n = float2(b.y - a.y, a.x - b.x) * inward;
+  float inward = area > 0 ? 1 : -1;
+  for (int k = 0; k < )" + corners + R"(; k++) {
+    float2 a = v[k], b = v[(k + 1) % )" + corners + R"(];
+    float2 n = float2(a.y - b.y, b.x - a.x) * inward;
     outside |= dot(n, center - a) + (abs(n.x) + abs(n.y)) * half_pixel < 0;
   }
   if (outside)
     discard_fragment();
+  return {in.position.z};
 }
 )";
     WMT::Reference<WMT::Error> err;
-    auto library = device_->GetMTLDevice().newLibraryWithSource(std::string_view(source, sizeof(source) - 1), err);
+    auto library = device_->GetMTLDevice().newLibraryWithSource(source, err);
     if (!library) {
       ERR("Failed to compile the conservative rasterizer's fragment function: ", err.description().getUTF8String());
       return {};
@@ -1100,13 +1098,13 @@ public:
     // (D3D12_CONSERVATIVE_RASTERIZATION_TIER_1); it does not apply to points and lines (D3D11.3 15.17)
     bool requested = pDesc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
     conservative = requested && (!plain || pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
-    // a geometry shader's triangles are grown where it emits them, when their fans fit a mesh; a domain shader's
-    // triangles in pieces of their workloads, when a fan of its vertices fits one; after a mesh shader, or where the
-    // fans do not fit, those triangles rasterize as usual for now
+    // a geometry shader's triangles are grown where it emits them, when they fit a mesh; a domain shader's
+    // triangles in pieces of their workloads, when one of its triangles fits one; after a mesh shader, or where they
+    // do not fit, those triangles rasterize as usual for now
     bool geometry_grows = !mesh_shader && pDesc->GS.pShaderBytecode && ref_gs.GeometryShader.ConservativeFits;
-    // a mesh shader's triangles in slices of its groups' (SM50_SHADER_MESH_SHADER_DATA), when the shader writes no
-    // resources and its outputs fit
-    bool mesh_grows = mesh_shader && ref_ms.MeshConservativeFans;
+    // a mesh shader's triangles in slices of its groups' (SM50_SHADER_MESH_SHADER_DATA), when its outputs fit, in one
+    // slice where the shader writes resources
+    bool mesh_grows = mesh_shader && ref_ms.MeshConservativeTriangles;
     auto tessellated = microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(tessellation ? ref_hs.Tessellator.OutputPrimitive : 0);
     bool domain_grows = tessellation && !pDesc->GS.pShaderBytecode &&
                         (tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
@@ -1257,8 +1255,8 @@ public:
       if (conservative) {
         link.conservative = true;
         link.amplified = AS.pShaderBytecode;
-        link.fans = ref_ms.MeshConservativeFans;
-        link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.fans - 1) / link.fans;
+        link.triangles = ref_ms.MeshConservativeTriangles;
+        link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.triangles - 1) / link.triangles;
         link.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
         link.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
       }

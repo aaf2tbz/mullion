@@ -354,9 +354,9 @@ component_type_from_pixel_format(air::MTLPixelFormat format) {
 }
 
 // whether a conservative rasterizer leaves out the pixel at `position`: its square, a unit wide, has no point in the
-// triangle with these window coordinates (SM50_CONSERVATIVE_VARYINGS). the separating axis test: the axes, then each
-// edge's normal. a first coordinate that is NaN takes every pixel. and whether the square is inside the triangle,
-// every edge having all of it (SV_InnerCoverage), which a triangle of no area has of no square
+// polygon with these window coordinates (SM50_CONSERVATIVE_VARYINGS). the separating axis test: the axes, then each
+// edge's normal; a repeated corner's edge of no length separates nothing. and whether the square is inside the polygon,
+// every edge having all of it (SV_InnerCoverage), which a polygon of no area has of no square: its edges go both ways
 static std::pair<llvm::Value *, llvm::Value *>
 conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Value *position, llvm::Value *const *window) {
   using llvm::air::AIRBuilder;
@@ -364,33 +364,34 @@ conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llv
   auto abs = [&](llvm::Value *v) { return air.CreateFPUnOp(AIRBuilder::fabs, v, false); };
   auto min = [&](llvm::Value *l, llvm::Value *r) { return air.CreateFPBinOp(AIRBuilder::fmin, l, r, false); };
   auto max = [&](llvm::Value *l, llvm::Value *r) { return air.CreateFPBinOp(AIRBuilder::fmax, l, r, false); };
-  // the pixel's center; a little more than half a pixel around it, the uncertainty tier 1 has room for
+  // the pixel's center; a 256th of a pixel more than half a pixel around it, the uncertainty tier 2 has room for
   const double half = 0.5 + 1.0 / 256;
+  const uint32_t n = SM50_CONSERVATIVE_CORNERS;
   llvm::Value *center[2];
   for (uint32_t axis = 0; axis < 2; axis++)
     center[axis] = builder.CreateFAdd(
         air.CreateFPUnOp(AIRBuilder::floor, builder.CreateExtractElement(position, axis), false), f(0.5)
     );
-  auto at = [&](uint32_t k, uint32_t axis) { return window[2 * k + axis]; };
-  auto x = [&](uint32_t k) { return at(k, 0); };
-  auto y = [&](uint32_t k) { return at(k, 1); };
+  auto x = [&](uint32_t k) { return window[2 * (k % n)]; };
+  auto y = [&](uint32_t k) { return window[2 * (k % n) + 1]; };
   llvm::Value *outside = builder.getFalse();
   for (uint32_t axis = 0; axis < 2; axis++) {
-    auto of = [&](uint32_t k) { return at(k, axis); };
-    auto low = min(min(of(0), of(1)), of(2)), high = max(max(of(0), of(1)), of(2));
+    auto low = window[axis], high = window[axis];
+    for (uint32_t k = 1; k < n; k++)
+      low = min(low, window[2 * k + axis]), high = max(high, window[2 * k + axis]);
     outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(center[axis], f(half)), low));
     outside = builder.CreateOr(outside, builder.CreateFCmpOGT(builder.CreateFSub(center[axis], f(half)), high));
   }
-  auto area = builder.CreateFSub(
-      builder.CreateFMul(builder.CreateFSub(x(1), x(0)), builder.CreateFSub(y(2), y(0))),
-      builder.CreateFMul(builder.CreateFSub(x(2), x(0)), builder.CreateFSub(y(1), y(0)))
-  );
-  auto inward = builder.CreateSelect(builder.CreateFCmpOGT(area, f(0)), f(-1), f(1));
+  llvm::Value *area = f(0);
+  for (uint32_t k = 0; k < n; k++)
+    area = builder.CreateFAdd(
+        area, builder.CreateFSub(builder.CreateFMul(x(k), y(k + 1)), builder.CreateFMul(x(k + 1), y(k)))
+    );
+  auto inward = builder.CreateSelect(builder.CreateFCmpOGT(area, f(0)), f(1), f(-1));
   llvm::Value *inside = builder.CreateFCmpONE(area, f(0));
-  for (uint32_t i = 0; i < 3; i++) {
-    uint32_t n = (i + 1) % 3;
-    auto a = builder.CreateFMul(builder.CreateFSub(y(n), y(i)), inward);
-    auto b = builder.CreateFNeg(builder.CreateFMul(builder.CreateFSub(x(n), x(i)), inward));
+  for (uint32_t i = 0; i < n; i++) {
+    auto a = builder.CreateFMul(builder.CreateFSub(y(i), y(i + 1)), inward);
+    auto b = builder.CreateFMul(builder.CreateFSub(x(i + 1), x(i)), inward);
     // the edge's value at the center, against its most at any point of the square
     auto value = builder.CreateFAdd(
         builder.CreateFMul(a, builder.CreateFSub(center[0], x(i))), builder.CreateFMul(b, builder.CreateFSub(center[1], y(i)))
@@ -399,7 +400,7 @@ conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llv
     outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(value, reach), f(0)));
     inside = builder.CreateAnd(inside, builder.CreateFCmpOGE(builder.CreateFSub(value, reach), f(0)));
   }
-  return {builder.CreateAnd(outside, builder.CreateNot(air.CreateIsNaN(x(0)))), builder.CreateAnd(inside, builder.CreateNot(air.CreateIsNaN(x(0))))};
+  return {outside, inside};
 }
 
 llvm::Error convert_dxbc_pixel_shader(
@@ -527,15 +528,19 @@ llvm::Error convert_dxbc_pixel_shader(
         air::Interpolation::center_no_perspective, air::Interpolation::centroid_no_perspective,
         air::Interpolation::sample_no_perspective, air::Interpolation::center_perspective
     };
+    // only the 1/w the inputs need, the center's for the position: an input at the sample runs the shader once a
+    // sample (MSL's sample_no_perspective), where D3D runs it once a pixel
+    bool needed[SM50_CONSERVATIVE_RCP_W] = {true};
+    for (auto [index, at] : conservative_over_w)
+      needed[at] = true;
     for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
-      conservative_rcp_w[i] = func_signature.DefineInput(
-          air::InputFragmentStageIn{
-              .user = "mullion_conservative" + std::to_string(SM50_CONSERVATIVE_VARYINGS + i),
-              .type = air::msl_float,
-              .interpolation = rcp_w_at[i],
-              .pull_mode = i == 3
-          }
-      );
+      if (needed[i])
+        conservative_rcp_w[i] = func_signature.DefineInput(air::InputFragmentStageIn{
+            .user = "mullion_conservative" + std::to_string(SM50_CONSERVATIVE_VARYINGS + i),
+            .type = air::msl_float,
+            .interpolation = rcp_w_at[i],
+            .pull_mode = i == 3
+        });
     conservative_position =
         func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
     for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
@@ -545,6 +550,20 @@ llvm::Error convert_dxbc_pixel_shader(
           .interpolation = air::Interpolation::flat,
           .pull_mode = false
       });
+    // the depth, clamped to the viewport's range (D3D11.3 17.10): Metal clamps what a function that may discard
+    // interpolates past it wrongly, and what one writes as it should (probe-depth-clamp.m)
+    bool writes_depth = std::ranges::any_of(func_signature.Outputs(), [](auto &output) {
+      return std::holds_alternative<air::OutputDepth>(output);
+    });
+    if (!writes_depth && !pso_disable_depth_output && !func_signature.EarlyFragmentTests()) {
+      auto at = func_signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
+      epilogue >> [=](pvalue value) {
+        return make_irvalue([=](struct context ctx) {
+          auto position = ctx.function->getArg(conservative_position);
+          return ctx.builder.CreateInsertValue(value, ctx.builder.CreateExtractElement(position, uint64_t(2)), {at});
+        });
+      };
+    }
   }
 
   auto binding_map = rootsig ? setup_binding_rootsig(
@@ -1484,26 +1503,28 @@ AIRCONV_API int SM50Initialize(
     }
     pRefl->GroupsWorkTogether = sm50_shader->groups_work_together;
     pRefl->DeviceAtomics64 = sm50_shader->device_atomics64;
-    // a mesh shader's conservative fans: its outputs wait in threadgroup memory, 16 KB of it, for a mesh of fans of
-    // its triangles, each vertex its components and the window coordinates, each primitive its own and four words
+    // a mesh shader's conservative triangles: its outputs wait in threadgroup memory, 16 KB of it, for a mesh of its
+    // triangles, three vertices each of its components and the conservative rasterizer's, each primitive its own
+    // and four words. a group too large for one mesh runs once for each, which one that writes resources cannot
     pRefl->MeshMaxPrimitives = sm50_shader->mesh_max_primitives;
-    pRefl->MeshConservativeFans = 0;
-    if (sm50_shader->shader_type == microsoft::D3D12_SB_MESH_SHADER && !sm50_shader->mesh_lines &&
-        !sm50_shader->writes_resources) {
+    pRefl->MeshConservativeTriangles = 0;
+    if (sm50_shader->shader_type == microsoft::D3D12_SB_MESH_SHADER && !sm50_shader->mesh_lines) {
       uint32_t components[2] = {};
       for (uint32_t primitive = 0; primitive < 2; primitive++)
         for (auto &e : sm50_shader->mesh_outputs[primitive])
           components[primitive] += e.rows * e.cols;
       uint32_t staged = sm50_shader->mesh_max_vertices * (components[0] + 1) * 4 +
                         sm50_shader->mesh_max_primitives * (components[1] * 4 + 8);
-      uint32_t vertex_size = (components[0] + SM50_CONSERVATIVE_VARYINGS) * 4;
-      uint32_t fans = staged <= mullion::dxbc::conservative_stash_limit
-                          ? std::min({256u / 9, 512u / 7, std::max(sm50_shader->mesh_max_primitives, 1u)})
-                          : 0;
-      while (fans && mullion::dxbc::mesh_size(9 * fans, vertex_size, 7 * fans * (4 + components[1])) >
-                         mullion::dxbc::mesh_size_limit)
-        fans--;
-      pRefl->MeshConservativeFans = fans;
+      uint32_t vertex_size = (components[0] + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4;
+      uint32_t triangles = staged <= mullion::dxbc::conservative_stash_limit
+                               ? std::min({256u / 3, 512u, std::max(sm50_shader->mesh_max_primitives, 1u)})
+                               : 0;
+      while (triangles && mullion::dxbc::mesh_size(3 * triangles, vertex_size, triangles * (4 + components[1])) >
+                              mullion::dxbc::mesh_size_limit)
+        triangles--;
+      if (sm50_shader->writes_resources && triangles < std::max(sm50_shader->mesh_max_primitives, 1u))
+        triangles = 0;
+      pRefl->MeshConservativeTriangles = triangles;
     }
     if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER) {
       auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
@@ -1561,15 +1582,17 @@ AIRCONV_API int SM50Initialize(
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
-      // a fan's vertex: the position, the varyings and the window coordinates, and clip distances; its triangles
-      // carry what Metal's primitives may, counted as four words each. Metal has 256 vertices and 512 primitives
-      uint32_t fans = sm50_shader->gs_max_vertex_output >= 3 ? sm50_shader->gs_max_vertex_output - 2 : 0;
-      uint32_t vertex_size = sizeof(float[4]) + (sm50_shader->num_mesh_vertex_data + SM50_CONSERVATIVE_VARYINGS) * 4 +
+      // a grown triangle's vertex: the position, the varyings and the conservative rasterizer's, and clip distances;
+      // the triangle carries what Metal's primitives may, counted as four words. Metal has 256 vertices and 512
+      // primitives
+      uint32_t triangles = sm50_shader->gs_max_vertex_output >= 3 ? sm50_shader->gs_max_vertex_output - 2 : 0;
+      uint32_t vertex_size = sizeof(float[4]) +
+                             (sm50_shader->num_mesh_vertex_data + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4 +
                              sm50_shader->clip_distance_scalars.size() * sizeof(float);
       pRefl->GeometryShader.ConservativeFits =
-          sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && fans &&
-          9 * fans <= 256 && 7 * fans <= 512 &&
-          mullion::dxbc::mesh_size(9 * fans, vertex_size, 7 * fans * 4) <= mullion::dxbc::mesh_size_limit;
+          sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && triangles &&
+          3 * triangles <= 256 && triangles <= 512 &&
+          mullion::dxbc::mesh_size(3 * triangles, vertex_size, triangles * 4) <= mullion::dxbc::mesh_size_limit;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
       pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0,

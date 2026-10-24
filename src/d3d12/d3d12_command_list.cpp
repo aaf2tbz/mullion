@@ -864,7 +864,8 @@ public:
       auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       cmd_setrs.type = WMTRenderCommandSetRasterizerState;
       cmd_setrs.cull_mode = pso_graphics_->cull_mode;
-      cmd_setrs.depth_clip_mode = pso_graphics_->depth_clip_mode;
+      // a conservative rasterizer clips depth itself, and its grown triangles' depth goes past the polygon's
+      cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
       cmd_setrs.depth_bias = pso_graphics_->depth_bias;
       cmd_setrs.depth_bias_clamp = pso_graphics_->depth_bias_clamp;
@@ -911,7 +912,8 @@ public:
       dirty_state_.clr(DirtyState::GraphicsRootSignature);
     }
 
-    // a conservative rasterizer's mesh stage dilates triangles by pixels of the viewport each chooses
+    // a conservative rasterizer's mesh stage grows triangles by pixels of the viewport each chooses, clipping depth
+    // as the pipeline does and facing as it does
     if (pso_graphics_->conservative) {
       auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(SM50_CONSERVATIVE_VIEWPORTS), 16);
       auto data = static_cast<SM50_CONSERVATIVE_VIEWPORTS *>(mapped);
@@ -919,6 +921,8 @@ public:
       for (UINT i = 0; i < std::min<UINT>(num_viewports, std::size(data->viewports)); i++)
         data->viewports[i][0] = viewports[i].TopLeftX, data->viewports[i][1] = viewports[i].TopLeftY,
         data->viewports[i][2] = viewports[i].Width, data->viewports[i][3] = viewports[i].Height;
+      data->state[0] = pso_graphics_->depth_clip_mode == WMTDepthClipModeClip;
+      data->state[1] = pso_graphics_->winding == WMTWindingCounterClockwise;
       if (allocator_->records_)
         allocator_->RecordGPUHeap(mapped, sizeof(*data), "conservative viewports");
       EncodeBuffer(WMTRenderCommandSetMeshBuffer, offset, SM50_BINDING_INDEX_VIEWPORTS);
