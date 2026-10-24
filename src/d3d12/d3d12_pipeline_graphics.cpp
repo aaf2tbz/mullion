@@ -1192,6 +1192,9 @@ public:
     // the alpha-to-coverage state reads the pixel shader's reflection
     if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->PS, &shader_ps, &ref_ps)))
       return hr;
+    uses_uav = (mesh_shader ? ref_ms.UAVSlotMask | (AS.pShaderBytecode ? ref_as.UAVSlotMask : 0) : ref_vs.UAVSlotMask) ||
+               (tessellation && (ref_hs.UAVSlotMask || ref_ds.UAVSlotMask)) ||
+               (pDesc->GS.pShaderBytecode && ref_gs.UAVSlotMask) || (pDesc->PS.pShaderBytecode && ref_ps.UAVSlotMask);
 
     SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
     data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;

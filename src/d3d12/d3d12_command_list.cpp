@@ -205,6 +205,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   WMT::Buffer depth_bounds_samples_{};
   EncoderData *depth_bounds_pass_ = nullptr;
   bool depth_bounds_stale_ = true;
+  // the last render pass a draw of a pipeline that uses UAVs was in: a UAV barrier orders nothing inside another
+  EncoderData *uav_draw_pass_ = nullptr;
   // variable rate shading: RSSetShadingRate's rate and combiners, and RSSetShadingRateImage's image, whose bytes a copy
   // before the pass gives the pixel shader (SM50_BINDING_INDEX_SHADING_RATE_IMAGE)
   D3D12_SHADING_RATE shading_rate_ = D3D12_SHADING_RATE_1X1;
@@ -1162,6 +1164,8 @@ public:
     }
     dirty_state_.clr(DirtyState::DepthBounds);
 
+    if (pso_graphics_->uses_uav)
+      uav_draw_pass_ = allocator_->encoder_current;
     return DrawCallStatus::Ordinary;
   }
 
@@ -2275,6 +2279,14 @@ public:
       return;
     }
     for (auto &barrier : std::span(barriers, Count)) {
+      // a UAV barrier orders UAV accesses alone: a render pass whose draws used none keeps going, as a dispatch's would
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && allocator_->encoder_current &&
+          allocator_->encoder_current->type == EncoderType::Render &&
+          allocator_->encoder_current != uav_draw_pass_) {
+        if (Order(false, true))
+          return;
+        continue;
+      }
       bool other = barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
       auto &states = barrier.Transition;
       if (Order(other || (states.StateBefore & draw_writes), other || ((states.StateBefore | states.StateAfter) & uav)))
