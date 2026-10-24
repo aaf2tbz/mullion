@@ -207,6 +207,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   bool depth_bounds_stale_ = true;
   // the last render pass a draw of a pipeline that uses UAVs was in: a UAV barrier orders nothing inside another
   EncoderData *uav_draw_pass_ = nullptr;
+  // no aliasing barrier since the last clear pass began (JoinableClear)
+  bool clear_joinable_ = false;
   // variable rate shading: RSSetShadingRate's rate and combiners, and RSSetShadingRateImage's image, whose bytes a copy
   // before the pass gives the pixel shader (SM50_BINDING_INDEX_SHADING_RATE_IMAGE)
   D3D12_SHADING_RATE shading_rate_ = D3D12_SHADING_RATE_1X1;
@@ -919,7 +921,7 @@ public:
             (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
             (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment) ||
             // a plane bound read-only may be sampled in the pass, and a load action clears only the tile's copy
-            (!clear->colors[0].attachment && render->dsv_readonly_flags))
+            ((clear->depth.attachment || clear->stencil.attachment) && render->dsv_readonly_flags))
           break;
         if (color != render->colors.end() && color->load_action == WMTLoadActionLoad) {
           color->load_action = WMTLoadActionClear;
@@ -2279,6 +2281,8 @@ public:
       return;
     }
     for (auto &barrier : std::span(barriers, Count)) {
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
+        clear_joinable_ = false;
       // a UAV barrier orders UAV accesses alone: a render pass whose draws used none keeps going, as a dispatch's would
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && allocator_->encoder_current &&
           allocator_->encoder_current->type == EncoderType::Render &&
@@ -2585,10 +2589,11 @@ public:
       allocator_->clear_rtv_.end();
       return;
     }
-    allocator_->InvalidateCurrentPass();
-    auto encoder_info = allocator_->AllocatePass<RenderEncoderData>();
-    encoder_info->type = EncoderType::Clear;
-    encoder_info->previous = allocator_->encoder_last;
+    auto encoder_info = JoinableClear(AttachmentDesc);
+    if (encoder_info && (encoder_info->depth.attachment || encoder_info->stencil.attachment))
+      encoder_info = nullptr;
+    if (!encoder_info)
+      encoder_info = StartClearPass(AttachmentDesc);
     if (CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) {
       auto &rt = encoder_info->depth;
       rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
@@ -2603,11 +2608,6 @@ public:
       rt.store_action = WMTStoreActionStore;
       rt.clear_stencil = Stencil;
     }
-    encoder_info->render_target_array_length = AttachmentDesc.RenderTargetArrayLength;
-    encoder_info->render_target_width = AttachmentDesc.Width;
-    encoder_info->render_target_height = AttachmentDesc.Height;
-
-    allocator_->InvalidateCurrentPass();
   };
 
   void STDMETHODCALLTYPE
@@ -2637,10 +2637,11 @@ public:
       allocator_->clear_rtv_.end();
       return;
     }
-    allocator_->InvalidateCurrentPass();
-    auto encoder_info = allocator_->AllocatePass<RenderEncoderData>();
-    encoder_info->type = EncoderType::Clear;
-    encoder_info->previous = allocator_->encoder_last;
+    auto encoder_info = JoinableClear(AttachmentDesc);
+    if (encoder_info && encoder_info->colors[0].attachment)
+      encoder_info = nullptr;
+    if (!encoder_info)
+      encoder_info = StartClearPass(AttachmentDesc);
     auto &rt = encoder_info->colors[0];
     rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
     rt.depth_plane = AttachmentDesc.DepthPlane;
@@ -2648,12 +2649,39 @@ public:
     rt.store_action = WMTStoreActionStore;
     rt.clear_color = {Color[0], Color[1], Color[2], Color[3]};
     SanitizeRTVClearColor(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View), rt.clear_color);
-    encoder_info->render_target_array_length = AttachmentDesc.RenderTargetArrayLength;
-    encoder_info->render_target_width = AttachmentDesc.Width;
-    encoder_info->render_target_height = AttachmentDesc.Height;
-
-    allocator_->InvalidateCurrentPass();
   };
+
+  // a pass of its own for a full clear of a view, which a draw to the view takes as its load action
+  RenderEncoderData *
+  StartClearPass(const MTL_RENDER_TARGET_DESC &Desc) {
+    allocator_->InvalidateCurrentPass();
+    auto clear = allocator_->AllocatePass<RenderEncoderData>();
+    clear->type = EncoderType::Clear;
+    clear->previous = allocator_->encoder_last;
+    clear->render_target_array_length = Desc.RenderTargetArrayLength;
+    clear->render_target_width = Desc.Width;
+    clear->render_target_height = Desc.Height;
+    clear->clear_sample_count = Desc.Texture->sampleCount();
+    allocator_->InvalidateCurrentPass();
+    clear_joinable_ = true;
+    return clear;
+  }
+
+  // the clear pass just before, which a full clear of a view of the same size can join (a color clear's a depth
+  // stencil clear's, or that one's a color clear's): Metal clears the attachments of one pass for about the cost of
+  // one. nothing between the two orders them, but an aliasing barrier, which ends the chance
+  RenderEncoderData *
+  JoinableClear(const MTL_RENDER_TARGET_DESC &Desc) {
+    auto last = allocator_->encoder_last;
+    if (!clear_joinable_ || allocator_->encoder_current || !last || last->type != EncoderType::Clear || last->stamps)
+      return nullptr;
+    auto clear = static_cast<RenderEncoderData *>(last);
+    if (clear->render_target_width != Desc.Width || clear->render_target_height != Desc.Height ||
+        clear->render_target_array_length != Desc.RenderTargetArrayLength ||
+        clear->clear_sample_count != Desc.Texture->sampleCount())
+      return nullptr;
+    return clear;
+  }
 
   void STDMETHODCALLTYPE
   ClearUnorderedAccessViewUint(
