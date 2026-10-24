@@ -220,6 +220,8 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   std::vector<uint32_t> free_ray_functions_;
   uint32_t next_ray_function_ = SM50_RAY_FUNCTION_FIRST_SHADER;
   WMT::Reference<WMT::ResidencySet> residency_set_;
+  // allocations were added or removed since the set was last committed (CommitResidency)
+  bool residency_dirty_ = false;
   std::map<uint64_t, BufferAllocation *> interval_map_;
   std::map<uint64_t, std::vector<uint64_t>> sparse_buffer_mappings_;
   // what a null acceleration structure is to a ray query: a top-level structure of nothing
@@ -1930,6 +1932,15 @@ public:
     return __ret;
   }
 
+  // committing the set is a kernel call: creating or releasing a resource only changes it, and the queues commit
+  // the changes before the next command buffer, the first GPU work that can use them
+  void
+  CommitResidency() final {
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
+    if (std::exchange(residency_dirty_, false))
+      residency_set_.commit();
+  }
+
   WMT::ResidencySet
   GetGlobalResidencySet() {
     return residency_set_;
@@ -1997,7 +2008,7 @@ public:
   RegisterResidency(WMT::Allocation allocation) {
     std::unique_lock<mullion::mutex> lock(residency_lock_);
     residency_set_.addAllocations(&allocation, 1);
-    residency_set_.commit();
+    residency_dirty_ = true;
     return S_OK;
   }
 
@@ -2005,7 +2016,7 @@ public:
   UnregisterResidency(WMT::Allocation allocation) {
     std::unique_lock<mullion::mutex> lock(residency_lock_);
     residency_set_.removeAllocations(&allocation, 1);
-    residency_set_.commit();
+    residency_dirty_ = true;
     return S_OK;
   }
 
@@ -2021,7 +2032,7 @@ public:
       return S_OK;
     auto buffer = allocation->buffer();
     residency_set_.addAllocations(&buffer, 1);
-    residency_set_.commit();
+    residency_dirty_ = true;
     return S_OK;
   }
 
@@ -2047,7 +2058,7 @@ public:
       return S_OK;
     auto buffer = allocation->buffer();
     residency_set_.removeAllocations(&buffer, 1);
-    residency_set_.commit();
+    residency_dirty_ = true;
     return S_OK;
   }
 
