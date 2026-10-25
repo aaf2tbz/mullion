@@ -23,7 +23,7 @@ Direct3D 12 is supported at feature level 12_0 with shader models up to 6.7, inc
 
 ## Requirements
 
-- A Mac with an M3 or later. M1 and M2 are in progress.
+- A Mac with Apple silicon, M1 or later.
 - macOS 15 or later.
 - Wine for x86_64. Stock Wine works, with no patches and no DLL overrides. Only 64-bit games run for now.
 
