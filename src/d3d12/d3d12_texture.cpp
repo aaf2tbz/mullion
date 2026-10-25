@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include <bit>
 #include "mullion_format.hpp"
 #include "com/com_pointer.hpp"
 
@@ -29,22 +30,25 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
   HRESULT hr = MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, Format);
   if (FAILED(hr))
     return hr;
+  if (Desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+      (Desc.SampleDesc.Count != 1 || Desc.SampleDesc.Quality))
+    return E_INVALIDARG;
 
   if (Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
     if (Desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !Desc.Width || !Desc.Height || !Desc.DepthOrArraySize ||
         ((Desc.Width | Desc.Height) & 1) || Desc.MipLevels != 1 || Desc.SampleDesc.Count != 1 ||
         Desc.SampleDesc.Quality || Desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
         (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (Plane != ~0u && FAILED(MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, Format, Plane)))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
   }
   InfoOut.pixel_format = Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32
                              ? WMTPixelFormat(ORIGINAL_FORMAT(Format.PixelFormat)) : Format.PixelFormat;
   if ((Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) &&
       (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
     switch (Format.PixelFormat) {
@@ -69,12 +73,20 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
   if (ORIGINAL_FORMAT(InfoOut.pixel_format) == WMTPixelFormatX32_Stencil8)
     InfoOut.pixel_format = WMTPixelFormatDepth32Float_Stencil8;
 
+  // a format makes the textures its row names (Microsoft Learn, "Format support for Direct3D Feature Level 12.0
+  // hardware": Texture1D, Texture2D, Texture3D)
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support{Desc.Format};
+  Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
+  if (!(support.Support1 & (Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D   ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
+                            : Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ? D3D12_FORMAT_SUPPORT1_TEXTURE2D
+                            : Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+                                                                                    : D3D12_FORMAT_SUPPORT1_NONE)))
+    return FAIL(E_INVALIDARG);
+
   switch (Desc.Dimension) {
   default:
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   case D3D12_RESOURCE_DIMENSION_TEXTURE1D: {
-    if (Format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))
-      return E_INVALIDARG;
     InfoOut.width = Desc.Width;
     InfoOut.height = 1;
     InfoOut.depth = 1;
@@ -91,8 +103,15 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
     InfoOut.height = Desc.Height;
     InfoOut.depth = 1;
     InfoOut.array_length = Desc.DepthOrArraySize;
-    if (Desc.SampleDesc.Count == 0)
-      return E_INVALIDARG;
+    if (Desc.SampleDesc.Count != 1 || Desc.SampleDesc.Quality) {
+      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{Desc.Format, Desc.SampleDesc.Count};
+      if (FAILED(Device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))) ||
+          !quality.NumQualityLevels ||
+          (Desc.SampleDesc.Quality >= quality.NumQualityLevels &&
+           Desc.SampleDesc.Quality != DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN &&
+           Desc.SampleDesc.Quality != DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN))
+        return FAIL(E_INVALIDARG);
+    }
     if (Desc.SampleDesc.Count > 1) {
       if (Desc.DepthOrArraySize > 1)
         InfoOut.type = WMTTextureType2DMultisampleArray;
@@ -127,11 +146,11 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
 
   // Metal lays texels out its own way; D3D12's standard swizzle is not one of them
   if (Desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   WMTTextureUsage Usage = ORIGINAL_FORMAT(InfoOut.pixel_format) == WMTPixelFormatDepth32Float_Stencil8
                               ? WMTTextureUsagePixelFormatView : WMTTextureUsageUnknown;
-  if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+  if (Format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_EMULATED_RGB32))
     Usage |= WMTTextureUsagePixelFormatView;
   if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     Usage |= WMTTextureUsageRenderTarget;
@@ -161,17 +180,17 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
     if (Desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
         Desc.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
         (Desc.SampleDesc.Count == 1 || Desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     if (Desc.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) {
       // Textures with UNKNOWN layout without MSAA and without render-target nor depth-stencil flags may be created with
       // 4KB Alignment
       if (Desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       if (Desc.SampleDesc.Count > 1)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
 
       WMTTextureInfo info_one_slice = InfoOut;
       info_one_slice.mipmap_level_count = 1;
@@ -190,7 +209,7 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
       // Applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
       // total of the larger alignment restriction or less.
       if (size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     }
   }
 
@@ -239,7 +258,7 @@ public:
     case D3D12_RESOURCE_STATE_RENDER_TARGET: {
       if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
         break;
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
     default:
       break;
@@ -257,7 +276,7 @@ public:
       if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
           desc_.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE ||
           (DepthStencilPlanarFlags(texture_info.pixel_format) & DepthStencilPlanarFlags(WMTPixelFormatStencil8)))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc_.DepthOrArraySize > 1) {
         auto size = device_->GetMTLDevice().sparseTileSize(
             texture_info.type, texture_info.pixel_format, texture_info.sample_count, device_->GetSparsePageSize()
@@ -265,7 +284,7 @@ public:
         auto extent = GetResourceExtent(desc_, texture_info.mipmap_level_count - 1);
         // tier 2 arrays cannot contain packed mips (D3D11.3 5.9.7.2)
         if (extent.right < size.width || extent.bottom < size.height)
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
       }
     }
 
@@ -280,11 +299,11 @@ public:
     uint64_t offset = HeapOffset;
     for (UINT plane = 0; plane < planes; plane++) {
       if (plane && FAILED(PopulateWMTTextureInfo(device_, texture_info, desc_, plane)))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       Flags<TextureAllocationFlag> flags = {};
       if (Reserved) {
         if (planes > 1)
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         texture_info.placement_sparse_page_size = device_->GetSparsePageSize();
         flags.set(TextureAllocationFlag::CpuInvisible);
       }
@@ -292,11 +311,16 @@ public:
       if (pHeap) {
         size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
         if (planes > 1 && !plane && offset % std::max<uint64_t>(desc_.Alignment, size_and_align.align))
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         if (plane)
           offset = align(offset, size_and_align.align);
         if (offset > pHeap->GetDesc().SizeInBytes || size_and_align.size > pHeap->GetDesc().SizeInBytes - offset)
+          return FAIL(E_INVALIDARG);
+      }
+      if (pTexture) {
+        if (planes > 1)
           return E_INVALIDARG;
+        texture_info = pTexture->texture_info;
       }
       if (pTexture) {
         if (planes != 1)
@@ -309,9 +333,10 @@ public:
       storage->rename(pTexture ? storage->wrap(WMT::Reference<WMT::Texture>(adopted), texture_info, pTexture->flags)
                       : pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
       if (!storage->current()->texture())
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
       if (!pHeap)
         device_->RegisterResidency(storage->current()->texture());
+      storage->centered = desc_.SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN;
       if (plane)
         texture->chroma = std::move(storage);
       else
@@ -332,7 +357,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -352,19 +377,23 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   Map(UINT Subresource, const D3D12_RANGE *pReadRange, void **ppData) {
-    if (!IsCpuVisibleHeap(&heap_props_))
-      return E_INVALIDARG;
+    if (!IsCpuVisibleHeap(&heap_props_) || (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        desc_.SampleDesc.Count != 1)
+      return FAIL(E_INVALIDARG);
     UINT subresource_count = desc_.MipLevels;
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       subresource_count *= desc_.DepthOrArraySize;
     MTL_DXGI_FORMAT_DESC format;
-    MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, format);
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, format)) ||
+        !std::has_single_bit(format.BytesPerTexel))
+      return FAIL(E_INVALIDARG);
     if (format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)
       subresource_count *= format.PlanarCount;
     if (Subresource >= subresource_count)
-      return E_INVALIDARG;
-    if (ppData || (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc_.MipLevels > 1))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
+    if (ppData || (pReadRange && pReadRange->End > pReadRange->Begin) ||
+        (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc_.MipLevels > 1))
+      return FAIL(E_INVALIDARG);
     return S_OK;
   };
 
@@ -387,44 +416,41 @@ public:
   ) {
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       SrcSlicePitch = 0;
-    if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-      return E_INVALIDARG;
+    if ((desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || desc_.SampleDesc.Count != 1 ||
+        (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc_.MipLevels > 1))
+      return FAIL(E_INVALIDARG);
     uint32_t Level = 0, Slice = 0, Plane = 0;
     DecomposeSubresource(desc_, DstSubresource, &Level, &Slice, &Plane);
     MTL_DXGI_FORMAT_DESC Format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
-      return E_INVALIDARG;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)) ||
+        !std::has_single_bit(Format.BytesPerTexel))
+      return FAIL(E_INVALIDARG);
     if (Plane >= Format.PlanarCount || (Plane && !(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
         !IsCpuVisibleHeap(&heap_props_))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto storage = texture->plane(Plane);
     D3D12_BOX full_box = GetResourceExtent(desc_, Level);
     full_box.right = std::max(1u, storage->width() >> Level);
     full_box.bottom = std::max(1u, storage->height() >> Level);
+    // D3D11.3 19.5.1 defines BC regions in full 4-texel blocks, including the physical extent of small mips.
+    constexpr UINT block_width = 4;
+    if (Format.Flag & MTL_DXGI_FORMAT_BC) {
+      full_box.right = align(full_box.right, block_width);
+      full_box.bottom = align(full_box.bottom, block_width);
+    }
     D3D12_BOX box = pDstBox ? *pDstBox : full_box;
 
     if (!IsD3D12BoxInBounds(box, full_box))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     if (box.left == box.right || box.top == box.bottom || box.front == box.back)
       return S_OK;
 
     if (Format.Flag & MTL_DXGI_FORMAT_BC) {
-      if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
-        return E_INVALIDARG;
-    }
-
-    if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
-      const size_t width = box.right - box.left, height = box.bottom - box.top, depth = box.back - box.front;
-      const size_t row_bytes = width * MTLGetTexelSize(storage->pixelFormat()), image_bytes = row_bytes * height;
-      std::vector<uint8_t> rgba(image_bytes * depth);
-      for (size_t z = 0; z < depth; z++)
-        for (size_t y = 0; y < height; y++)
-          CopyRGB32(rgba.data() + z * image_bytes + y * row_bytes,
-                    static_cast<const char *>(pSrcData) + z * SrcSlicePitch + y * SrcRowPitch, width, true);
-      storage->current()->texture().replaceRegion(
-          {box.left, box.top, box.front}, {width, height, depth}, Level, Slice, rgba.data(), row_bytes, image_bytes);
-      return S_OK;
+      if ((box.left | box.right | box.top | box.bottom) & (block_width - 1))
+        return FAIL(E_INVALIDARG);
+      box.right = std::min(box.right, std::max(1u, storage->width() >> Level));
+      box.bottom = std::min(box.bottom, std::max(1u, storage->height() >> Level));
     }
 
     storage->current()->texture().replaceRegion(
@@ -440,44 +466,41 @@ public:
   ) {
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       DstSlicePitch = 0;
-    if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-      return E_INVALIDARG;
+    if ((desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || desc_.SampleDesc.Count != 1 ||
+        (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc_.MipLevels > 1))
+      return FAIL(E_INVALIDARG);
     uint32_t Level = 0, Slice = 0, Plane = 0;
     DecomposeSubresource(desc_, SrcSubresource, &Level, &Slice, &Plane);
     MTL_DXGI_FORMAT_DESC Format;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)))
-      return E_INVALIDARG;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)) ||
+        !std::has_single_bit(Format.BytesPerTexel))
+      return FAIL(E_INVALIDARG);
     if (Plane >= Format.PlanarCount || (Plane && !(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
         !IsCpuVisibleHeap(&heap_props_))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto storage = texture->plane(Plane);
     D3D12_BOX full_box = GetResourceExtent(desc_, Level);
     full_box.right = std::max(1u, storage->width() >> Level);
     full_box.bottom = std::max(1u, storage->height() >> Level);
+    // D3D11.3 19.5.1 defines BC regions in full 4-texel blocks, including the physical extent of small mips.
+    constexpr UINT block_width = 4;
+    if (Format.Flag & MTL_DXGI_FORMAT_BC) {
+      full_box.right = align(full_box.right, block_width);
+      full_box.bottom = align(full_box.bottom, block_width);
+    }
     D3D12_BOX box = pSrcBox ? *pSrcBox : full_box;
 
     if (!IsD3D12BoxInBounds(box, full_box))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     if (box.left == box.right || box.top == box.bottom || box.front == box.back)
       return S_OK;
 
     if (Format.Flag & MTL_DXGI_FORMAT_BC) {
-      if ((box.left | box.right | box.top | box.bottom) & (Format.BlockSize - 1))
-        return E_INVALIDARG;
-    }
-
-    if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) {
-      const size_t width = box.right - box.left, height = box.bottom - box.top, depth = box.back - box.front;
-      const size_t row_bytes = width * MTLGetTexelSize(storage->pixelFormat()), image_bytes = row_bytes * height;
-      std::vector<uint8_t> rgba(image_bytes * depth);
-      storage->current()->texture().getBytes(
-          {box.left, box.top, box.front}, {width, height, depth}, Level, Slice, rgba.data(), row_bytes, image_bytes);
-      for (size_t z = 0; z < depth; z++)
-        for (size_t y = 0; y < height; y++)
-          CopyRGB32(static_cast<char *>(pDstData) + z * DstSlicePitch + y * DstRowPitch,
-                    rgba.data() + z * image_bytes + y * row_bytes, width, false);
-      return S_OK;
+      if ((box.left | box.right | box.top | box.bottom) & (block_width - 1))
+        return FAIL(E_INVALIDARG);
+      box.right = std::min(box.right, std::max(1u, storage->width() >> Level));
+      box.bottom = std::min(box.bottom, std::max(1u, storage->height() >> Level));
     }
 
     storage->current()->texture().getBytes(
@@ -490,7 +513,7 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {
     if (reserved_)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (pHeapProps)
       *pHeapProps = heap_props_;
     if (pFlags)
@@ -520,7 +543,7 @@ public:
     if (this->texture->chroma) {
       if (plane >= 2 || (plane ? ViewDesc.Format != DXGI_FORMAT_R8G8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8G8_UINT
                               : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     }
     TextureViewKey View = texture->fullView;
 
@@ -528,12 +551,13 @@ public:
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
     if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
-      return FAILED(hr) ? hr : E_INVALIDARG;
+      return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
     view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, metal_format.PixelFormat);
 
     if (texture->pixelFormat() == WMTPixelFormatDepth32Float || texture->pixelFormat() == WMTPixelFormatDepth16Unorm) {
-      view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, texture->pixelFormat());
+      view_descriptor.format = EncodeComponentMapping(
+          ViewDesc.Shader4ComponentMapping, WMTPixelFormat(texture->pixelFormat() | WMTPixelFormatR001Swizzle));
     }
 
     FLOAT ResourceMinLODClamp = 0;
@@ -663,7 +687,7 @@ public:
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
 
     // into the view's mip numbering, keeping the fraction (D3D12_TEX2D_SRV: a clamp of 0.5 is not 0)
@@ -700,7 +724,7 @@ public:
     if (this->texture->chroma) {
       if (plane >= 2 || (plane ? ViewDesc.Format != DXGI_FORMAT_R8G8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8G8_UINT
                               : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     }
     TextureViewKey View = texture->fullView;
     UINT FirstWSlice = 0, WSize = 0; // the W range of a 3D view
@@ -710,7 +734,7 @@ public:
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
     if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
         (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
-      return FAILED(hr) ? hr : E_INVALIDARG;
+      return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
     view_descriptor.format = metal_format.PixelFormat;
 
@@ -770,7 +794,7 @@ public:
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
 
     return Heap->AddUnorderedAccessView(Index, texture, View, FirstWSlice, WSize);
@@ -798,7 +822,7 @@ public:
     if (this->texture->chroma) {
       if (plane >= 2 || (plane ? ViewDesc.Format != DXGI_FORMAT_R8G8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8G8_UINT
                               : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     }
     TextureViewKey View = texture->fullView;
 
@@ -806,7 +830,7 @@ public:
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
     if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
-      return FAILED(hr) ? hr : E_INVALIDARG;
+      return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
     view_descriptor.format = metal_format.PixelFormat;
 
@@ -838,7 +862,7 @@ public:
     }
     case D3D12_RTV_DIMENSION_TEXTURE2D: {
       if (ViewDesc.Texture2D.PlaneSlice && !this->texture->chroma)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MipSlice;
       view_descriptor.miplevelCount = 1;
@@ -849,7 +873,7 @@ public:
     }
     case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: {
       if (ViewDesc.Texture2DArray.PlaneSlice && !this->texture->chroma)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       view_descriptor.type = WMTTextureType2DArray;
       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MipSlice;
       view_descriptor.miplevelCount = 1;
@@ -893,7 +917,7 @@ public:
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
 
     RenderTargetDesc.Texture = texture;
@@ -907,7 +931,7 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   CreateDepthStencilView(const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
     if (texture->chroma)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     HRESULT hr;
     D3D12_DEPTH_STENCIL_VIEW_DESC ViewDesc;
     if (!pDesc) {
@@ -928,13 +952,14 @@ public:
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
     if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
         DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format))
-      return FAILED(hr) ? hr : E_INVALIDARG;
+      return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
     view_descriptor.format = metal_format.PixelFormat;
 
     MTL_RENDER_TARGET_DESC RenderTargetDesc;
     RenderTargetDesc.DepthPlane = 0;
     RenderTargetDesc.RenderTargetArrayLength = 0;
     RenderTargetDesc.Flags = ViewDesc.Flags;
+    RenderTargetDesc.DepthFormat = ViewDesc.Format;
 
     switch (ViewDesc.ViewDimension) {
     case D3D12_DSV_DIMENSION_TEXTURE1D: {
@@ -998,7 +1023,7 @@ public:
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
 
     RenderTargetDesc.Texture = texture.ptr();
@@ -1143,10 +1168,10 @@ CreatePlacedTexture(
 
   if (pDesc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
     if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
   } else {
     if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
   }
 
   HRESULT hr = texture->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, InitialState, pHeap, HeapOffset);

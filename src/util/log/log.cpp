@@ -59,6 +59,7 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
 
     const char *prefix = s_prefixes.at(static_cast<uint32_t>(level));
 
+    std::string unwritten;
     if (!std::exchange(m_initialized, true)) {
 #ifdef _WIN32
       HMODULE ntdll = GetModuleHandleA("ntdll.dll");
@@ -69,11 +70,12 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
 #endif
       auto path = getFileName(m_fileName);
 
-      if (!path.empty())
-        m_fileStream = std::ofstream(str::topath(path.c_str()).c_str());
+      // a log asked for and not written says so, where the lines go instead
+      if (!path.empty() && !(m_fileStream = std::ofstream(str::topath(path.c_str()).c_str())))
+        unwritten = "cannot write the log file " + path + "\n";
     }
 
-    std::stringstream stream(message);
+    std::stringstream stream(unwritten + message);
     std::string line;
 
     while (std::getline(stream, line, '\n')) {

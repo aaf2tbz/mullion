@@ -37,6 +37,17 @@ static void add_count(device ulong &count, ulong value) {
                             memory_order_relaxed);
 }
 
+// a stream output draw's scratch words, one a vertex, which its passes add to (SM50StreamOutputZeroed)
+[[vertex]] void zero_words(device uint *words [[buffer(kCustomBufferArgumentIndex0)]], uint word [[vertex_id]]) {
+  words[word] = 0;
+}
+
+[[kernel]] void pipeline_statistics_dispatch(
+    device PipelineStatisticsDispatch &count [[buffer(kCustomBufferArgumentIndex0)]],
+    device const uint *arguments [[buffer(kCustomBufferArgumentIndex1)]]) {
+  count.invocations = count.threads * arguments[0] * arguments[1] * arguments[2];
+}
+
 [[vertex]] void pipeline_statistics_draw(constant PipelineStatisticsDraw &draw
                                          [[buffer(kCustomBufferArgumentIndex0)]]) {
   auto result = reinterpret_cast<device PipelineStatisticsResult *>(draw.result);
@@ -738,7 +749,7 @@ struct linear_texture_desc {
   uint buffer_offset = pos.x * sizeof(uint) 
                         + pos.y * desc.bytes_per_row;
   uint data = *reinterpret_cast<device uint *>(buffer + buffer_offset);
-  result.depth = float(data & 0xffffff) / float(0xffffff);
+  result.depth = precise::divide(float(data & kD24UnormMax), float(kD24UnormMax));
   result.stencil = data >> 24;
   return result;
 }
@@ -776,7 +787,7 @@ struct linear_texture_desc {
     auto dst = reinterpret_cast<device uint *>(buffer + buffer_offset);
     float depth = tex_depth.read(pos).x;
     uint stencil = tex_stencil.read(pos).x;
-    *dst = (uint(0xffffff * clamp(depth, 0.0, 1.0)) & 0xffffff) | (stencil << 24);
+    *dst = (uint(round(kD24UnormMax * clamp(depth, 0.0, 1.0))) & kD24UnormMax) | (stencil << 24);
   }
 }
 
@@ -986,8 +997,12 @@ struct DrawStatisticsSlot {
   for (uint k = sum.first_draw; k < sum.first_draw + sum.draw_count; k++) {
     result[7] += draws[k].count->pixels;
     result[1] += draws[k].count->primitives;
-    result[5] += draws[k].count->primitives;
-    result[6] += draws[k].count->primitives;
+    // a geometry shader's primitives reach the rasterizer in place of its inputs
+    ulong clipped = draws[k].count->primitives + draws[k].count->rasterized - draws[k].count->gs_inputs;
+    result[5] += clipped;
+    result[6] += clipped;
+    result[3] += draws[k].count->gs_invocations;
+    result[4] += draws[k].count->gs_primitives;
     result[0] += draws[k].count->vertices;
     result[2] += draws[k].count->vertices;
   }
@@ -1449,4 +1464,20 @@ enum {
   auto rgba = *(device const uint4 *)(src + pos.z * layout.src_image + pos.y * layout.src_row + pos.x * sizeof(uint4));
   *(device packed_uint3 *)(dst + pos.z * layout.dst_image + pos.y * layout.dst_row +
                           pos.x * sizeof(packed_uint3)) = packed_uint3(rgba.xyz);
+}
+
+[[kernel]] void cs_unpack_d24(
+    device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+    constant uint2 &pitches [[buffer(2)]], uint2 pos [[thread_position_in_grid]]) {
+  uint code = *(device const uint *)(src + ulong(pos.y) * pitches.x + pos.x * sizeof(uint));
+  *(device float *)(dst + ulong(pos.y) * pitches.y + pos.x * sizeof(float)) =
+      precise::divide(float(code & kD24UnormMax), float(kD24UnormMax));
+}
+
+[[kernel]] void cs_pack_d24(
+    device uchar *buffer [[buffer(0)]], constant uint2 &pitches [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]) {
+  auto texel = buffer + ulong(pos.y) * pitches.x + pos.x * sizeof(uint);
+  float depth = *(device const float *)texel;
+  *(device uint *)texel = uint(round(kD24UnormMax * clamp(depth, 0.0f, 1.0f)));
 }

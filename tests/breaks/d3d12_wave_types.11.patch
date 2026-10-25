@@ -1,0 +1,12 @@
+# returns false for native boolean quad lane reads.
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -2326,7 +2326,7 @@
+       ret = move("simd_broadcast_first", a(1), {});
+       break;
+     case QuadReadLaneAt:
+-      ret = move("quad_shuffle", a(1), {i16(a(2))});
++      ret = ty->isIntegerTy(1) ? ir.getFalse() : move("quad_shuffle", a(1), {i16(a(2))});
+       break;
+     case QuadOp:
+       // across X, Y or the diagonal: the lane whose quad index differs in bit 0, bit 1, or both

@@ -3,6 +3,8 @@
 // target nor its UAV where it fails, and occlusion queries do not count it. the range may come from a bundle, a wide
 // range passes all, an inverted one none, NaN counts as 0, and a pipeline without the test or a pass without a depth
 // buffer passes all. each case draws into its own band of pixels whose stored depths are `stored`.
+// "The default values are 0 and 1 for the minimum and maximum, respectively."
+// https://microsoft.github.io/DirectX-Specs/d3d/DepthBoundsTest.html
 #include "d3d12_test.hpp"
 #include <cfloat>
 #include <cmath>
@@ -20,10 +22,12 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
   float2 uv = float2((id << 1) & 2, id & 2);
   return float4(uv * float2(2, -2) + float2(-1, 1), depth, 1);
 }
-[earlydepthstencil] uint ps(float4 p : SV_Position) : SV_Target {
+uint shade(float4 p) {
   o[uint(p.x)] = value;
   return value;
 }
+[earlydepthstencil] uint ps(float4 p : SV_Position) : SV_Target { return shade(p); }
+uint ps_late(float4 p : SV_Position) : SV_Target { return shade(p); }
 )hlsl";
 
 int
@@ -33,6 +37,10 @@ main(int argc, char **argv) {
     printf("skipped: dxcompiler.dll not found\n");
     return 77;
   }
+  auto vs = compiler.compile(hlsl, "vs", "vs"), ps = compiler.compile(hlsl, "ps", "ps"),
+       late = compiler.compile(hlsl, "ps_late", "ps");
+  if (!expect(!vs.empty() && !ps.empty() && !late.empty(), "depth-bounds HLSL did not compile"))
+    return verdict();
   ComPtr<ID3D12Device2> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_FEATURE_DATA_D3D12_OPTIONS2 options{};
@@ -41,20 +49,23 @@ main(int argc, char **argv) {
     printf("skipped: no depth bounds test\n");
     return 77;
   }
-  auto vs = compiler.compile(hlsl, "vs", "vs"), ps = compiler.compile(hlsl, "ps", "ps");
-  if (vs.empty() || ps.empty()) {
-    printf("failed: HLSL did not compile\n");
-    return 1;
-  }
   const float stored[] = {0.0f, 0.3f, 0.5f, 0.6f, 1.0f};
   const UINT band = std::size(stored);
   struct Case {
     float min, max;
-    bool test, depth_buffer, bundle;
+    bool test, depth_buffer, bundle, late = false, initial = false, draw_bundle = false;
   } cases[] = {
+      {0, 1, true, true, false, false, true},
       {0.3f, 0.6f, true, true, false},     {0.3f, 0.6f, true, true, true},  {-FLT_MAX, FLT_MAX, true, true, false},
       {FLT_MAX, -FLT_MAX, true, true, false}, {0.3f, 0.6f, false, true, false}, {0.3f, 0.6f, true, false, false},
       {NAN, 0.5f, true, true, false},
+      {0, NAN, true, true, false}, {NAN, NAN, true, true, false},
+      {0.3f, NAN, true, true, false}, {0.5f, 0.5f, true, true, false},
+      {-INFINITY, INFINITY, true, true, false}, {-0.0f, -0.0f, true, true, false},
+      {0.3f, 0.6f, true, true, false, true},
+      {0.3f, 0.6f, true, true, false, false, false, true},
+      {0.3f, 0.6f, true, true, true, false, false, true},
+      {0.3f, 0.6f, true, true, false, true, false, true},
   };
   const UINT width = band * std::size(cases);
 
@@ -79,7 +90,8 @@ main(int argc, char **argv) {
   stream.topology.data = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   stream.rasterizer.data = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
   stream.rasterizer.data.DepthClipEnable = TRUE;
-  auto pipeline = [&](bool write, bool test, bool depth_buffer) -> ComPtr<ID3D12PipelineState> {
+  auto pipeline = [&](bool write, bool test, bool depth_buffer, bool late_shader = false) -> ComPtr<ID3D12PipelineState> {
+    stream.ps.data = bytecode(late_shader ? late : ps);
     stream.depth.data = {depth_buffer, write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
     stream.depth.data.DepthBoundsTestEnable = test;
     stream.depth_format.data = depth_buffer ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;
@@ -142,14 +154,14 @@ main(int argc, char **argv) {
     D3D12_RECT rect{(LONG)first, 0, LONG(first + count), 1};
     list->RSSetScissorRects(1, &rect);
   };
-  auto draw = [&](float z, UINT value) {
+  auto draw = [&](ID3D12GraphicsCommandList *commands, float z, UINT value) {
     const UINT constants[2] = {*reinterpret_cast<const UINT *>(&z), value};
-    list->SetGraphicsRoot32BitConstants(0, 2, constants, 0);
-    list->DrawInstanced(3, 1, 0, 0);
+    commands->SetGraphicsRoot32BitConstants(0, 2, constants, 0);
+    commands->DrawInstanced(3, 1, 0, 0);
   };
   // stored depths, then the UAV's zeros (the fill draws wrote it)
   for (UINT x = 0; x < width; x++)
-    columns(x, 1), draw(stored[x % band], 0);
+    columns(x, 1), draw(list.Get(), stored[x % band], 0);
   D3D12_RESOURCE_BARRIER uav{D3D12_RESOURCE_BARRIER_TYPE_UAV};
   uav.UAV.pResource = out.Get();
   list->ResourceBarrier(1, &uav);
@@ -160,7 +172,8 @@ main(int argc, char **argv) {
   std::vector<ComPtr<ID3D12GraphicsCommandList1>> bundles;
   for (UINT c = 0; c < std::size(cases); c++) {
     auto &k = cases[c];
-    auto &pso = psos.emplace_back(pipeline(false, k.test, k.depth_buffer));
+    step("depth bounds case %u, late %u, bundle draw %u", c, k.late, k.draw_bundle);
+    auto &pso = psos.emplace_back(pipeline(false, k.test, k.depth_buffer, k.late));
     if (!pso) {
       printf("failed: pipeline of case %u\n", c);
       return 1;
@@ -168,17 +181,23 @@ main(int argc, char **argv) {
     list->SetPipelineState(pso.Get());
     list->OMSetRenderTargets(1, &rtv, FALSE, k.depth_buffer ? &dsv : nullptr);
     columns(c * band, band);
-    if (k.bundle) {
+    list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, c);
+    if (!k.initial && !k.bundle) list->OMSetDepthBounds(k.min, k.max);
+    if (k.bundle || k.draw_bundle) {
       auto &bundle = bundles.emplace_back();
       CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.Get(), nullptr, IID_PPV_ARGS(&bundle)));
-      bundle->OMSetDepthBounds(k.min, k.max);
+      if (k.bundle) bundle->OMSetDepthBounds(k.min, k.max);
+      if (k.draw_bundle) {
+        bundle->SetPipelineState(pso.Get());
+        bundle->SetGraphicsRootSignature(rs.Get());
+        bundle->SetGraphicsRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+        bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        draw(bundle.Get(), 0, c + 1);
+      }
       CHECK(bundle->Close());
       list->ExecuteBundle(bundle.Get());
-    } else {
-      list->OMSetDepthBounds(k.min, k.max);
     }
-    list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, c);
-    draw(0, c + 1);
+    if (!k.draw_bundle) draw(list.Get(), 0, c + 1);
     list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, c);
   }
   list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, std::size(cases), readback.Get(), counts_at);
@@ -193,24 +212,23 @@ main(int argc, char **argv) {
 
   UINT *got;
   CHECK(readback->Map(0, nullptr, (void **)&got));
-  unsigned failures = 0;
   for (UINT c = 0; c < std::size(cases); c++) {
     auto &k = cases[c];
     float lo = std::isnan(k.min) ? 0 : k.min, hi = std::isnan(k.max) ? 0 : k.max;
+    step("depth bounds case %u: readback", c);
     UINT passed = 0;
     for (UINT i = 0; i < band; i++) {
       bool pass = !k.test || !k.depth_buffer || (lo <= stored[i] && stored[i] <= hi);
       UINT x = c * band + i, want = pass ? c + 1 : 0;
       passed += pass;
       UINT written = got[row / 4 + x];
-      if ((got[x] != want || written != want) && failures++ < 12)
-        printf("case %u, stored %g: target %u, UAV %u, want %u\n", c, stored[i], got[x], written, want);
+      UINT want_uav = k.late || pass ? c + 1 : 0;
+      expect(got[x] == want && written == want_uav,
+             "stored %g: target %u/%u, UAV %u/%u", stored[i], got[x], want, written, want_uav);
     }
     UINT64 count = reinterpret_cast<UINT64 *>(reinterpret_cast<char *>(got) + counts_at)[c];
-    if (count != passed && failures++ < 12)
-      printf("case %u: occlusion %llu, want %u\n", c, count, passed);
+    expect(count == passed, "occlusion %llu, want %u", count, passed);
   }
   readback->Unmap(0, nullptr);
-  printf("%s: %u wrong values over %zu cases\n", failures ? "failed" : "passed", failures, std::size(cases));
-  return failures != 0;
+  return verdict();
 }

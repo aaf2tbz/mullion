@@ -22,6 +22,7 @@
 #include "d3d11_enumerable.hpp"
 #include "d3d11_view.hpp"
 #include "mullion_dynamic.hpp"
+#include "mullion_fence.hpp"
 #include "mullion_staging.hpp"
 #include "mullion_texture.hpp"
 #include "d3d11_resource.hpp"
@@ -32,6 +33,14 @@
 namespace mullion {
 
 #pragma region DeviceTexture
+
+template <typename DESC>
+bool
+centered(const DESC &desc) {
+  if constexpr (requires { desc.SampleDesc; })
+    return desc.SampleDesc.Quality == D3D11_CENTER_MULTISAMPLE_PATTERN;
+  return false;
+}
 
 template <typename tag_texture>
 class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
@@ -147,6 +156,7 @@ public:
   DeviceTexture(const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, MTLD3D11Device *pDevice) :
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice) {
         this->texture_ = std::move(u_texture);
+        this->texture_->centered = centered(*pDesc);
       }
 
   DeviceTexture(
@@ -156,6 +166,7 @@ public:
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
       renamable_(std::move(renamable)) {
         this->texture_ = std::move(u_texture);
+        this->texture_->centered = centered(*pDesc);
       }
 
   DeviceTexture(
@@ -165,6 +176,7 @@ public:
       TResourceBase<tag_texture, IMTLMinLODClampable>(*pDesc, pDevice),
       local_kmt_(localHandle), global_kmt_(globalHandle) {
         this->texture_ = std::move(u_texture);
+        this->texture_->centered = centered(*pDesc);
         this->keyed_mutex_ = std::move(keyed_mutex);
       }
 
@@ -392,6 +404,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   if (FAILED(CreateMTLTextureDescriptor(pDevice, pDesc, &finalDesc, &info))) {
     return E_INVALIDARG;
   }
+  // a renamed texture would leave the Direct3D 12 resource Direct3D 11 on 12 makes of it
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
                             !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && !pDevice->shares_with_d3d12;
   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
@@ -848,34 +861,11 @@ HRESULT
 ImportSharedTextureByName(
     MTLD3D11Device *pDevice, LPCWSTR lpName, DWORD dwDesiredAccess, REFIID riid, void **ppTexture
 ) {
-  D3DKMT_OPENNTHANDLEFROMNAME openFromName = {};
-  openFromName.dwDesiredAccess = dwDesiredAccess;
-
-  OBJECT_ATTRIBUTES attr = {};
-  attr.Length = sizeof(attr);
-
-  WCHAR buffer[MAX_PATH];
-  UNICODE_STRING name_str;
-  DWORD session, len, name_len = wcslen(lpName);
-
-  ProcessIdToSessionId(GetCurrentProcessId(), &session);
-  len = swprintf(buffer, ARRAYSIZE(buffer), L"\\Sessions\\%u\\BaseNamedObjects\\", session);
-  memcpy(buffer + len, lpName, (name_len + 1) * sizeof(WCHAR));
-  name_str.MaximumLength = name_str.Length = (len + name_len) * sizeof(WCHAR);
-  name_str.MaximumLength += sizeof(WCHAR);
-  name_str.Buffer = buffer;
-
-  attr.ObjectName = &name_str;
-  attr.Attributes = OBJ_CASE_INSENSITIVE;
-  openFromName.pObjAttrib = &attr;
-
-  if (D3DKMTOpenNtHandleFromName(&openFromName)) {
-    WARN(str::format("ImportSharedTextureByName: Failed to open NT handle from name: ", lpName));
+  HANDLE handle;
+  if (FAILED(openHandleByName(lpName, dwDesiredAccess, &handle)))
     return E_INVALIDARG;
-  }
-
-  HRESULT res = ImportSharedTextureFromNtHandle(pDevice, openFromName.hNtHandle, riid, ppTexture);
-  CloseHandle(openFromName.hNtHandle);
+  HRESULT res = ImportSharedTextureFromNtHandle(pDevice, handle, riid, ppTexture);
+  CloseHandle(handle);
   return res;
 }
 

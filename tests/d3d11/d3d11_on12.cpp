@@ -16,6 +16,8 @@
 #include <array>
 #include <atomic>
 #include <limits>
+#include <memory>
+#include <stop_token>
 #include <thread>
 
 int
@@ -25,7 +27,7 @@ main(int argc, char **argv) {
                   !strcmp(part, "unwrap") || !strcmp(part, "swapchain") || !strcmp(part, "lifetime") ||
                   !strcmp(part, "ordering") || !strcmp(part, "teardown") || !strcmp(part, "longwait") ||
                   !strcmp(part, "dimensions") || !strcmp(part, "cpu") || !strcmp(part, "flags") || !strcmp(part, "aliases") ||
-                  !strcmp(part, "predication"),
+                  !strcmp(part, "predication") || !strcmp(part, "independent"),
               "unknown case: %s", part))
     return verdict();
   const char hlsl[] = R"(
@@ -315,6 +317,144 @@ main(int argc, char **argv) {
                                    D3D12_TEXTURE_LAYOUT_UNKNOWN,
                                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
   D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+
+  if (!strcmp(part, "independent")) {
+    // Return waits belong to the allocation first used, including through another wrapper or a deferred list.
+    // https://learn.microsoft.com/en-us/windows/win32/api/d3d11on12/nf-d3d11on12-id3d11on12device2-returnunderlyingresource
+    ComPtr<ID3D11On12Device2> on12;
+    ComPtr<ID3D11Device5> device5;
+    ComPtr<ID3D11DeviceContext4> context4;
+    CHECK(device.As(&on12));
+    CHECK(device.As(&device5));
+    CHECK(context.As(&context4));
+    for (UINT phase : {1u, 2u, 3u}) {
+      step("independent: B completes while A waits, then A's deferred alias survives its original wrapper, phase %u", phase);
+      ComPtr<ID3D12Resource> original[2], underlying[2];
+      ComPtr<ID3D11Texture2D> wrapped[2][2], staging[2];
+      D3D11_RESOURCE_FLAGS flags{D3D11_BIND_RENDER_TARGET};
+      D3D11_TEXTURE2D_DESC desc{UINT(texture_desc.Width), texture_desc.Height, 1, 1, texture_desc.Format,
+                              {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
+      std::vector<Pixel> zeroes(desc.Width * desc.Height);
+      D3D11_SUBRESOURCE_DATA initial{zeroes.data(), UINT(desc.Width * sizeof(Pixel))};
+      for (UINT i = 0; i < std::size(original); ++i) {
+        CHECK(device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&original[i])));
+        for (auto &alias : wrapped[i])
+          CHECK(interop->CreateWrappedResource(original[i].Get(), &flags, D3D12_RESOURCE_STATE_COMMON,
+                                               D3D12_RESOURCE_STATE_COMMON, IID_PPV_ARGS(&alias)));
+        CHECK(device->CreateTexture2D(&desc, &initial, &staging[i]));
+        CHECK(draw(wrapped[i][0].Get(), i ? phase + 4 : 0));
+        CHECK(on12->UnwrapUnderlyingResource(wrapped[i][0].Get(), queues[1].Get(), IID_PPV_ARGS(&underlying[i])));
+      }
+      context->Flush();
+      CHECK(read12(underlying[0].Get(), queues[1].Get(), D3D12_RESOURCE_STATE_COMMON, 0));
+      CHECK(read12(underlying[1].Get(), queues[1].Get(), D3D12_RESOURCE_STATE_COMMON, phase + 4));
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+      UINT64 bytes;
+      device12->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+      auto upload = buffer(device12.Get(), D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+      if (!expect(upload != nullptr, "upload buffer was not created"))
+        return verdict();
+      BYTE *mapped;
+      CHECK(upload->Map(0, nullptr, reinterpret_cast<void **>(&mapped)));
+      for (UINT y = 0; y < desc.Height; ++y)
+        for (UINT x = 0; x < desc.Width; ++x)
+          memcpy(mapped + footprint.Offset + y * footprint.Footprint.RowPitch + x * sizeof(Pixel),
+                 pixel(x, y, phase).data(), sizeof(Pixel));
+      upload->Unmap(0, nullptr);
+      ComPtr<ID3D12CommandAllocator> allocator;
+      ComPtr<ID3D12GraphicsCommandList> producer;
+      CHECK(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+      CHECK(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                        IID_PPV_ARGS(&producer)));
+      transition(producer.Get(), underlying[0].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+      D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                       {.PlacedFootprint = footprint}},
+          to{underlying[0].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+      producer->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+      transition(producer.Get(), underlying[0].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+      CHECK(producer->Close());
+      ComPtr<ID3D11DeviceContext> deferred;
+      ComPtr<ID3D11CommandList> consumer;
+      CHECK(device->CreateDeferredContext(0, &deferred));
+      deferred->CopyResource(staging[0].Get(), wrapped[0][1].Get());
+      CHECK(deferred->FinishCommandList(FALSE, &consumer));
+      ComPtr<ID3D12Fence> gate, produced, available, retired;
+      CHECK(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+      CHECK(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&produced)));
+      CHECK(device12->CreateFence(1, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&available)));
+      CHECK(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&retired)));
+      ComPtr<ID3D11Fence> completed;
+      CHECK(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&completed)));
+      std::unique_ptr<void, decltype(&CloseHandle)> release(CreateEventA(nullptr, TRUE, FALSE, nullptr), &CloseHandle),
+          done(CreateEventA(nullptr, FALSE, FALSE, nullptr), &CloseHandle),
+          finished(CreateEventA(nullptr, TRUE, FALSE, nullptr), &CloseHandle),
+          drained(CreateEventA(nullptr, FALSE, FALSE, nullptr), &CloseHandle);
+      if (!expect(release && done && finished && drained, "completion events were not created"))
+        return verdict();
+      std::atomic<bool> opened = false;
+      HRESULT released = E_FAIL;
+      std::jthread watchdog([&](std::stop_token stop) {
+        std::stop_callback finished_submission(stop, [&] { SetEvent(finished.get()); });
+        WaitForSingleObject(release.get(), 5000);
+        opened = true;
+        released = gate->Signal(1);
+        // retire after submission ends, including when a failing API call unwinds this scope.
+        WaitForSingleObject(finished.get(), INFINITE);
+        HRESULT hr = queues[1]->Signal(retired.Get(), 1);
+        if (SUCCEEDED(hr))
+          hr = retired->SetEventOnCompletion(1, drained.get());
+        if (FAILED(hr) || WaitForSingleObject(drained.get(), 5000) != WAIT_OBJECT_0) {
+          printf("failed: independent producer cleanup did not finish, %#lx\n", hr);
+          ExitProcess(1);
+        }
+      });
+      CHECK(queues[1]->Wait(gate.Get(), 1));
+      ID3D12CommandList *lists[] = {producer.Get()};
+      queues[1]->ExecuteCommandLists(1, lists);
+      CHECK(queues[1]->Signal(produced.Get(), 1));
+      UINT64 one = 1;
+      ID3D12Fence *a[] = {produced.Get()}, *b[] = {available.Get()};
+      CHECK(on12->ReturnUnderlyingResource(wrapped[0][0].Get(), 1, &one, a));
+      CHECK(on12->ReturnUnderlyingResource(wrapped[1][0].Get(), 1, &one, b));
+      produced.Reset();
+      available.Reset();
+      for (UINT i = 0; i < std::size(original); ++i) {
+        wrapped[i][0].Reset();
+        underlying[i].Reset();
+        original[i].Reset();
+      }
+      context->CopyResource(staging[1].Get(), wrapped[1][1].Get());
+      CHECK(completed->SetEventOnCompletion(1, done.get()));
+      CHECK(context4->Signal(completed.Get(), 1));
+      context->Flush();
+      expect(WaitForSingleObject(done.get(), 1000) == WAIT_OBJECT_0 && !opened,
+             "B inherited A's pending return fence");
+      CHECK(completed->SetEventOnCompletion(2, done.get()));
+      context->ExecuteCommandList(consumer.Get(), FALSE);
+      CHECK(context4->Signal(completed.Get(), 2));
+      context->Flush();
+      const DWORD early = WaitForSingleObject(done.get(), 100);
+      expect(early == WAIT_TIMEOUT && !opened,
+             "A's deferred alias bypassed its released return fence");
+      SetEvent(release.get());
+      watchdog.request_stop();
+      watchdog.join();
+      CHECK(released);
+      if (!expect(early == WAIT_OBJECT_0 || WaitForSingleObject(done.get(), 5000) == WAIT_OBJECT_0,
+                  "A's deferred alias did not finish"))
+        return verdict();
+      for (UINT i = 0; i < std::size(staging); ++i) {
+        D3D11_MAPPED_SUBRESOURCE result;
+        CHECK(context->Map(staging[i].Get(), 0, D3D11_MAP_READ, 0, &result));
+        pixels(static_cast<const BYTE *>(result.pData), result.RowPitch, desc.Width, desc.Height, i ? phase + 4 : phase);
+        context->Unmap(staging[i].Get(), 0);
+      }
+      CHECK(device->GetDeviceRemovedReason());
+      CHECK(device12->GetDeviceRemovedReason());
+    }
+    return verdict();
+  }
 
   if (!strcmp(part, "cpu") || !strcmp(part, "aliases") || !strcmp(part, "predication")) {
     const bool aliases = strcmp(part, "cpu") != 0;
@@ -1109,7 +1249,7 @@ main(int argc, char **argv) {
         std::vector<UINT> wanted(word_count);
         for (UINT i = 0; i < word_count; i++)
           wanted[i] = (phase + 1) * (i + 1);
-        D3D11_BUFFER_DESC desc{UINT(wanted.size() * sizeof(UINT)), D3D11_USAGE_IMMUTABLE};
+        D3D11_BUFFER_DESC desc{UINT(wanted.size() * sizeof(UINT)), D3D11_USAGE_DEFAULT};
         D3D11_SUBRESOURCE_DATA initial{wanted.data()};
         ComPtr<ID3D11Buffer> source;
         CHECK(device->CreateBuffer(&desc, &initial, &source));

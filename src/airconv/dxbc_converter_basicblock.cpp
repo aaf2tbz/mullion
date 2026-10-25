@@ -234,7 +234,7 @@ IREffect init_input_reg(
       if (~sample_index_at) {
         // Metal's position is the pixel center. x, y, z and 1/w are all affine in screen space, so one step along
         // each derivative moves the whole position to the sample
-        auto offset = ctx.air.CreateSamplePos(ctx.air.CreateGetNumSamples(), ctx.function->getArg(sample_index_at));
+        auto offset = ctx.air.CreateRasterizerSamplePos(ctx.function->getArg(sample_index_at));
         auto ddx = ctx.air.CreateDerivative(arg, false), ddy = ctx.air.CreateDerivative(arg, true);
         auto step = [&](pvalue d, uint64_t i) {
           return ctx.builder.CreateFMul(d, ctx.builder.CreateVectorSplat(4, ctx.builder.CreateExtractElement(offset, i)));
@@ -300,7 +300,7 @@ IREffect init_input_reg_with_interpolation(
 }
 
 std::function<IRValue(pvalue)>
-pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
+pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element, std::array<int, 4> channels) {
   return [=](pvalue ret) {
     return make_irvalue_bind([=](context ctx) {
       auto const_index =
@@ -310,7 +310,11 @@ pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
              ) >>= [=, &ctx](auto ivec4) {
         auto desired_type =
           ctx.function->getReturnType()->getStructElementType(to_element);
-        return to_desired_type_from_int_vec4(ivec4, desired_type, mask) |
+        uint32_t stored_mask = 0;
+        for (unsigned c = 0; c < channels.size(); c++)
+          stored_mask |= (mask >> channels[c] & 1) << c;
+        auto stored = ctx.builder.CreateShuffleVector(ivec4, channels);
+        return to_desired_type_from_int_vec4(stored, desired_type, stored_mask) |
                [=, &ctx](auto value) {
                  return ctx.builder.CreateInsertValue(ret, value, {to_element});
                };

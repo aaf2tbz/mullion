@@ -606,6 +606,9 @@ enum WMTAttributeFormat : uint32_t {
   WMTAttributeFormatHalf = 53,
   WMTAttributeFormatFloatRG11B10 = 54,
   WMTAttributeFormatFloatRGB9E5 = 55,
+  // past Metal's own: encodings Metal has no format for, which shaders decode (D3D11.3 8.20)
+  WMTAttributeFormatUInt1010102 = 0x100,
+  WMTAttributeFormatUChar4Normalized_BGRX,
 };
 
 WINEMETAL_API obj_handle_t MTLDevice_newLibrary(obj_handle_t device, obj_handle_t data, obj_handle_t *err_out);
@@ -699,6 +702,8 @@ struct WMTRenderPassInfo {
   uint8_t render_target_array_length;
   uint8_t tile_width;
   uint8_t tile_height;
+  // the samples placed at the pixel center, for targets of the center pattern; 0 keeps Metal's, the standard pattern
+  uint8_t center_samples;
   uint32_t render_target_height;
   uint32_t render_target_width;
   obj_handle_t visibility_buffer;
@@ -1272,6 +1277,8 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetDepthStencilState,
   WMTRenderCommandSetDepthTestBounds,
   WMTRenderCommandExecuteCommandsInBufferIndirect,
+  WMTRenderCommandSetVertexBytes,
+  WMTRenderCommandSetMeshBytes,
 };
 
 struct wmtcmd_render_nop {
@@ -1745,11 +1752,18 @@ enum WMTGPUFamily {
   WMTGPUFamilyMacCatalyst1 = 4001,
   WMTGPUFamilyMacCatalyst2 = 4002,
   WMTGPUFamilyMetal3 = 5001,
+  WMTGPUFamilyMetal4 = 5002,
 };
 
 WINEMETAL_API bool MTLDevice_supportsFamily(obj_handle_t device, enum WMTGPUFamily gpu_family);
 
 WINEMETAL_API bool MTLDevice_supportsBCTextureCompression(obj_handle_t device);
+
+WINEMETAL_API bool MTLDevice_supports32BitFloatFiltering(obj_handle_t device);
+
+WINEMETAL_API bool MTLDevice_supports32BitMSAA(obj_handle_t device);
+
+WINEMETAL_API uint64_t MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supportsTextureSampleCount(obj_handle_t device, uint8_t sample_count);
 
@@ -2449,7 +2463,8 @@ enum WMTSampledEncoder {
 };
 // appended calls keep the preceding bridge ABI indices
 enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixComputeMaxThreadsPerThreadgroup,
-       WMTUnixCallCount };
+       WMTUnixDeviceSupports32BitFloatFiltering, WMTUnixDeviceMaxArgumentBufferSamplerCount,
+       WMTUnixDeviceSupports32BitMSAA, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);

@@ -1,3 +1,6 @@
+// alpha-to-coverage endpoints: "alpha of 0 (or less) must map to no coverage and alpha of 1 (or greater) must
+// map to full coverage"; "An alpha value of NaN results in a no coverage (zero) mask." and "If the Pixel Shader
+// outputs oMask (output coverage), Alpha-to-Coverage is disabled." (D3D11.3 17.18).
 // contract: the view interprets the pixel shader's register bits, then converts to its storage format.
 // "There is no data type associated with registers; Shader instructions determine how the data stored in
 // registers is interpreted." (D3D11.3 7.8.1). "The application is given control over the data type interpretation for
@@ -21,6 +24,7 @@
 #include <climits>
 #include <cfloat>
 #include <cmath>
+#include <limits>
 
 static constexpr UINT TARGETS = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT;
 static constexpr UINT SIDE = 4, SAMPLES = 4;
@@ -38,8 +42,12 @@ enum Mode {
   SampleFrequency,
   Geometry,
   Tessellation,
+  AlphaToCoverage,
+  CoverageOverridesAlpha,
   MODES
 };
+
+static const float alphas[] = {-INFINITY, -1, -0.0f, 0, 1, 2, INFINITY, std::numeric_limits<float>::quiet_NaN()};
 
 static const char hlsl[] = R"hlsl(
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -72,6 +80,9 @@ int4 out_int(float4 v) { return asint(v); }
 struct Outputs {
   TYPE0 colour : TARGET;
   TYPE1 other : OTHER_TARGET;
+#if COVERAGE_OUTPUT
+  uint coverage : SV_Coverage;
+#endif
 #if DEPTH
   float z : SV_Depth;
 #endif
@@ -85,7 +96,14 @@ Outputs ps(float4 pos : SV_Position
   uint sid = 0;
 #endif
   float4 v = float4((1 + ((uint)pos.x + sid) % 3) * 0.25, -0.5, 0.5, 1);
+#if ALPHA_COVERAGE
+  static const uint bits[] = {ALPHA_VALUES};
+  v.a = asfloat(bits[((uint)pos.y * SIDE + (uint)pos.x) % ALPHA_COUNT]);
+#endif
   Outputs o;
+#if COVERAGE_OUTPUT
+  o.coverage = ~0u;
+#endif
   o.colour = CONVERT0(v).CHANNELS;
   o.other = CONVERT1(float4(0.5, 0.25, 1, 0.75));
 #if DEPTH
@@ -129,6 +147,7 @@ format(Kind kind, UINT components) {
 // ideal output conversion and its tolerances, D3D11.3 3.2.3.4, 3.2.3.6 and 3.2.3.8
 static double
 scaled(Format f, float value, UINT channel) {
+  if (std::isnan(value)) value = 0;
   if (f.kind == Snorm)
     return std::clamp(double(value), -1.0, 1.0) * INT8_MAX;
   double v = std::clamp(double(value), 0.0, 1.0);
@@ -150,7 +169,7 @@ stored(Format f, float value, UINT channel) {
 static bool
 matches(Format f, UINT got, float value, UINT channel, bool sampled) {
   if (f.bits == sizeof(UINT) * CHAR_BIT)
-    return got == stored(f, value, channel);
+    return f.kind == Float && std::isnan(value) ? std::isnan(std::bit_cast<float>(got)) : got == stored(f, value, channel);
   double actual = f.kind == Snorm ? int(int8_t(got)) : int(got);
   double tolerance = D3D12_FLOAT32_TO_INTEGER_TOLERANCE_IN_ULP;
   if (sampled) {
@@ -168,7 +187,15 @@ defines(UINT kind, UINT slot, UINT mode) {
   const char *types[] = {"float", "int", "uint"}, *conversions[] = {"out_float", "out_int", "out_uint"};
   UINT components = mode == Fewer ? 1 : mode == Mask ? 2 : 4;
   std::string suffix = components == 1 ? "" : std::to_string(components);
-  return {std::string("TYPE0=") + types[kind] + suffix,
+  std::string alpha_values;
+  for (auto alpha : alphas) {
+    if (!alpha_values.empty()) alpha_values += ",";
+    alpha_values += std::to_string(std::bit_cast<UINT>(alpha)) + "u";
+  }
+  return {"ALPHA_COVERAGE=" + std::to_string(mode == AlphaToCoverage || mode == CoverageOverridesAlpha),
+          "COVERAGE_OUTPUT=" + std::to_string(mode == CoverageOverridesAlpha),
+          "ALPHA_COUNT=" + std::to_string(std::size(alphas)), "ALPHA_VALUES=" + alpha_values,
+          std::string("TYPE0=") + types[kind] + suffix,
           std::string("TYPE1=") + types[(kind + 1) % std::size(types)] + "4",
           std::string("CONVERT0=") + conversions[kind],
           std::string("CONVERT1=") + conversions[(kind + 1) % std::size(types)],
@@ -265,7 +292,8 @@ main(int argc, char **argv) {
         for (UINT slot = 0; slot < (mode ? 1 : TARGETS); slot++)
           for (UINT view = 0; view <= Uint; view++) {
             auto target_kind = Kind(cycle ? Uint - view : view);
-            bool dual = mode == Dual, multisample = mode == PixelFrequency || mode == SampleFrequency;
+            bool dual = mode == Dual, multisample = mode == PixelFrequency || mode == SampleFrequency ||
+                mode == AlphaToCoverage || mode == CoverageOverridesAlpha;
             if (dual && (target_kind == Sint || target_kind == Uint))
               continue;
             step("cycle %u, output %u, view %u, slot %u, mode %u", cycle, kind, target_kind, slot, mode);
@@ -312,12 +340,13 @@ main(int argc, char **argv) {
                 mode == Tessellation ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
             desc.SampleDesc = {samples, 0};
             desc.SampleMask = ~0u;
-            if (mode == PixelFrequency) {
+            if (mode == PixelFrequency || mode == AlphaToCoverage || mode == CoverageOverridesAlpha) {
               desc.SampleMask = 0;
               for (UINT s = 0; s < samples; s += 2)
                 desc.SampleMask |= 1u << s;
             }
             desc.BlendState.IndependentBlendEnable = !dual;
+            desc.BlendState.AlphaToCoverageEnable = mode == AlphaToCoverage || mode == CoverageOverridesAlpha;
             for (auto &rt : desc.BlendState.RenderTarget) {
               rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
               rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
@@ -453,9 +482,12 @@ main(int argc, char **argv) {
                 for (UINT x = 0; x < SIDE; x++)
                   for (UINT s = 0; s < samples; s++) {
                     float colour[] = {(1 + (x + (mode == SampleFrequency ? s : 0)) % 3) * 0.25f, -0.5f, 0.5f, 1};
+                    if (mode == AlphaToCoverage || mode == CoverageOverridesAlpha)
+                      colour[3] = alphas[(y * SIDE + x) % std::size(alphas)];
                     const float secondary[] = {0.5, 0.25, 1, 0.75};
                     for (UINT c = 0; c < formats[i].components; c++) {
                       bool written = (i || (blend.RenderTargetWriteMask >> c & 1)) && (desc.SampleMask >> s & 1);
+                      if (mode == AlphaToCoverage && !(colour[3] > 0)) written = false;
                       if (!i && c >= components && written)
                         continue;
                       float value = i ? secondary[c] : colour[c];

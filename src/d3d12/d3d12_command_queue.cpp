@@ -27,6 +27,7 @@
 #include "dxgi_interfaces.h"
 #include "log/log.hpp"
 #include "util_env.hpp"
+#include "mullion_capture.hpp"
 #include "mullion_diag.hpp"
 #include "mullion_command_constants.hpp"
 #include <atomic>
@@ -54,6 +55,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   WMT::Reference<WMT::CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
+  CaptureState capture_;
   // a Signal and a timestamp resolve wait here for a command buffer the completion thread is done with
   Reached retired_{};
 
@@ -263,7 +265,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::shared_ptr<GPURecordChecks> records{};
     HANDLE semaphore{};
     std::function<void()> completed{};
-    std::vector<std::pair<WMT::Reference<WMT::Buffer>, std::span<const uint32_t>>> omitted{};
+    std::vector<std::tuple<WMT::Reference<WMT::Buffer>, std::span<const uint32_t>, bool>> omitted{};
     // the timestamp queries the command buffer samples: the device's counter sample buffer it holds until it
     // completes, and where each sample taken is with the queries it is for
     WMT::Reference<WMT::CounterSampleBuffer> samples{};
@@ -450,13 +452,20 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         memcpy(resolve.to, &resolve.heap->timestamps[resolve.first], resolve.count * sizeof(uint64_t));
       }
       sample(inflight.sampled.size());
-      uint32_t omitted = 0;
+      uint32_t omitted[2] = {};
       if (inflight.cmdbuf.status() == WMTCommandBufferStatusCompleted)
-        for (auto &[buffer, words] : inflight.omitted)
+        for (auto &[buffer, words, scratch] : inflight.omitted)
           for (auto word : words)
-            omitted = std::max(omitted, word);
-      if (omitted)
-        WARN("Omitted indirect mesh draw (GS) because of too many object threadgroups (", omitted, ")");
+            omitted[scratch] = std::max(omitted[scratch], word);
+      if (omitted[0])
+        WARN("Omitted indirect mesh draw (GS) because of too many object threadgroups (", omitted[0], ")");
+      if (omitted[1]) {
+        for (auto budget = device_->so_scratch_budget.load();
+             omitted[1] > budget && !device_->so_scratch_budget.compare_exchange_weak(budget, omitted[1]);) {
+        }
+        ERR("Stream output from an indirect command needed ", omitted[1], " bytes of scratch, more than it had: the "
+            "command was not run, and lists recorded from now on have that much");
+      }
       for (auto &allocator : inflight.allocators)
         if (allocator)
           allocator->pending--;
@@ -600,10 +609,12 @@ public:
     auto metal_device = device_->GetMTLDevice();
     queue_ = metal_device.newCommandQueue(kCommandQueueSize);
     if (!queue_)
-      return E_FAIL;
+      return FAIL(E_FAIL);
     queue_.addResidencySet(device_->GetGlobalResidencySet());
 
     fence_ = metal_device.newFence();
+    // the work before the first present is frame 0, as Present numbers the work after it
+    capture_.frame(metal_device, 0);
     if (profile_) {
       UINT64 cpu, gpu;
       GetClockCalibration(&gpu, &cpu);
@@ -617,7 +628,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -1005,6 +1016,7 @@ public:
               stencil_info.clear_stencil = stencil_data.clear_stencil;
             }
             render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
+            render_pass_info.center_samples = data->center_samples;
             render_pass_info.render_target_array_length = data->render_target_array_length;
             render_pass_info.render_target_width = data->render_target_width;
             render_pass_info.render_target_height = data->render_target_height;
@@ -1031,14 +1043,15 @@ public:
               copy.waitForFence(fence_);
               size_t offset = 0;
               for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
-                copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset, omitted->words * sizeof(uint32_t));
-                offset += omitted->words * sizeof(uint32_t);
+                copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset * sizeof(uint32_t), omitted->words * sizeof(uint32_t));
+                scope.inflight->omitted.emplace_back(
+                    buffer, std::span(static_cast<const uint32_t *>(info.memory.get()) + offset, omitted->words),
+                    omitted->scratch
+                );
+                offset += omitted->words;
               }
               copy.updateFence(fence_);
               copy.endEncoding();
-              scope.inflight->omitted.emplace_back(
-                  std::move(buffer), std::span(static_cast<const uint32_t *>(info.memory.get()), count)
-              );
             }
           }
           auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
@@ -1380,7 +1393,7 @@ public:
       std::lock_guard<mullion::mutex> lock(mutex_commit_);
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
-        fence->Reach(Value);
+        fence->Signaled(Value);
       });
     };
     Trace("Signal of fence ", pFence, " to ", Value);
@@ -1393,7 +1406,7 @@ public:
   Wait(ID3D12Fence *pFence, UINT64 Value) {
     auto gate = std::make_shared<Gate>();
     gate->closed = true;
-    static_cast<MTLD3D12Fence *>(pFence)->Expect(Value, [gate] { gate->Open(); });
+    static_cast<MTLD3D12Fence *>(pFence)->completion->Expect(Value, [gate] { gate->Open(); });
     auto work = [this, gate] {
       gate_->closed.wait(true);
       {
@@ -1417,7 +1430,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   GetTimestampFrequency(UINT64 *pFrequency) {
     if (!pFrequency)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     *pFrequency = kGPUTimestampFrequency;
     return S_OK;
   };
@@ -1426,7 +1439,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) {
     if (!gpu_timestamp || !cpu_timestamp)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     LARGE_INTEGER before, after;
     uint64_t metal_cpu;
     QueryPerformanceCounter(&before);
@@ -1448,27 +1461,30 @@ public:
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain
   ) {
     if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     if (hWnd == GetDesktopWindow())
-      return E_ACCESSDENIED;
+      return FAIL(E_ACCESSDENIED);
     return mullion::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
   HRESULT
   Present(
-      IUnknown *swapchain, Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
-      uint64_t id, uint64_t number
-  ) {
+      IUnknown *swapchain, Presenter *presenter, ID3D12Resource *backbuffer, TextureViewKey view,
+      HANDLE hLantecyWaitable, double after, uint64_t id, uint64_t number, ID3D12Resource *previous,
+      std::vector<PresentCopy> copies
+  ) override {
     if (device_->NamesPasses()) {
       std::chrono::steady_clock::time_point unset;
       device_->first_present.compare_exchange_strong(unset, std::chrono::steady_clock::now());
     }
     auto state = presenter->synchronizeLayerProperties();
     if (Holding() &&
-        Hold([this, swapchain = Com(swapchain), presenter, backbuffer = Com(backbuffer), hLantecyWaitable, after, id,
-              number, state] { Commit(presenter, backbuffer.ptr(), state, hLantecyWaitable, after, id, number); }))
+        Hold([this, swapchain = Com(swapchain), presenter, backbuffer = Com(backbuffer), view, hLantecyWaitable, after,
+              id, number, state, previous = Com(previous), copies] {
+          Commit(presenter, backbuffer.ptr(), view, state, hLantecyWaitable, after, id, number, previous.ptr(), copies);
+        }))
       return S_OK;
-    return Commit(presenter, backbuffer, state, hLantecyWaitable, after, id, number);
+    return Commit(presenter, backbuffer, view, state, hLantecyWaitable, after, id, number, previous, copies);
   }
 
   void
@@ -1548,8 +1564,9 @@ public:
 
   HRESULT
   Commit(
-      Presenter *presenter, ID3D12Resource *backbuffer, const Presenter::PresentState &state, HANDLE hLantecyWaitable,
-      double after, uint64_t id, uint64_t number
+      Presenter *presenter, ID3D12Resource *backbuffer, TextureViewKey shown, const Presenter::PresentState &state,
+      HANDLE hLantecyWaitable, double after, uint64_t id, uint64_t number, ID3D12Resource *previous,
+      const std::vector<PresentCopy> &copies
   ) {
     Trace("Present");
     auto scope = StartCommitting();
@@ -1559,9 +1576,28 @@ public:
 
     auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
     auto &view = g->texture->view(g->texture->fullView);
+    if (!copies.empty()) {
+      auto p = reinterpret_cast<MTLD3D12Resource *>(previous);
+      auto blit = cmdbuf.blitCommandEncoder();
+      blit.waitForFence(fence_);
+      for (auto [to, from] : copies)
+        for (uint32_t eye = 0; eye < g->texture->arrayLength(); eye++) {
+          wmtcmd_blit_copy_from_texture_to_texture copy{.type = WMTBlitCommandCopyFromTextureToTexture};
+          copy.src = p->texture->view(p->texture->fullView).texture.handle;
+          copy.src_slice = eye;
+          copy.src_origin = {uint32_t(to.left + from.x), uint32_t(to.top + from.y), 0};
+          copy.src_size = {uint32_t(to.right - to.left), uint32_t(to.bottom - to.top), 1};
+          copy.dst = view.texture.handle;
+          copy.dst_slice = eye;
+          copy.dst_origin = {uint32_t(to.left), uint32_t(to.top), 0};
+          blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
+        }
+      blit.updateFence(fence_);
+      blit.endEncoding();
+    }
 
     auto drawable = presenter->encodeCommands(
-        cmdbuf, view.texture, state,
+        cmdbuf, g->texture->view(shown).texture, state,
         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
     );
@@ -1576,6 +1612,8 @@ public:
       DumpFrame(backbuffer, *scope.inflight, id, number);
     scope.inflight->semaphore = hLantecyWaitable;
     scope.inflight->presents = true;
+    // the work after this present is frame number + 1
+    capture_.frame(device_->GetMTLDevice(), number + 1);
 
     return S_OK;
   }

@@ -163,6 +163,8 @@ PipelineRuns(Head head, Name name) {
       case WMTComputeCommandDispatchIndirect:
       case WMTComputeCommandDispatchThreads:
       case WMTComputeCommandDispatchPart:
+      case WMTComputeCommandExecuteCommandsInBuffer:
+      case WMTComputeCommandExecuteCommandsInBufferIndirect:
         calls++;
         break;
       default:

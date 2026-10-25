@@ -280,8 +280,12 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
       {{&true_data}, WMTDataTypeBool, kPresentFCIndex_BackbufferSizeMatched},
       {{is_pq ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_HDRPQ},
       {{with_hdr_metadata ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_WithHDRMetadata},
-      {{Is_sRGBVariant(ConvertSwapChainFormat(source_format_)) ? &true_data : &false_data}, WMTDataTypeBool,
-       kPresentFCIndex_BackbufferIsSRGB},
+      // linear values the target takes as sRGB bytes: an sRGB back buffer's, or a linear color space's in a GDI
+      // bitmap, where an sRGB target's own encoding misses D3D11.3 3.2.3.8 by up to 0.8 of a code
+      {{Is_sRGBVariant(ConvertSwapChainFormat(source_format_)) || (!layer_ && colorspace_ & WMTColorSpaceSRGBLinear)
+            ? &true_data
+            : &false_data},
+       WMTDataTypeBool, kPresentFCIndex_BackbufferIsSRGB},
       {{is_ms ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_BackbufferIsMS},
       {{gamma_enable ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_GammaEnabled},
       {{source_format_ == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM ? &true_data : &false_data}, WMTDataTypeBool,

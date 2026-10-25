@@ -996,12 +996,20 @@ convert_dxbc_tesselator_domain_shader(
     func_signature.DefineMeshVertexOutput(air::OutputPointSize {});
   }
 
-  if (pShaderInternal->clip_distance_scalars.size() > 0) {
+  // the clip distances, or as varyings after the stage's own
+  bool clip_varyings = gs_passthrough && gs_passthrough->ClipDistanceVaryings;
+  uint32_t clip_data = pShaderInternal->num_mesh_vertex_data;
+  for (uint32_t i = 0; clip_varyings && i < pShaderInternal->clip_distance_scalars.size(); i++)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = clip_varying_name(i), .type = air::msl_float, .index = clip_data + i}
+    );
+  if (!clip_varyings && pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
     );
   }
 
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, rasterization_disabled);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -1021,6 +1029,7 @@ convert_dxbc_tesselator_domain_shader(
       },
       builder, nulldbg
   );
+  air.RasterScale = function->getArg(raster_scale);
 
   setup_metal_version(module, metal_version);
   setup_temp_register(shader_info, resource_map, types, module, builder);
@@ -1108,9 +1117,11 @@ convert_dxbc_tesselator_domain_shader(
         llvm::ArrayType::get(types._float4, max_output_register), resource_map.output.ptr_float4,
         {builder.getInt32(0), builder.getInt32(x.value().reg), builder.getInt32(x.value().component)}
     );
-    air.CreateSetMeshClipDistance(
-        vertex_id, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr)
-    );
+    auto distance = builder.CreateLoad(types._float, src_ptr);
+    if (clip_varyings)
+      air.CreateSetMeshVertexData(vertex_id, clip_data + x.index(), distance);
+    else
+      air.CreateSetMeshClipDistance(vertex_id, builder.getInt32(x.index()), distance);
   }
 
   if (behind) {

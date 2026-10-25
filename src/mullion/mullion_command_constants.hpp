@@ -14,6 +14,9 @@ constexpr CONSTANT auto kCustomBufferArgumentIndex0 = 30;
 constexpr CONSTANT auto kCustomBufferArgumentIndex1 = 29;
 constexpr CONSTANT auto kSparseBufferArgumentIndex = kCustomBufferArgumentIndex1 - 1;
 
+// D3D11.3 19.1.3.1 defines D24_UNORM_S8_UINT with 24 normalized depth bits.
+constexpr CONSTANT auto kD24UnormMax = (1u << 24) - 1;
+
 struct RGB32CopyLayout {
   sm50_sparse_qword src_row, src_image, dst_row, dst_image;
 };
@@ -31,8 +34,14 @@ struct PipelineStatisticsDraw {
   sm50_sparse_qword first, step, cut, threads;
 };
 
+// the counts the shaders add to are at their SM50_PIPELINE_STATISTIC words
 struct PipelineStatisticsResult {
   sm50_sparse_qword pixels, primitives, vertices;
+  sm50_sparse_qword gs_invocations, gs_primitives, rasterized, gs_inputs;
+};
+
+struct PipelineStatisticsDispatch {
+  sm50_sparse_qword invocations, threads;
 };
 
 constexpr CONSTANT auto kPresentFCIndex_BackbufferSizeMatched = 0x100;

@@ -65,7 +65,11 @@ def main():
     parser.add_argument("--frames", type=int, default=216, help="frames to draw (default: %(default)s, the scene's nine phases)")
     parser.add_argument("--seconds", type=int, default=600, help="the most a run may take (default: %(default)s)")
     args = parser.parse_args()
-    builds, binary, base = run.environment(args)
+    with run.session(args) as runtime:
+        compare(args, *runtime)
+
+
+def compare(args, builds, binary, base):
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     windows = next(args.godot.glob("Godot_v*_win64.exe")).resolve()

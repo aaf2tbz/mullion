@@ -142,7 +142,7 @@ int main() {
                 if (indirect) {
                   D3D11_DRAW_INSTANCED_INDIRECT_ARGS draw{count, instances};
                   D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS draw_indexed{count, instances};
-                  D3D11_BUFFER_DESC desc{UINT(indexed ? sizeof(draw_indexed) : sizeof(draw)), D3D11_USAGE_IMMUTABLE, 0,
+                  D3D11_BUFFER_DESC desc{UINT(indexed ? sizeof(draw_indexed) : sizeof(draw)), D3D11_USAGE_DEFAULT, 0,
                                          0, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS};
                   D3D11_SUBRESOURCE_DATA data{indexed ? (const void *)&draw_indexed : &draw};
                   ComPtr<ID3D11Buffer> arguments;

@@ -2,7 +2,9 @@
 // in its specification; an engine reads the report at start-up and makes those calls, and each one succeeds:
 // - a feature level (D3D12_FEATURE_FEATURE_LEVELS) creates a device, as does every level below it, and has what its
 //   column of the feature level table requires (Microsoft Learn, "Hardware Feature Levels"; DirectX-Specs,
-//   "Direct3D feature level 12_2");
+//   "Direct3D feature level 12_2"), and 11_0's formats resolve the 32-bit floats ("Multisample Resolve: hardware
+//   support required" for R32_FLOAT, R32G32_FLOAT and R32G32B32A32_FLOAT, Microsoft Learn, "Format support for
+//   Direct3D Feature Level 11.0 hardware");
 // - a shader model (D3D12_FEATURE_SHADER_MODEL) is the answer to every model asked for at or above it, a lower
 //   model asked for is answered with itself (D3D12_FEATURE_DATA_SHADER_MODEL), and a compute shader of each model up
 //   to it makes a pipeline;
@@ -21,7 +23,10 @@
 // - typed UAV loads of additional formats are reported for the formats that are "supported as a set" (Microsoft
 //   Learn, "Typed unordered access view (UAV) loads");
 // - resource heap tier 2 has one heap for buffers, textures and render targets (D3D12_RESOURCE_HEAP_TIER), a tiled
-//   resources tier has reserved resources (D3D12_TILED_RESOURCES_TIER), root signature 1.1 makes a 1.1 signature;
+//   resources tier has reserved resources (D3D12_TILED_RESOURCES_TIER), of "all formats that would be available for
+//   the given configuration regardless of it being tiled" but those with stencil (D3D11.3 5.9.2.3, 5.9.2.5.1), which
+//   for the depth formats D16_UNORM and D32_FLOAT is a reserved depth target, and the formats report it (TILED); root
+//   signature 1.1 makes a 1.1 signature;
 // - a buffer's GPU address and size lie inside the reported address bits;
 // - output merger logic ops, a shader specified stencil reference, rasterizer ordered views and a render target
 //   array index from the vertex shader each make a pipeline that uses them (D3D12_FEATURE_DATA_D3D12_OPTIONS).
@@ -130,6 +135,12 @@ main(int argc, char **argv) {
   for (auto &r : required)
     expect(level.MaxSupportedFeatureLevel < r.level || r.has, "feature level %x reported without %s",
            level.MaxSupportedFeatureLevel, r.what);
+  for (auto format : {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT}) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    expect(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)) == S_OK &&
+               (support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE),
+           "feature level 11_0 reported without resolves of format %u", format);
+  }
 
   // a root signature with one parameter of each kind an indirect argument can change
   D3D12_ROOT_PARAMETER parameters[4] = {{D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS}, {D3D12_ROOT_PARAMETER_TYPE_CBV},
@@ -315,6 +326,19 @@ main(int argc, char **argv) {
     ComPtr<ID3D12Resource> reserved;
     HRESULT hr = device->CreateReservedResource(&reserved_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&reserved));
     expect(hr == S_OK, "CreateReservedResource: %08lx", hr);
+    for (auto format : {DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT}) {
+      step("tiled resources tier %u: a reserved depth target of format %u", options.TiledResourcesTier, format);
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+      expect(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)) == S_OK &&
+                 (support.Support2 & D3D12_FORMAT_SUPPORT2_TILED),
+             "format support: Support2 %x", support.Support2);
+      auto depth_desc = reserved_desc;
+      depth_desc.Format = format;
+      depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+      ComPtr<ID3D12Resource> depth;
+      hr = device->CreateReservedResource(&depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr, IID_PPV_ARGS(&depth));
+      expect(hr == S_OK, "CreateReservedResource: %08lx", hr);
+    }
   }
   if (root_version.HighestVersion >= D3D_ROOT_SIGNATURE_VERSION_1_1) {
     step("root signature 1.1: a signature of that version, with a static descriptor range");

@@ -190,6 +190,7 @@ struct MTL_RENDER_TARGET_DESC {
   UINT DepthPlane;
   UINT RenderTargetArrayLength;
   UINT Flags;
+  DXGI_FORMAT DepthFormat = DXGI_FORMAT_UNKNOWN;
   bool operator==(const MTL_RENDER_TARGET_DESC &) const = default;
 };
 

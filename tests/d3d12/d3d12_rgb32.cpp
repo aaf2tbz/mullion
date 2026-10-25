@@ -1,10 +1,13 @@
-// contract: RGB32 texture copies and CPU subresource transfers retain all 96 bits per texel.
+// contract: RGB32 texture copies retain all 96 bits per texel; CPU subresource methods refuse 12-byte elements.
 // "but the raw value of memory happens to be equal" (D3D11.3 5.6.2); CopyTextureRegion performs no conversion.
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-copytextureregion
 // expected bytes are the supplied data, and footprint pitches come from GetCopyableFootprints. a typed buffer
 // view's out-of-bounds ld "returns 0 in all components present in the format of the resource, and the defaults
 // (0,0,0,1)" (D3D11.3 22.4.7, ld2dms), and Buffer is required of R32G32B32 (Format support for Direct3D Feature
 // Level 11.0 hardware).
+// DirectX-Specs ResourceHeaps, Map and Unmap / Strip-mine CPU copy operations, excludes element sizes that are
+// not powers of two from opaque Map and CPU subresource copies.
+// https://microsoft.github.io/DirectX-Specs/d3d/ResourceHeaps.html
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <array>
@@ -24,7 +27,10 @@ RWStructuredBuffer<uint4> result : register(u0);
 cbuffer Layout : register(b0) { uint width, height, mip, slice, base; };
 [numthreads(1,1,1)] void cs(uint3 id : SV_DispatchThreadID) {
 #if DIM == 0
+  // each of these loads takes some components alone: green, then red and alpha, then blue
   TYPE value = tex.Load(id.x);
+  value.xw = tex.Load(id.x + mip).xw;
+  value.z = tex.Load(id.x + 2 * mip).z;
 #elif DIM == 1
   TYPE value = tex.Load(int3(id.x,slice,mip));
 #elif DIM == 2
@@ -369,18 +375,14 @@ int main(int argc, char **argv) {
               source[b] = uint8_t(b * 13 + sub + 201);
             step("RGB32 format %u dimension %u width %u sub %u box %u: CPU read/write", format, dimension, width, sub,
                  boxed);
-            CHECK(cpu_texture->Map(sub, nullptr, nullptr));
-            CHECK(cpu_texture->WriteToSubresource(sub, boxed ? &box : nullptr, source.data(), row, image));
-            CHECK(cpu_texture->ReadFromSubresource(destination.data(), row, image, sub, boxed ? &box : nullptr));
-            cpu_texture->Unmap(sub, nullptr);
-            bool same = true;
-            for (UINT z = 0; z < deep; z++)
-              for (UINT b = 0; b < image; b++) {
-                const bool payload = b < row * high && b % row < wide * texel;
-                same &= destination[z * image + b] == (payload ? source[z * image + b] : 0);
-              }
-            if (!expect(same, "RGB32 CPU subresource lost bytes"))
-              return verdict();
+            HRESULT mapped_cpu = cpu_texture->Map(sub, nullptr, nullptr);
+            expect(FAILED(mapped_cpu), "RGB32 opaque Map accepts a non-power-of-two element size");
+            expect(FAILED(cpu_texture->WriteToSubresource(sub, boxed ? &box : nullptr, source.data(), row, image)),
+                   "RGB32 CPU write accepts a non-power-of-two element size");
+            expect(FAILED(cpu_texture->ReadFromSubresource(destination.data(), row, image, sub, boxed ? &box : nullptr)),
+                   "RGB32 CPU read accepts a non-power-of-two element size");
+            if (SUCCEEDED(mapped_cpu))
+              cpu_texture->Unmap(sub, nullptr);
           }
         }
       }

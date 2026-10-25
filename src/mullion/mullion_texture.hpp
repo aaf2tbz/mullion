@@ -293,6 +293,8 @@ public:
   }
   // the most detailed level a shader samples (ID3D11DeviceContext::SetResourceMinLOD), as of the commands encoded
   float minLOD = 0;
+  // its samples all lie at the pixel center (D3D11_CENTER_MULTISAMPLE_PATTERN, D3D11.3 19.2.4.1)
+  bool centered = false;
 
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset = 0);

@@ -9,6 +9,9 @@
 // span several object threadgroups and the draws two instances, and the expectations are the same shaders run on the
 // CPU. a statistics query per stream counts the primitives written and those that would have been. the stream points
 // and the vertex shader's points, drawn again from many vertices, span thousands of object threadgroups.
+// the indirect build repeats these byte, filled-size, statistics and pixel checks through ExecuteIndirect's DRAW operation:
+// "for(UINT CommandIndex = 0; CommandIndex < MaxCommandCount; CommandIndex++)" (Microsoft Learn, ExecuteIndirect).
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-executeindirect
 #include "d3d12_test.hpp"
 #include <array>
 #include <cstdint>
@@ -60,6 +63,11 @@ void gs_streams(point V v[1], inout PointStream<P> s0, inout PointStream<P> s1) 
 
 int
 main(int argc, char **argv) {
+#ifdef MULLION_TEST_INDIRECT_STREAM_OUTPUT
+  constexpr bool indirect = true;
+#else
+  constexpr bool indirect = false;
+#endif
   Compiler compiler;
   if (!front_end(argc, argv, compiler)) {
     printf("skipped: dxcompiler.dll not found\n");
@@ -184,8 +192,10 @@ main(int argc, char **argv) {
   CHECK(upload->Map(0, nullptr, (void **)&init));
   std::fill_n(reinterpret_cast<uint32_t *>(init), filled_at / 4, sentinel);
   // filled sizes: the strip slots (slot 0 past a triangle), the small slot, the two streams, the vertex shader's, the
-  // many points'
-  const UINT64 filled[9] = {start0};
+  // many points'. each is "a 32-bit quantity" (Microsoft Learn, Stream Output Counters), and the word after it a guard
+  uint32_t filled[2 * 9];
+  for (UINT i = 0; i < 9; i++)
+    filled[2 * i] = i ? 0 : start0, filled[2 * i + 1] = sentinel;
   memcpy(init + filled_at, filled, sizeof(filled));
 
   ComPtr<ID3D12CommandQueue> queue;
@@ -195,6 +205,31 @@ main(int argc, char **argv) {
   CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
   CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
   CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), strips_pso.Get(), IID_PPV_ARGS(&list)));
+  enum { Points, ManyPoints, Strip };
+  const D3D12_DRAW_ARGUMENTS arguments[] = {{points, instances, 0, 0}, {many_points, instances, 0, 0},
+                                           {strip_vertices, 1, 0, 0}};
+  ComPtr<ID3D12Resource> argument_buffer;
+  ComPtr<ID3D12CommandSignature> signature;
+  if (indirect) {
+    argument_buffer = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(arguments), D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!expect(argument_buffer != nullptr, "indirect argument buffer"))
+      return verdict();
+    void *mapped;
+    CHECK(argument_buffer->Map(0, nullptr, &mapped));
+    memcpy(mapped, arguments, sizeof(arguments));
+    argument_buffer->Unmap(0, nullptr);
+    D3D12_INDIRECT_ARGUMENT_DESC operation{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+    D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(arguments[0]), 1, &operation};
+    CHECK(device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)));
+  }
+  auto draw = [&](UINT kind) {
+    step("%s stream output, argument set %u", indirect ? "indirect" : "direct", kind);
+    const auto &a = arguments[kind];
+    if (indirect)
+      list->ExecuteIndirect(signature.Get(), 1, argument_buffer.Get(), kind * sizeof(a), nullptr, 0);
+    else
+      list->DrawInstanced(a.VertexCountPerInstance, a.InstanceCount, a.StartVertexLocation, a.StartInstanceLocation);
+  };
   list->CopyBufferRegion(out.Get(), 0, upload.Get(), 0, total);
   transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
   auto base = out->GetGPUVirtualAddress();
@@ -211,21 +246,21 @@ main(int argc, char **argv) {
   // two draws append; the third, slot 0 still appending, overflows the small slot 1 after `fits` triangles
   D3D12_STREAM_OUTPUT_BUFFER_VIEW strip_views[] = {view(slot0_at, slot0_bytes, 0), view(slot1_at, slot1_bytes, 1)};
   list->SOSetTargets(0, 2, strip_views);
-  list->DrawInstanced(points, instances, 0, 0);
-  list->DrawInstanced(points, instances, 0, 0);
+  draw(Points);
+  draw(Points);
   D3D12_STREAM_OUTPUT_BUFFER_VIEW small_views[] = {view(slot0_at, slot0_bytes, 0), view(small_at, small_bytes, 2)};
   list->SOSetTargets(0, 2, small_views);
-  list->DrawInstanced(points, instances, 0, 0);
+  draw(Points);
   list->EndQuery(statistics.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
   list->SetPipelineState(streams_pso.Get());
   D3D12_STREAM_OUTPUT_BUFFER_VIEW stream_views[] = {view(stream0_at, stream_bytes, 3), view(stream1_at, stream_bytes, 4)};
   list->SOSetTargets(0, 2, stream_views);
   list->BeginQuery(statistics.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1);
-  list->DrawInstanced(points, instances, 0, 0);
+  draw(Points);
   list->EndQuery(statistics.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1);
   D3D12_STREAM_OUTPUT_BUFFER_VIEW many_views[] = {view(many0_at, 4 * many0.size(), 6), view(many1_at, 4 * many1.size(), 7)};
   list->SOSetTargets(0, 2, many_views);
-  list->DrawInstanced(many_points, instances, 0, 0);
+  draw(ManyPoints);
   list->ResolveQueryData(statistics.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 2, statistics_out.Get(), 0);
   // the vertex shader alone, into one buffer: the strip, drawn too, then the points
   ComPtr<ID3D12Resource> target;
@@ -251,13 +286,13 @@ main(int argc, char **argv) {
   list->SOSetTargets(0, 1, &alone_view);
   list->SetPipelineState(alone_strip_pso.Get());
   list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-  list->DrawInstanced(strip_vertices, 1, 0, 0);
+  draw(Strip);
   list->SetPipelineState(alone_points_pso.Get());
   list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
-  list->DrawInstanced(points, instances, 0, 0);
+  draw(Points);
   D3D12_STREAM_OUTPUT_BUFFER_VIEW many_alone_view = view(many_alone_at, many_alone_bytes, 8);
   list->SOSetTargets(0, 1, &many_alone_view);
-  list->DrawInstanced(many_points, instances, 0, 0);
+  draw(ManyPoints);
   transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->CopyBufferRegion(readback.Get(), 0, out.Get(), 0, total);
   transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -266,75 +301,88 @@ main(int argc, char **argv) {
       pixels_src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
   pixels_dst.PlacedFootprint = {0, {DXGI_FORMAT_R32_UINT, size, size, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}};
   list->CopyTextureRegion(&pixels_dst, 0, 0, 0, &pixels_src, nullptr);
-  CHECK(submit(device.Get(), queue.Get(), list.Get()));
-  uint8_t *got;
-  CHECK(readback->Map(0, nullptr, (void **)&got));
+  transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  CHECK(list->Close());
+  for (UINT replay : {0u, 1u, 2u}) {
+    step("multiple stream-output draws in one pass, replay %u", replay);
+    CHECK(forget(readback.Get()));
+    CHECK(forget(statistics_out.Get()));
+    CHECK(forget(pixels.Get()));
+    CHECK(execute(device.Get(), queue.Get(), list.Get()));
+    uint8_t *got;
+    CHECK(readback->Map(0, nullptr, (void **)&got));
 
-  unsigned failures = 0;
-  auto expect = [&](const char *what, uint64_t value, uint64_t want) {
-    if (value != want && failures++ < 12)
-      printf("%s: %#llx, want %#llx\n", what, (unsigned long long)value, (unsigned long long)want);
-  };
-  auto word = [&](UINT64 at) { return *reinterpret_cast<const uint32_t *>(got + at); };
-  auto filled_size = [&](UINT index) { return *reinterpret_cast<const uint64_t *>(got + filled_at + 8 * index); };
-  // the strip slots: the first two draws' triangles twice after the one already there, then the third draw's
-  // `fits` (its slot 1 was full after them, which stops slot 0 too)
-  const UINT64 written = triangles.size() * 2 + fits;
-  for (UINT64 v = 0; v < 3 * (written + 1); v++) {
-    UINT64 n = v / 3 - 1;
-    bool before = v < 3;
-    auto &want = triangles[before ? 0 : n % triangles.size()][v % 3];
-    UINT64 at = slot0_at + v * strip_strides[0];
-    expect("slot 0 x", word(at), before ? sentinel : want[0]);
-    expect("slot 0 y", word(at + 4), before ? sentinel : want[1]);
-    expect("slot 0 gap", word(at + 8), sentinel);
-    expect("slot 0 w", word(at + 12), before ? sentinel : want[3]);
-    expect("slot 0 past the elements", word(at + 16), sentinel);
-  }
-  for (UINT64 v = 0; v < 3 * triangles.size() * 2; v++) {
-    expect("slot 1 z", word(slot1_at + v * strip_strides[1]), triangles[v / 3 % triangles.size()][v % 3][2]);
-    expect("slot 1 past the element", word(slot1_at + v * strip_strides[1] + 4), sentinel);
-  }
-  for (UINT64 v = 0; v < 3 * fits; v++)
-    expect("small slot z", word(small_at + v * strip_strides[1]), triangles[v / 3][v % 3][2]);
-  expect("small slot past the fit", word(small_at + 3 * fits * strip_strides[1]), sentinel);
-  expect("slot 0 filled", filled_size(0), start0 + 3 * strip_strides[0] * written);
-  expect("slot 1 filled", filled_size(1), 3 * strip_strides[1] * triangles.size() * 2);
-  expect("small slot filled", filled_size(2), 3 * strip_strides[1] * fits);
-  for (size_t v = 0; v < stream0.size(); v++)
-    expect("stream 0", word(stream0_at + 4 * v), stream0[v]);
-  for (size_t v = 0; v < stream1.size(); v++)
-    expect("stream 1", word(stream1_at + 4 * v), stream1[v]);
-  expect("stream 0 filled", filled_size(3), 4 * stream0.size());
-  expect("stream 1 filled", filled_size(4), 4 * stream1.size());
-  for (size_t v = 0; v < alone.size(); v++)
-    for (int c = 0; c < 4; c++)
-      expect("vertex shader alone", word(alone_at + 16 * v + 4 * c), alone[v][c]);
-  expect("vertex shader alone filled", filled_size(5), alone_bytes);
-  for (size_t v = 0; v < many0.size(); v++)
-    expect("many points, stream 0", word(many0_at + 4 * v), many0[v]);
-  for (size_t v = 0; v < many1.size(); v++)
-    expect("many points, stream 1", word(many1_at + 4 * v), many1[v]);
-  for (size_t v = 0; v < many_alone.size(); v++)
-    for (int c = 0; c < 4; c++)
-      expect("many points, vertex shader alone", word(many_alone_at + 16 * v + 4 * c), many_alone[v][c]);
-  expect("many points, stream 0 filled", filled_size(6), 4 * many0.size());
-  expect("many points, stream 1 filled", filled_size(7), 4 * many1.size());
-  expect("many points, vertex shader alone filled", filled_size(8), many_alone_bytes);
-  D3D12_QUERY_DATA_SO_STATISTICS *counted;
-  CHECK(statistics_out->Map(0, nullptr, (void **)&counted));
-  expect("stream 0 primitives written", counted[0].NumPrimitivesWritten, written);
-  expect("stream 0 primitives needed", counted[0].PrimitivesStorageNeeded, 3 * triangles.size());
-  expect("stream 1 primitives written", counted[1].NumPrimitivesWritten, stream1.size());
-  expect("stream 1 primitives needed", counted[1].PrimitivesStorageNeeded, stream1.size());
-  uint8_t *drawn;
-  CHECK(pixels->Map(0, nullptr, (void **)&drawn));
-  for (UINT y = 0; y < size; y++)
-    for (UINT x = 0; x < size; x++)
-      expect("drawn pixel", reinterpret_cast<const uint32_t *>(drawn + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * y)[x], 1);
-  if (failures) {
-    printf("failed: %u wrong values\n", failures);
-    return 1;
+    unsigned failures = 0;
+    auto expect = [&](const char *what, uint64_t value, uint64_t want) {
+      if (value != want && failures++ < 12)
+        printf("%s: %#llx, want %#llx\n", what, (unsigned long long)value, (unsigned long long)want);
+    };
+    auto word = [&](UINT64 at) { return *reinterpret_cast<const uint32_t *>(got + at); };
+    auto filled_size = [&](UINT index) { return word(filled_at + 8 * index); };
+    // the strip slots: the first two draws' triangles twice after the one already there, then the third draw's
+    // `fits` (its slot 1 was full after them, which stops slot 0 too)
+    const UINT64 written = triangles.size() * 2 + fits;
+    for (UINT64 v = 0; v < 3 * (written + 1); v++) {
+      UINT64 n = v / 3 - 1;
+      bool before = v < 3;
+      auto &want = triangles[before ? 0 : n % triangles.size()][v % 3];
+      UINT64 at = slot0_at + v * strip_strides[0];
+      expect("slot 0 x", word(at), before ? sentinel : want[0]);
+      expect("slot 0 y", word(at + 4), before ? sentinel : want[1]);
+      expect("slot 0 gap", word(at + 8), sentinel);
+      expect("slot 0 w", word(at + 12), before ? sentinel : want[3]);
+      expect("slot 0 past the elements", word(at + 16), sentinel);
+    }
+    for (UINT64 v = 0; v < 3 * triangles.size() * 2; v++) {
+      expect("slot 1 z", word(slot1_at + v * strip_strides[1]), triangles[v / 3 % triangles.size()][v % 3][2]);
+      expect("slot 1 past the element", word(slot1_at + v * strip_strides[1] + 4), sentinel);
+    }
+    for (UINT64 v = 0; v < 3 * fits; v++)
+      expect("small slot z", word(small_at + v * strip_strides[1]), triangles[v / 3][v % 3][2]);
+    expect("small slot past the fit", word(small_at + 3 * fits * strip_strides[1]), sentinel);
+    expect("slot 0 filled", filled_size(0), start0 + 3 * strip_strides[0] * written);
+    expect("slot 1 filled", filled_size(1), 3 * strip_strides[1] * triangles.size() * 2);
+    expect("small slot filled", filled_size(2), 3 * strip_strides[1] * fits);
+    for (size_t v = 0; v < stream0.size(); v++)
+      expect("stream 0", word(stream0_at + 4 * v), stream0[v]);
+    for (size_t v = 0; v < stream1.size(); v++)
+      expect("stream 1", word(stream1_at + 4 * v), stream1[v]);
+    expect("stream 0 filled", filled_size(3), 4 * stream0.size());
+    expect("stream 1 filled", filled_size(4), 4 * stream1.size());
+    for (size_t v = 0; v < alone.size(); v++)
+      for (int c = 0; c < 4; c++)
+        expect("vertex shader alone", word(alone_at + 16 * v + 4 * c), alone[v][c]);
+    expect("vertex shader alone filled", filled_size(5), alone_bytes);
+    for (size_t v = 0; v < many0.size(); v++)
+      expect("many points, stream 0", word(many0_at + 4 * v), many0[v]);
+    for (size_t v = 0; v < many1.size(); v++)
+      expect("many points, stream 1", word(many1_at + 4 * v), many1[v]);
+    for (size_t v = 0; v < many_alone.size(); v++)
+      for (int c = 0; c < 4; c++)
+        expect("many points, vertex shader alone", word(many_alone_at + 16 * v + 4 * c), many_alone[v][c]);
+    expect("many points, stream 0 filled", filled_size(6), 4 * many0.size());
+    expect("many points, stream 1 filled", filled_size(7), 4 * many1.size());
+    expect("many points, vertex shader alone filled", filled_size(8), many_alone_bytes);
+    for (UINT i = 0; i < 9; i++)
+      expect("word after a filled size", word(filled_at + 8 * i + 4), sentinel);
+    D3D12_QUERY_DATA_SO_STATISTICS *counted;
+    CHECK(statistics_out->Map(0, nullptr, (void **)&counted));
+    expect("stream 0 primitives written", counted[0].NumPrimitivesWritten, written);
+    expect("stream 0 primitives needed", counted[0].PrimitivesStorageNeeded, 3 * triangles.size());
+    expect("stream 1 primitives written", counted[1].NumPrimitivesWritten, stream1.size());
+    expect("stream 1 primitives needed", counted[1].PrimitivesStorageNeeded, stream1.size());
+    uint8_t *drawn;
+    CHECK(pixels->Map(0, nullptr, (void **)&drawn));
+    for (UINT y = 0; y < size; y++)
+      for (UINT x = 0; x < size; x++)
+        expect("drawn pixel", reinterpret_cast<const uint32_t *>(drawn + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * y)[x], 1);
+    readback->Unmap(0, nullptr);
+    statistics_out->Unmap(0, nullptr);
+    pixels->Unmap(0, nullptr);
+    if (failures) {
+      printf("failed: %u wrong values\n", failures);
+      return 1;
+    }
   }
   printf("passed: %zu triangles per draw, %zu + %zu stream points, %zu vertices without a geometry shader\n",
          triangles.size(), stream0.size(), stream1.size(), alone.size());

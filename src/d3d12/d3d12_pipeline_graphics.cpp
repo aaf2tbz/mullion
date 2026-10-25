@@ -269,7 +269,7 @@ MTLD3D12PipelineState::InitializeShader(
   using namespace microsoft;
   if (!ShaderContainerHolds(Bytecode.pShaderBytecode, Bytecode.BytecodeLength) ||
       !ShaderFeaturesSupported(Device, Bytecode.pShaderBytecode, Bytecode.BytecodeLength))
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   SM50Error error;
   if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
@@ -278,7 +278,7 @@ MTLD3D12PipelineState::InitializeShader(
         ": ", SM50GetErrorMessageString(error)
     );
     DumpShaders({Bytecode});
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   }
 
   return S_OK;
@@ -304,7 +304,7 @@ GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
   if (desc.pRootSignature) {
     static_cast<MTLD3D12RootSignature *>(desc.pRootSignature)->GetBlob(&root);
     if (FAILED(microsoft::DXBCGetRootSignature(root, &root, &root_size)))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
   }
   bytes(root, root_size);
   constexpr bool compute = std::is_same_v<Desc, D3D12_COMPUTE_PIPELINE_STATE_DESC>;
@@ -319,7 +319,7 @@ GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
     if (count > std::size(formats) || layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
         (layout.NumElements && !layout.pInputElementDescs) || (so.NumEntries && !so.pSODeclaration) ||
         so.NumStrides > D3D12_SO_BUFFER_SLOT_COUNT || (so.NumStrides && !so.pBufferStrides))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     for (auto shader : {vs, ps, ds, hs, gs, as, ms})
       bytes(shader.pShaderBytecode, shader.BytecodeLength);
     hash(depth_bounds, so.NumEntries, so.NumStrides, so.RasterizedStream);
@@ -350,7 +350,7 @@ GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
     for (UINT i = 0; i < layout.NumElements; i++) {
       auto &[name, index, format, slot, offset, classification, rate] = layout.pInputElementDescs[i];
       if (!name)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       bytes(name, strlen(name) + 1);
       hash(index, format, slot, offset, classification, rate);
     }
@@ -359,7 +359,7 @@ GetPipelineKey(const Desc &desc, Sha1Digest &key, bool depth_bounds = false,
     bytes(formats, count * sizeof(*formats));
   }
   key = h.final();
-  return valid ? S_OK : E_INVALIDARG;
+  return valid ? S_OK : FAIL(E_INVALIDARG);
 }
 
 HRESULT
@@ -402,8 +402,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
-      auto &[next, type, mask, dual, depth, unorm, formats, statistics] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
-      hash(mask, dual, depth, unorm, formats, statistics);
+      auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips] =
+          *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -416,8 +417,13 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
-      auto &[next, type, strip, cut, index, primitive, pass] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
-      hash(strip, cut, index, primitive, pass);
+      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
+      hash(strip, cut, index, primitive, pass, statistics, clips, quads);
+      break;
+    }
+    case SM50_SHADER_GS_PASS_THROUGH: {
+      auto &data = *(SM50_SHADER_GS_PASS_THROUGH_DATA *)arg;
+      hash(data.DataEncoded, data.RasterizationDisabled, data.ClipDistanceVaryings);
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
@@ -552,6 +558,9 @@ protected:
     std::variant<WMTRenderPipelineInfo, WMTMeshRenderPipelineInfo> info;
     std::vector<WMT::Reference<WMT::Function>> functions;
     std::unordered_map<uint32_t, WMT::Reference<WMT::RenderPipelineState>> variants;
+    // the geometry shader that counts pipeline statistics, made when first used
+    std::function<WMT::Reference<WMT::Function>()> statistics_geometry_shader;
+    WMT::Reference<WMT::Function> statistics_gs;
   };
   std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
   mullion::mutex render_targets_mutex_;
@@ -560,13 +569,15 @@ protected:
 
   template <typename Info>
   WMT::Reference<WMT::RenderPipelineState>
-  CreatePipeline(const Info &info, WMT::Reference<WMT::Error> &error) {
+  CreatePipeline(const Info &info, WMT::Reference<WMT::Error> &error,
+                 std::function<WMT::Reference<WMT::Function>()> statistics_geometry_shader = {}) {
     auto pipeline = device_->GetMTLDevice().newRenderPipelineState(info, error);
-    if (!pipeline || (!rtv_mask && !dsv_mask && !pixel_shader))
+    if (!pipeline || (!rtv_mask && !dsv_mask && !pixel_shader && !statistics_geometry_shader))
       return pipeline;
     std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
     auto &descriptor = pipeline_descriptors_[pipeline.handle];
     descriptor.info = info;
+    descriptor.statistics_geometry_shader = std::move(statistics_geometry_shader);
     descriptor.functions.emplace_back(WMT::Function(info.fragment_function));
     if constexpr (std::is_same_v<Info, WMTRenderPipelineInfo>) {
       descriptor.functions.emplace_back(WMT::Function(info.vertex_function));
@@ -588,7 +599,7 @@ protected:
   // topologies with adjacency a draw may bring: Metal has none, D3D12_PRIMITIVE_TOPOLOGY_TYPE does not tell them
   // from the others, and only a mesh stage can leave the adjacent vertices out (D3D11.3 8.15)
   struct GeometryInputs {
-    std::string vs;                          // bytecode
+    std::string vs, gs;                      // bytecode
     Com<ID3D12RootSignature> root_signature;
     std::vector<SM50_IA_INPUT_ELEMENT> elements;
     SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout;
@@ -600,11 +611,15 @@ protected:
     WMT::Reference<WMT::Function> ps;
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut;
     uint32_t primitive; // D3D10_SB_PRIMITIVE of the topology type
+    bool clip_distance_varyings;
+    bool quad_lines;
   };
-  std::unique_ptr<GeometryInputs> adjacency_inputs_;
-  mullion::mutex adjacency_mutex_;
-  // by stream output's counting pass and strip
-  WMT::Reference<WMT::RenderPipelineState> adjacency_[2][2];
+  std::shared_ptr<GeometryInputs> topology_inputs_;
+  // whether a pipeline's geometry shader can count pipeline statistics
+  bool statistics_geometry_ = false;
+  mullion::mutex topology_mutex_;
+  // by topology and stream output's counting pass
+  std::unordered_map<uint32_t, WMT::Reference<WMT::RenderPipelineState>> topology_variants_;
 
   static SM50_SHADER_COMPILATION_ARGUMENT_DATA *
   RootSignature(
@@ -621,15 +636,12 @@ protected:
   // in the object stage, reading indices through the index buffer view each draw binds, and in the mesh stage the
   // geometry shader, or without one what passes the primitives on to the rasterizer (`pass_through`), or nothing.
   // stream output's counting pass draws nothing
-  WMT::Reference<WMT::RenderPipelineState>
-  GeometryVariant(
-      GeometryInputs &in, sm50_shader_t shader_vs, sm50_shader_t shader_gs, D3D12_SHADER_BYTECODE GS, bool strip,
-      bool counting, uint32_t primitive, bool pass_through, HRESULT &status
+  // the geometry stage's arguments, its stream output in `so`
+  static SM50_SHADER_PSO_GEOMETRY_SHADER_DATA
+  GeometryArguments(
+      GeometryInputs &in, SM50_SHADER_STREAM_OUTPUT_DATA &so, bool strip, bool counting, uint32_t primitive,
+      bool pass_through, bool statistics
   ) {
-    status = E_FAIL;
-    WMT::Reference<WMT::RenderPipelineState> variant;
-    WMT::Reference<WMT::Error> err;
-    D3D12_SHADER_BYTECODE VS{in.vs.data(), in.vs.size()};
     SM50_SHADER_PSO_GEOMETRY_SHADER_DATA pso_gs{};
     pso_gs.type = SM50_SHADER_PSO_GEOMETRY_SHADER;
     pso_gs.strip_topology = strip;
@@ -637,16 +649,51 @@ protected:
     pso_gs.strip_cut_index = in.strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF ? 0xffff : ~0u;
     pso_gs.input_primitive = primitive;
     pso_gs.pass_through = pass_through && !counting;
-    pso_gs.next = &in.common;
-    in.so.counting = counting;
-    in.so.elements = in.so_elements.data();
-    in.so.next = &in.common;
-    if (in.stream_output)
-      pso_gs.next = &in.so;
+    pso_gs.pipeline_statistics = statistics;
+    pso_gs.clip_distance_varyings = in.clip_distance_varyings;
+    pso_gs.quad_lines = in.quad_lines && pass_through && !counting;
+    so = in.so;
+    so.counting = counting;
+    so.elements = in.so_elements.data();
+    so.next = &in.common;
+    pso_gs.next = in.stream_output ? (void *)&so : (void *)&in.common;
+    return pso_gs;
+  }
+
+  WMT::Reference<WMT::Function>
+  GeometryFunction(
+      GeometryInputs &in, sm50_shader_t shader_vs, sm50_shader_t shader_gs, D3D12_SHADER_BYTECODE GS,
+      SM50_SHADER_PSO_GEOMETRY_SHADER_DATA &pso_gs, HRESULT &status
+  ) {
+    SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
+    return CompileFunction(
+        device_, this, std::array{D3D12_SHADER_BYTECODE{in.vs.data(), in.vs.size()}, GS},
+        RootSignature(rootsig, in.root_signature.ptr(), &pso_gs), "gs_main",
+        [&](auto args, auto name, auto bitcode, auto error) {
+          auto result = SM50CompileGeometryPipelineGeometry(shader_vs, shader_gs, args, name, bitcode, error);
+          if (result)
+            status = E_INVALIDARG;
+          return result;
+        }
+    );
+  }
+
+  WMT::Reference<WMT::RenderPipelineState>
+  GeometryVariant(
+      const std::shared_ptr<GeometryInputs> &inputs, sm50_shader_t shader_vs, sm50_shader_t shader_gs,
+      D3D12_SHADER_BYTECODE GS, bool strip, bool counting, uint32_t primitive, bool pass_through, HRESULT &status
+  ) {
+    status = E_FAIL;
+    auto &in = *inputs;
+    WMT::Reference<WMT::RenderPipelineState> variant;
+    WMT::Reference<WMT::Error> err;
+    D3D12_SHADER_BYTECODE VS{in.vs.data(), in.vs.size()};
+    SM50_SHADER_STREAM_OUTPUT_DATA so;
+    auto pso_gs = GeometryArguments(in, so, strip, counting, primitive, pass_through, false);
     in.ia_layout.elements = in.elements.data();
     in.ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_VIEW;
     in.ia_layout.next = &pso_gs;
-    SM50_SHADER_ROOT_SIGNATURE_DATA rootsig_vs, rootsig_gs;
+    SM50_SHADER_ROOT_SIGNATURE_DATA rootsig_vs;
     auto args_vs = RootSignature(rootsig_vs, in.root_signature.ptr(), &in.ia_layout);
     auto vs_func = CompileFunction(
         device_, this, std::array{VS, GS}, args_vs, "vsgs_main", [&](auto args, auto name, auto bitcode, auto error) {
@@ -658,25 +705,35 @@ protected:
     );
     if (!vs_func)
       return variant;
-    auto args_gs = RootSignature(rootsig_gs, in.root_signature.ptr(), &pso_gs);
-    auto gs_func = CompileFunction(
-        device_, this, std::array{VS, GS}, args_gs, "gs_main", [&](auto args, auto name, auto bitcode, auto error) {
-          auto result = SM50CompileGeometryPipelineGeometry(shader_vs, shader_gs, args, name, bitcode, error);
-          if (result)
-            status = E_INVALIDARG;
-          return result;
-        }
-    );
+    auto gs_func = GeometryFunction(in, shader_vs, shader_gs, GS, pso_gs, status);
     if (!gs_func)
       return variant;
+    // a pipeline statistics query's variant counts in the geometry shader as well
+    std::function<WMT::Reference<WMT::Function>()> statistics;
+    if (shader_gs && !counting) {
+      statistics_geometry_ = true;
+      statistics = [this, inputs, strip, primitive, pass_through] {
+        auto &in = *inputs;
+        D3D12_SHADER_BYTECODE VS{in.vs.data(), in.vs.size()}, GS{in.gs.data(), in.gs.size()};
+        SM50Shader shader_vs, shader_gs;
+        MTL_SHADER_REFLECTION reflection;
+        if (FAILED(InitializeShader(device_, VS, &shader_vs, &reflection)) ||
+            FAILED(InitializeShader(device_, GS, &shader_gs, &reflection)))
+          return WMT::Reference<WMT::Function>{};
+        SM50_SHADER_STREAM_OUTPUT_DATA so;
+        auto pso_gs = GeometryArguments(in, so, strip, false, primitive, pass_through, true);
+        HRESULT status;
+        return GeometryFunction(in, shader_vs, shader_gs, GS, pso_gs, status);
+      };
+    }
     auto info = in.info;
     info.object_function = vs_func.handle;
     info.mesh_function = gs_func.handle;
-    bool rasterized = (shader_gs || pass_through) && !counting && (!in.stream_output || in.so.rasterized_stream != ~0u);
+    bool rasterized = (shader_gs || pass_through) && !counting && (!in.stream_output || so.rasterized_stream != ~0u);
     info.fragment_function = rasterized ? in.ps.handle : obj_handle_t{};
     info.rasterization_enabled = rasterized;
     info.payload_memory_length = SM50_GEOMETRY_PAYLOAD_SIZE;
-    if (!(variant = CreatePipeline(info, err))) {
+    if (!(variant = CreatePipeline(info, err, std::move(statistics)))) {
       ERR("Failed to create geometry PSO of shaders ", name, ": ", err.description().getUTF8String());
       DumpShaders({VS, GS});
     }
@@ -691,20 +748,26 @@ public:
 
   // made when first drawn
   WMT::RenderPipelineState
-  AdjacencyPipeline(bool strip, bool counting) final {
-    std::lock_guard<mullion::mutex> lock(adjacency_mutex_);
-    auto &variant = adjacency_[counting][strip];
-    if (!variant && adjacency_inputs_) {
+  TopologyPipeline(D3D12_PRIMITIVE_TOPOLOGY topology, bool counting) final {
+    bool patch = topology >= D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST &&
+                 topology <= D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST;
+    if (patch != patches)
+      return {};
+    std::lock_guard<mullion::mutex> lock(topology_mutex_);
+    auto &variant = topology_variants_[topology * 2 + counting];
+    if (!variant && topology_inputs_) {
       auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-      auto &in = *adjacency_inputs_;
+      auto &in = *topology_inputs_;
       SM50Shader shader_vs;
       MTL_SHADER_REFLECTION reflection;
       HRESULT hr;
+      bool strip = topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ || topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+      auto primitive = patch ? D3D_PRIMITIVE_1_CONTROL_POINT_PATCH + (topology - D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST)
+                       : in.primitive == D3D_PRIMITIVE_LINE ? D3D_PRIMITIVE_LINE_ADJ
+                                                            : D3D_PRIMITIVE_TRIANGLE_ADJ;
+      // patches only stream out: nothing rasterizes them without a tessellator
       if (SUCCEEDED(InitializeShader(device_, {in.vs.data(), in.vs.size()}, &shader_vs, &reflection)))
-        variant = GeometryVariant(
-            in, shader_vs, {}, {}, strip, counting,
-            in.primitive == D3D_PRIMITIVE_LINE ? D3D_PRIMITIVE_LINE_ADJ : D3D_PRIMITIVE_TRIANGLE_ADJ, true, hr
-        );
+        variant = GeometryVariant(topology_inputs_, shader_vs, {}, {}, strip, counting, primitive, !patch, hr);
       if (variant && device_->NamesPasses())
         device_->PipelineMade(name, "graphics", start);
     }
@@ -732,20 +795,23 @@ public:
       if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc))) {
         return hr;
       }
-      rt.pixel_format = format_desc.PixelFormat;
-      rtv_mask |= 1u << i;
-
       auto renderTarget = pDesc->BlendState.RenderTarget[pDesc->BlendState.IndependentBlendEnable ? i : 0];
 
       if (renderTarget.BlendEnable && renderTarget.LogicOpEnable)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
 
       if (pDesc->BlendState.IndependentBlendEnable && renderTarget.LogicOpEnable)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
+
+      // Windows accepts non-renderable formats as null slots (vkd3d-proton test_render_target_support_validation).
+      if (!any_bit_set(device_->GetMTLPixelFormatCapability(format_desc.PixelFormat) & FormatCapability::Color))
+        continue;
+      rt.pixel_format = format_desc.PixelFormat;
+      rtv_mask |= 1u << i;
 
       // an undeclared output leaves the target alone even with blending (D3D11.3 16.9.1)
       rt.write_mask = (ref_ps.PixelShader.ValidRenderTargets & (1u << i))
-                          ? kColorWriteMaskMap[renderTarget.RenderTargetWriteMask]
+                          ? RenderTargetWriteMask(rt.pixel_format, kColorWriteMaskMap[renderTarget.RenderTargetWriteMask])
                           : WMTColorWriteMaskNone;
 
       if (rt.pixel_format == WMTPixelFormatRGB9E5Float)
@@ -774,12 +840,12 @@ public:
     }
 
     if (dual_source_blending && effective_dual_source_rtvs > 1)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     // one logic op, the first target's, for all: independent blending cannot carry one
     if (pDesc->BlendState.RenderTarget[0].LogicOpEnable) {
 #ifdef MULLION_NO_PRIVATE_API
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 #else
       info.logic_operation_enabled = true;
       info.logic_operation = kLogicOpMap[pDesc->BlendState.RenderTarget[0].LogicOp];
@@ -814,14 +880,22 @@ public:
       }
     }
 
-    // a description left at zero has one sample (Unreal Engine 5's pipelines; vkd3d-proton draws them so)
-    info.raster_sample_count = std::max(pDesc->SampleDesc.Count, 1u);
+    // a description left at zero has one sample (Unreal Engine 5's pipelines; vkd3d-proton draws them so). a pass
+    // with no targets rasterizes the forced count (d3d12_command_list.cpp), and its pipeline with it
+    info.raster_sample_count = !rtv_mask && !dsv_mask && pDesc->RasterizerState.ForcedSampleCount
+                                   ? pDesc->RasterizerState.ForcedSampleCount
+                                   : std::max(pDesc->SampleDesc.Count, 1u);
+    // refused before its shaders are compiled for a pipeline Metal would refuse
+    if (!device_->GetMTLDevice().supportsTextureSampleCount(info.raster_sample_count))
+      return FAIL(E_INVALIDARG);
     // Metal refuses a mesh pipeline that asks for indirect command buffers on GPUs before Apple9, where mesh draws
     // never go in them (d3d12_command_allocator.cpp)
     info.support_indirect_command_buffers = std::is_same_v<RenderPipelineInfo, WMTRenderPipelineInfo> ||
                                             device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple9);
 
-    info.alpha_to_coverage_enabled = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput;
+    // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
+    info.alpha_to_coverage_enabled = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
+                                     !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info.colors[0].pixel_format)));
 
     return S_OK;
   }
@@ -930,6 +1004,27 @@ public:
   virtual HRESULT
   Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, D3D12_SHADER_BYTECODE AS, D3D12_SHADER_BYTECODE MS,
              const D3D12_DEPTH_STENCIL_DESC2 *depth_stencil2) {
+    const auto &rasterizer = pDesc->RasterizerState;
+    if ((rasterizer.FillMode != D3D12_FILL_MODE_SOLID && rasterizer.FillMode != D3D12_FILL_MODE_WIREFRAME) ||
+        rasterizer.CullMode < D3D12_CULL_MODE_NONE || rasterizer.CullMode > D3D12_CULL_MODE_BACK)
+      return E_INVALIDARG;
+    // D3D12_RASTERIZER_DESC, ForcedSampleCount: only 0, 1, 4, 8 and optionally 16 are valid; Metal rasterizes the
+    // sample counts its textures take
+    if (rasterizer.ForcedSampleCount != 0 && rasterizer.ForcedSampleCount != 1 && rasterizer.ForcedSampleCount != 4 &&
+        rasterizer.ForcedSampleCount != 8 && rasterizer.ForcedSampleCount != 16)
+      return E_INVALIDARG;
+    if (rasterizer.ForcedSampleCount > 1 && !device_->GetMTLDevice().supportsTextureSampleCount(rasterizer.ForcedSampleCount))
+      return E_INVALIDARG;
+    if (rasterizer.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF) {
+      D3D12_FEATURE_DATA_D3D12_OPTIONS support{};
+      HRESULT hr = device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &support, sizeof(support));
+      if (FAILED(hr))
+        return hr;
+      if (rasterizer.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON ||
+          support.ConservativeRasterizationTier == D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED ||
+          rasterizer.FillMode != D3D12_FILL_MODE_SOLID)
+        return E_INVALIDARG;
+    }
     auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     stream_output = pDesc->StreamOutput.NumEntries;
     mesh_shader = MS.pShaderBytecode;
@@ -945,7 +1040,7 @@ public:
       return E_NOTIMPL;
     }
     if (tessellation != !!pDesc->DS.pShaderBytecode)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     if (!pDesc->VS.pShaderBytecode && !mesh_shader) {
       ERR("no vertex shader");
@@ -1016,18 +1111,37 @@ public:
       so_data.next = &common;
     }
     // a vertex shader's cull distances discard whole primitives (D3D11.3 15.4.2), which Metal can only by primitive:
-    // the mesh stage passes the vertex shader's primitives on, less those
+    // the mesh stage passes the vertex shader's primitives on, less those. it also rasterizes what stream output
+    // without a geometry shader streams out of the object stage
     vertex_registers = mesh_shader ? 0 : ref_vs.NumOutputElement;
     bool plain = !mesh_shader && !tessellation && !pDesc->GS.pShaderBytecode;
-    bool pass_through = plain && ref_vs.CullDistances;
+    // and passes lines on as quadrilaterals (D3D11.3 15.14.1, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
+    bool quad_lines =
+        plain && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE && pDesc->RasterizerState.MultisampleEnable;
+    bool pass_through = plain && pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
+                        (ref_vs.CullDistances || (stream_output && so_data.rasterized_stream == 0) || quad_lines);
     geometry_shader |= pass_through;
     mesh_instances = sm50_shader_t(shader_gs) ? gs_instances : pass_through;
     adjacency = plain && (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
                           pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    patches = plain && stream_output && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     bool mesh = tessellation || geometry_shader || mesh_shader;
     // the alpha-to-coverage state reads the pixel shader's reflection
     if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->PS, &shader_ps, &ref_ps)))
       return hr;
+    // a pixel shader whose runs are seen tests the last pre-raster stage's clip distances itself (D3D11.3 15.4.1),
+    // where Metal would cut the primitive and run a pixel on the cut once for each piece. a geometry shader after
+    // tessellation still clips in Metal
+    uint32_t clips = pDesc->PS.pShaderBytecode && !mesh_shader && !(tessellation && pDesc->GS.pShaderBytecode) &&
+                             (ref_ps.UAVSlotMask || ref_ps.PixelShader.HasCoverageInput)
+                         ? (pDesc->GS.pShaderBytecode ? ref_gs : tessellation ? ref_ds : ref_vs).ClipDistances
+                         : 0;
+    // what the stage before the rasterizer takes of it
+    SM50_SHADER_GS_PASS_THROUGH_DATA clip_data{};
+    clip_data.type = SM50_SHADER_GS_PASS_THROUGH;
+    clip_data.DataEncoded = ~0u;
+    clip_data.ClipDistanceVaryings = clips;
+    clip_data.next = &common;
 
     SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
     data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
@@ -1072,10 +1186,21 @@ public:
       data_ps.disable_depth_output =
           (mesh ? mesh_info.depth_pixel_format : info.depth_pixel_format) == WMTPixelFormatInvalid;
       data_ps.unorm_output_reg_mask = 0;
-      data_ps.sample_mask = pDesc->SampleMask;
+      // the sample mask selects output samples, which rendering with UAVs alone has none of (D3D11.3 3.5.6.4)
+      bool attached = pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN ||
+                      std::any_of(pDesc->RTVFormats, pDesc->RTVFormats + pDesc->NumRenderTargets,
+                                  [](auto format) { return format != DXGI_FORMAT_UNKNOWN; });
+      data_ps.sample_mask = attached ? pDesc->SampleMask : ~0u;
       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
       data_ps.next = &common;
       data_ps.pipeline_statistics = false;
+      data_ps.alpha_to_coverage = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
+                                  !(mesh ? mesh_info.alpha_to_coverage_enabled : info.alpha_to_coverage_enabled);
+      // one sample rasterizes at the pixel center, and the targets' samples with it (D3D11.3 3.5.6.2)
+      data_ps.single_raster_sample = attached && pDesc->RasterizerState.ForcedSampleCount == 1;
+      data_ps.clip_distances = clips;
+      data_ps.centered_samples =
+          data_ps.single_raster_sample || pDesc->SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN;
 
       std::array<WMTPixelFormat, std::size(data_ps.pixel_formats)> formats{};
       for (unsigned i = 0; i < pDesc->NumRenderTargets; i++)
@@ -1086,7 +1211,7 @@ public:
 
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       if (!(ps_func = function(shader_ps, pDesc->PS, root_signature(rootsig, &data_ps), ps_name.c_str())))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       statistics_pixel_shader_ =
           [this, code = std::string((const char *)pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength),
            signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common, ps_name]() mutable {
@@ -1107,8 +1232,10 @@ public:
     }
 
     auto geometry_inputs = [&] {
-      auto in = std::make_unique<GeometryInputs>();
+      auto in = std::make_shared<GeometryInputs>();
       in->vs.assign((const char *)pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
+      if (pDesc->GS.pShaderBytecode)
+        in->gs.assign((const char *)pDesc->GS.pShaderBytecode, pDesc->GS.BytecodeLength);
       in->root_signature = pDesc->pRootSignature;
       in->elements = elements;
       in->ia_layout = data_ia_layout;
@@ -1117,6 +1244,8 @@ public:
       in->stream_output = stream_output;
       in->common = common;
       in->ps = ps_func;
+      in->clip_distance_varyings = clips;
+      in->quad_lines = quad_lines;
       in->strip_cut = pDesc->IBStripCutValue;
       in->primitive = pDesc->PrimitiveTopologyType;
       WMT::InitializeMeshRenderPipelineInfo(in->info);
@@ -1137,7 +1266,7 @@ public:
       WMT::Reference<WMT::Function> as_func, ms_func = compile(shader_ms, MS, &link, "ms_main", pDesc->PS);
       if (!ms_func || (AS.pShaderBytecode && !(as_func = compile(shader_as, AS, &common, "as_main")))) {
         DumpShaders({AS, MS});
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       }
       mesh_info.object_function = as_func.handle;
       mesh_info.mesh_function = ms_func.handle;
@@ -1154,44 +1283,28 @@ public:
       // a strip's primitives share vertices, so strips and lists each have their pipeline
       auto inputs = geometry_inputs();
       if (!inputs)
-        return E_FAIL;
+        return FAIL(E_FAIL);
       // D3D12_PRIMITIVE_TOPOLOGY_TYPE's point, line and triangle are D3D10_SB_PRIMITIVE's
       auto variant = [&](bool strip, bool counting = false) {
         return GeometryVariant(
-            *inputs, shader_vs, shader_gs, pDesc->GS, strip, counting, pDesc->PrimitiveTopologyType, pass_through, hr
+            inputs, shader_vs, shader_gs, pDesc->GS, strip, counting, pDesc->PrimitiveTopologyType, pass_through, hr
         );
       };
       bool strips = sm50_shader_t(shader_gs) ? ref_gs.GeometryShader.Primitive != D3D_PRIMITIVE_POINT
                               : pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
-      if (!(pso = variant(false)) || (strips && !(pso_strip = variant(true))))
+      if (!patches && (!(pso = variant(false)) || (strips && !(pso_strip = variant(true)))))
         return hr;
-      if (stream_output && (!(so_count = variant(false, true)) || (strips && !(so_count_strip = variant(true, true)))))
+      if (!patches && stream_output &&
+          (!(so_count = variant(false, true)) || (strips && !(so_count_strip = variant(true, true)))))
         return hr;
-      if (adjacency)
-        adjacency_inputs_ = std::move(inputs);
-      // without a geometry shader, the vertex shader also rasterizes as usual, unless the mesh stage does
-      if (stream_output && !sm50_shader_t(shader_gs) && !pass_through && so_data.rasterized_stream == 0) {
-        if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
-          return hr;
-        data_ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
-        data_ia_layout.next = &common;
-        SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
-        auto vs_func = function(shader_vs, pDesc->VS, root_signature(rootsig, &data_ia_layout), "vs_main");
-        if (!vs_func)
-          return E_INVALIDARG;
-        info.vertex_function = vs_func.handle;
-        info.fragment_function = ps_func.handle;
-        if (!(so_raster = CreatePipeline(info, err))) {
-          ERR("Failed to create PSO of shaders ", name, ": ", err.description().getUTF8String());
-          return E_FAIL;
-        }
-      }
+      if (adjacency || patches)
+        topology_inputs_ = inputs;
     } else if (!tessellation) {
-      data_ia_layout.next = &common;
+      data_ia_layout.next = &clip_data;
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       auto vs_func = function(shader_vs, pDesc->VS, root_signature(rootsig, &data_ia_layout), "vs_main");
       if (!vs_func)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       info.vertex_function = vs_func.handle;
       info.fragment_function = ps_func.handle;
       if (!(pso = CreatePipeline(info, err))) {
@@ -1199,8 +1312,8 @@ public:
         DumpShaders({pDesc->VS, pDesc->PS});
         return E_FAIL;
       }
-      if (adjacency && !(adjacency_inputs_ = geometry_inputs()))
-        return E_FAIL;
+      if (adjacency && !(topology_inputs_ = geometry_inputs()))
+        return FAIL(E_FAIL);
     } else {
       // every factor there is, and what a vertex of the domain shader's takes of a mesh
       SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess{};
@@ -1208,7 +1321,7 @@ public:
       pso_tess.max_potential_tess_factor = D3D12_TESSELLATOR_MAX_TESSELLATION_FACTOR;
       pso_tess.mesh_vertex_size = ref_ds.PostTessellator.MeshVertexSize;
       pso_tess.geometry = shader_gs;
-      pso_tess.next = &common;
+      pso_tess.next = &clip_data;
       mesh_info.fragment_function = ps_func.handle;
       mesh_info.rasterization_enabled = true;
       // the vertex and hull stages run 32 threads per object threadgroup, the domain stage 32 per mesh threadgroup
@@ -1245,7 +1358,7 @@ public:
             }
         );
         if (!ds_func)
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         mesh_info.mesh_function = ds_func.handle;
 
         // the object stage fetches indices itself, through the index buffer view each draw binds
@@ -1262,7 +1375,7 @@ public:
             }
         );
         if (!vshs_func)
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         mesh_info.object_function = vshs_func.handle;
         pipeline_descriptors_.erase(pso.handle);
         if (!(pso = CreatePipeline(mesh_info, err))) {
@@ -1286,6 +1399,8 @@ public:
     InitializeDSSO(pDesc, depth_stencil2);
 
     InitializeRasterizerState(pDesc);
+    if (quad_lines)
+      RasterizeAsLines(*this);
 
     if (device_->NamesPasses())
       device_->PipelineMade(name, "graphics", start);
@@ -1296,7 +1411,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -1322,11 +1437,15 @@ public:
                                          bool Statistics) override {
     Mask &= rtv_mask;
     DSVPlanar &= dsv_mask;
-    Statistics &= pixel_shader;
+    Statistics &= pixel_shader || statistics_geometry_;
     if (!Pipeline || (!Statistics && Mask == rtv_mask && DSVPlanar == dsv_mask))
       return Pipeline;
     std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
-    auto &descriptor = pipeline_descriptors_.at(Pipeline.handle);
+    auto described = pipeline_descriptors_.find(Pipeline.handle);
+    // a pipeline with nothing to vary has no descriptor
+    if (described == pipeline_descriptors_.end())
+      return Pipeline;
+    auto &descriptor = described->second;
     auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) |
                (uint32_t(Statistics) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 2));
     auto found = descriptor.variants.find(key);
@@ -1345,6 +1464,13 @@ public:
             }
             info.fragment_function = statistics_ps_;
           }
+          if constexpr (std::is_same_v<decltype(info), WMTMeshRenderPipelineInfo>)
+            if (Statistics && descriptor.statistics_geometry_shader) {
+              if (!descriptor.statistics_gs &&
+                  !(descriptor.statistics_gs = descriptor.statistics_geometry_shader()))
+                return WMT::Reference<WMT::RenderPipelineState>{};
+              info.mesh_function = descriptor.statistics_gs;
+            }
           for (unsigned i = 0; i < std::size(info.colors); i++)
             if (!(Mask & (1u << i)))
               info.colors[i] = {.pixel_format = WMTPixelFormatInvalid};
@@ -1409,14 +1535,14 @@ CreateGraphicsPipelineState(
       if (!code.pShaderBytecode)
         continue;
       if (!ShaderContainerHolds(code.pShaderBytecode, code.BytecodeLength))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       const void *part;
       UINT size;
       if (FAILED(microsoft::DXBCGetRootSignature(code.pShaderBytecode, &part, &size)))
         continue;
       if (signature) {
         if (size != signature_size || memcmp(part, signature, size))
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
       } else {
         HRESULT hr = CreateRootSignature(
             pDevice, 0, code.pShaderBytecode, code.BytecodeLength, __uuidof(ID3D12RootSignature),
@@ -1429,7 +1555,7 @@ CreateGraphicsPipelineState(
       }
     }
     if (!embedded)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     desc.pRootSignature = embedded.ptr();
   }
   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));

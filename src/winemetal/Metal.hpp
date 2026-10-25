@@ -1144,6 +1144,21 @@ public:
   }
 
   bool
+  supports32BitFloatFiltering() {
+    return MTLDevice_supports32BitFloatFiltering(handle);
+  }
+
+  bool
+  supports32BitMSAA() {
+    return MTLDevice_supports32BitMSAA(handle);
+  }
+
+  uint64_t
+  maxArgumentBufferSamplerCount() {
+    return MTLDevice_maxArgumentBufferSamplerCount(handle);
+  }
+
+  bool
   supportsTextureSampleCount(uint8_t sample_count) {
     return MTLDevice_supportsTextureSampleCount(handle, sample_count);
   }

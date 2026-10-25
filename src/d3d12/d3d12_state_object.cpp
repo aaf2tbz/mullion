@@ -259,7 +259,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
     auto library = std::make_shared<RayLibrary>();
     if (!ShaderContainerHolds(desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength) ||
         !ShaderFeaturesSupported(device_, desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     SM50Error error;
     if (SM50Initialize(
             desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength, &library->shader, nullptr, &error
@@ -374,7 +374,7 @@ public:
     libraries_.clear();
     if (pParent) {
       if (type_ != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE || pParent->type_ != type_)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       if (device_->NamesPasses())
         name = pParent->name;
       shaders_ = pParent->shaders_;
@@ -624,7 +624,7 @@ public:
 
     if (pParent && (!(flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) ||
                     !(pParent->flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS)))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     deferred_ = type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
                 (flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS);
     if (type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION) {
@@ -787,7 +787,7 @@ public:
     if (type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION)
       deferred_associations_ = std::move(associations);
     if (failed)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (auto &config = configurations_[PipelineConfig - ShaderConfig]; config)
       pipeline_config_ = {config->first, (D3D12_RAYTRACING_PIPELINE_FLAGS)config->second};
 
@@ -820,7 +820,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
     *ppvObject = nullptr;
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
         riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12StateObject)) {
@@ -931,7 +931,7 @@ CreateStateObject(
 ) {
   InitReturnPtr(ppStateObject);
   if (!pDesc)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   auto state = Com(new MTLD3D12StateObjectImpl(pDevice));
   HRESULT hr = state->Initialize(pDesc, static_cast<MTLD3D12StateObjectImpl *>(pParent));
   if (FAILED(hr))

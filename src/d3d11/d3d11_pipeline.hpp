@@ -25,11 +25,19 @@ struct MTL_GRAPHICS_PIPELINE_DESC {
   bool GSStripTopology;
   SM50_INDEX_BUFFER_FORMAT IndexBufferFormat;
   uint32_t SampleMask;
+  // the render targets' samples all lie at the pixel center (D3D11_CENTER_MULTISAMPLE_PATTERN)
+  bool CenteredSamples;
+  // one sample rasterizes for multisampled targets (ForcedSampleCount 1)
+  bool SingleRasterSample;
+  // the last pre-raster stage's clip distances, which the pixel shader tests (SM50_SHADER_PSO_PIXEL_SHADER_DATA)
+  uint32_t ClipDistances;
   uint32_t GSPassthrough;
   // a geometry pipeline without a geometry shader: its input primitive (D3D10_SB_PRIMITIVE), and whether the mesh
   // stage passes the vertex shader's primitives on to the rasterizer; without that it only streams output
   uint32_t InputPrimitive;
   bool PassThrough;
+  // the lines it passes on are quadrilaterals (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
+  bool QuadLines;
   bool PipelineStatistics = false;
 };
 
@@ -76,10 +84,14 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
     state.add((size_t)v.IndexBufferFormat);
     state.add((size_t)v.GSStripTopology);
     state.add((size_t)v.SampleMask);
+    state.add(v.CenteredSamples);
+    state.add(v.SingleRasterSample);
+    state.add(v.ClipDistances);
     state.add((size_t)v.GSPassthrough);
     state.add((size_t)v.SOLayout);
     state.add((size_t)v.InputPrimitive);
     state.add((size_t)v.PassThrough);
+    state.add(v.QuadLines);
     state.add(v.PipelineStatistics);
     state.add((size_t)v.SampleCount);
     state.add((size_t)v.NumColorAttachments);
@@ -149,9 +161,10 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
            (x.GSStripTopology == y.GSStripTopology) &&
            (x.SampleCount == y.SampleCount) &&
            (x.IndexBufferFormat == y.IndexBufferFormat) &&
-           (x.SampleMask == y.SampleMask) &&
+           (x.SampleMask == y.SampleMask) && (x.CenteredSamples == y.CenteredSamples) &&
+           (x.SingleRasterSample == y.SingleRasterSample) && (x.ClipDistances == y.ClipDistances) &&
            (x.GSPassthrough == y.GSPassthrough) && (x.SOLayout == y.SOLayout) &&
-           (x.InputPrimitive == y.InputPrimitive) && (x.PassThrough == y.PassThrough) &&
+           (x.InputPrimitive == y.InputPrimitive) && (x.PassThrough == y.PassThrough) && (x.QuadLines == y.QuadLines) &&
            (x.PipelineStatistics == y.PipelineStatistics);
   }
 };

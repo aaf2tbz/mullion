@@ -5,6 +5,11 @@
 // from element StartVertexLocation + VertexID, or BaseVertexLocation + the index (8.6.1). SV_InstanceID "starts at
 // 0 for the first instance" and SV_VertexID starts at 0 or "represents the index value", whatever the starts are
 // (8.18, 8.16). ExecuteIndirect draws as the direct draw with its arguments does.
+// 8.1.3 permits "any value, including 0" for the instance rate; a rate with its high bit and low bit set
+// stays on the same element across this draw. bundles, direct draws and indirect draws must fetch the same data.
+// https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm
+// IndirectDrawing, Bundles permits a null count buffer and a signature containing exactly one operation.
+// https://microsoft.github.io/DirectX-Specs/d3d/IndirectDrawing.html
 // engines lean on all of it at once: Unreal finds a draw's instances in its GPU scene through a per-instance
 // element (InstanceIdOffset) that only StartInstanceLocation selects, with SV_InstanceID added in the shader.
 // a point a vertex and instance. a vertex's element gives its column, an instance's element at rate 1 its row,
@@ -13,17 +18,19 @@
 // held to the draw's arguments: nothing else is drawn. draws with and without starts, indexed with a base vertex
 // above and below 0, each direct and through ExecuteIndirect.
 #include "d3d12_test.hpp"
+#include <limits>
 
 static const char hlsl[] = R"hlsl(
 struct In {
   uint column : COLUMN; uint row : ROW; uint second : SECOND; uint still : STILL;
+  uint high : HIGHSTEP;
   uint instance : SV_InstanceID; uint vertex : SV_VertexID;
 };
 struct V { float4 pos : SV_Position; nointerpolation uint4 got : GOT; };
 V vs(In i) {
   V v;
   v.pos = float4((i.column + 0.5) * 2 / WIDE - 1, 1 - (i.row + 0.5) * 2 / HIGH, 0, 1);
-  v.got = uint4(i.second, i.still, i.instance + 1, i.vertex + 1);
+  v.got = uint4(i.second | (i.high << HIGH_SHIFT), i.still, i.instance + 1, i.vertex + 1);
   return v;
 }
 uint4 ps(V v) : SV_Target { return v.got; }
@@ -37,8 +44,9 @@ main(int argc, char **argv) {
     return 77;
   }
   // as many vertex elements as columns and instance elements as rows; the slots after the vertices' step at these rates
-  const UINT wide = 8, high = 16, word = sizeof(UINT), rates[] = {1, 2, 0}, slots = 1 + std::size(rates);
-  const std::vector<std::string> defines = {"WIDE=" + std::to_string(wide), "HIGH=" + std::to_string(high)};
+  const UINT wide = 8, high = 16, word = sizeof(UINT), rates[] = {1, 2, 0, (std::numeric_limits<UINT>::max() >> 1) + 2}, slots = 1 + std::size(rates);
+  const UINT high_shift = std::numeric_limits<UINT>::digits / 2;
+  const std::vector<std::string> defines = {"HIGH_SHIFT=" + std::to_string(high_shift), "WIDE=" + std::to_string(wide), "HIGH=" + std::to_string(high)};
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), ps = compiler.compile(hlsl, "ps", "ps", defines);
   if (vs.empty() || ps.empty()) {
     printf("failed: HLSL did not compile\n");
@@ -56,7 +64,7 @@ main(int argc, char **argv) {
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   auto rs = root_signature(device.Get(), {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT});
-  const char *names[] = {"COLUMN", "ROW", "SECOND", "STILL"};
+  const char *names[] = {"COLUMN", "ROW", "SECOND", "STILL", "HIGHSTEP"};
   D3D12_INPUT_ELEMENT_DESC elements[slots];
   for (UINT slot = 0; slot < slots; slot++)
     elements[slot] = {names[slot], 0, DXGI_FORMAT_R32_UINT, slot, 0,
@@ -83,7 +91,7 @@ main(int argc, char **argv) {
   }
 
   // one buffer: the slots' elements one after another, then the indices, then room for a draw's arguments
-  const UINT elements_of[slots] = {wide, high, high, high};
+  const UINT elements_of[slots] = {wide, high, high, high, high};
   UINT begins[slots + 2] = {};
   for (UINT slot = 0; slot < slots; slot++)
     begins[slot + 1] = begins[slot] + elements_of[slot];
@@ -133,9 +141,15 @@ main(int argc, char **argv) {
     bool indexed;
   };
   const Draw draws[] = {{3, 5, 0, 0, 0, false}, {3, 5, 2, 0, 3, false}, {3, 5, 0, 0, 0, true}, {3, 5, 1, 2, 3, true}, {3, 5, 2, -1, 6, true}};
+  ComPtr<ID3D12CommandAllocator> bundle_allocator;
+  ComPtr<ID3D12GraphicsCommandList> bundle;
+  CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator)));
+  CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.Get(), pso.Get(), IID_PPV_ARGS(&bundle)));
+  CHECK(bundle->Close());
   for (auto &draw : draws)
-    for (bool indirect : {false, true}) {
-      step("%s%s of %u from %u in %u instances from %u, base vertex %d", indirect ? "ExecuteIndirect: " : "", draw.indexed ? "indices" : "vertices",
+    for (UINT path : {0u, 1u, 2u, 3u}) {
+      const bool indirect = path & 1, bundled = path >= 2;
+      step("bundled=%u indirect=%u: %s of %u from %u in %u instances from %u, base vertex %d", bundled, indirect, draw.indexed ? "indices" : "vertices",
            draw.count, draw.start, draw.instances, draw.start_instance, draw.base);
       std::vector<UINT> want(4 * wide * high);
       for (UINT instance = 0; instance < draw.instances; instance++)
@@ -144,7 +158,7 @@ main(int argc, char **argv) {
           // the instance's element at each rate: the start, and a step every `rate` instances
           auto element = [&](UINT slot) { return draw.start_instance + (rates[slot - 1] ? instance / rates[slot - 1] : 0); };
           auto pixel = &want[4 * (held(1, element(1)) * wide + held(0, vertex))];
-          pixel[0] = held(2, element(2)), pixel[1] = held(3, element(3)), pixel[2] = instance + 1, pixel[3] = id + 1;
+          pixel[0] = held(2, element(2)) | (held(4, element(4)) << high_shift), pixel[1] = held(3, element(3)), pixel[2] = instance + 1, pixel[3] = id + 1;
         }
       if (FAILED(forget(readback.Get())) || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), pso.Get()))) {
         expect(false, "the list could not be begun");
@@ -164,12 +178,23 @@ main(int argc, char **argv) {
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
       list->IASetVertexBuffers(0, slots, views);
       list->IASetIndexBuffer(&index_view);
+      auto draw_list = list.Get();
+      if (bundled) {
+        CHECK(bundle_allocator->Reset());
+        CHECK(bundle->Reset(bundle_allocator.Get(), pso.Get()));
+        draw_list = bundle.Get();
+        draw_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+      }
       if (indirect)
-        list->ExecuteIndirect(signatures[draw.indexed].Get(), 1, data.Get(), arguments_at, nullptr, 0);
+        draw_list->ExecuteIndirect(signatures[draw.indexed].Get(), 1, data.Get(), arguments_at, nullptr, 0);
       else if (draw.indexed)
-        list->DrawIndexedInstanced(draw.count, draw.instances, draw.start, draw.base, draw.start_instance);
+        draw_list->DrawIndexedInstanced(draw.count, draw.instances, draw.start, draw.base, draw.start_instance);
       else
-        list->DrawInstanced(draw.count, draw.instances, draw.start, draw.start_instance);
+        draw_list->DrawInstanced(draw.count, draw.instances, draw.start, draw.start_instance);
+      if (bundled) {
+        CHECK(bundle->Close());
+        list->ExecuteBundle(bundle.Get());
+      }
       transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
       D3D12_TEXTURE_COPY_LOCATION from{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX},
           to{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {.PlacedFootprint = footprint}};

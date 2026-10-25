@@ -72,18 +72,26 @@ EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalComma
 }
 
 WMT::RenderPipelineState InternalCommandLibrary::PipelineStatistics(bool scan) {
+  return VertexPipeline(pipeline_statistics_draw_[scan], scan ? "pipeline_statistics_strip" : "pipeline_statistics_draw");
+}
+
+WMT::RenderPipelineState InternalCommandLibrary::ZeroWords() {
+  return VertexPipeline(zero_words_, "zero_words");
+}
+
+WMT::RenderPipelineState
+InternalCommandLibrary::VertexPipeline(WMT::Reference<WMT::RenderPipelineState> &pipeline, const char *name) {
   std::lock_guard lock(statistics_mutex_);
-  auto &pipeline = pipeline_statistics_draw_[scan];
   if (!pipeline) {
     WMTRenderPipelineInfo info;
     WMT::InitializeRenderPipelineInfo(info);
-    auto function = library_.newFunction(scan ? "pipeline_statistics_strip" : "pipeline_statistics_draw");
+    auto function = library_.newFunction(name);
     info.vertex_function = function;
     info.rasterization_enabled = false;
     WMT::Reference<WMT::Error> error;
     pipeline = device_.newRenderPipelineState(info, error);
     if (!pipeline) {
-      ERR("Failed to create statistics pipeline: ", error.description().getUTF8String());
+      ERR("Failed to create pipeline ", name, ": ", error.description().getUTF8String());
       abort();
     }
   }

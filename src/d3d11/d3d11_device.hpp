@@ -10,6 +10,7 @@
 
 struct MTL_GRAPHICS_PIPELINE_DESC;
 struct MTL_COMPUTE_PIPELINE_DESC;
+struct IMTLD3D11RasterizerState;
 
 DEFINE_COM_INTERFACE("3a3f085a-d0fe-4324-b0ae-fe04de18571c",
                      IMTLD3D11DeviceContext)
@@ -57,6 +58,8 @@ public:
                                                  *ppPipeline) = 0;
 
   virtual bool IsTraced() = 0;
+
+  virtual IMTLD3D11RasterizerState *GetDefaultRasterizerState() = 0;
 
   virtual Device& GetMullionDevice() = 0;
 

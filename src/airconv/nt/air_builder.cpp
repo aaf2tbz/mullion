@@ -523,7 +523,7 @@ AIRBuilder::CreateSampleCmpCommon(
 std::pair<Value *, Value *>
 AIRBuilder::CreateSampleGrad(
     const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
-    Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+    Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference
 ) {
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
@@ -567,6 +567,11 @@ AIRBuilder::CreateSampleGrad(
   if (TexInfo.is_array) {
     Tys.push_back(getIntTy());
     Ops.push_back(ArrayIndex ? ArrayIndex : getInt(0));
+  }
+
+  if (Reference) {
+    Tys.push_back(getFloatTy());
+    Ops.push_back(Reference);
   }
 
   Tys.push_back(getTextureSampleCoordType(Texture));
@@ -613,7 +618,7 @@ AIRBuilder::CreateSampleGrad(
   Tys.push_back(getIntTy());
   Ops.push_back(getInt(0));
 
-  std::string FnName = "air.sample_";
+  std::string FnName = Reference ? "air.sample_compare_" : "air.sample_";
   FnName += TexInfo.air_symbol_suffix;
   FnName += "_grad";
   FnName += getTypeOverloadSuffix(getTexelType(Texture), getTexelSign(Texture));
@@ -1176,6 +1181,12 @@ AIRBuilder::CreateSamplePos(Value *SampleCount, Value *Index) {
   return builder.CreateCall(Fn, {SampleCount, Index});
 }
 
+// a render target sample's offset: the pattern of no samples places every one at the center
+Value *
+AIRBuilder::CreateRasterizerSamplePos(Value *Index) {
+  return CreateSamplePos(CenteredSamples ? getInt(0) : CreateGetNumSamples(), Index);
+}
+
 Value *
 AIRBuilder::CreateDerivative(Value *Val, bool YAxis) {
   if (!Val->getType()->getScalarType()->isFloatingPointTy()) {
@@ -1205,6 +1216,8 @@ AIRBuilder::CreateDerivative(Value *Val, bool YAxis) {
 
 CallInst *
 AIRBuilder::CreateDiscard() {
+  if (Live)
+    builder.CreateStore(builder.getFalse(), Live);
   auto &Context = getContext();
   auto Attrs = AttributeList::get(
       Context, {{~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
@@ -1563,8 +1576,19 @@ AIRBuilder::CreateInterpolateAtCentroid(Value *Interpoant, bool Perspective) {
       Perspective ? "air.interpolate_centroid_perspective.f32" : "air.interpolate_centroid_no_perspective.f32",
       FunctionType::get(getFloatTy(), {Interpoant->getType()}, false), Attrs
   );
-
-  return builder.CreateCall(Fn, {Interpoant});
+  if (!CentroidCoverage)
+    return builder.CreateCall(Fn, {Interpoant});
+  // the center when every sample is covered, else the first covered; a helper run covers none, and takes the
+  // mask's first sample, or the center with all of them
+  auto all = builder.CreateSub(builder.CreateShl(getInt(1), CreateGetNumSamples()), getInt(1));
+  auto mask = builder.CreateAnd(CentroidMask, all), covered = builder.CreateAnd(CentroidCoverage, mask);
+  auto pick = builder.CreateSelect(builder.CreateICmpNE(covered, getInt(0)), covered, mask);
+  auto ctz = getModule()->getOrInsertFunction("air.ctz.i32", FunctionType::get(getIntTy(), {getIntTy(), builder.getInt1Ty()}, false));
+  auto first = builder.CreateCall(ctz, {pick, builder.getFalse()});
+  return builder.CreateSelect(
+      builder.CreateICmpEQ(pick, all), CreateInterpolateAtCenter(Interpoant, Perspective),
+      CreateInterpolateAtSample(Interpoant, first, Perspective)
+  );
 }
 
 Value *
@@ -1930,6 +1954,7 @@ AIRBuilder::CreateIntBinOp(IntBinOp Op, Value *LHS, Value *RHS, bool Signed) {
   static char const *FnNames[] = {
       "max",
       "min",
+      "mul_hi",
   };
 
   if (uint32_t(Op) >= std::size(FnNames)) {
@@ -2090,7 +2115,13 @@ AIRBuilder::SanitizePosition(llvm::Value *Pos) {
       builder.CreateAnd(builder.CreateExtractElement(Mask, 2ull), builder.CreateExtractElement(Mask, 3ull))
   );
   auto PosClipped = llvm::ConstantVector::get({getFloat(0.0f), getFloat(0.0f), getFloat(1.0f), getFloat(0.0f)});
-  return builder.CreateSelect(ValidPos, Pos, PosClipped);
+  Pos = builder.CreateSelect(ValidPos, Pos, PosClipped);
+  if (!RasterScale)
+    return Pos;
+  auto Scale = builder.CreateLoad(getFloatTy(), RasterScale);
+  for (unsigned i = 0; i < 2; i++)
+    Pos = builder.CreateInsertElement(Pos, builder.CreateFMul(builder.CreateExtractElement(Pos, i), Scale), i);
+  return Pos;
 }
 
 } // namespace llvm::air

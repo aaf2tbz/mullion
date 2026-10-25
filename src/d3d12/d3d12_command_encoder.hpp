@@ -94,6 +94,7 @@ struct RenderEncoderData : EncoderData {
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;
   uint8_t default_raster_sample_count;
+  uint8_t center_samples = 0;
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;
@@ -108,11 +109,14 @@ struct RenderEncoderData : EncoderData {
     const struct IndirectRenderCommandData *call;
     Most *next;
   } *most;
+  // where the resolvers of the pass's indirect commands leave those they left out: for a geometry command its object
+  // threadgroups, for stream output (`scratch`) the scratch bytes it needed
   struct Omitted {
     WMT::Buffer buffer;
     uint64_t offset;
     uint64_t words;
     Omitted *next;
+    bool scratch = false;
   } *omitted = nullptr;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;

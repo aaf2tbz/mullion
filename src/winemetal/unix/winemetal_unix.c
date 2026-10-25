@@ -519,6 +519,14 @@ renderCommandEncoder(void *obj, const struct WMTSampleBufferAttachmentInfo *samp
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
 
+  // one sample lies at the center already, and Metal takes custom positions only for more
+  if (info->center_samples > 1) {
+    MTLSamplePosition center[info->center_samples];
+    for (unsigned i = 0; i < info->center_samples; i++)
+      center[i] = MTLSamplePositionMake(0.5, 0.5);
+    [descriptor setSamplePositions:center count:info->center_samples];
+  }
+
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
     descriptor.tileHeight = info->tile_height;
@@ -1136,6 +1144,16 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setFragmentBytes:body->bytes.ptr length:body->length atIndex:body->index];
       break;
     }
+    case WMTRenderCommandSetVertexBytes: {
+      struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
+      [encoder setVertexBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetMeshBytes: {
+      struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
+      [encoder setMeshBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      break;
+    }
     case WMTRenderCommandSetFragmentTexture: {
       struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
       [encoder setFragmentTexture:(id<MTLTexture>)body->texture atIndex:body->index];
@@ -1541,9 +1559,37 @@ _MTLDevice_supportsBCTextureCompression(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_supports32BitFloatFiltering(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle supports32BitFloatFiltering];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_supports32BitMSAA(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle supports32BitMSAA];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_maxArgumentBufferSamplerCount(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle maxArgumentBufferSamplerCount];
+  // an emulated Apple7 or Apple8 holds what they do: 1024 samplers a stage reaches from an argument buffer (Metal
+  // feature set tables), which an M1 Pro reports here too
+  if (emulated_family() && emulated_family() < MTLGPUFamilyApple9 - MTLGPUFamilyApple1 + 1)
+    params->ret = MIN(params->ret, 1024);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_supportsTextureSampleCount(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
   params->ret = [(id<MTLDevice>)params->handle supportsTextureSampleCount:params->arg];
+  // render passes take 8 samples from Apple10 on, 4 before (Metal feature set tables)
+  if (emulated_family() && emulated_family() < MTLGPUFamilyApple10 - MTLGPUFamilyApple1 + 1)
+    params->ret &= params->arg <= 4;
   return STATUS_SUCCESS;
 }
 
@@ -2229,6 +2275,10 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   /** MTLPixelFormat */
   uint32_t pixel_formats[8];
   bool pipeline_statistics;
+  bool alpha_to_coverage;
+  bool centered_samples;
+  bool single_raster_sample;
+  uint32_t clip_distances;
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -2239,6 +2289,7 @@ struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
     uint32_t DataEncoded;
   };
   bool RasterizationDisabled;
+  bool ClipDistanceVaryings;
 };
 
 struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA32 {
@@ -2249,6 +2300,9 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA32 {
   uint32_t strip_cut_index;
   uint32_t input_primitive;
   bool pass_through;
+  bool pipeline_statistics;
+  bool clip_distance_varyings;
+  bool quad_lines;
 };
 
 struct SM50_SHADER_STREAM_OUTPUT_DATA32 {
@@ -2314,6 +2368,10 @@ sm50_compilation_argument32_convert(
       data->dual_source_blending = src->dual_source_blending;
       memcpy(data->pixel_formats, src->pixel_formats, sizeof(data->pixel_formats));
       data->pipeline_statistics = src->pipeline_statistics;
+      data->alpha_to_coverage = src->alpha_to_coverage;
+      data->centered_samples = src->centered_samples;
+      data->single_raster_sample = src->single_raster_sample;
+      data->clip_distances = src->clip_distances;
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -2338,6 +2396,7 @@ sm50_compilation_argument32_convert(
       data->type = src->type;
       data->Data = src->Data;
       data->RasterizationDisabled = src->RasterizationDisabled;
+      data->ClipDistanceVaryings = src->ClipDistanceVaryings;
       break;
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
@@ -2352,6 +2411,9 @@ sm50_compilation_argument32_convert(
       data->strip_cut_index = src->strip_cut_index;
       data->input_primitive = src->input_primitive;
       data->pass_through = src->pass_through;
+      data->pipeline_statistics = src->pipeline_statistics;
+      data->clip_distance_varyings = src->clip_distance_varyings;
+      data->quad_lines = src->quad_lines;
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
@@ -4168,6 +4230,9 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTDiagWrite,
     &_DispatchData_getBytes,
     &_MTLComputePipelineState_maxTotalThreadsPerThreadgroup,
+    &_MTLDevice_supports32BitFloatFiltering,
+    &_MTLDevice_maxArgumentBufferSamplerCount,
+    &_MTLDevice_supports32BitMSAA,
 };
 
 #ifndef MULLION_NATIVE
@@ -4343,6 +4408,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTDiagWrite,
     &_DispatchData_getBytes,
     &_MTLComputePipelineState_maxTotalThreadsPerThreadgroup,
+    &_MTLDevice_supports32BitFloatFiltering,
+    &_MTLDevice_maxArgumentBufferSamplerCount,
+    &_MTLDevice_supports32BitMSAA,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

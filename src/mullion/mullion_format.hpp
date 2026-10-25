@@ -7,6 +7,9 @@
 #include <map>
 
 namespace mullion {
+
+// dxgiformat.h of the toolchain ends before the Agility SDK's 4-bit format
+constexpr auto DXGI_FORMAT_A4B4G4R4_UNORM = (DXGI_FORMAT)191;
 enum class FormatCapability : int {
   None = 0,
   Atomic = 0x1,
@@ -95,6 +98,12 @@ bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);
 bool IsIntegerFormat(WMTPixelFormat format);
 
 void SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color);
+
+// the stored channel red, green, blue and alpha each land in: a view's component swizzle is undone for render target
+// writes, clears and write masks, which bypass it (B4G4R4A4 stores its channels rotated)
+std::array<uint8_t, 4> RenderTargetChannels(WMTPixelFormat format);
+
+WMTColorWriteMask RenderTargetWriteMask(WMTPixelFormat format, WMTColorWriteMask mask);
 
 // the range a border color clamps to before filtering (D3D11.3 7.18.9.1): normalized formats' own, the rest as their
 // clear colors clamp

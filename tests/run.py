@@ -7,6 +7,7 @@ build's libraries are installed into. a family other than the GPU's own lowers w
 every repeat: one that fails once, ends without a result or outlives its time has failed.
 """
 import argparse
+import atexit
 import contextlib
 import fcntl
 import json
@@ -81,24 +82,44 @@ def install(wine, prefix, unix, pe):
 FAULTS = ("Device error", "failed assertion", "message sent to deallocated instance")
 
 
+def waiting(markers):
+    """whether a live process has a marker in the directory; a dead one's is removed"""
+    for marker in Path(markers).glob("*"):
+        try:
+            os.kill(int(marker.name), 0)
+            return True
+        except (ProcessLookupError, ValueError):
+            marker.unlink(missing_ok=True)
+    return False
+
+
 @contextlib.contextmanager
 def alone():
     """one GPU job at a time on a machine that has others: MULLION_TEST_LOCK names their lock, a directory that holds
     its owner's process id and is taken over when the owner is gone. held for one test, so the others get their turn"""
     lock = os.environ.get("MULLION_TEST_LOCK")
+    # MULLION_TEST_URGENT marks a run that others let go first, for as long as it lives: a check of one change
+    # waits for one test of a long run, not for its turns
+    urgent = lock and os.environ.get("MULLION_TEST_URGENT")
+    if urgent and not hasattr(alone, "marker"):
+        alone.marker = Path(lock + ".urgent", str(os.getpid()))
+        alone.marker.parent.mkdir(exist_ok=True)
+        alone.marker.touch()
+        atexit.register(alone.marker.unlink, missing_ok=True)
     while lock:
         # the guard is never removed: publication and takeover must lock the same inode, including shell users
         with open(lock + ".guard", "a") as guard:
             fcntl.flock(guard, fcntl.LOCK_EX)
-            try:
-                os.mkdir(lock)
-                Path(lock, "pid").write_text(str(os.getpid()))
-                break
-            except FileExistsError:
+            if urgent or not waiting(lock + ".urgent"):
                 try:
-                    os.kill(int(Path(lock, "pid").read_text()), 0)
-                except (ProcessLookupError, FileNotFoundError, ValueError):
-                    shutil.rmtree(lock, ignore_errors=True)
+                    os.mkdir(lock)
+                    Path(lock, "pid").write_text(str(os.getpid()))
+                    break
+                except FileExistsError:
+                    try:
+                        os.kill(int(Path(lock, "pid").read_text()), 0)
+                    except (ProcessLookupError, FileNotFoundError, ValueError):
+                        shutil.rmtree(lock, ignore_errors=True)
         time.sleep(5)
     try:
         yield
@@ -236,13 +257,31 @@ def arguments(parser):
     parser.add_argument("--no-install", action="store_true", help="leave the Wine's libraries as they are")
 
 
+@contextlib.contextmanager
+def session(args):
+    """keep a Wine's installed libraries unchanged until its tests finish, even between GPU turns"""
+    wine = args.wine.resolve().stat()
+    directory = Path("/tmp") / f"mullion-tests-{os.getuid()}"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.stat().st_uid != os.getuid():
+        raise PermissionError(f"test lock directory is not owned by this user: {directory}")
+    path = directory / f"wine-{wine.st_dev}-{wine.st_ino}.lock"
+    with open(path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield environment(args)
+
+
 def environment(args):
     """the builds, the Wine's binary and the environment of a test in it, with the builds' libraries installed"""
     builds = [build.resolve() for build in args.build]
     wine = args.wine.resolve()
     prefix = (args.prefix or builds[0] / "tests-prefix").resolve()
     unix, pe = libraries(builds)
-    base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), MULLION_SHADER_CACHE="0", **ZOMBIES)
+    base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), MULLION_SHADER_CACHE="0")
+    if getattr(args, "benchmark", False):
+        base.pop("NSZombieEnabled", None)
+    else:
+        base.update(ZOMBIES)
     base.pop("MULLION_GPU_FAMILY", None)
     # the build's libraries in place of the Wine's own, the shader compiler the prefix has (Wine's own when it has
     # none: winetricks' d3dcompiler_47 is x86 only, so an arm64 Wine's ARM64 tests have no other), and no installer or
@@ -295,13 +334,14 @@ def options(parser):
     parser.add_argument("--late", type=int, help="delay each Metal command buffer's commit by this many milliseconds")
     parser.add_argument("--suite", action="append", default=[], help="only tests of this suite (may repeat)")
     parser.add_argument("--exact", action="store_true", help="match whole test names instead of prefixes")
+    parser.add_argument("--benchmark", action="store_true", help="run declared benchmarks instead of correctness tests")
     parser.add_argument("tests", nargs="*", help="test name prefixes, or whole names with --exact")
 
 
 def chosen(args):
     """the build's tests the arguments name"""
     declared = [json.loads(path.read_text()) for build in args.build
-                for path in [build.resolve() / "meson-info" / "intro-tests.json"] if path.exists()]
+                for path in [build.resolve() / "meson-info" / ("intro-benchmarks.json" if getattr(args, "benchmark", False) else "intro-tests.json")] if path.exists()]
     declared = next((tests for tests in declared if tests), None)
     if not declared:
         sys.exit("no build was set up with tests (-Denable_tests=true)")
@@ -319,7 +359,7 @@ def own(args, tests, builds, binary, base):
     """runs the build's tests as each family; how many failed"""
     if args.late is not None and args.late < 0:
         sys.exit("--late must be nonnegative milliseconds")
-    logs = builds[0] / "meson-logs" / "tests"
+    logs = builds[0] / "meson-logs" / ("benchmarks" if getattr(args, "benchmark", False) else "tests")
     logs.mkdir(parents=True, exist_ok=True)
     families = args.family.split(",")
     verdicts = {}
@@ -365,7 +405,8 @@ def main():
     options(parser)
     args = parser.parse_args()
     tests = chosen(args)
-    sys.exit(own(args, tests, *environment(args)) != 0)
+    with session(args) as runtime:
+        sys.exit(own(args, tests, *runtime) != 0)
 
 
 if __name__ == "__main__":

@@ -91,14 +91,14 @@ public:
   HRESULT
   Initialize(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc) {
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     desc_ = *pDesc;
     switch (pDesc->Type) {
     case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV: {
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
     descriptors_.resize(pDesc->NumDescriptors);
 
@@ -135,7 +135,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -176,7 +176,7 @@ public:
       bool Multisample
   ) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexture;
     cpu_storage.SRVTexture.texture = Texture;
@@ -188,7 +188,9 @@ public:
       gpu_storage.SRVTexture.metadata = TextureMetadata(Texture->arrayLength(View), ResourceMinLODClamp);
       if (Multisample)
         gpu_storage.SRVTexture.metadata =
-            TextureMetadata(Texture->arrayLength(View), 0) | (Texture->sampleCount() == 1);
+            TextureMetadata(Texture->arrayLength(View), 0) |
+            (Texture->sampleCount() == 1 ? SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE : 0) |
+            (Texture->centered ? SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED : 0);
       gpu_storage.SRVTexture.padding[0] = std::bit_cast<uint64_t>(BorderRange);
       // the view's place in its resource, which sampler feedback is recorded for: the first mip and how many mips the
       // resource has, a byte each, then 16 bits each for the first slice and the resource's width and height
@@ -202,14 +204,14 @@ public:
     virtual HRESULT
   AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::ConstantBuffer;
     cpu_storage.ConstantBuffer.address = VA;
     cpu_storage.ConstantBuffer.size = SizeInBytes;
     if (mapped_argument_buffer_) {
       auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.ConstantBuffer.address = VA;
+      gpu_storage.ConstantBuffer.address = VA && SizeInBytes ? VA : device_->GetNullBuffer();
       gpu_storage.ConstantBuffer.size = SizeInBytes;
     }
     return S_OK;
@@ -220,7 +222,7 @@ public:
       UINT Index, Texture *Texture, TextureViewKey View, UINT FirstWSlice, UINT WSize, bool MinMipFeedback
   ) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexture;
     cpu_storage.UAVTexture.texture = Texture; // 
@@ -245,7 +247,7 @@ public:
   virtual HRESULT
   AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferViewKey View, BufferSlice Slice) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexelBuffer;
     cpu_storage.UAVTexelBuffer.buffer = UAVBuffer;
@@ -270,7 +272,7 @@ public:
   virtual HRESULT
   AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT CounterOffsetInBytes) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVBuffer;
     cpu_storage.UAVBuffer.buffer = UAVBuffer;
@@ -282,7 +284,7 @@ public:
         gpu_storage.UAVBuffer.metadata = Slice.byteLength;
         gpu_storage.UAVBuffer.counter_pointer = Counter ? Counter->current()->gpuAddress() + CounterOffsetInBytes : 0;
       } else {
-        gpu_storage.UAVBuffer.pointer = 0;
+        gpu_storage.UAVBuffer.pointer = device_->GetNullBuffer();
         gpu_storage.UAVBuffer.metadata = 0;
         gpu_storage.UAVBuffer.counter_pointer = 0;
       }
@@ -292,7 +294,7 @@ public:
 
   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexelBuffer;
     cpu_storage.SRVTexelBuffer.buffer = Buffer;
@@ -315,7 +317,7 @@ public:
   virtual HRESULT
   AddAccelerationStructureView(UINT Index, UINT64 VA) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     descriptors_[Index].type = ShaderVisibleDescriptorType::Null;
     if (mapped_argument_buffer_) {
       auto &gpu_storage = mapped_argument_buffer_[Index];
@@ -327,7 +329,7 @@ public:
 
   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVBuffer;
     cpu_storage.SRVBuffer.buffer = Buffer;
@@ -338,7 +340,7 @@ public:
         gpu_storage.SRVBuffer.pointer = Buffer->current()->gpuAddress() + Slice.byteOffset;
         gpu_storage.SRVBuffer.metadata = Slice.byteLength;
       } else {
-        gpu_storage.SRVBuffer.pointer = 0;
+        gpu_storage.SRVBuffer.pointer = device_->GetNullBuffer();
         gpu_storage.SRVBuffer.metadata = 0;
       }
     }
@@ -348,9 +350,9 @@ public:
   virtual HRESULT
   AddShaderResourceView(UINT Index, D3D12_SHADER_RESOURCE_VIEW_DESC const *pDesc) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     /**
      * TODO: support null descriptor properly (respect different view dimensions)
      */
@@ -359,6 +361,9 @@ public:
     if (mapped_argument_buffer_) {
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.ZeroFilled = {{}};
+      if (pDesc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+          (pDesc->Format == DXGI_FORMAT_UNKNOWN || pDesc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW))
+        gpu_storage.SRVBuffer.pointer = device_->GetNullBuffer();
     }
     return S_OK;
   }
@@ -366,9 +371,9 @@ public:
   virtual HRESULT
   AddUnorderedAccessView(UINT Index, D3D12_UNORDERED_ACCESS_VIEW_DESC const *pDesc) {
     if (Index >= descriptors_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     /**
      * TODO: support null descriptor properly (respect different view dimensions)
      */
@@ -377,6 +382,9 @@ public:
     if (mapped_argument_buffer_) {
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.ZeroFilled = {{}};
+      if (pDesc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER &&
+          (pDesc->Format == DXGI_FORMAT_UNKNOWN || pDesc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW))
+        gpu_storage.UAVBuffer.pointer = device_->GetNullBuffer();
     }
     return S_OK;
   }
@@ -409,18 +417,18 @@ public:
   HRESULT
   Initialize(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc) {
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     desc_ = *pDesc;
     switch (pDesc->Type) {
     case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
     case D3D12_DESCRIPTOR_HEAP_TYPE_RTV: {
       if (pDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       render_targets_.resize(pDesc->NumDescriptors);
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
     return S_OK;
   };
@@ -429,7 +437,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -467,7 +475,7 @@ public:
   virtual HRESULT
   AddRenderTarget(UINT Index, MTL_RENDER_TARGET_DESC const *pDesc) {
     if (Index >= render_targets_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (pDesc)
       render_targets_[Index] = *pDesc;
     else
@@ -526,14 +534,14 @@ public:
   HRESULT
   Initialize(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc) {
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     desc_ = *pDesc;
     switch (pDesc->Type) {
     case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER: {
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
     samplers_.resize(pDesc->NumDescriptors);
 
@@ -570,7 +578,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -609,9 +617,9 @@ public:
   virtual HRESULT
   AddSampler(UINT Index, const D3D12_SAMPLER_DESC *pDesc) {
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (Index >= samplers_.size())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
   
     WMTSamplerInfo info;
     bool custom = PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, *pDesc);
@@ -649,7 +657,7 @@ CreateDescriptorHeap(
 ) {
   InitReturnPtr(ppDescriptorHeap);
   if (!pDesc)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   if (pDesc->NumDescriptors >> EMBEDDED_DESCRIPTOR_HANDLE::kDescriptorBits) {
     ERR("CreateDescriptorHeap: ", pDesc->NumDescriptors, " descriptors of type ", pDesc->Type, " are too many");
     return E_INVALIDARG;
@@ -686,7 +694,7 @@ CreateDescriptorHeap(
   default:
     break;
   }
-  return E_INVALIDARG;
+  return FAIL(E_INVALIDARG);
 }
 
 } // namespace mullion

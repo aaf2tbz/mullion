@@ -433,7 +433,8 @@ public:
       case 0b10:
       case 0b100:
       case 0b1000:
-        return ir.CreateExtractElement(Value, __builtin_ctz(Mask));
+        // the value holds only the combined mask's components, packed
+        return ir.CreateExtractElement(Value, __builtin_popcount(CombinedMask & (Mask - 1)));
       default:
         break;
     }
@@ -495,6 +496,18 @@ public:
       llvm::Value *Level = nullptr, bool Conservative = false
   );
 
+  // a sample whose LOD comes from its quad's derivatives, with `Bias` and `MinLOD`, of `Reference` when it compares.
+  // Metal biases the footprint's minor axis before an anisotropic filter clamps the footprint's ratio, which can undo
+  // the bias; D3D biases the LOD of the clamped footprint ("biasedLOD = output.LOD + MipLODBias", D3D11.3 7.18.11).
+  // so a pixel shader's sample of a 2D texture through an anisotropic sampler with a bias scales its gradients
+  // instead, which keeps the ratio. `OwnBias`: the instruction adds a bias of its own, which may differ within the
+  // quad, so the sampler alone takes the branch
+  std::pair<llvm::Value *, llvm::Value *> SampleImplicit(
+      const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
+      llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD,
+      bool OwnBias
+  );
+
   // a sample's texels and status, where Metal's own are wrong: a reserved texture a shader can write reports no
   // texel mapped, and filters as if magnified, when the level is past its last mip (D3D11.3 7.18.10: the level is
   // "clamped to available miplevels"). `Read` reads again, `Level` or the gradients say how the sample chose its level
@@ -517,6 +530,7 @@ public:
 
   // 1.0 when `Reference` passes the sampler's comparison function against `Texel`, else 0.0
   llvm::Value *SamplerCompare(llvm::Value *SamplerMetadata, llvm::Value *Reference, llvm::Value *Texel);
+  llvm::Value *CompareReference(llvm::Value *SamplerMetadata, llvm::Value *Reference);
 
   // `Value`, what `Sampler` read (a sample, a gather of `Component`, or a comparison of either with `Reference`), with
   // the sampler's custom border color (SM50_SAMPLER_BORDER). `Read(Sampler)` repeats the read without its comparison
@@ -547,9 +561,10 @@ public:
 
   llvm::Value *FirstBit(IntegerUnaryOp Op, llvm::Value *Value);
   llvm::Value *SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value);
+  // `Used`: the components the caller takes of the texel
   std::pair<llvm::Value *, llvm::Value *> ReadTexel(
       const TextureResourceHandle &Tex, llvm::Value *Address, llvm::Value *ArrayIndex, llvm::Value *SampleIndex,
-      llvm::Value *Level
+      llvm::Value *Level, mask_t Used = kMaskAll
   );
   llvm::Value *ExtractBits(llvm::Value *Width, llvm::Value *Offset, llvm::Value *Src, bool Signed);
   llvm::Value *InsertBits(llvm::Value *Width, llvm::Value *Offset, llvm::Value *Src, llvm::Value *Dst);
@@ -568,6 +583,12 @@ public:
 
   // width, height, depth or array length, and mip count, as the D3D resinfo instruction returns them
   llvm::Value *TextureDimensions(const TextureResourceHandle &Tex, llvm::Value *Level);
+  // how many sizes the texture has: a cube reports the size of a face
+  static unsigned
+  SizeDimension(llvm::air::Texture::ResourceKind Logical) {
+    auto &Info = llvm::air::AIRBuilder::getTextureInfo(Logical);
+    return Info.is_cube ? 2 : Info.coord_dimension;
+  }
 
   BufferResourceHandle
   MakeBufferHandle(const BufferDescriptor &Descriptor, Swizzle Swizzle) {
@@ -583,10 +604,10 @@ public:
     Texture.kind = Descriptor.ResourceKind;
     Texture.memory_access = Descriptor.MemoryAccess;
     Texture.sample_type = Descriptor.SampleType;
-    // Metal's MS textures require more than one sample (Metal Programming Guide, listing 5-2); 1 in the low word
-    // names the regular texture used for a one-sample view (D3D11.3 22.4.7)
     if (llvm::air::AIRBuilder::getTextureInfo(Texture.kind).is_ms)
-      Texture.SingleSample = ir.CreateICmpEQ(ir.CreateTrunc(Descriptor.Metadata, air.getIntTy()), air.getInt(1));
+      Texture.SingleSample = ir.CreateICmpNE(
+          ir.CreateAnd(Descriptor.Metadata, SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE), ir.getInt64(0)
+      );
     return {
         Texture,
         Descriptor.ResourceKindLogical,
@@ -597,6 +618,14 @@ public:
         Descriptor.Range,
         Descriptor.IsUAV
     };
+  }
+
+  // a multisample texture's sample offset: the pattern of no samples places every one at the center
+  llvm::Value *
+  TextureSamplePos(const TextureResourceHandle &Tex, llvm::Value *Samples, llvm::Value *Index) {
+    auto Centered =
+        ir.CreateICmpNE(ir.CreateAnd(Tex.Metadata, SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED), ir.getInt64(0));
+    return air.CreateSamplePos(ir.CreateSelect(Centered, ir.getInt32(0), Samples), Index);
   }
 
   // a 3D UAV's W range, which a Metal view cannot select: its metadata holds the first W slice where a texture holds
@@ -669,10 +698,10 @@ public:
 
   llvm::Value *BufferResidency(llvm::Value *Pointer);
   // Then() where Condition holds and Else() where it does not
-  llvm::Value *Either(llvm::Value *Condition, llvm::function_ref<llvm::Value *()> Then, llvm::function_ref<llvm::Value *()> Else);
   llvm::Value *LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr, bool Inside = false);
   llvm::Value *LoadBufferUnits(
-      BufferResourceHandle &Buffer, llvm::Value *Last, uint32_t UnitBytes, llvm::function_ref<llvm::Value *(bool)> Read
+      BufferResourceHandle &Buffer, llvm::Value *Base, llvm::Value *Last, uint32_t UnitBytes,
+      llvm::function_ref<llvm::Value *(llvm::Value *, bool)> Read
   );
   void LoadBufferWords(
       BufferResourceHandle &Buf, llvm::Value *Index, const DstOperand &Dst, const std::optional<DstOperand> &Feedback

@@ -5,7 +5,11 @@
 // lists and strips, and counts below, at and past an object group's capacity return the expected vertex bytes.
 // without stream output, "Primitives will be completely discarded" when every vertex has a negative cull distance
 // (D3D11.3 15.4.2): a full-target triangle with positive distances draws; one with negative distances does not.
+// omitted rasterizer state uses solid fill, back culling, clockwise fronts and depth clipping (D3D12_RASTERIZER_DESC
+// default table); ../raster.hpp supplies the independent pixel expectation for both windings and near/far Z.
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_rasterizer_desc
 #include "d3d12_test.hpp"
+#include "../raster.hpp"
 #include "../../src/airconv/airconv_public.h"
 #include <cstddef>
 #include <cstdint>
@@ -20,12 +24,13 @@ O vs(uint id : SV_VertexID) {
 }
 struct C { float4 position : SV_Position; float distance : SV_CullDistance; };
 C vs_cull(uint id : SV_VertexID) {
+  id = BACKFACE && id != 0 ? 3 - id : id;
   C o;
-  o.position = float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1);
+  o.position = float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), VERTEX_Z, 1);
   o.distance = VISIBLE ? 1 : -1;
   return o;
 }
-uint ps() : SV_Target { return 1; }
+uint ps(bool face : SV_IsFrontFace) : SV_Target { return face ? 1 : 2; }
 )hlsl";
 
 int
@@ -35,12 +40,21 @@ main(int argc, char **argv) {
     printf("skipped: dxcompiler.dll not found\n");
     return 77;
   }
-  auto vs = compiler.compile(hlsl, "vs", "vs", {"VISIBLE=1"});
-  auto ps = compiler.compile(hlsl, "ps", "ps", {"VISIBLE=1"});
-  std::string cull_vs[2];
-  for (UINT visible = 0; visible < std::size(cull_vs); visible++)
-    cull_vs[visible] = compiler.compile(hlsl, "vs_cull", "vs", {"VISIBLE=" + std::to_string(visible)});
-  if (!expect(!vs.empty() && !ps.empty() && !cull_vs[0].empty() && !cull_vs[1].empty(), "HLSL did not compile"))
+  auto vs = compiler.compile(hlsl, "vs", "vs", {"VISIBLE=1", "BACKFACE=0", "VERTEX_Z=0"});
+  auto ps = compiler.compile(hlsl, "ps", "ps", {"VISIBLE=1", "BACKFACE=0", "VERTEX_Z=0"});
+  constexpr float depths[] = {-1, 0, 0.5f, 1, 2};
+  std::string cull_vs[2][2][std::size(depths)];
+  for (UINT visible : {0u, 1u})
+    for (bool backface : {false, true})
+      for (size_t z = 0; z < std::size(depths); z++) {
+        cull_vs[visible][backface][z] =
+            compiler.compile(hlsl, "vs_cull", "vs",
+                             {"VISIBLE=" + std::to_string(visible), "BACKFACE=" + std::to_string(backface),
+                              "VERTEX_Z=" + std::to_string(depths[z])});
+        if (cull_vs[visible][backface][z].empty())
+          return 1;
+      }
+  if (!expect(!vs.empty() && !ps.empty(), "HLSL did not compile"))
     return verdict();
   ComPtr<ID3D12Device2> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
@@ -186,42 +200,58 @@ main(int argc, char **argv) {
   auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST);
   if (!expect(!!readback, "cull readback"))
     return verdict();
-  for (UINT visible = 0; visible < std::size(cull_vs); visible++) {
-    cull_stream.vertex.value = bytecode(cull_vs[visible]);
-    for (bool omitted : {true, false}) {
-      step("without stream output visible=%u omitted=%u draw cull-distance triangle", visible, omitted);
-      D3D12_PIPELINE_STATE_STREAM_DESC desc{omitted ? offsetof(CullStream, topology) : sizeof(cull_stream),
-                                            &cull_stream};
-      ComPtr<ID3D12PipelineState> pso;
-      HRESULT hr = device->CreatePipelineState(&desc, IID_PPV_ARGS(&pso));
-      if (!expect(hr == S_OK, "CreatePipelineState returned %#lx", hr))
-        continue;
-      CHECK(forget(readback.Get()));
-      CHECK(allocator->Reset());
-      CHECK(list->Reset(allocator.Get(), pso.Get()));
-      list->SetGraphicsRootSignature(rs.Get());
-      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-      D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-      D3D12_RECT rect{0, 0, 1, 1};
-      list->RSSetViewports(1, &viewport);
-      list->RSSetScissorRects(1, &rect);
-      list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-      const float clear[4]{};
-      list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-      list->DrawInstanced(3, 1, 0, 0);
-      transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-      D3D12_TEXTURE_COPY_LOCATION to{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT},
-          from{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-      to.PlacedFootprint = footprint;
-      list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-      transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-      CHECK(submit(device.Get(), queue.Get(), list.Get()));
-      uint32_t *got;
-      CHECK(readback->Map(0, nullptr, (void **)&got));
-      expect(got[footprint.Offset / sizeof(*got)] == visible, "cull pixel got=%u want=%u",
-             got[footprint.Offset / sizeof(*got)], visible);
-      readback->Unmap(0, nullptr);
-    }
-  }
+  for (UINT visible = 0; visible < std::size(cull_vs); visible++)
+    for (bool backface : {false, true})
+      for (size_t z = 0; z < std::size(depths); z++) {
+        cull_stream.vertex.value = bytecode(cull_vs[visible][backface][z]);
+        for (bool omitted : {true, false}) {
+          step("default rasterizer visible=%u backface=%u depth=%g omitted topology=%u", visible, backface, depths[z],
+               omitted);
+          D3D12_PIPELINE_STATE_STREAM_DESC desc{omitted ? offsetof(CullStream, topology) : sizeof(cull_stream),
+                                                &cull_stream};
+          ComPtr<ID3D12PipelineState> pso;
+          HRESULT hr = device->CreatePipelineState(&desc, IID_PPV_ARGS(&pso));
+          if (!expect(hr == S_OK, "CreatePipelineState returned %#lx", hr))
+            continue;
+          CHECK(forget(readback.Get()));
+          CHECK(allocator->Reset());
+          CHECK(list->Reset(allocator.Get(), pso.Get()));
+          list->SetGraphicsRootSignature(rs.Get());
+          list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
+          D3D12_RECT rect{0, 0, 1, 1};
+          list->RSSetViewports(1, &viewport);
+          list->RSSetScissorRects(1, &rect);
+          list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+          const float clear[4]{};
+          list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+          list->DrawInstanced(3, 1, 0, 0);
+          transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+          D3D12_TEXTURE_COPY_LOCATION to{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT},
+              from{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+          to.PlacedFootprint = footprint;
+          list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+          transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+          CHECK(submit(device.Get(), queue.Get(), list.Get()));
+          uint32_t *got;
+          CHECK(readback->Map(0, nullptr, (void **)&got));
+          auto reference = raster::base();
+          reference.viewport = {0, 0, 1, 1, 0, 1};
+          reference.rect = {0, 0, 1, 1};
+          reference.cull = raster::CullBack;
+          reference.mode = raster::Cull;
+          reference.vertices = {{{-1, 1, depths[z], 1}, {}}, {{3, 1, depths[z], 1}, {}}, {{-1, -3, depths[z], 1}, {}}};
+          for (auto &v : reference.vertices) {
+            v.distance.fill(1);
+            v.distance[0] = visible ? 1 : -1;
+          }
+          if (backface)
+            std::swap(reference.vertices[1], reference.vertices[2]);
+          auto want = UINT(raster::expected(reference)[0][0]);
+          expect(got[footprint.Offset / sizeof(*got)] == want, "raster default pixel got=%u want=%u",
+                 got[footprint.Offset / sizeof(*got)], want);
+          readback->Unmap(0, nullptr);
+        }
+      }
   return verdict();
 }

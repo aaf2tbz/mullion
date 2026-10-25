@@ -157,6 +157,11 @@ runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(GlobalCleanupPM), true /* ? */));
   }
 
+  if (auto temp = getenv("DXMT_TEMP_O2"))
+    MPM.addPass(createModuleToFunctionPassAdaptor(PB.buildFunctionSimplificationPipeline(
+        temp[0] == '3' ? OptimizationLevel::O3 : OptimizationLevel::O2, ThinOrFullLTOPhase::None
+    )));
+
   // MPM.addPass(VerifierPass());
 
   // Optimize the IR!

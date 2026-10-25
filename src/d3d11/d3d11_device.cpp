@@ -390,6 +390,8 @@ public:
       d3dmt_(static_cast<ID3D11Device *>(this), mutex) {
     commandlist_pool_ = InitializeCommandListPool(this);
     pipeline_cache_ = InitializePipelineCache(this);
+    rasterizer_states_.CreateStateObject(&kDefaultRasterizerDesc, &default_rasterizer_state_);
+    default_rasterizer_state_->Release();
     context_ = InitializeImmediateContext(this, device_.queue());
     d3d10_ = std::make_unique<MTLD3D10Device>(this, context_.get());
     if (FeatureFlags & D3D11_CREATE_DEVICE_DEBUG)
@@ -408,6 +410,8 @@ public:
   ULONG STDMETHODCALLTYPE Release() override { return container_->Release(); }
 
   bool IsTraced() override { return is_traced_; }
+
+  IMTLD3D11RasterizerState *GetDefaultRasterizerState() override { return default_rasterizer_state_; }
 
   HRESULT STDMETHODCALLTYPE
   CreateBuffer(const D3D11_BUFFER_DESC *pDesc,
@@ -437,8 +441,12 @@ public:
     } else {
       desc.StructureByteStride = 0;
     }
-    if ((desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) || UINT(desc.Usage) > D3D11_USAGE_STAGING ||
-        (desc.Usage == D3D11_USAGE_IMMUTABLE && !pInitialData))
+    constexpr UINT input = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER |
+                           D3D11_BIND_SHADER_RESOURCE;
+    if ((desc.BindFlags & ~(input | (kD3D11OutputBindFlags & ~D3D11_BIND_DEPTH_STENCIL))) ||
+        ((desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) && (desc.BindFlags & D3D11_BIND_STREAM_OUTPUT)) ||
+        !ValidUsage(desc.Usage, desc.BindFlags, desc.CPUAccessFlags, pInitialData) ||
+        (desc.MiscFlags & (D3D11_RESOURCE_MISC_TILE_POOL | D3D11_RESOURCE_MISC_TILED)))
       return E_INVALIDARG;
 
     try {
@@ -719,6 +727,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateBlendState(const D3D11_BLEND_DESC *pBlendStateDesc,
                    ID3D11BlendState **ppBlendState) override {
+    InitReturnPtr(ppBlendState);
     if (!pBlendStateDesc)
       return E_INVALIDARG;
     ID3D11BlendState1 *pBlendState1;
@@ -744,8 +753,9 @@ public:
       desc.RenderTarget[i].RenderTargetWriteMask =
           pBlendStateDesc->RenderTarget[i].RenderTargetWriteMask;
     }
-    auto hr = CreateBlendState1(&desc, &pBlendState1);
-    *ppBlendState = pBlendState1;
+    auto hr = CreateBlendState1(&desc, ppBlendState ? &pBlendState1 : nullptr);
+    if (ppBlendState)
+      *ppBlendState = pBlendState1;
     return hr;
   }
 
@@ -759,6 +769,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateRasterizerState(const D3D11_RASTERIZER_DESC *pRasterizerDesc,
                         ID3D11RasterizerState **ppRasterizerState) override {
+    InitReturnPtr(ppRasterizerState);
     if (!pRasterizerDesc)
       return E_INVALIDARG;
     ID3D11RasterizerState2 *pRasterizerState;
@@ -775,8 +786,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = 0;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState : nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -789,6 +801,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateQuery(const D3D11_QUERY_DESC *pQueryDesc, ID3D11Query **ppQuery) override {
+    InitReturnPtr(ppQuery);
     if (!pQueryDesc)
       return E_INVALIDARG;
     D3D11_QUERY_DESC1 desc;
@@ -996,6 +1009,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateRasterizerState1(const D3D11_RASTERIZER_DESC1 *pRasterizerDesc,
                          ID3D11RasterizerState1 **ppRasterizerState) override {
+    InitReturnPtr(ppRasterizerState);
     if (!pRasterizerDesc)
       return E_INVALIDARG;
     ID3D11RasterizerState2 *pRasterizerState;
@@ -1012,8 +1026,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = pRasterizerDesc->ForcedSampleCount;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState : nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -1272,7 +1287,7 @@ public:
   CreateQuery1(const D3D11_QUERY_DESC1 *pQueryDesc, ID3D11Query1 **ppQuery) override {
     InitReturnPtr(ppQuery);
 
-    if (!pQueryDesc)
+    if (!pQueryDesc || UINT(pQueryDesc->Query) > D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3)
       return E_INVALIDARG;
 
     if (!ppQuery)
@@ -1403,10 +1418,14 @@ public:
 
   virtual FormatCapability
   GetMTLPixelFormatCapability(WMTPixelFormat Format) final {
-    Format = ORIGINAL_FORMAT(Format);
-    if (!format_inspector_.textureCapabilities.contains(Format))
+    auto original = WMTPixelFormat(ORIGINAL_FORMAT(Format));
+    if (!format_inspector_.textureCapabilities.contains(original))
       return FormatCapability(0);
-    return format_inspector_.textureCapabilities.at(Format);
+    auto capability = format_inspector_.textureCapabilities.at(original);
+    // blending takes the stored channels as they are: rotated ones would blend red with alpha's factors
+    if (RenderTargetChannels(Format) != RenderTargetChannels(original))
+      capability = capability & ~FormatCapability::Blend;
+    return capability;
   };
 
   virtual IMTLD3D11DeviceContext *GetImmediateContextPrivate() final {
@@ -1449,11 +1468,28 @@ public:
   }
 
 private:
+  // usage, CPU access and bind flags, as Windows takes them (Wine's d3d11 test_resource_access): a default resource
+  // has no CPU access (MapOnDefaultBuffers is not offered), an immutable one has initial data and binds as an input
+  // only, a dynamic one as well and the CPU writes it, and a staging one only copies
+  static bool
+  ValidUsage(D3D11_USAGE usage, UINT bind, UINT cpu, bool initial) {
+    switch (usage) {
+    case D3D11_USAGE_DEFAULT:
+      return !cpu;
+    case D3D11_USAGE_IMMUTABLE:
+      return initial && !cpu && bind && !(bind & kD3D11OutputBindFlags);
+    case D3D11_USAGE_DYNAMIC:
+      return cpu == D3D11_CPU_ACCESS_WRITE && bind && !(bind & kD3D11OutputBindFlags);
+    case D3D11_USAGE_STAGING:
+      return cpu && !(cpu & ~(D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE)) && !bind;
+    }
+    return false;
+  }
+
   template <typename Desc>
   HRESULT
   ValidateTexture(const Desc *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData) {
-    if (UINT(pDesc->Usage) > D3D11_USAGE_STAGING || (pDesc->Usage == D3D11_USAGE_IMMUTABLE && !pInitialData) ||
-        (pDesc->Usage == D3D11_USAGE_STAGING && pDesc->BindFlags))
+    if (!ValidUsage(pDesc->Usage, pDesc->BindFlags, pDesc->CPUAccessFlags, pInitialData))
       return E_INVALIDARG;
     Desc desc;
     WMTTextureInfo info{};
@@ -1479,6 +1515,7 @@ private:
 
   StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState> sampler_states_;
   StateObjectCache<D3D11_RASTERIZER_DESC2, IMTLD3D11RasterizerState> rasterizer_states_;
+  IMTLD3D11RasterizerState *default_rasterizer_state_;
   StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState> depthstencil_states_;
 
   std::unique_ptr<MTLD3D11CommandListPoolBase> commandlist_pool_;

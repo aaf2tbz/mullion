@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -198,6 +199,8 @@ struct io_binding_map {
   llvm::Value *thread_id_in_group_arg = nullptr;
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
   llvm::Value *coverage_mask_arg = nullptr;
+  // the samples a pixel shader's clip test kept (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
+  llvm::Value *clip_coverage = nullptr;
 
   llvm::Value *domain = nullptr;
   llvm::Value *patch_id = nullptr;
@@ -252,6 +255,7 @@ struct context {
   io_binding_map &resource;
   air::AirType &types; // hmmm
   uint32_t pso_sample_mask;
+  bool pso_single_raster_sample = false;
   microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type;
   SM50_SHADER_METAL_VERSION metal_version;
   uint32_t simd_width = 0; // the device's SIMD-group width, which vertex functions have no input for; 0 when unknown
@@ -295,7 +299,7 @@ IREffect init_input_reg_with_interpolation(
 );
 
 std::function<IRValue(pvalue)>
-pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element, std::array<int, 4> channels = {0, 1, 2, 3});
 
 std::function<IRValue(pvalue)>
 pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element);
@@ -344,6 +348,11 @@ inline std::string
 varying_name(uint32_t reg, uint32_t component) {
   return "reg" + std::to_string(reg) + "_" + std::to_string(component);
 }
+// a clip distance a pipeline's pixel shader tests itself (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
+inline std::string
+clip_varying_name(uint32_t index) {
+  return "clip" + std::to_string(index);
+}
 constexpr air::MSLScalerOrVectorType
 varying_type(RegisterComponentType type) {
   return type == RegisterComponentType::Float ? air::MSLScalerOrVectorType(air::msl_float) : air::msl_uint;
@@ -370,6 +379,8 @@ struct SignatureContext {
   bool disable_depth_output;
   bool skip_vertex_output;
   uint32_t pull_mode_reg_mask;
+  // centroid inputs are interpolated in the shader (llvm::air::AIRBuilder::CentroidCoverage)
+  bool pull_centroids;
   uint32_t unorm_output_reg_mask;
   // it is considered optional (as a hint)
   air::MTLPixelFormat pixel_formats[8];
@@ -386,12 +397,26 @@ struct SignatureContext {
       disable_depth_output(false),
       skip_vertex_output(false),
       pull_mode_reg_mask(0),
+      pull_centroids(false),
       unorm_output_reg_mask(0) {
     memset(pixel_formats, 0, sizeof(pixel_formats));
   };
 };
 
 RegisterComponentType component_type_from_pixel_format(air::MTLPixelFormat format);
+
+// the input a stage that writes rasterized positions scales them with (llvm::air::AIRBuilder::RasterScale)
+inline uint32_t
+DefineRasterScale(air::FunctionSignatureBuilder &signature) {
+  return signature.DefineInput(air::ArgumentBindingBuffer{
+      .location_index = SM50_BINDING_INDEX_RASTER_SCALE,
+      .array_size = 1,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_float,
+      .arg_name = "raster_scale",
+  });
+}
 
 struct MeshOutputContext {
   llvm::Value *vertex_id;
@@ -511,6 +536,7 @@ public:
   uint32_t gs_max_vertex_output = 0;
   uint32_t gs_instance_count = 1;
   uint32_t ps_has_coverage_output = 0;
+  uint32_t ps_has_coverage_input = 0;
   std::string dxil; // bitcode of a DXIL shader, empty for DXBC
   // a DXIL library's ray tracing shaders, by their functions' names
   struct RayShader {

@@ -313,6 +313,16 @@ CreateMTLTextureDescriptorInternal(
   if (Width == 0 || Height == 0 || Depth == 0 || ArraySize == 0 || SampleCount == 0)
     return E_INVALIDARG;
 
+  const bool d3d11 = pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0;
+  const UINT dimension_limit =
+      Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D
+          ? (d3d11 ? D3D11_REQ_TEXTURE1D_U_DIMENSION : D3D10_REQ_TEXTURE1D_U_DIMENSION)
+      : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+          ? (d3d11 ? D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION : D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+          : (d3d11 ? D3D11_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D10_REQ_TEXTURE3D_U_V_OR_W_DIMENSION);
+  if (Width > dimension_limit || Height > dimension_limit || Depth > dimension_limit)
+    return E_INVALIDARG;
+
   UINT array_limit = pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0 ?
                        (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? D3D11_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION :
                                                                          D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION) :
@@ -340,10 +350,11 @@ CreateMTLTextureDescriptorInternal(
   }
 
   // a format makes the textures its row names (Microsoft Learn, "Format support for Direct3D Feature Level 11.0
-  // hardware": Texture1D, Texture2D, Texture3D)
+  // hardware": Texture1D, Texture2D, Texture3D, TextureCube)
   UINT support = 0;
   pDevice->CheckFormatSupport(Format, &support);
-  if (!(support & (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D   ? D3D11_FORMAT_SUPPORT_TEXTURE1D
+  if (!(support & ((MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)    ? D3D11_FORMAT_SUPPORT_TEXTURECUBE
+                   : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? D3D11_FORMAT_SUPPORT_TEXTURE1D
                    : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D ? D3D11_FORMAT_SUPPORT_TEXTURE2D
                                                                      : D3D11_FORMAT_SUPPORT_TEXTURE3D)))
     return E_INVALIDARG;

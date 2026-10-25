@@ -5,7 +5,8 @@
 // ClearFlags "Identify the type of data to clear" (Microsoft Learn, ID3D11DeviceContext::ClearDepthStencilView):
 // a stencil-only clear leaves depth unchanged, including when the format has no stencil component.
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-cleardepthstencilview
-// the format names give each component's width and order (19.1.3.1). UNORM endpoints are exactly 0 and 2^n - 1;
+// "This conversion is permitted tolerance of 0.6f ULP" (3.2.3.6, on the integer side). interior depth values
+// distinguish rounding from truncation. the format names give each component's width and order (19.1.3.1).
 // FLOAT quarters are exact. unused bits and pitch padding have no expectation. formats come from the API header,
 // decoded by their names, not the library's texel sizes or flags. dimensions cross the readback's threadgroup and
 // allocation page boundaries; all mip levels and array slices are read, directly and through a staging copy.
@@ -14,14 +15,13 @@
 #include <d3d10_1.h>
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <utility>
 #include "../depth_formats.hpp"
+#include "../depth_readback.hpp"
 
 int
 main() {
-  static const unsigned char commands[] = {
-#embed "../../src/mullion/mullion_command.cpp"
-      , 0};
   struct Format {
     DXGI_FORMAT format;
     UINT depth_bits, stencil_bits, unused_bits;
@@ -41,11 +41,7 @@ main() {
     formats.push_back(format);
   }
   UINT group[3]{};
-  const char *copy = strstr((const char *)commands, "DepthStencilBlitContext::copyFromTexture(");
-  const char *threads = copy ? strstr(copy, "threadgroup_size = {") : nullptr;
-  if (!expect(!formats.empty() && threads &&
-                  sscanf(threads, "threadgroup_size = {%u, %u, %u}", &group[0], &group[1], &group[2]) == 3 &&
-                  group[0] && group[1],
+  if (!expect(!formats.empty() && depth_readback_group(group),
               "could not read depth formats or the readback threadgroup"))
     return verdict();
   const UINT seed = 0x5a17;
@@ -133,7 +129,12 @@ main() {
             step("seed %u, format %u, variant %u, D3D%u, writable %u, phase %u: clear and copy", seed,
                  format.format, variant, legacy ? 10 : 11, writable, phase);
             for (UINT sub = 0; sub < subresources; sub++) {
-              float depth = format.floating ? float((seed + sub + phase) % 5) / 4 : float((sub + phase) % 2);
+              const float quarters[] = {0, 0.25f, 0.5f, 0.75f, 1};
+              float depth = quarters[(seed + sub + phase) % std::size(quarters)];
+              if (!format.floating && (sub + phase) % 3) {
+                float direction = (sub + phase) % 3 == 1 ? 0.0f : 1.0f;
+                depth = std::nextafter(depth, direction);
+              }
               uint8_t stencil = uint8_t(seed + sub + phase);
               if (clears[phase] & D3D11_CLEAR_DEPTH)
                 depths[sub] = depth;
@@ -184,7 +185,7 @@ main() {
                       uint32_t maximum = uint32_t((uint64_t(1) << format.depth_bits) - 1);
                       got_depth = depth;
                       want_depth *= maximum;
-                      equal = depth == uint32_t(depths[sub] * maximum);
+                      equal = std::fabs(double(depth) - want_depth) <= 0.6;
                     }
                     if (format.stencil_bits)
                       equal &= pixel[format.depth_bits / CHAR_BIT] == stencils[sub];

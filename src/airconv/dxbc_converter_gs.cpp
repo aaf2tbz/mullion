@@ -237,8 +237,27 @@ convert_dxbc_geometry_shader(
   // a tessellated draw's mesh threadgroups have the domain stage's threads, of which the first does the work
   uint32_t thread_idx = pHullStage ? func_signature.DefineInput(air::InputThreadPositionInThreadgroup{}) : ~0u;
   uint32_t so_idx = so ? stream_output_input(func_signature, context, types) : ~0u;
+  // the writing pass counts, not the counting one
+  bool statistics = pso_data && pso_data->pipeline_statistics && !(so && so->counting);
+  uint32_t statistics_idx = statistics ? func_signature.DefineInput(air::ArgumentBindingBuffer{
+                                             .buffer_size = SM50_STATISTIC_COUNT * sizeof(uint64_t),
+                                             .location_index = SM50_BINDING_INDEX_PIPELINE_STATISTICS,
+                                             .array_size = 1,
+                                             .memory_access = air::MemoryAccess::read_write,
+                                             .address_space = air::AddressSpace::device,
+                                             .type = air::msl_uint,
+                                             .arg_name = "pipeline_statistics",
+                                         })
+                                       : ~0u;
 
-  if (pShaderInternal->clip_distance_scalars.size() > 0) {
+  // the clip distances, or as varyings after the stage's own
+  bool clip_varyings = pso_data && pso_data->clip_distance_varyings;
+  uint32_t clip_data = pShaderInternal->num_mesh_vertex_data;
+  for (uint32_t i = 0; clip_varyings && i < pShaderInternal->clip_distance_scalars.size(); i++)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = clip_varying_name(i), .type = air::msl_float, .index = clip_data + i}
+    );
+  if (!clip_varyings && pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
     );
@@ -251,6 +270,7 @@ convert_dxbc_geometry_shader(
   if (culls)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
 
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -266,6 +286,7 @@ convert_dxbc_geometry_shader(
       },
       builder, nulldbg
   );
+  air.RasterScale = function->getArg(raster_scale);
   setup_metal_version(module, metal_version);
 
   auto [warp_vertex_count, warp_primitive_count, vertex_per_primitive] =
@@ -317,7 +338,11 @@ convert_dxbc_geometry_shader(
           llvm::ArrayType::get(types._float4, max_output_register), resource_map.output.ptr_float4,
           {builder.getInt32(0), builder.getInt32(x.value().reg), builder.getInt32(x.value().component)}
       );
-      air.CreateSetMeshClipDistance(vertex, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr));
+      auto distance = builder.CreateLoad(types._float, src_ptr);
+      if (clip_varyings)
+        air.CreateSetMeshVertexData(vertex, clip_data + x.index(), distance);
+      else
+        air.CreateSetMeshClipDistance(vertex, builder.getInt32(x.index()), distance);
     }
   };
 
@@ -505,6 +530,13 @@ convert_dxbc_geometry_shader(
   uint32_t vertices_per_primitive = topology == air::MeshOutputTopology::Triangle ? 3
                                     : topology == air::MeshOutputTopology::Line   ? 2
                                                                                   : 1;
+  // the primitives the shader generates on all its streams, from how far each stream's strip has come
+  pvalue generated = nullptr, strip_length[4] = {};
+  if (statistics) {
+    builder.CreateStore(zero_const, generated = builder.CreateAlloca(types._int));
+    for (auto &length : strip_length)
+      builder.CreateStore(zero_const, length = builder.CreateAlloca(types._int));
+  }
   std::vector<uint32_t> so_elements[4];
   uint32_t so_slots[4] = {};
   for (uint32_t i = 0; so && i < so->num_elements; i++) {
@@ -606,6 +638,14 @@ convert_dxbc_geometry_shader(
   };
   // stream output sees every stream, the rasterizer only its own
   resource_map.call_emit = [&](uint32_t stream) -> IREffect {
+    if (statistics && stream < 4) {
+      auto length = builder.CreateAdd(builder.CreateLoad(types._int, strip_length[stream]), one_const);
+      builder.CreateStore(length, strip_length[stream]);
+      auto whole = builder.CreateICmpUGE(length, builder.getInt32(vertices_per_primitive));
+      builder.CreateStore(
+          builder.CreateAdd(builder.CreateLoad(types._int, generated), builder.CreateZExt(whole, types._int)), generated
+      );
+    }
     if (so && stream < 4)
       so_emit(stream);
     if (stream == rasterized_stream)
@@ -613,6 +653,8 @@ convert_dxbc_geometry_shader(
     co_return {};
   };
   resource_map.call_cut = [&](uint32_t stream) -> IREffect {
+    if (statistics && stream < 4)
+      builder.CreateStore(zero_const, strip_length[stream]);
     if (so && stream < 4 && so_strip[stream])
       builder.CreateStore(zero_const, so_strip[stream]);
     if (stream == rasterized_stream)
@@ -783,13 +825,12 @@ convert_dxbc_geometry_shader(
     builder.CreateRetVoid();
     builder.SetInsertPoint(first);
   }
-  builder.CreateCondBr(
-      pHullStage ? corner_location(zero_const).second
-                 : builder.CreateICmpNE(
-                       builder.CreateAnd(valid_primitive_mask, builder.CreateShl(one_const, primitive_id_in_warp)), zero_const
-                   ),
-      active_, epilogue_bb
-  );
+  auto active = pHullStage ? corner_location(zero_const).second
+                           : builder.CreateICmpNE(
+                                 builder.CreateAnd(valid_primitive_mask, builder.CreateShl(one_const, primitive_id_in_warp)),
+                                 zero_const
+                             );
+  builder.CreateCondBr(active, active_, epilogue_bb);
   builder.SetInsertPoint(active_);
 
   auto vertices_ptr = builder.CreateBitCast(
@@ -935,9 +976,33 @@ convert_dxbc_geometry_shader(
     return err;
   }
   // a point is a primitive as it is emitted; a strip's are counted where it ends
-  air.CreateSetMeshPrimitiveCount(builder.CreateLoad(
-      types._int, topology == air::MeshOutputTopology::Point ? next_write_vertex : primitive_count
-  ));
+  auto rasterized =
+      builder.CreateLoad(types._int, topology == air::MeshOutputTopology::Point ? next_write_vertex : primitive_count);
+  air.CreateSetMeshPrimitiveCount(rasterized);
+  if (statistics) {
+    auto counted = llvm::BasicBlock::Create(context, "counted", function), count = llvm::BasicBlock::Create(context, "count", function, counted);
+    builder.CreateCondBr(active, count, counted);
+    builder.SetInsertPoint(count);
+    // Metal adds 32-bit words: a count's carry goes to its high word
+    auto add = [&](uint32_t statistic, pvalue value) {
+      auto word = [&](uint32_t half) {
+        return builder.CreateConstInBoundsGEP1_32(types._int, function->getArg(statistics_idx), statistic * 2 + half);
+      };
+      auto low = air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, word(0), value);
+      air.CreateAtomicRMW(
+          llvm::AtomicRMWInst::Add, word(1),
+          builder.CreateZExt(builder.CreateICmpULT(builder.CreateAdd(low, value), low), types._int)
+      );
+    };
+    add(SM50_STATISTIC_GS_INVOCATIONS, one_const);
+    add(SM50_STATISTIC_GS_PRIMITIVES, builder.CreateLoad(types._int, generated));
+    add(SM50_STATISTIC_RASTERIZED, rasterized);
+    // an input primitive's first instance takes it; after a tessellator the hull stage took the patch
+    if (!pHullStage)
+      add(SM50_STATISTIC_GS_INPUTS, builder.CreateZExt(builder.CreateICmpEQ(resource_map.gs_instance_id, zero_const), types._int));
+    builder.CreateBr(counted);
+    builder.SetInsertPoint(counted);
+  }
   // the first pass leaves each invocation's counts and each object threadgroup's totals, and the filled sizes as the
   // draw starts; the second pass's last invocation, which knows every stream's total, moves the filled sizes on
   if (so) {
@@ -985,17 +1050,21 @@ convert_dxbc_geometry_shader(
           stream = s;
       if (stream == 4)
         continue;
-      auto location = builder.CreateIntToPtr(filled(b), types._long->getPointerTo((uint32_t)air::AddressSpace::device));
+      // a filled size is 32 bits (Microsoft Learn, Stream Output Counters), 4-byte aligned
+      auto location = builder.CreateIntToPtr(filled(b), types._int->getPointerTo((uint32_t)air::AddressSpace::device));
       auto bound = llvm::BasicBlock::Create(context, "so_bound", function), skip = llvm::BasicBlock::Create(context, "so_skip", function);
       builder.CreateCondBr(builder.CreateICmpNE(filled(b), builder.getInt64(0)), bound, skip);
       builder.SetInsertPoint(bound);
       if (so->counting) {
-        builder.CreateStore(builder.CreateLoad(types._long, location), builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
+        builder.CreateStore(i64(builder.CreateLoad(types._int, location)), builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
       } else {
         auto total = builder.CreateAdd(so_base[stream], i64(builder.CreateLoad(types._int, so_count[stream])));
         auto written = builder.CreateSelect(builder.CreateICmpULT(total, so_limit[stream]), total, so_limit[stream]);
         builder.CreateStore(
-            builder.CreateAdd(so_snapshot[b], builder.CreateMul(written, builder.getInt64(uint64_t(vertices_per_primitive) * so->strides[b]))),
+            builder.CreateTrunc(
+                builder.CreateAdd(so_snapshot[b], builder.CreateMul(written, builder.getInt64(uint64_t(vertices_per_primitive) * so->strides[b]))),
+                types._int
+            ),
             location
         );
       }
@@ -1039,7 +1108,8 @@ convert_null_geometry_shader(const char *name, llvm::LLVMContext &context, llvm:
   return llvm::Error::success();
 }
 
-// without a geometry shader a primitive is its own vertices: those adjacent to it are seen by nothing (D3D11.3 8.15).
+// without a geometry shader a primitive is its own vertices: those adjacent to it are seen by nothing (D3D11.3 8.15),
+// and an untessellated patch goes to stream output whole (11.8.1.2).
 // where its vertex `corner` is among the payload's, for the group's primitive `lane`: a strip's primitives share
 // their vertices, odd triangles as (n, n + 2, n + 1) with `odd` counted from the strip's start, unless the object
 // stage assembled them, as a list's are
@@ -1060,7 +1130,7 @@ own_vertices(D3D10_SB_PRIMITIVE primitive) {
   case D3D10_SB_PRIMITIVE_TRIANGLE_ADJ:
     return {3, 0, 2};
   default:
-    return {};
+    return {vertices_per_primitive(primitive)};
   }
 }
 static pvalue
@@ -1092,7 +1162,8 @@ convert_pass_through_geometry_shader(
   auto primitive = (D3D10_SB_PRIMITIVE)pso_data->input_primitive;
   bool strip = pso_data->strip_topology;
   auto own = own_vertices(primitive);
-  if (!own.count)
+  // a patch reaches the rasterizer only through a tessellator or a geometry shader
+  if (!own.count || primitive >= D3D11_SB_PRIMITIVE_1_CONTROL_POINT_PATCH)
     return llvm::make_error<UnsupportedFeature>("a primitive that only a geometry shader can take");
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
@@ -1102,11 +1173,15 @@ convert_pass_through_geometry_shader(
   air::AirType types(context);
   air::FunctionSignatureBuilder func_signature;
   uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = SM50_GEOMETRY_PAYLOAD_SIZE});
+  // a quadrilateral line is a rectangle 1.4 pixels wide, two triangles whose corners take their end's attributes
+  // (D3D11.3 3.4.5): what Metal's own lines are not
+  bool quads = pso_data->quad_lines && own.count == 2;
+  uint32_t corners = quads ? 4 : own.count, primitives = quads ? 2 : 1;
   func_signature.DefineInput(air::InputMesh{
-      own.count, 1,
-      own.count == 3   ? air::MeshOutputTopology::Triangle
-      : own.count == 2 ? air::MeshOutputTopology::Line
-                       : air::MeshOutputTopology::Point
+      corners, primitives,
+      quads || own.count == 3 ? air::MeshOutputTopology::Triangle
+      : own.count == 2        ? air::MeshOutputTopology::Line
+                              : air::MeshOutputTopology::Point
   });
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
   func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveID{});
@@ -1145,7 +1220,13 @@ convert_pass_through_geometry_shader(
       });
     }
   }
-  if (pVertexStage->clip_distance_scalars.size())
+  // the clip distances, or as varyings after the others
+  bool clip_varyings = pso_data->clip_distance_varyings;
+  for (uint32_t i = 0; clip_varyings && i < pVertexStage->clip_distance_scalars.size(); i++)
+    func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+        .user = clip_varying_name(i), .type = air::msl_float, .index = uint32_t(varyings.size() + i)
+    });
+  if (!clip_varyings && pVertexStage->clip_distance_scalars.size())
     func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = pVertexStage->clip_distance_scalars.size()});
   if (pVertexStage->cull_distance_scalars.size())
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
@@ -1153,6 +1234,7 @@ convert_pass_through_geometry_shader(
   if (own.count == 1)
     func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
 
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
   auto entry = llvm::BasicBlock::Create(context, "entry", function);
   auto active = llvm::BasicBlock::Create(context, "active", function);
@@ -1160,6 +1242,7 @@ convert_pass_through_geometry_shader(
   llvm::IRBuilder<> builder(entry);
   llvm::raw_null_ostream nulldbg{};
   llvm::air::AIRBuilder air({}, builder, nulldbg);
+  air.RasterScale = function->getArg(raster_scale);
   setup_metal_version(module, metal_version);
   auto payload = function->getArg(payload_idx);
   auto word = [&](uint32_t i) {
@@ -1176,12 +1259,11 @@ convert_pass_through_geometry_shader(
   builder.SetInsertPoint(active);
   // mesh threadgroups each emit one primitive, so its ID counts the draw's preceding primitives (D3D11.3 8.17)
   auto below = builder.CreateSub(builder.CreateShl(one, lane), one);
-  air.CreateSetMeshPrimitiveID(
-      zero, builder.CreateAdd(
-                word(kPayloadPrimitivesBefore),
-                air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, builder.CreateAnd(valid, below))
-            )
+  auto primitive_id = builder.CreateAdd(
+      word(kPayloadPrimitivesBefore), air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, builder.CreateAnd(valid, below))
   );
+  for (uint32_t i = 0; i < primitives; i++)
+    air.CreateSetMeshPrimitiveID(builder.getInt32(i), primitive_id);
   auto odd = strip_parity(builder, air, valid, lane, word(kPayloadStripOffset));
   uint32_t registers = pVertexStage->max_output_register;
   // component `c` of register `reg` of the primitive's vertex `corner`
@@ -1197,36 +1279,87 @@ convert_pass_through_geometry_shader(
     );
   };
   auto real = [&](pvalue bits) { return builder.CreateBitCast(bits, types._float); };
-  for (uint32_t corner = 0; corner < own.count; corner++) {
-    auto vertex = builder.getInt32(corner);
-    for (auto &element : pVertexStage->output_signature) {
-      if (element.systemValue() != D3D10_SB_NAME_POSITION)
-        continue;
-      pvalue position = llvm::UndefValue::get(types._float4);
-      for (uint32_t c = 0; c < 4; c++)
-        position = builder.CreateInsertElement(position, real(component(corner, element.reg(), c)), c);
-      air.CreateSetMeshPosition(vertex, position);
+  // the first vertex's choice of layer or viewport, which is the primitive's (D3D11.3 15.8.1)
+  auto chosen = [&](D3D10_SB_NAME name) -> pvalue {
+    for (auto &element : pVertexStage->output_signature)
+      if (element.systemValue() == name)
+        return component(0, element.reg(), std::countr_zero(element.mask()));
+    return nullptr;
+  };
+  auto position = [&](uint32_t corner) -> pvalue {
+    for (auto &element : pVertexStage->output_signature)
+      if (element.systemValue() == D3D10_SB_NAME_POSITION) {
+        pvalue position = llvm::UndefValue::get(types._float4);
+        for (uint32_t c = 0; c < 4; c++)
+          position = builder.CreateInsertElement(position, real(component(corner, element.reg(), c)), c);
+        return position;
+      }
+    return nullptr;
+  };
+  // the rectangle's half width in x and y of normalized device coordinates. on the screen the line points along
+  // d = (xb wa - xa wb, yb wa - ya wb), whichever side of w = 0 either end is, as d/dt (x/w) = d/w^2 along it; its
+  // normal in pixels of the viewport (width and height in the raster scale buffer, an out-of-range index meaning
+  // viewport 0) is then 0.7 (H dy, W dx) / |(W dx, H dy)| / (W/2, -H/2). a line of no length has no rectangle, and
+  // its NaN corners are discarded
+  pvalue half_width = nullptr;
+  if (quads) {
+    auto a = position(0), b = position(1);
+    auto at = [&](pvalue v, uint32_t i) { return builder.CreateExtractElement(v, i); };
+    pvalue viewport = chosen(D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX);
+    viewport = viewport ? builder.CreateSelect(builder.CreateICmpULT(viewport, builder.getInt32(SM50_VIEWPORTS)), viewport, zero) : zero;
+    auto size = [&](uint32_t i) {
+      auto index = builder.CreateAdd(builder.CreateShl(viewport, 1), builder.getInt32(1 + i));
+      return builder.CreateLoad(types._float, builder.CreateGEP(types._float, function->getArg(raster_scale), index));
+    };
+    auto w = size(0), h = size(1);
+    auto sx = builder.CreateFMul(w, builder.CreateFSub(builder.CreateFMul(at(b, 0), at(a, 3)), builder.CreateFMul(at(a, 0), at(b, 3))));
+    auto sy = builder.CreateFMul(h, builder.CreateFSub(builder.CreateFMul(at(b, 1), at(a, 3)), builder.CreateFMul(at(a, 1), at(b, 3))));
+    constexpr float line_width = 1.4f;
+    auto scale = builder.CreateFDiv(
+        llvm::ConstantFP::get(types._float, line_width),
+        air.CreateFPUnOp(llvm::air::AIRBuilder::sqrt, builder.CreateFAdd(builder.CreateFMul(sx, sx), builder.CreateFMul(sy, sy)), false)
+    );
+    half_width = builder.CreateInsertElement(
+        builder.CreateInsertElement(llvm::ConstantAggregateZero::get(types._float4), builder.CreateFDiv(builder.CreateFMul(scale, sy), w), (uint64_t)0),
+        builder.CreateFNeg(builder.CreateFDiv(builder.CreateFMul(scale, sx), h)), 1
+    );
+  }
+  // a quadrilateral's corners are its ends' to either side, the first end's two then the second's
+  for (uint32_t index = 0; index < corners; index++) {
+    auto vertex = builder.getInt32(index);
+    uint32_t corner = quads ? index / 2 : index;
+    if (auto p = position(corner)) {
+      if (quads) {
+        auto offset = builder.CreateFMul(half_width, builder.CreateVectorSplat(4, builder.CreateExtractElement(p, 3)));
+        p = index % 2 ? builder.CreateFSub(p, offset) : builder.CreateFAdd(p, offset);
+      }
+      air.CreateSetMeshPosition(vertex, p);
     }
     for (auto &v : varyings) {
       auto value = component(corner, v.reg, v.component);
       bool integer = pVertexStage->register_types(v.reg, RegisterComponentType::Float)[v.component] != RegisterComponentType::Float;
       air.CreateSetMeshVertexData(vertex, builder.getInt32(v.index), integer ? value : real(value));
     }
-    for (auto distance : llvm::enumerate(pVertexStage->clip_distance_scalars))
-      air.CreateSetMeshClipDistance(
-          vertex, builder.getInt32(distance.index()), real(component(corner, distance.value().reg, distance.value().component))
-      );
+    for (auto distance : llvm::enumerate(pVertexStage->clip_distance_scalars)) {
+      auto value = real(component(corner, distance.value().reg, distance.value().component));
+      if (clip_varyings)
+        air.CreateSetMeshVertexData(vertex, varyings.size() + distance.index(), value);
+      else
+        air.CreateSetMeshClipDistance(vertex, builder.getInt32(distance.index()), value);
+    }
     if (own.count == 1)
       air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
-    air.CreateSetMeshIndex(vertex, vertex);
   }
-  // a primitive's layer and viewport are its first vertex's
-  for (auto &element : pVertexStage->output_signature) {
-    auto value = [&] { return component(0, element.reg(), std::countr_zero(element.mask())); };
-    if (element.systemValue() == D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX)
-      air.CreateSetMeshRenderTargetArrayIndex(zero, value());
-    if (element.systemValue() == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
-      air.CreateSetMeshViewportArrayIndex(zero, value());
+  // the normal turns the line a quarter clockwise on the screen, so (a+, b+, a-) and (a-, b+, b-) run
+  // counterclockwise, and each starts at the first end, whose constant attributes are the line's (D3D11.3 8.14)
+  static constexpr uint32_t quad_indices[] = {0, 2, 1, 1, 2, 3};
+  for (uint32_t i = 0; i < (quads ? std::size(quad_indices) : own.count); i++)
+    air.CreateSetMeshIndex(builder.getInt32(i), builder.getInt32(quads ? quad_indices[i] : i));
+  for (uint32_t i = 0; i < primitives; i++) {
+    if (auto layer = chosen(D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX))
+      air.CreateSetMeshRenderTargetArrayIndex(builder.getInt32(i), layer);
+    if (auto viewport = chosen(D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX))
+      air.CreateSetMeshViewportArrayIndex(builder.getInt32(i), viewport);
   }
   // culled by a distance that every vertex is behind: negative, or NaN
   pvalue culled = builder.getFalse();
@@ -1238,9 +1371,9 @@ convert_pass_through_geometry_shader(
       );
     culled = builder.CreateOr(culled, behind);
   }
-  if (pVertexStage->cull_distance_scalars.size())
-    air.CreateSetMeshPrimitiveCulled(zero, culled);
-  builder.CreateStore(one, count);
+  for (uint32_t i = 0; pVertexStage->cull_distance_scalars.size() && i < primitives; i++)
+    air.CreateSetMeshPrimitiveCulled(builder.getInt32(i), culled);
+  builder.CreateStore(builder.getInt32(primitives), count);
   builder.CreateBr(done);
 
   builder.SetInsertPoint(done);
@@ -1304,7 +1437,7 @@ stream_out_primitives(
         for (uint32_t b = 0; b < 4; b++)
           if (slots & (1u << b))
             when(builder.CreateICmpNE(field(2, b), builder.getInt64(0)), [&] {
-              builder.CreateStore(builder.CreateLoad(types._long, device(types._long, field(2, b))), builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
+              builder.CreateStore(builder.CreateZExt(builder.CreateLoad(types._int, device(types._int, field(2, b))), types._long), builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
             });
       });
     });
@@ -1357,8 +1490,11 @@ stream_out_primitives(
       if (slots & (1u << b))
         when(builder.CreateICmpNE(field(2, b), builder.getInt64(0)), [&] {
           builder.CreateStore(
-              builder.CreateAdd(snapshot[b], builder.CreateMul(written, builder.getInt64(uint64_t(per_primitive) * so->strides[b]))),
-              device(types._long, field(2, b))
+              builder.CreateTrunc(
+                  builder.CreateAdd(snapshot[b], builder.CreateMul(written, builder.getInt64(uint64_t(per_primitive) * so->strides[b]))),
+                  types._int
+              ),
+              device(types._int, field(2, b))
           );
         });
   });

@@ -56,6 +56,7 @@ enum Op : uint32_t {
   IsNaN = 8,
   IsInf = 9,
   IsFinite = 10,
+  IsNormal = 11,
   Cos = 12,
   Sin = 13,
   Tan = 14,
@@ -1111,7 +1112,8 @@ read_dxil(
   };
   bool compute = shader->shader_type == D3D11_SB_COMPUTE_SHADER;
   if (shader->shader_type != D3D10_SB_VERTEX_SHADER &&
-      (used({WaveGetLaneIndex, WaveGetLaneCount, WavePrefixOp, WaveMultiPrefixOp, WaveMultiPrefixBitCount}) ||
+      (used({WaveIsFirstLane, WaveGetLaneIndex, WaveGetLaneCount, WavePrefixOp, WaveMultiPrefixOp,
+             WaveMultiPrefixBitCount}) ||
        (compute && used({DerivFineX, DerivFineY})))) {
     shader->func_signature.DefineInput(air::InputThreadIndexInSIMDGroup{});
     shader->func_signature.DefineInput(air::InputThreadsPerSIMDGroup{});
@@ -1761,11 +1763,20 @@ convert_dxil(
     return dxbc.ClampMinLOD(tex.texture->Metadata, defined(lod) ? lod : nullptr);
   };
   // typed reads and writes of textures and texel buffers; `coord` holds the LOD last
-  auto texel_read = [&](Handle &h, Value *coord, const int32_t offset[3], Value *sample) {
+  // the components a load's users extract
+  auto used = [&](CallInst *call) {
+    uint32_t mask = 0;
+    for (auto user : call->users()) {
+      auto extract = dyn_cast<ExtractValueInst>(user);
+      mask |= extract ? 1u << extract->getIndices()[0] : ~0u;
+    }
+    return mask;
+  };
+  auto texel_read = [&](Handle &h, Value *coord, const int32_t offset[3], Value *sample, CallInst *call) {
     auto &t = *h.texture;
     auto lod = sample ? ir.getInt32(0) : ir.CreateExtractElement(coord, 3);
     auto [address, array] = dxbc.TexelAddress(t, coord, offset, sample ? nullptr : lod);
-    return dxbc.ReadTexel(t, address, array, sample, lod);
+    return dxbc.ReadTexel(t, address, array, sample, lod, used(call) & kMaskAll);
   };
   auto texel_write = [&](Handle &h, Value *coord, CallInst *call, unsigned first) {
     auto &t = *h.texture;
@@ -2119,6 +2130,8 @@ convert_dxil(
     ir.SetInsertPoint(held);
     air.CreateAtomicFence(word.memory, scope);
     auto value = word.read();
+    // an exchange's write does not wait on the read for its value, so nothing else keeps them in order
+    air.CreateAtomicFence(word.memory, scope);
     word.write(update(value));
     air.CreateAtomicFence(word.memory, scope);
     air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
@@ -2143,6 +2156,9 @@ convert_dxil(
   // these for 32 bits and less, without groups; the rest walk the lanes
   auto reduce = [&](const std::string &name, Value *v, Signedness sign, bool prefix, Combine combine, Value *identity,
                     Value *group = nullptr) -> Value * {
+    // Metal's half sums count the helper lanes a branch leaves out; given the identity, they add nothing
+    if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves && v->getType()->isHalfTy())
+      v = ir.CreateSelect(simd("simd_is_helper_thread", ir.getInt1Ty(), {}), identity, v);
     if (v->getType()->getPrimitiveSizeInBits() != 64 && !group)
       return simd(prefix ? "simd_prefix_exclusive_" + name : "simd_" + name, v->getType(), {v}, v->getType(), sign);
     auto lane = prefix ? lane_index() : nullptr;
@@ -2298,9 +2314,17 @@ convert_dxil(
     case PrimitiveID:
       ret = ctx.resource.patch_id;
       break;
-    case WaveIsFirstLane:
-      ret = simd("simd_is_first", ir.getInt1Ty(), {});
+    case WaveIsFirstLane: {
+      // the lowest lane of the ballot: simd_is_first can take a helper lane, which the branch around it left out
+      auto ctz = ctx.module.getOrInsertFunction(
+          "air.ctz.i64", FunctionType::get(ir.getInt64Ty(), {ir.getInt64Ty(), ir.getInt1Ty()}, false)
+      );
+      auto mask = simd("simd_ballot", ir.getInt64Ty(), {ir.getTrue()}, ir.getInt64Ty());
+      ret = ir.CreateICmpEQ(
+          ir.CreateZExtOrTrunc(lane_index(), ir.getInt64Ty()), ir.CreateCall(ctz, {mask, ir.getFalse()})
+      );
       break;
+    }
     case WaveGetLaneIndex:
       ret = lane_index();
       break;
@@ -2567,14 +2591,15 @@ convert_dxil(
       break;
     }
     case CBufferLoad: {
-      // DXIL.rst CBufferLoad aligns the offset; DXR shader records can put root constants after one DWORD
+      // DXIL.rst CBufferLoad aligns the offset; DXR shader records can put root constants after one DWORD. past the
+      // bound size it reads 0 (D3D11.3 7.5): from the start instead, its value dropped, as LoadConstantBuffer does
       auto &buffer = *handles[a(1)].cbuffer;
       auto offset = ir.CreateZExt(a(2), ir.getInt64Ty());
-      auto from = ir.GetInsertBlock();
-      llvm::Instruction *then = nullptr;
+      Value *inside = nullptr;
       if (buffer.Metadata) {
         auto end = ir.CreateAdd(offset, ir.getInt64(ctx.module.getDataLayout().getTypeStoreSize(ty).getFixedSize()));
-        ir.SetInsertPoint(then = SplitBlockAndInsertIfThen(ir.CreateICmpULE(end, buffer.Metadata), call, false));
+        inside = ir.CreateICmpULE(end, buffer.Metadata);
+        offset = ir.CreateSelect(inside, offset, ir.getInt64(0));
       }
       auto space = buffer.Pointer->getType()->getPointerAddressSpace();
       auto pointer = ir.CreateGEP(
@@ -2584,13 +2609,8 @@ convert_dxil(
           ty, ir.CreatePointerCast(pointer, ty->getPointerTo(space)),
           std::min(Align(constant(a(3))), getKnownAlignment(buffer.Pointer, ctx.module.getDataLayout()))
       );
-      if (then) {
-        ir.SetInsertPoint(call);
-        auto value = ir.CreatePHI(ty, 2);
-        value->addIncoming(Constant::getNullValue(ty), from);
-        value->addIncoming(ret, then->getParent());
-        ret = value;
-      }
+      if (inside)
+        ret = ir.CreateSelect(inside, ret, Constant::getNullValue(ty));
       break;
     }
     case CBufferLoadLegacy: {
@@ -2617,7 +2637,7 @@ convert_dxil(
       int32_t offset[3];
       offsets(call, 7, 3, offset);
       auto handle = tex.texture->Handle;
-      auto reference = op == SampleCmp || op == SampleCmpLevelZero ? a(10) : nullptr;
+      auto reference = op == SampleCmp || op == SampleCmpLevelZero ? dxbc.CompareReference(smp.sampler->Metadata, a(10)) : nullptr;
       // compute shaders have no derivatives: they sample with their quads' gradients, or compare at their LOD
       bool compute = ctx.shader_type == D3D11_SB_COMPUTE_SHADER;
       Value *residency_level = nullptr, *residency_bias = bias, *residency_clamp = nullptr;
@@ -2649,7 +2669,10 @@ convert_dxil(
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(10))}};
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *) {
-            return air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
+            return dxbc.SampleImplicit(
+                *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
+                options.second.lod, false
+            );
           };
           break;
         }
@@ -2659,7 +2682,10 @@ convert_dxil(
           };
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *) {
-            return air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
+            return dxbc.SampleImplicit(
+                *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
+                options.second.lod, true
+            );
           };
           break;
         }
@@ -2685,8 +2711,10 @@ convert_dxil(
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(11))}};
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *ref) {
-            return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, options.first, options.second)
-                       : air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
+            return dxbc.SampleImplicit(
+                *tex.texture, s, smp.sampler->Metadata, coord, array, offset, ref, options.first.bias,
+                options.second.lod, false
+            );
           };
           break;
         }
@@ -2726,7 +2754,7 @@ convert_dxil(
       offsets(call, 6, 3, offset);
       bool ms = llvm::air::AIRBuilder::getTextureInfo(h.texture->Logical).is_ms;
       auto [value, residency] = texel_read(
-          h, texel_coord(call, 3, !ms && defined(a(2)) ? a(2) : ir.getInt32(0)), offset, ms ? a(2) : nullptr
+          h, texel_coord(call, 3, !ms && defined(a(2)) ? a(2) : ir.getInt32(0)), offset, ms ? a(2) : nullptr, call
       );
       ret = to_struct(ty, value, residency);
       break;
@@ -2749,7 +2777,8 @@ convert_dxil(
         if (store) {
           texel_write(h, coord, call, 4);
         } else {
-          auto [value, residency] = texel_read(h, ir.CreateInsertElement(coord, ir.getInt32(0), 3), no_offset, nullptr);
+          auto [value, residency] =
+              texel_read(h, ir.CreateInsertElement(coord, ir.getInt32(0), 3), no_offset, nullptr, call);
           ret = to_struct(ty, value, residency);
         }
         break;
@@ -2764,19 +2793,14 @@ convert_dxil(
       auto parts = bits / unit->getBitWidth();
       auto base = ir.CreateUDiv(byte_address(h, a(2), a(3)), ir.getInt64(unit->getBitWidth() / 8));
       // a load reads only the components its users extract, so nothing is read past what the shader asks for
-      uint32_t mask = store ? constant(a(8)) : 0;
-      if (!store)
-        for (auto user : call->users()) {
-          auto extract = dyn_cast<ExtractValueInst>(user);
-          mask |= extract ? 1u << extract->getIndices()[0]
-                          : llvm::maskTrailingOnes<uint32_t>(cast<StructType>(ty)->getNumElements());
-        }
+      uint32_t mask =
+          store ? constant(a(8)) : used(call) & llvm::maskTrailingOnes<uint32_t>(cast<StructType>(ty)->getNumElements());
       auto element = ir.getIntNTy(bits);
       bool feedback = !store && (mask & (1u << 4));
       if (feedback)
         mask |= op == RawBufferLoad ? constant(a(4)) : (mask & kMaskAll ? 0 : kMaskAll);
       Value *residency = ir.getInt32(0);
-      auto units = [&](bool inside) {
+      auto units = [&](Value *base, bool inside) {
         Value *v = UndefValue::get(FixedVectorType::get(element, 4));
         for (unsigned i = 0; i < 4; i++) {
           if (!(mask & (1u << i)))
@@ -2807,7 +2831,7 @@ convert_dxil(
       // one bound for a load of several units where its last unit is inside
       auto read = mask & kMaskAll, last = llvm::Log2_32(read) * parts + parts - 1;
       bool whole = !store && !feedback && read && (parts > 1 || (read & (read - 1)));
-      auto v = dxbc.LoadBufferUnits(b, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units);
+      auto v = dxbc.LoadBufferUnits(b, base, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units);
       if (!store)
         ret = to_struct(ty, v, residency);
       break;
@@ -3336,6 +3360,15 @@ convert_dxil(
     case IsFinite:
       ret = ir.CreateFCmpOLT(fp_unary(llvm::air::AIRBuilder::fabs, a(1)), ConstantFP::getInfinity(a(1)->getType()));
       break;
+    case IsNormal: {
+      auto magnitude = fp_unary(llvm::air::AIRBuilder::fabs, a(1));
+      auto &semantics = a(1)->getType()->getFltSemantics();
+      ret = ir.CreateAnd(
+          ir.CreateFCmpOGE(magnitude, ConstantFP::get(a(1)->getType(), APFloat::getSmallestNormalized(semantics))),
+          ir.CreateFCmpOLT(magnitude, ConstantFP::getInfinity(a(1)->getType()))
+      );
+      break;
+    }
     case Bfrev:
       ret = air.CreateIntUnOp(llvm::air::AIRBuilder::reverse_bits, a(1));
       break;
@@ -3455,7 +3488,7 @@ convert_dxil(
         ret = samples;
         break;
       }
-      auto pos = air.CreateSamplePos(samples, a(texture ? 2 : 1));
+      auto pos = texture ? dxbc.TextureSamplePos(*handles[a(1)].texture, samples, a(2)) : air.CreateRasterizerSamplePos(a(1));
       ret = UndefValue::get(ty);
       for (unsigned i = 0; i < 2; i++)
         ret = ir.CreateInsertValue(ret, ir.CreateExtractElement(pos, i), {i});
@@ -3902,6 +3935,7 @@ convert_dxil_mesh_stage(
     return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
   setup_tgsm(shader_info, resource_map, types, module);
 
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -3916,6 +3950,7 @@ convert_dxil_mesh_stage(
       },
       builder, nulldbg
   );
+  air.RasterScale = function->getArg(raster_scale);
 
   setup_metal_version(module, metal_version);
   setup_temp_register(shader_info, resource_map, types, module, builder);

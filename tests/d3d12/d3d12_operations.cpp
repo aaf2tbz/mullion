@@ -1,6 +1,11 @@
 // contract: sin and cos obey every entry of D3D11.3 22.10.20, including outside the accuracy interval.
 // "Theta values can be any IEEE 32-bit floating point values."
 // "The maximum absolute error is 0.0008 in the interval from -100*Pi to +100*Pi."
+// classification uses encodings, not host floating arithmetic. DXIL.rst: "Returns true if x is finite, false
+// otherwise", "Returns true if x is +INF or -INF, false otherwise", "Returns true if x is NAN or QNAN, false
+// otherwise" (https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst#isfinite). all binary16
+// encodings and every binary32 exponent at mantissa boundaries run through the eight stages below. min16 inputs
+// fit both precisions: "implementations can use equal or greater precision" (D3D11.3 7.20.3.2).
 // TableSinCos quotes, in source order:
 // src:     -inf, -F,         -denorm, -0, +0, +denorm, +F,         +inf, NaN
 // DestSin: NaN,  [-1 to +1], -0,      -0, +0, +0,      [-1 to +1], NaN,  NaN
@@ -9,9 +14,9 @@
 // other entries (https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst#tan).
 // contract: an operation of the shading language gives what Direct3D defines for it, whatever the type it is done in
 // and whatever the stage it is done in. every operation below runs on every value triple of every type the device
-// has (16, 32 and 64-bit integers of both signs, half, float, double) in the vertex, hull, domain, geometry, pixel and
-// compute shader, and each result is set against the same expression in C++, where each type is a number that
-// follows Direct3D's rules:
+// has (16, 32 and 64-bit integers of both signs, half, float, double) in the vertex, hull, domain, geometry, pixel,
+// compute, mesh and amplification shader, and each result is set against the same expression in C++, where each
+// type is a number that follows Direct3D's rules:
 // - integers wrap, shifts take the low bits of the count that the type's width needs (D3D11.3 22.11.7 ishl, 22.11.8
 //   ishr, 22.11.12 ushr), and results are exact;
 // - float add, subtract and multiply are the nearest representable value, divide and sqrt within 1 ULP
@@ -42,6 +47,7 @@
 #undef min
 #undef max
 #include <bit>
+#include <climits>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -297,7 +303,13 @@ struct Stage {
   const char *name, *vs, *hs, *ds, *gs, *ps;
   D3D12_PRIMITIVE_TOPOLOGY_TYPE kind;
   D3D_PRIMITIVE_TOPOLOGY topology;
-  std::string code[5];
+  std::string code[7];
+  const char *ms = nullptr, *as = nullptr;
+};
+
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE K, class T> struct alignas(void *) Subobject {
+  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE kind = K;
+  T data{};
 };
 
 struct Type {
@@ -487,6 +499,22 @@ V hs_passes(InputPatch<V, 1> points) { return points[0]; }
   v.r = pc.r;
   return v;
 }
+#if !DXBC
+struct Payload { uint unused; };
+groupshared Payload payload;
+[numthreads(MESH_GROUP, 1, 1)] void as_runs(uint i : SV_DispatchThreadID, uint t : SV_GroupIndex) {
+  if (i < CASES * VALUES) output[i] = run(i);
+  if (t == 0) payload.unused = 0;
+  DispatchMesh(0, 1, 1, payload);
+}
+[numthreads(MESH_GROUP, 1, 1)] [outputtopology("triangle")]
+void ms_runs(uint i : SV_DispatchThreadID, out vertices V vertices[3], out indices uint3 indices[1]) {
+  if (i < CASES * VALUES) output[i] = run(i);
+  SetMeshOutputCounts(0, 0);
+}
+[numthreads(MESH_GROUP, 1, 1)] [outputtopology("triangle")]
+void ms_empty(out vertices V vertices[3], out indices uint3 indices[1]) { SetMeshOutputCounts(0, 0); }
+#endif
 )hlsl";
 
 int
@@ -497,6 +525,9 @@ main(int argc, char **argv) {
     return 77;
   }
   const bool dxbc = !compiler.dxc;
+  // "The threadgroup dimensions are limited by X*Y*Z <= 128."
+  // https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html#numthreads
+  const UINT mesh_group = 128;
   const wchar_t *narrow = L"-enable-16bit-types";
   std::vector<uint64_t> trig_values;
   for (float a : {0.0f, 1.0f, std::nextafter(float(sincos_accuracy_limit), 0.0f), float(sincos_accuracy_limit),
@@ -510,7 +541,7 @@ main(int argc, char **argv) {
     float a = std::ldexp(1.0f, exponent - 1);
     trig_values.insert(trig_values.end(), {hlsl::raw(a), hlsl::raw(-a)});
   }
-  Type types[] = {
+  std::vector<Type> types = {
       type<int32_t>("int", "uint", true, nullptr, TRUE),
       type<uint32_t>("uint", "uint", true, nullptr, TRUE),
       type<float>("float", "float", true, nullptr, TRUE),
@@ -531,6 +562,49 @@ main(int argc, char **argv) {
        }, {}},
   };
 
+  auto classify = [&](const char *name, UINT width, bool dxbc, const wchar_t *flag,
+                      const std::vector<uint64_t> &inputs) {
+    // binary16 has ten fraction bits and five exponent bits (D3D11.3 3.1.5); binary32 follows the host IEEE type
+    const UINT fraction_bits = width == 16 ? 10 : std::numeric_limits<float>::digits - 1;
+    const UINT exponent_bits = width - fraction_bits - 1;
+    const UINT exponent_mask = (1u << exponent_bits) - 1, fraction_mask = (1u << fraction_bits) - 1;
+    for (size_t begin = 0; begin < inputs.size(); begin += D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+      size_t end = std::min(inputs.size(), begin + D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+      types.push_back(
+          {name,
+           name,
+           true,
+           width,
+           dxbc,
+           flag,
+           TRUE,
+           {{"bool", "isnan(a)", same}, {"bool", "isinf(a)", same}, {"bool", "isfinite(a)", same}},
+           {inputs.begin() + begin, inputs.begin() + end},
+           [=](unsigned which, const uint64_t *in) -> uint64_t {
+             bool special = ((in[0] >> fraction_bits) & exponent_mask) == exponent_mask;
+             bool payload = (in[0] & fraction_mask) != 0;
+             return which == 0 ? special && payload : which == 1 ? special && !payload : !special;
+           },
+           {}}
+      );
+    }
+  };
+  std::vector<uint64_t> half_encodings, half_as_float, float_encodings;
+  for (UINT bits = 0; bits <= UINT16_MAX; bits++) {
+    half_encodings.push_back(bits);
+    half_as_float.push_back(std::bit_cast<uint32_t>(float(std::bit_cast<_Float16>(uint16_t(bits)))));
+  }
+  const UINT fraction_bits = std::numeric_limits<float>::digits - 1;
+  const UINT exponent_bits = sizeof(float) * CHAR_BIT - fraction_bits - 1;
+  const UINT fraction_mask = (1u << fraction_bits) - 1, quiet = 1u << (fraction_bits - 1);
+  for (UINT exponent = 0; exponent < (1u << exponent_bits); exponent++)
+    for (UINT fraction : {0u, 1u, quiet - 1, quiet, fraction_mask - 1, fraction_mask})
+      for (UINT sign : {0u, 1u})
+        float_encodings.push_back((sign << (sizeof(float) * CHAR_BIT - 1)) | (exponent << fraction_bits) | fraction);
+  classify("float16_t", 16, false, narrow, half_encodings);
+  classify("float", 32, true, nullptr, float_encodings);
+  classify("min16float", 32, true, nullptr, half_as_float);
+
   for (auto &type : types) {
     if (dxbc && !type.dxbc)
       continue;
@@ -542,10 +616,11 @@ main(int argc, char **argv) {
     const std::vector<std::string> defines = {
         std::string("T=") + type.name, std::string("U=") + type.unsigned_name, "REAL=" + std::to_string(type.real),
         "WIDTH=" + std::to_string(type.width), "CASES=" + std::to_string(cases), "VALUES=" + std::to_string(count),
-        "SWITCH=" + body};
+        "SWITCH=" + body, "MESH_GROUP=" + std::to_string(mesh_group), "DXBC=" + std::to_string(dxbc)};
     auto compiled = [&](const char *entry) {
       std::string stage(entry, 2);
-      return compiler.compile(hlsl_source, entry, type.flag ? (stage + "_6_2").c_str() : stage.c_str(), defines,
+      auto profile = stage == "ms" || stage == "as" ? stage + "_6_6" : type.flag ? stage + "_6_2" : stage;
+      return compiler.compile(hlsl_source, entry, profile.c_str(), defines,
                               type.flag ? std::vector<std::wstring>{type.flag} : std::vector<std::wstring>{});
     };
 
@@ -557,23 +632,31 @@ main(int argc, char **argv) {
         {"hull", "vs_passes", "hs_runs", "ds_passes", nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST},
         {"domain", "vs_passes", "hs_passes", "ds_runs", nullptr, "ps_passes", D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST},
     };
+    if (!dxbc) {
+      type.stages.push_back({"mesh"});
+      type.stages.back().ms = "ms_runs";
+      type.stages.push_back({"amplification"});
+      type.stages.back().ms = "ms_empty", type.stages.back().as = "as_runs";
+    }
     for (auto &stage : type.stages) {
       step("compile the operations of %s in the %s shader", type.name, stage.name);
-      const char *entries[] = {stage.vs ? stage.vs : "cs", stage.hs, stage.ds, stage.gs, stage.ps};
+      const char *entries[] = {stage.vs ? stage.vs : stage.ms ? nullptr : "cs", stage.hs, stage.ds, stage.gs, stage.ps, stage.ms, stage.as};
       for (UINT i = 0; i < std::size(entries); i++)
         if (entries[i] && !expect(!(stage.code[i] = compiled(entries[i])).empty(), "%s %s HLSL", type.name, entries[i]))
           return verdict();
     }
   }
 
-  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12Device2> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
   D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
   D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1)));
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &options4, sizeof(options4)));
+  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7)));
   for (auto &type : types)
     type.supported = type.width == 64 ? (type.real ? options.DoublePrecisionFloatShaderOps : options1.Int64ShaderOps)
                      : type.width == 16 ? options4.Native16BitShaderOpsSupported : TRUE;
@@ -582,7 +665,7 @@ main(int argc, char **argv) {
   auto rs = root_signature(device.Get(), {(UINT)std::size(params), params});
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12CommandAllocator> allocator;
-  ComPtr<ID3D12GraphicsCommandList> list;
+  ComPtr<ID3D12GraphicsCommandList6> list;
   D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
   CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
   CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
@@ -608,9 +691,14 @@ main(int argc, char **argv) {
     for (UINT i = 0; i < count; i++)
       triples.insert(triples.end(), {type.values[i], type.values[i % 8 ? (i * 7 + 3) % count : i], type.values[(i * 11 + 5) % count]});
     auto input = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, triples.size() * 8, D3D12_RESOURCE_STATE_GENERIC_READ);
-    auto computed = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, total * 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    auto computed = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, total * 8, D3D12_RESOURCE_STATE_COPY_DEST,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto initial = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, total * 8, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!expect(input && computed && initial, "operation buffers")) return verdict();
     void *mapped;
+    CHECK(initial->Map(0, nullptr, &mapped));
+    memset(mapped, 0xcd, total * 8);
+    initial->Unmap(0, nullptr);
     CHECK(input->Map(0, nullptr, &mapped));
     memcpy(mapped, triples.data(), triples.size() * 8);
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -628,10 +716,26 @@ main(int argc, char **argv) {
 
     // a stage's pipeline: the shader that runs the operations, and the ones that carry its results to the target
     for (auto &stage : type.stages) {
+      if (stage.ms && options7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) {
+        not_run += std::string(not_run.empty() ? "" : ", ") + type.name + " " + stage.name;
+        continue;
+      }
       step("the operations of %s in the %s shader", type.name, stage.name);
       ComPtr<ID3D12PipelineState> pso;
       HRESULT made;
-      if (stage.vs) {
+      if (stage.ms) {
+        struct {
+          Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> root;
+          Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+          Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+          Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+        } stream;
+        stream.root.data = rs.Get(), stream.ms.data = bytecode(stage.code[5]);
+        if (stage.as) stream.as.data = bytecode(stage.code[6]);
+        stream.raster.data = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
+        D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+        made = device->CreatePipelineState(&desc, IID_PPV_ARGS(&pso));
+      } else if (stage.vs) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = rs.Get();
         // a stage the pipeline does not have has no bytecode at all
@@ -674,13 +778,22 @@ main(int argc, char **argv) {
         list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
         transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
       } else {
-        list->SetComputeRootSignature(rs.Get());
-        list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
-        list->SetComputeRootUnorderedAccessView(1, computed->GetGPUVirtualAddress());
-        list->Dispatch((total + 63) / 64, 1, 1);
+        list->CopyResource(computed.Get(), initial.Get());
+        transition(list.Get(), computed.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (stage.ms) {
+          list->SetGraphicsRootSignature(rs.Get());
+          list->SetGraphicsRootShaderResourceView(0, input->GetGPUVirtualAddress());
+          list->SetGraphicsRootUnorderedAccessView(1, computed->GetGPUVirtualAddress());
+          list->DispatchMesh((total + mesh_group - 1) / mesh_group, 1, 1);
+        } else {
+          list->SetComputeRootSignature(rs.Get());
+          list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
+          list->SetComputeRootUnorderedAccessView(1, computed->GetGPUVirtualAddress());
+          list->Dispatch((total + 63) / 64, 1, 1);
+        }
         transition(list.Get(), computed.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->CopyBufferRegion(readback.Get(), 0, computed.Get(), 0, total * 8);
-        transition(list.Get(), computed.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(list.Get(), computed.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
       }
       CHECK(submit(device.Get(), queue.Get(), list.Get()));
 

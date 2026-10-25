@@ -39,7 +39,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -59,7 +59,7 @@ public:
   HRESULT
   Initialize(const D3D12_HEAP_DESC *pDesc) {
     if (pDesc->Flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)
-      return E_INVALIDARG; // must be committed resource
+      return FAIL(E_INVALIDARG); // must be committed resource
 
     desc_ = *pDesc;
     desc_.Properties.CreationNodeMask = 1;
@@ -74,12 +74,12 @@ public:
     case D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT:
       break;
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
 
     auto size_aligned = align(pDesc->SizeInBytes, desc_.Alignment);
     if (!size_aligned)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     if (pDesc->Flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) {
       SYSTEM_INFO system;
@@ -89,7 +89,7 @@ public:
                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE),
           [](void *address) { if (address) VirtualFree(address, 0, MEM_RELEASE); }
       );
-      return memory ? S_OK : E_OUTOFMEMORY;
+      return memory ? S_OK : FAIL(E_OUTOFMEMORY);
     }
 
     WMTHeapInfo info;
@@ -113,9 +113,9 @@ public:
     MEMORY_BASIC_INFORMATION region, next;
     if (!address || !VirtualQuery(address, &region, sizeof(region)) || region.AllocationBase != address ||
         region.BaseAddress != address || region.State != MEM_COMMIT || region.Protect & (PAGE_NOACCESS | PAGE_GUARD))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (VirtualQuery((char *)address + region.RegionSize, &next, sizeof(next)) && next.AllocationBase == address)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     desc_ = {region.RegionSize,
              {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1},
              D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,

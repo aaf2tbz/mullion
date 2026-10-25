@@ -1,0 +1,12 @@
+# treats a NaN upper depth bound as one instead of zero.
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -3092,7 +3092,7 @@
+     if (Record([=](auto *l) { l->OMSetDepthBounds(Min, Max); }))
+       return;
+     depth_bounds_[0] = std::isnan(Min) ? 0.0f : Min;
+-    depth_bounds_[1] = std::isnan(Max) ? 0.0f : Max;
++    depth_bounds_[1] = std::isnan(Max) ? 1.0f : Max;
+     dirty_state_.set(DirtyState::DepthBounds);
+   }
+ 

@@ -151,15 +151,6 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.reset();
   };
   event = device.newSharedEvent();
-
-  std::string env = env::getEnvVar("MULLION_CAPTURE_FRAME");
-
-  if (!env.empty()) {
-    try {
-      capture_state.scheduleNextFrameCapture(std::stoull(env));
-    } catch (const std::invalid_argument &) {
-    }
-  }
 }
 
 CommandQueue::~CommandQueue() {
@@ -173,12 +164,19 @@ CommandQueue::Drain() {
   ready_for_encode.fetch_add(1, std::memory_order_release);
   ready_for_encode.notify_one();
   encodeThread.join();
-  // only committed work has completion callbacks; the blocked chunk and its tail are abandoned
-  WaitCPUFence(ready_for_commit.load(std::memory_order_acquire) - 1);
+  // only committed work has completion callbacks; the blocked chunk and its tail are abandoned, and so not ongoing
+  auto committed = ready_for_commit.load(std::memory_order_acquire) - 1;
+  WaitCPUFence(committed);
+  chunk_ongoing.fetch_sub(drain_last_seq_ - committed, std::memory_order_release);
 }
 
 void
 CommandQueue::Shutdown() {
+  if (stopped.load())
+    return;
+  // what was committed runs to its end, with its completions
+  for (uint64_t ongoing; (ongoing = chunk_ongoing.load(std::memory_order_acquire));)
+    chunk_ongoing.wait(ongoing, std::memory_order_acquire);
   if (stopped.exchange(true))
     return;
   TRACE("Destructing command queue");
@@ -238,35 +236,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
 
   auto pool = WMT::MakeAutoreleasePool();
 
-  switch (capture_state.getNextAction(chunk.frame_)) {
-  case CaptureState::NextAction::StartCapture: {
-    WMTCaptureInfo info;
-    auto capture_mgr = WMT::CaptureManager::sharedCaptureManager();
-    info.capture_object = device;
-    info.destination = WMTCaptureDestinationGPUTraceDocument;
-    char filename[1024];
-    std::time_t now;
-    std::time(&now);
-    std::strftime(filename, 1024, "_%H'%M'%S_%m-%d-%y.gputrace", std::localtime(&now));
-    auto fileUrl = env::getUnixPath(env::getExeBaseName() + "_F." + std::to_string(chunk.frame_) + filename);
-    WARN("A new capture will be saved to ", fileUrl);
-    info.output_url.set(fileUrl.c_str());
-
-    capture_mgr.startCapture(info);
-    break;
-  }
-  case CaptureState::NextAction::StopCapture: {
-    auto capture_mgr = WMT::CaptureManager::sharedCaptureManager();
-    capture_mgr.stopCapture();
-    break;
-  }
-  case CaptureState::NextAction::Nothing: {
-    if (capture_state.shouldCaptureNextFrame()) {
-      capture_state.scheduleNextFrameCapture(chunk.frame_ + 1);
-    }
-    break;
-  }
-  }
+  capture_state.frame(device, chunk.frame_);
 
   auto cmdbuf = commandQueue.commandBuffer();
   chunk.attached_cmdbuf = cmdbuf;

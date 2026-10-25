@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 61
+#define AIRCONV_VERSION 70
 
 #ifdef __cplusplus
 #include <string>
@@ -37,10 +37,19 @@ enum SM50_BINDING_INDEX: uint32_t {
   /* a geometry draw's first object threadgroup and instance (uint2): not zero where a draw runs in parts */
   SM50_BINDING_INDEX_DRAW_ORIGIN = 9,
   SM50_BINDING_INDEX_PIPELINE_STATISTICS = SM50_BINDING_INDEX_DRAW_ORIGIN + 1,
+  /* each viewport's MinDepth and MaxDepth (float2), for a pixel shader that writes depth */
+  SM50_BINDING_INDEX_DEPTH_RANGES = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 1,
+  /* what the stage before the rasterizer multiplies a position's x and y by (float), the inverse of the factor
+     Metal's viewports are larger by than the application's; then the width and height of each of the
+     SM50_VIEWPORTS viewports, as the application gave them */
+  SM50_BINDING_INDEX_RASTER_SCALE = SM50_BINDING_INDEX_DEPTH_RANGES + 1,
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
 };
+
+/* the viewports a primitive may choose from (D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) */
+#define SM50_VIEWPORTS 16
 
 /* the bytes before the lock table of 64-bit atomics, which every root signature's arguments name, are the header of
  * an acceleration structure of nothing: what a null structure is to a ray query */
@@ -113,6 +122,7 @@ struct MTL_PIXEL_SHADER_REFLECTION {
   uint32_t HasCoverageOutput;
   uint32_t SintRenderTargets;
   uint32_t UintRenderTargets;
+  uint32_t HasCoverageInput;
 };
 
 struct MTL_SHADER_REFLECTION {
@@ -139,8 +149,9 @@ struct MTL_SHADER_REFLECTION {
   uint32_t NumOutputElement;
   uint32_t ThreadsPerPatch;
   uint32_t ArgumentTableQwords;
-  /* how many cull distances the stage outputs */
+  /* how many cull distances the stage outputs, and clip distances */
   uint32_t CullDistances;
+  uint32_t ClipDistances;
   /* a compute shader whose threadgroups wait for one another (a loop reads globally coherent memory): its dispatch
      may be made in parts, each with the stage-in region's origin at the part's first group */
   uint32_t GroupsWorkTogether;
@@ -352,6 +363,14 @@ enum SM50_TEXTURE_VIEW_METADATA : uint64_t {
   SM50_TEXTURE_VIEW_METADATA_SPARSE_WRITE = 1ull << SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS,
 };
 
+/* the low word of a multisample texture's metadata: a one-sample view, which reads a regular texture since Metal's
+   MS textures need more than one sample (D3D11.3 22.4.7), and the center pattern, whose samples all lie at the pixel
+   center (19.2.4.1) */
+enum SM50_TEXTURE_MULTISAMPLE_METADATA : uint64_t {
+  SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE = 1 << 0,
+  SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED = 1 << 1,
+};
+
 /* WMTSamplerAddressMode, with one border */
 enum SM50_SAMPLER_ADDRESS {
   SM50_SAMPLER_ADDRESS_CLAMP,
@@ -394,6 +413,9 @@ struct SM50_SHADER_COMMON_DATA {
   uint32_t simd_width;
 };
 
+#define SM50_PIXEL_FORMAT_CHANNELS (1u << 16)
+#define SM50_PIXEL_FORMAT_CHANNEL(format, channel) (((format) >> (8 + 2 * (channel))) & 3)
+
 struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -401,9 +423,18 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
-  /** MTLPixelFormat */
+  /** MTLPixelFormat in the low 8 bits; with SM50_PIXEL_FORMAT_CHANNELS, SM50_PIXEL_FORMAT_CHANNEL names the output
+      component each stored channel takes */
   uint32_t pixel_formats[8];
   bool pipeline_statistics;
+  /** o0.a becomes the coverage mask, for a render target 0 Metal takes no alpha-to-coverage with */
+  bool alpha_to_coverage;
+  /** the render target samples all lie at the pixel center (D3D11.3 19.2.4.1) */
+  bool centered_samples;
+  /** one sample rasterizes for render targets of more (ForcedSampleCount 1, D3D11.3 3.5.6.2) */
+  bool single_raster_sample;
+  /* how many clip distances reach the shader as varyings, to test at each sample (D3D11.3 15.4.1) */
+  uint32_t clip_distances;
 };
 
 struct SM50_IA_INPUT_ELEMENT {
@@ -412,8 +443,8 @@ struct SM50_IA_INPUT_ELEMENT {
   uint32_t aligned_byte_offset;
   /** MTLAttributeFormat */
   uint32_t format;
-  uint32_t step_function: 1;
-  uint32_t step_rate: 31;
+  uint32_t step_function;
+  uint32_t step_rate;
 };
 
 enum SM50_INDEX_BUFFER_FORMAT {
@@ -443,6 +474,8 @@ struct SM50_SHADER_GS_PASS_THROUGH_DATA {
     uint32_t DataEncoded;
   };
   bool RasterizationDisabled;
+  /* the clip distances leave as varyings, which the pixel shader tests (SM50_SHADER_PSO_PIXEL_SHADER_DATA) */
+  bool ClipDistanceVaryings;
 };
 
 /* a geometry pipeline's object threadgroup takes a warp of the draw's vertices: as many whole input primitives as
@@ -478,6 +511,18 @@ SM50GeometryWarp(uint32_t per_primitive, bool strip, uint32_t registers) {
   return warp;
 }
 
+/* the 64-bit counts a draw's shaders add to at SM50_BINDING_INDEX_PIPELINE_STATISTICS, in its words' order: a pixel
+   shader's invocations; a geometry shader's invocations, its primitives, those it rasterizes, and the input primitives
+   it takes, which the rasterizer counted in their place */
+enum SM50_PIPELINE_STATISTIC : uint32_t {
+  SM50_STATISTIC_PIXELS = 0,
+  SM50_STATISTIC_GS_INVOCATIONS = 3,
+  SM50_STATISTIC_GS_PRIMITIVES,
+  SM50_STATISTIC_RASTERIZED,
+  SM50_STATISTIC_GS_INPUTS,
+  SM50_STATISTIC_COUNT,
+};
+
 struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -491,6 +536,13 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
      primitives their cull distances discard. otherwise the pipeline only streams output */
   uint32_t input_primitive;
   bool pass_through;
+  /* the geometry shader adds to the draw's statistics (SM50_PIPELINE_STATISTIC) */
+  bool pipeline_statistics;
+  /* as SM50_SHADER_GS_PASS_THROUGH_DATA's */
+  bool clip_distance_varyings;
+  /* the lines passed on are quadrilaterals (D3D11.3 3.4.5): two counterclockwise triangles, which the pipeline
+     draws with no culling, no depth bias, solid fill and counterclockwise front faces, as lines are drawn */
+  bool quad_lines;
 };
 
 struct SM50_SHADER_PSO_TESSELLATOR_DATA {

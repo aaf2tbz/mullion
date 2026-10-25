@@ -7,6 +7,8 @@
 #include "mullion_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
+#include <cmath>
+#include <span>
 #include <unordered_map>
 
 namespace mullion {
@@ -19,7 +21,7 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   resource.type = WMTRenderCommandUseResource;
   resource.resource = result;
   resource.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
-  resource.stages = WMTRenderStageVertex | WMTRenderStageFragment;
+  resource.stages = WMTRenderStageVertex | WMTRenderStageMesh | WMTRenderStageFragment;
   auto &pipeline = emit.template operator()<wmtcmd_render_setpso>();
   pipeline.type = WMTRenderCommandSetPSO;
   pipeline.pso = count;
@@ -37,7 +39,7 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   zeroed.type = WMTRenderCommandMemoryBarrier;
   zeroed.scope = WMTBarrierScopeBuffers;
   zeroed.stages_after = WMTRenderStageVertex;
-  zeroed.stages_before = WMTRenderStageVertex | WMTRenderStageFragment;
+  zeroed.stages_before = WMTRenderStageVertex | WMTRenderStageMesh | WMTRenderStageFragment;
   if (scan) {
     auto &strip_pipeline = emit.template operator()<wmtcmd_render_setpso>();
     strip_pipeline.type = WMTRenderCommandSetPSO;
@@ -54,9 +56,47 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   pixel.buffer = result;
   pixel.offset = result_offset;
   pixel.index = SM50_BINDING_INDEX_PIPELINE_STATISTICS;
+  auto &geometry = emit.template operator()<wmtcmd_render_setbuffer>();
+  geometry.type = WMTRenderCommandSetMeshBuffer;
+  geometry.buffer = result;
+  geometry.offset = result_offset;
+  geometry.index = SM50_BINDING_INDEX_PIPELINE_STATISTICS;
   auto &previous = emit.template operator()<wmtcmd_render_setpso>();
   previous.type = WMTRenderCommandSetPSO;
   previous.pso = restore;
+}
+
+// Metal clips a triangle that reaches 1.5 of a viewport past its center into pieces, and on their seams runs a pixel
+// shader once for each piece. D3D allows that (D3D11.3 15.4), but applications draw
+// past the viewport as if it never happened, a full-screen triangle reaches 3. so Metal's viewports are made larger
+// about their centers, and the stage before the rasterizer multiplies x and y by the inverse
+// (SM50_BINDING_INDEX_RASTER_SCALE): positions land on the same pixels, and the cut moves out by the factor. it is the
+// largest power of two, which keeps the scale exact, that leaves the viewports in the bounds an application may give
+// them itself. returns the inverse
+inline float
+EnlargeViewports(std::span<WMTViewport> viewports, double bound_min, double bound_max) {
+  double reach = INFINITY;
+  for (auto &v : viewports)
+    for (auto [origin, size] : {std::pair{v.originX, v.width}, std::pair{v.originY, v.height}})
+      if (size > 0)
+        reach = std::min({reach, (origin - bound_min) / (size / 2) + 1, (bound_max - origin) / (size / 2) - 1});
+  double factor = std::isfinite(reach) && reach >= 1 ? std::exp2(std::floor(std::log2(reach))) : 1;
+  for (auto &v : viewports) {
+    v.originX -= (factor - 1) * v.width / 2, v.originY -= (factor - 1) * v.height / 2;
+    v.width *= factor, v.height *= factor;
+  }
+  return float(1 / factor);
+}
+
+// what a line drawn as triangles keeps of the rasterizer state, which those of SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's
+// quad_lines are: a line is not culled, filled or biased, and faces front (D3D11.3 15.10, 15.13, 15.14)
+template <typename State>
+inline void
+RasterizeAsLines(State &state) {
+  state.fill_mode = WMTTriangleFillModeFill;
+  state.cull_mode = WMTCullModeNone;
+  state.depth_bias = state.scole_scale = state.depth_bias_clamp = 0;
+  state.winding = WMTWindingCounterClockwise;
 }
 
 struct TileBarrierPSOKey {
@@ -97,12 +137,17 @@ public:
     return library_;
   }
   WMT::RenderPipelineState PipelineStatistics(bool scan = false);
+  // zeroes a stream output draw's scratch inside its render pass (zero_words)
+  WMT::RenderPipelineState ZeroWords();
 
 private:
+  // a vertex function that runs without rasterizing, made when first used
+  WMT::RenderPipelineState VertexPipeline(WMT::Reference<WMT::RenderPipelineState> &pipeline, const char *name);
+
   WMT::Reference<WMT::Library> library_;
   WMT::Device device_;
   mullion::mutex statistics_mutex_;
-  WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2];
+  WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2], zero_words_;
 };
 
 class EmulatedCommandContext {

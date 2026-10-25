@@ -25,6 +25,7 @@
 #include "mullion_geometry.hpp"
 #include "mullion_command.hpp"
 #include <span>
+#include <cmath>
 #include "util_env.hpp"
 
 namespace mullion {
@@ -150,6 +151,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   UINT num_viewports;
   D3D12_VIEWPORT
   viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {{}};
+  // where the pass's viewports' depth ranges and raster scale are in the GPU heap, for indirect commands to bind
+  uint64_t depth_ranges_ = 0, raster_scale_ = 0;
 
   UINT num_scissors;
   D3D12_RECT
@@ -634,7 +637,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -663,7 +666,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   Close() {
     if (encoder_count < std::numeric_limits<size_t>::max())
-      return E_FAIL;
+      return FAIL(E_FAIL);
     SumOcclusion();
     SumStatistics();
     EndPredication();
@@ -681,7 +684,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   Reset(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState) {
     if (encoder_count == std::numeric_limits<size_t>::max())
-      return E_FAIL;
+      return FAIL(E_FAIL);
     return FAILED(recording_error_) ? recording_error_ : Initialize(pAllocator, pInitialState);
   };
 
@@ -753,6 +756,8 @@ public:
         if (!AttachmentDesc.Texture)
           continue;
         effective_rtvs++;
+        if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
+          render->center_samples = AttachmentDesc.Texture->sampleCount();
         auto &rt = render->colors[i];
         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
         rt.depth_plane = AttachmentDesc.DepthPlane;
@@ -765,6 +770,8 @@ public:
       if (dsv.Texture && pso_graphics_->dsv_mask) {
         auto &AttachmentDesc = dsv;
         effective_rtvs++;
+        if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
+          render->center_samples = AttachmentDesc.Texture->sampleCount();
         auto dsv_planar_flags =
             DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View)) & pso_graphics_->dsv_mask;
         if (dsv_planar_flags & 1) {
@@ -843,8 +850,7 @@ public:
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       // a pipeline for a topology with adjacency is made here, and may fail
       auto pipeline = Pipeline();
-      if (!pipeline || (pso_graphics_->stream_output &&
-                        (!Pipeline(true) || (StreamOutputRasterizes() && !RenderTargets(pso_graphics_->so_raster)))))
+      if (!pipeline || (pso_graphics_->stream_output && !Pipeline(true)))
         return DrawCallStatus::Invalid;
       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd_setpso.type = WMTRenderCommandSetPSO;
@@ -875,10 +881,9 @@ public:
     }
     // under tessellation the vertex and hull shaders run in the object stage, the domain shader in the mesh stage; with
     // a geometry shader the vertex shader runs in the object stage, the geometry shader in the mesh stage
-    // stream output without a geometry shader also rasterizes through the vertex stage
     // a mesh shader pipeline has an object stage (its amplification shader, if any) and a mesh stage
     bool mesh = pso_graphics_->threads_per_patch || Geometry() || pso_graphics_->mesh_shader;
-    bool vertex = !mesh || StreamOutputRasterizes();
+    bool vertex = !mesh;
     auto geometry_buffer = [&](uint64_t Offset, uint8_t Index) {
       if (mesh) {
         EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, Index);
@@ -914,18 +919,43 @@ public:
     // a primitive names one of the viewports and scissors there may be (D3D11.3 15.8.1). a viewport that is not set
     // is of no size and a scissor that is not set is empty (15.6, 15.7): nothing is drawn through either, which an
     // empty scissor says to Metal, whatever viewport it has there
-    if (dirty_state_.test(DirtyState::Viewport) && num_viewports) {
-      auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(count);
-      for (auto i = 0u; i < count; i++) {
+    if (dirty_state_.test(DirtyState::Viewport)) {
+      auto [ranges, ranges_offset] = allocator_->AllocateGPUHeap(2 * count * sizeof(float), alignof(float));
+      static_assert(SM50_VIEWPORTS == D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+      auto [scale, scale_offset] = allocator_->AllocateGPUHeap((1 + 2 * SM50_VIEWPORTS) * sizeof(float), alignof(float));
+      *(float *)scale = 1;
+      // with no viewport set, Metal's covers the pass
+      auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      for (auto i = 0u; i < SM50_VIEWPORTS; i++) {
         auto &viewport = viewports[i < num_viewports ? i : 0];
-        metal_viewport[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
-                             viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
+        ((float *)scale)[1 + 2 * i] = num_viewports ? viewport.Width : pass->render_target_width;
+        ((float *)scale)[2 + 2 * i] = num_viewports ? viewport.Height : pass->render_target_height;
       }
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
-      cmd.type = WMTRenderCommandSetViewports;
-      cmd.viewports.set(metal_viewport);
-      cmd.viewport_count = count;
-      static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
+      // with no viewport set, Metal's own has the range 0 to 1
+      for (auto i = 0u; i < count; i++) {
+        ((float *)ranges)[2 * i] = num_viewports ? viewports[i < num_viewports ? i : 0].MinDepth : 0;
+        ((float *)ranges)[2 * i + 1] = num_viewports ? viewports[i < num_viewports ? i : 0].MaxDepth : 1;
+      }
+      if (num_viewports) {
+        auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(count);
+        for (auto i = 0u; i < count; i++) {
+          auto &viewport = viewports[i < num_viewports ? i : 0];
+          metal_viewport[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+                               viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
+        }
+        *(float *)scale =
+            EnlargeViewports({metal_viewport, count}, D3D12_VIEWPORT_BOUNDS_MIN, D3D12_VIEWPORT_BOUNDS_MAX);
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
+        cmd.type = WMTRenderCommandSetViewports;
+        cmd.viewports.set(metal_viewport);
+        cmd.viewport_count = count;
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
+      }
+      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, ranges_offset, SM50_BINDING_INDEX_DEPTH_RANGES);
+      EncodeBuffer(WMTRenderCommandSetVertexBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
+      EncodeBuffer(WMTRenderCommandSetMeshBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
+      depth_ranges_ = allocator_->gpu_heap_buffer_address_ + ranges_offset;
+      raster_scale_ = allocator_->gpu_heap_buffer_address_ + scale_offset;
       dirty_state_.clr(DirtyState::Viewport);
     }
 
@@ -936,11 +966,15 @@ public:
       auto metal_scissors = allocator_->AllocateCommandData<WMTScissorRect>(count);
       for (auto i = 0u; i < count; i++) {
         if (i < num_scissors && i < num_viewports) {
+          // a viewport scissors to the pixels its floored extents hold (D3D11.3 15.6.1)
           auto &d3d_rect = scissors[i];
-          LONG left = std::clamp(d3d_rect.left, (LONG)0, width);
-          LONG top = std::clamp(d3d_rect.top, (LONG)0, height);
-          LONG right = std::clamp(d3d_rect.right, left, width);
-          LONG bottom = std::clamp(d3d_rect.bottom, top, height);
+          auto &viewport = viewports[i];
+          LONG left = std::clamp(std::max(d3d_rect.left, LONG(std::floor(viewport.TopLeftX))), (LONG)0, width);
+          LONG top = std::clamp(std::max(d3d_rect.top, LONG(std::floor(viewport.TopLeftY))), (LONG)0, height);
+          LONG right =
+              std::clamp(std::min(d3d_rect.right, LONG(std::floor(viewport.TopLeftX + viewport.Width))), left, width);
+          LONG bottom =
+              std::clamp(std::min(d3d_rect.bottom, LONG(std::floor(viewport.TopLeftY + viewport.Height))), top, height);
           metal_scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
         } else {
           metal_scissors[i] = {};
@@ -1069,12 +1103,6 @@ public:
     return pso_graphics_->geometry_shader || PassesAdjacency();
   }
 
-  // stream output without a geometry shader then draws as usual, unless the mesh stage already has
-  bool
-  StreamOutputRasterizes() {
-    return pso_graphics_->so_raster && !PassesAdjacency();
-  }
-
   WMT::RenderPipelineState
   RenderTargets(WMT::RenderPipelineState Pipeline) {
     auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
@@ -1090,8 +1118,8 @@ public:
   WMT::RenderPipelineState
   Pipeline(bool counting = false) {
     bool strip = Strip(topology_);
-    if (PassesAdjacency())
-      return RenderTargets(pso_graphics_->AdjacencyPipeline(strip, counting));
+    if (PassesAdjacency() || pso_graphics_->patches)
+      return RenderTargets(pso_graphics_->TopologyPipeline(topology_, counting));
     if (counting)
       return RenderTargets(strip ? pso_graphics_->so_count_strip : pso_graphics_->so_count);
     return RenderTargets(pso_graphics_->geometry_shader && strip ? pso_graphics_->pso_strip : pso_graphics_->pso);
@@ -1139,23 +1167,13 @@ public:
     };
     if (!pso_graphics_->stream_output)
       return draw();
-    // stream output (SM50_STREAM_OUTPUT_TARGETS) runs the draw twice: once counting each geometry invocation's
-    // primitives, and after a barrier again, writing them and drawing. its scratch area holds the filled sizes, a total
-    // per stream and object threadgroup, and a count per stream and invocation (at most a primitive per vertex)
-    SM50_STREAM_OUTPUT_TARGETS targets{};
-    for (unsigned b = 0; b < std::size(so_views_); b++) {
-      targets.address[b] = so_views_[b].BufferLocation;
-      targets.size[b] = so_views_[b].SizeInBytes;
-      targets.filled[b] = so_views_[b].BufferFilledSizeLocation;
-      targets.statistics[b] = so_statistics_[b];
-    }
+    auto targets = StreamOutputTargets();
     uint64_t groups = uint64_t(warps) * Args.InstanceCount;
-    uint64_t scratch_bytes = SM50StreamOutputScratch(groups, vertex_per_warp * pso_graphics_->gs_instances);
-    auto [Scratch, ScratchOffset] = allocator_->AllocateGPUHeap(scratch_bytes, 16);
+    auto [Scratch, ScratchOffset] =
+        allocator_->AllocateGPUHeap(SM50StreamOutputScratch(groups, vertex_per_warp * pso_graphics_->gs_instances), 16);
     // a draw whose scratch no heap has room for: the list fails when it is closed
     if (!Scratch)
       return;
-    memset(Scratch, 0, scratch_bytes);
     targets.scratch = allocator_->gpu_heap_buffer_address_ + ScratchOffset;
     targets.warps = warps;
     targets.instances = Args.InstanceCount;
@@ -1163,30 +1181,62 @@ public:
     if (allocator_->records_)
       allocator_->RecordGPUHeap(Targets, sizeof(targets), "stream output targets");
     memcpy(Targets, &targets, sizeof(targets));
+    StreamOut(TargetsOffset, ScratchOffset, draw, [&] {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
+      cmd = {WMTRenderCommandDraw};
+      cmd.primitive_type = WMTPrimitiveTypePoint;
+      cmd.vertex_count = SM50StreamOutputZeroed(groups) / sizeof(uint32_t);
+      cmd.instance_count = 1;
+    });
+  }
+
+  // the stream output targets bound, with no scratch area yet
+  SM50_STREAM_OUTPUT_TARGETS
+  StreamOutputTargets() {
+    SM50_STREAM_OUTPUT_TARGETS targets{};
+    for (unsigned b = 0; b < std::size(so_views_); b++) {
+      targets.address[b] = so_views_[b].BufferLocation;
+      targets.size[b] = so_views_[b].SizeInBytes;
+      targets.filled[b] = so_views_[b].BufferFilledSizeLocation;
+      targets.statistics[b] = so_statistics_[b];
+    }
+    return targets;
+  }
+
+  // stream output (SM50_STREAM_OUTPUT_TARGETS at `TargetsOffset`) runs a draw twice: once counting each geometry
+  // invocation's primitives, and after a barrier again, writing them and drawing. its scratch area holds the filled
+  // sizes, a total per stream and object threadgroup, and a count per stream and invocation (at most a primitive per
+  // vertex). the passes add to all but the counts, which `zero` zeroes first (zero_words), on every execution of the
+  // list, replays included
+  template <typename Draw, typename Zero>
+  void
+  StreamOut(uint64_t TargetsOffset, uint64_t ScratchOffset, Draw draw, Zero zero) {
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, TargetsOffset, SM50_BINDING_INDEX_STREAM_OUTPUT0);
     EncodeBuffer(WMTRenderCommandSetMeshBuffer, TargetsOffset, SM50_BINDING_INDEX_STREAM_OUTPUT0);
+    EncodeBuffer(WMTRenderCommandSetVertexBuffer, ScratchOffset, kCustomBufferArgumentIndex0);
     auto set_pso = [&](WMT::RenderPipelineState pso) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = pso;
     };
-    auto barrier = [&](WMTRenderStages before) {
+    auto barrier = [&](WMTRenderStages after, WMTRenderStages before) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_memory_barrier>();
       cmd.type = WMTRenderCommandMemoryBarrier;
       cmd.scope = WMTBarrierScopeBuffers;
-      cmd.stages_after = WMTRenderStageMesh;
+      cmd.stages_after = after;
       cmd.stages_before = before;
     };
+    set_pso(device_->GetLib().ZeroWords());
+    zero();
+    barrier(WMTRenderStageVertex, WMTRenderStagePreRaster);
     set_pso(Pipeline(true));
     draw();
-    barrier(WMTRenderStagePreRaster);
+    // without a geometry shader the object stage streams out
+    barrier(WMTRenderStagePreRaster, WMTRenderStagePreRaster);
     set_pso(Pipeline());
     draw();
     // the next draw may read what this one wrote, as vertices or filled sizes
-    barrier(WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
-    // without a geometry shader the caller then draws as usual
-    if (StreamOutputRasterizes())
-      set_pso(RenderTargets(pso_graphics_->so_raster));
+    barrier(WMTRenderStagePreRaster, WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
   }
 
   void STDMETHODCALLTYPE
@@ -1216,8 +1266,7 @@ public:
           D3D12_DRAW_ARGUMENTS{VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation},
           VertexCountPerInstance, {}
       );
-      if (!StreamOutputRasterizes())
-        return;
+      return;
     }
     // Metal's indirect draw arguments are D3D12's, instances second
     if (auto offset = Predicated(
@@ -1273,8 +1322,7 @@ public:
           },
           IndexCountPerInstance, IndexedView(index_view_)
       );
-      if (!StreamOutputRasterizes())
-        return;
+      return;
     }
     // Metal reads behind the view; Direct3D reads zero there, including with no index buffer (D3D11.3 8.19.2)
     const uint64_t index_size = index_type == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t);
@@ -1656,6 +1704,16 @@ public:
               {pSrc->PlacedFootprint.Footprint.RowPitch, src_depth_pitch, row_pitch, image_pitch}, size
           );
         }
+        // a D24 footprint stores UNORM24 codes (D3D11.3 19.1.3.1); Metal stores them as float32.
+        if (!dst_planar && (dst_format.Flag & MTL_DXGI_FORMAT_EMULATED_D24)) {
+          WMTSize size{src_box.right - src_box.left, src_box.bottom - src_box.top, 1};
+          row_pitch = align(size.width * sizeof(float), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+          std::tie(upload, upload_offset) =
+              allocator_->AllocateTempBuffer(row_pitch * size.height, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+          if (!allocator_->CopyD24(true, src->current()->buffer(), src_offset,
+                                   pSrc->PlacedFootprint.Footprint.RowPitch, upload, upload_offset, row_pitch, size))
+            return;
+        }
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
         cmd_cp.src = upload;
@@ -1805,6 +1863,8 @@ public:
               false, download, download_offset, dst->current()->buffer(), dst_offset,
               {row_pitch, image_pitch, pDst->PlacedFootprint.Footprint.RowPitch, dst_depth_pitch}, size
           );
+        if (!src_planar && (src_format.Flag & MTL_DXGI_FORMAT_EMULATED_D24))
+          allocator_->CopyD24(false, download, download_offset, row_pitch, download, download_offset, row_pitch, size);
       } else {
         // between buffers there is CopyBufferRegion: one end of this copy is a texture
         ERR("CopyTextureRegion: both the source and the destination are footprints in buffers");
@@ -1967,6 +2027,8 @@ public:
     // becomes one for a topology with adjacency, and binds its arguments to other stages
     if (pso_graphics_ && (pso_graphics_->geometry_shader || pso_graphics_->adjacency) && Strip(Topology) != Strip(topology_))
       dirty_state_.set(DirtyState::GraphicsPipelineState);
+    if (pso_graphics_ && pso_graphics_->patches && Topology != topology_)
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
     if (pso_graphics_ && pso_graphics_->adjacency && Adjacency(Topology) != Adjacency(topology_))
       dirty_state_.set(
           DirtyState::GraphicsPipelineState, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature,
@@ -2053,7 +2115,7 @@ public:
     // tessellation, geometry shaders and stream output bind root arguments to other stages
     auto stages = [&](MTLD3D12GraphicsPipelineState *p) {
       bool adjacency = p->adjacency && Adjacency(topology_);
-      return (p->threads_per_patch || p->geometry_shader || p->mesh_shader || adjacency) | (p->so_raster && !adjacency) << 1;
+      return p->threads_per_patch || p->geometry_shader || p->mesh_shader || adjacency;
     };
     if (!pso_graphics_ || stages(pso_graphics_.ptr()) != stages(graphics_pso))
       dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
@@ -2381,6 +2443,16 @@ public:
     auto CheckedFlags = Flags & DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
     if (!CheckedFlags)
       return;
+    if ((CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) &&
+        (AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM ||
+         AttachmentDesc.DepthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT)) {
+      auto maximum = AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM ? UINT16_MAX : kD24UnormMax;
+      auto code = std::lround(std::fmin(std::fmax(double(Depth), 0.0), 1.0) * maximum);
+      Depth = float(double(code) / maximum);
+      // a Metal clear may truncate; an upper float keeps the rounded D16 code (D3D11.3 3.2.3.6).
+      if (AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM)
+        Depth = std::nextafter(Depth, 1.0f);
+    }
     if (Rects) {
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
       for (unsigned i = 0; i < RectCount; i++) {
@@ -2723,7 +2795,52 @@ public:
       UINT64 AlignedDstBufferOffset
   ) {
     auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
-    auto dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
+    auto resource = static_cast<MTLD3D12Resource *>(pDstBuffer);
+    D3D12_QUERY_HEAP_TYPE heap_type;
+    // Microsoft Learn, Queries: only timestamps are supported outside direct lists.
+    switch (Type) {
+    case D3D12_QUERY_TYPE_OCCLUSION:
+    case D3D12_QUERY_TYPE_BINARY_OCCLUSION:
+      heap_type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+      break;
+    case D3D12_QUERY_TYPE_TIMESTAMP:
+      heap_type = type_ == D3D12_COMMAND_LIST_TYPE_COPY ? D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+                                                     : D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+      break;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS:
+      heap_type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+      break;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS1:
+      heap_type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1;
+      break;
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
+      heap_type = D3D12_QUERY_HEAP_TYPE_SO_STATISTICS;
+      break;
+    default:
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    if (!heap || !resource || heap->desc.Type != heap_type ||
+        (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT &&
+         !(Type == D3D12_QUERY_TYPE_TIMESTAMP &&
+           (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY)))) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    auto desc = resource->GetDesc();
+    // ResolveQueryData validates ranges before recording; subtraction keeps overflowing inputs out of them.
+    if (StartIndex > heap->desc.Count || QueryCount > heap->desc.Count - StartIndex ||
+        AlignedDstBufferOffset % sizeof(uint64_t) || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        AlignedDstBufferOffset > desc.Width || QueryCount > (desc.Width - AlignedDstBufferOffset) / heap->result_size) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    if (!QueryCount)
+      return;
+    auto dst = resource->buffer->current()->buffer();
     SumOcclusion();
     SumStatistics();
     if (!heap->timestamps.empty()) {
@@ -2819,6 +2936,10 @@ public:
       CountBufferAddress = count_buffer->buffer->current()->gpuAddress() + CountBufferOffset;
     }
     bool rays = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    if (!MaxCommandCount) {
+      ResetIndirectState(sig, rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
+      return;
+    }
     if (rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
       IndirectComputeCommandData *cmd;
       bool parts = !rays && pso_compute_ && pso_compute_->groups_work_together;
@@ -2859,8 +2980,7 @@ public:
         cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
         cmd->static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
         cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
-        ResetIndirectState(sig, rootarg_compute_staging_);
-        dirty_state_.set(DirtyState::ComputeRootArguments);
+        ResetIndirectState(sig, true);
       }
       if (parts) {
         auto [mapped, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(D3D12_DISPATCH_ARGUMENTS),
@@ -2922,10 +3042,6 @@ public:
     // a tessellated command binds every buffer itself, as does a geometry pipeline's and a mesh shader pipeline's
     bool geometry = pso_graphics_ && Geometry();
     bool tessellation = pso_graphics_ && (pso_graphics_->threads_per_patch || geometry || dispatch_mesh);
-    if (pso_graphics_ && pso_graphics_->stream_output) {
-      ERR("ExecuteIndirect: stream output is not implemented yet");
-      return;
-    }
     bool encode_binding = tessellation || sig->UpdateRootArguments || sig->UpdateIndexBuffer || sig->UpdateVertexBuffers;
     DrawCallStatus status = PreDraw(encode_binding);
     if (status == DrawCallStatus::Invalid)
@@ -2956,6 +3072,8 @@ public:
                                                        tessellation, statistics_cuts);
     cmd->statistics = statistics;
     cmd->pixel_statistics = pixel_statistics;
+    cmd->depth_ranges = depth_ranges_;
+    cmd->raster_scale = raster_scale_;
     if (statistics) {
       auto [first, step] = get_primitive_vertex_count(topology_);
       cmd->statistics_first = dispatch_mesh ? 0 : first;
@@ -3008,15 +3126,30 @@ public:
     auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount, sig->UpdateVertexBuffers);
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
-    ResetIndirectState(sig, rootarg_graphics_staging_);
-    for (unsigned slot = 0; slot < vertex_buffers_.size(); slot++)
-      if (sig->ResetVertexBuffers & (1u << slot))
-        vertex_buffers_[slot] = {};
-    if (sig->UpdateIndexBuffer)
-      IASetIndexBuffer(nullptr);
-    dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::VertexBuffer);
+    ResetIndirectState(sig, false);
     if (!cmd->draws)
       return;
+    // stream output runs each command as a direct draw (StreamOut), one after another in the list's scratch area
+    if (pso_graphics_->stream_output) {
+      if (!allocator_->so_scratch_size_) {
+        auto budget = device_->so_scratch_budget.load();
+        auto [Scratch, ScratchOffset] = allocator_->AllocateGPUHeap(budget, 16);
+        // a list whose scratch no heap has room for fails when it is closed
+        if (!Scratch)
+          return;
+        allocator_->so_scratch_offset_ = ScratchOffset;
+        allocator_->so_scratch_size_ = budget;
+      }
+      auto [Targets, TargetsOffset] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(SM50_STREAM_OUTPUT_TARGETS), 16);
+      if (!Targets)
+        return;
+      auto targets = StreamOutputTargets();
+      targets.scratch = allocator_->gpu_heap_buffer_address_ + allocator_->so_scratch_offset_;
+      std::fill_n(static_cast<SM50_STREAM_OUTPUT_TARGETS *>(Targets), MaxCommandCount, targets);
+      cmd->so_targets = allocator_->gpu_heap_buffer_address_ + TargetsOffset;
+      cmd->so_scratch_size = allocator_->so_scratch_size_;
+      cmd->so_invocations = cmd->geometry_threads * pso_graphics_->gs_instances;
+    }
     // a GPU without mesh commands in indirect command buffers: every command is a draw of its own, which binds what
     // the command's stages read and has the threadgroups the resolver left for it (none past the count)
     auto heap = allocator_->gpu_heap_buffer_address_;
@@ -3055,19 +3188,42 @@ public:
             WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, arguments), SM50_BINDING_INDEX_DRAW_ARGUMENTS
         );
       }
-      auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
-      draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
-      draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      draw.indirect_args_offset = at + offsetof(IndirectMeshDraw, threadgroups);
-      draw.object_threadgroup_size = object;
-      draw.mesh_threadgroup_size = mesh;
+      auto draw = [&] {
+        auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
+        draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
+        draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+        draw.indirect_args_offset = at + offsetof(IndirectMeshDraw, threadgroups);
+        draw.object_threadgroup_size = object;
+        draw.mesh_threadgroup_size = mesh;
+      };
+      if (!cmd->so_targets) {
+        draw();
+        continue;
+      }
+      StreamOut(cmd->so_targets - heap + i * sizeof(SM50_STREAM_OUTPUT_TARGETS), allocator_->so_scratch_offset_, draw, [&] {
+        auto &zero = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+        zero.type = WMTRenderCommandDrawIndirect;
+        zero.primitive_type = WMTPrimitiveTypePoint;
+        zero.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+        zero.indirect_args_offset = at + offsetof(IndirectMeshDraw, zero);
+      });
     }
   };
 
-  // the root argument half of D3D12's reset after ExecuteIndirect
-  void ResetIndirectState(MTLD3D12CommandSignature *sig, uint64_t *rootargs) {
+  void ResetIndirectState(MTLD3D12CommandSignature *sig, bool compute) {
+    auto rootargs = compute ? rootarg_compute_staging_ : rootarg_graphics_staging_;
     for (auto [offset, count] : sig->ResetRootDwords)
       std::fill_n(reinterpret_cast<uint32_t *>(rootargs) + offset, count, 0u);
+    if (compute) {
+      dirty_state_.set(DirtyState::ComputeRootArguments);
+      return;
+    }
+    for (unsigned slot = 0; slot < vertex_buffers_.size(); slot++)
+      if (sig->ResetVertexBuffers & (1u << slot))
+        vertex_buffers_[slot] = {};
+    if (sig->UpdateIndexBuffer)
+      IASetIndexBuffer(nullptr);
+    dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::VertexBuffer);
   }
 
   void STDMETHODCALLTYPE
@@ -3215,13 +3371,13 @@ public:
     UINT level[2], slice[2], plane[2];
     DecomposeSubresource(dst->GetDesc(), DstSubresource, &level[0], &slice[0], &plane[0]);
     DecomposeSubresource(src->GetDesc(), SrcSubresource, &level[1], &slice[1], &plane[1]);
-    // a color subresource is seen in the resolve's format, a depth or stencil plane in the only one it has, which for
-    // reading stencil beside depth is the stencil view of both
+    // a color subresource is seen in the resolve's format without its swizzle, as its channels are stored, a depth or
+    // stencil plane in the only one it has, which for reading stencil beside depth is the stencil view of both
     auto view = [&](MTLD3D12Resource *resource, bool source) {
       auto &texture = resource->texture;
       auto planes = DepthStencilPlanarFlags(texture->pixelFormat());
       TextureViewDescriptor desc;
-      desc.format = !planes                             ? format.PixelFormat
+      desc.format = !planes                             ? WMTPixelFormat(ORIGINAL_FORMAT(format.PixelFormat))
                     : source && planes == 3 && plane[1] ? WMTPixelFormatX32_Stencil8
                                                         : texture->pixelFormat();
       desc.type = texture->sampleCount() > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
@@ -3233,8 +3389,9 @@ public:
     D3D12_RECT whole{0, 0, (LONG)src->texture->width(src_view), (LONG)src->texture->height(src_view)},
         rect = pSrcRect ? *pSrcRect : whole;
     auto planes = DepthStencilPlanarFlags(dst->texture->pixelFormat());
-    // Metal's own resolve is of a whole attachment into one as large, by averaging colors
-    if (ResolveMode == D3D12_RESOLVE_MODE_AVERAGE && !planes && !IsIntegerFormat(format.PixelFormat) && !DstX && !DstY &&
+    // Metal's own resolve is of a whole attachment into one as large, by averaging colors of the formats it resolves
+    if (ResolveMode == D3D12_RESOLVE_MODE_AVERAGE && !planes &&
+        any_bit_set(device_->GetMTLPixelFormatCapability(format.PixelFormat) & FormatCapability::Resolve) && !DstX && !DstY &&
         !memcmp(&rect, &whole, sizeof(rect)) && dst->texture->width(dst_view) == (UINT)whole.right &&
         dst->texture->height(dst_view) == (UINT)whole.bottom) {
       allocator_->InvalidateCurrentPass();
@@ -3925,7 +4082,7 @@ MTLD3D12CommandAllocatorImpl::CreateCommandList(
     void **ppCommandList
 ) {
   if (Type != type_)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(device_, Type));
   HRESULT hr = cmd_list->Initialize(this, pInitialPipelineState);

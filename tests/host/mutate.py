@@ -282,6 +282,65 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                             process.kill()
                         process.join(5)
 
+    def test_runner_installation_lifetime(self):
+        ctx = multiprocessing.get_context("fork")
+        first, second, started, release = (ctx.Event() for _ in range(4))
+        with tempfile.TemporaryDirectory() as tmp:
+            def runner(entered, wait):
+                temporary = Path(tmp) / str(os.getpid())
+                temporary.mkdir()
+                def environment(_):
+                    entered.set()
+                    return [], None, {}
+
+                def own(*_):
+                    if wait and not release.wait(5):
+                        raise RuntimeError("runner was not released")
+                    return 0
+
+                with patch.object(sys, "argv", ["run.py", "--build", tmp, "--wine", tmp]), \
+                     patch.object(tempfile, "gettempdir", return_value=str(temporary)), \
+                     patch.object(tool.test_run, "chosen", return_value=[]), \
+                     patch.object(tool.test_run, "environment", environment), \
+                     patch.object(tool.test_run, "own", own):
+                    started.set()
+                    tool.test_run.main()
+
+            processes = [ctx.Process(target=runner, args=(first, True)), ctx.Process(target=runner, args=(second, False))]
+            try:
+                processes[0].start()
+                self.assertTrue(first.wait(5))
+                started.clear()
+                processes[1].start()
+                self.assertTrue(started.wait(5))
+                self.assertFalse(second.wait(0.3), "another runner installed DLLs before the running test finished")
+                release.set()
+                self.assertTrue(second.wait(5))
+                for process in processes:
+                    process.join(5)
+                    self.assertEqual(process.exitcode, 0)
+            finally:
+                release.set()
+                for process in processes:
+                    if process.pid is not None:
+                        if process.is_alive():
+                            process.kill()
+                        process.join(5)
+
+    def test_runner_readonly_wine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wine = Path(tmp) / "wine"
+            wine.mkdir(mode=0o500)
+            try:
+                with patch.object(sys, "argv", ["run.py", "--build", tmp, "--wine", str(wine), "--no-install"]), \
+                     patch.object(tool.test_run, "chosen", return_value=[]), \
+                     patch.object(tool.test_run, "environment", return_value=([], None, {})), \
+                     patch.object(tool.test_run, "own", return_value=0), self.assertRaises(SystemExit) as ended:
+                    tool.test_run.main()
+                self.assertEqual(ended.exception.code, 0)
+            finally:
+                wine.chmod(0o700)
+
     def test_lock_dead_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock = Path(tmp) / "gpu.lock"
@@ -395,6 +454,10 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             self.assertEqual([t["name"] for t in run.chosen(args)], ["test"])
             args.exact = False
             self.assertEqual(len(run.chosen(args)), 2)
+            (root / "meson-info/intro-benchmarks.json").write_text(json.dumps([
+                {"name": "test", "cmd": [str(exe), "bench"], "suite": []}]))
+            args.benchmark = True
+            self.assertEqual([t["cmd"] for t in run.chosen(args)], [[str(exe), "bench"]])
 
     def test_stop_and_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:

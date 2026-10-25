@@ -48,9 +48,10 @@ HRESULT ExtractMTLInputLayoutElements(
       ERR("CreateInputLayout: not an ordinary or packed format: ", desc.Format);
       return E_INVALIDARG;
     }
-    // a slot's elements step alike (the same test)
+    // a slot's elements step alike, in class and in rate (D3D11.3 8.1.3, D3D11_INPUT_ELEMENT_DESC), the shader's or not
     if (std::any_of(pInputElementDescs, &desc, [&](auto &other) {
-          return other.InputSlot == desc.InputSlot && other.InputSlotClass != desc.InputSlotClass;
+          return other.InputSlot == desc.InputSlot && (other.InputSlotClass != desc.InputSlotClass ||
+                                                       other.InstanceDataStepRate != desc.InstanceDataStepRate);
         }))
       return E_INVALIDARG;
     auto aligned_byte_offset = desc.AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT

@@ -1139,6 +1139,33 @@ MTLComputePipelineState_maxTotalThreadsPerThreadgroup(obj_handle_t pipeline) {
   return params.ret;
 }
 
+WINEMETAL_API bool
+MTLDevice_supports32BitFloatFiltering(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupports32BitFloatFiltering, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_supports32BitMSAA(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupports32BitMSAA, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceMaxArgumentBufferSamplerCount, &params);
+  return params.ret;
+}
+
 WINEMETAL_API uint64_t
 MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(obj_handle_t pipeline) {
   struct unixcall_generic_obj_uint64_ret params;

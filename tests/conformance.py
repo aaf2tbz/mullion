@@ -223,7 +223,8 @@ def main():
     run.arguments(parser)
     arguments(parser)
     args = parser.parse_args()
-    sys.exit(conformance(args, *run.environment(args)) != 0)
+    with run.session(args) as runtime:
+        sys.exit(conformance(args, *runtime) != 0)
 
 
 if __name__ == "__main__":

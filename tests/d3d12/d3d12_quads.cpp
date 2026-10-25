@@ -5,11 +5,16 @@
 // ID, or for a row, its place in the quad's 2x2), differentiates a function of p that is not linear, and samples at p
 // times 2^k texels, k its group's index, from mips whose texels all hold the mip's index, so the mip read is the LOD.
 // a cube's LOD must not change when each lane scales the same direction by its own length.
+// DXIL.rst DerivCoarseX/Y: "The exact calculation is up to the hardware vendor." either row or column is
+// allowed, but its result is shared by the quad. DerivFineX/Y: "The data in the current Pixel Shader invocation
+// always participates" (https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst).
+// isolated derivative shaders test the SM6.6 layout without another operation enabling it. native half and
+// minimum precision use exactly representable inputs; all shaders are compiled before device creation.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <bit>
+#include <climits>
 #include <cmath>
-#include <set>
 
 static const char hlsl[] = R"hlsl(
 Texture2D<float> mips : register(t0);
@@ -25,27 +30,33 @@ void cs(uint3 g : SV_GroupThreadID, uint3 d : SV_DispatchThreadID, uint3 group :
 #else
   uint2 p = g.xy;
 #endif
-  float f = p.x * p.x + 3 * p.y * p.y + p.x * p.y;
+  T x = T(p.x % TILE), y = T(p.y % TILE);
+  T f = T(x * x - 3 * y * y + x * y);
   float2 uv = float2(p) * exp2(group.x) / SIZE;
   uint b = (group.x * X * Y * Z + i) * FIELDS;
-  o[b + 0] = g.x | g.y << 8 | g.z << 16;
+  o[b + 0] = g.x | g.y << ID_BITS | g.z << (2 * ID_BITS);
   o[b + 1] = all(d == group * uint3(X, Y, Z) + g) && i == (g.z * Y + g.y) * X + g.x;
-  o[b + 2] = p.x | p.y << 8;
-  o[b + 3] = asuint(ddx_coarse(f));
-  o[b + 4] = asuint(ddy_coarse(f));
-  o[b + 5] = asuint(ddx_fine(f));
-  o[b + 6] = asuint(ddy_fine(f));
+  o[b + 2] = p.x | p.y << HALF_WORD;
+#if ONLY
+  o[b + 3] = asuint(float(OP(f)));
+#else
+  o[b + 14] = WaveGetLaneIndex() % 4;
+  o[b + 3] = asuint(float(ddx_coarse(f)));
+  o[b + 4] = asuint(float(ddy_coarse(f)));
+  o[b + 5] = asuint(float(ddx_fine(f)));
+  o[b + 6] = asuint(float(ddy_fine(f)));
   o[b + 7] = asuint(mips.Sample(linear_mips, uv));
   o[b + 8] = asuint(mips.SampleBias(linear_mips, uv, 1));
   o[b + 9] = asuint(mips.CalculateLevelOfDetail(linear_mips, uv));
   o[b + 10] = asuint(mips.CalculateLevelOfDetailUnclamped(linear_mips, uv));
   // on the +x face, s steps by CUBE_STEP / 2 per p, and each lane's direction has its own length
-  float3 direction = float3(1, float2(p) * CUBE_STEP) * (1 + (i & 1));
+  float3 direction = float3(1, float2(p % TILE) * CUBE_STEP) * (1 + (i & 1));
   o[b + 13] = asuint(cube.CalculateLevelOfDetailUnclamped(linear_mips, direction));
   // the depth mips hold (m + 1) / 16: references just under and over one mip's say which mip was compared
   float m = min(group.x, MIPS - 1);
   o[b + 11] = depth.SampleCmp(less, uv, (m + 0.5) / 16) > 0.5;
   o[b + 12] = depth.SampleCmp(less, uv, (m + 1.5) / 16) > 0.5;
+#endif
 }
 )hlsl";
 
@@ -60,9 +71,10 @@ main(int argc, char **argv) {
     printf("skipped: compute derivatives are shader model 6.6\n");
     return 77;
   }
-  const UINT size = 64, mip_count = std::bit_width(size), lods = mip_count + 1, fields = 14;
-  // a cube step of 2^(k + 1) / size in the direction is 2^k texels of the face; at LOD 0 the farthest quad position,
-  // 31 in a row of 64, stays on the +x face
+  const UINT size = 64, mip_count = std::bit_width(size), lods = mip_count + 1, fields = 15, tile = 8;
+  const UINT id_bits = std::bit_width(D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP - 1u),
+             half_word = sizeof(UINT16) * CHAR_BIT;
+  // a cube step of 2^(k + 1) / size is 2^k texels of the face; the tiled coordinates keep every quad on +x
   const UINT cube_lod = 0;
   const float cube_step = float(2 << cube_lod) / size;
   struct Layout {
@@ -70,10 +82,53 @@ main(int argc, char **argv) {
     bool linear;
   };
   // 2x2 quads in square, uneven and layered groups; quads of a row
-  const Layout layouts[] = {{8, 8, 1, false}, {6, 4, 1, false}, {4, 2, 2, false}, {64, 1, 1, true}};
+  const Layout layouts[] = {
+      {8, 8, 1, false},
+      {6, 4, 1, false},
+      {4, 2, 2, false},
+      {64, 1, 1, true},
+      {4, 1, 1, true},
+      {12, 1, 1, true},
+      {2, 2, 1, false},
+      {2, 2, 3, false},
+      {D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP, 1, 1, true},
+      {D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP / 2, 2, 1, false}
+  };
+  const char *operations[] = {"all", "ddx_coarse", "ddy_coarse", "ddx_fine", "ddy_fine"};
+  struct Variant {
+    UINT layout, operation;
+    const char *type;
+    std::string code;
+  };
+  std::vector<Variant> variants;
+  for (UINT l = 0; l < std::size(layouts); l++)
+    for (const char *type : {"float", "float16_t", "min16float"})
+      for (UINT op = 0; op < std::size(operations); op++) {
+        if (op == 0 && strcmp(type, "float"))
+          continue;
+        auto &shape = layouts[l];
+        step("compile %s %s in %ux%ux%u", type, operations[op], shape.x, shape.y, shape.z);
+        auto code = compiler.compile(
+            hlsl, "cs", "cs_6_6",
+            {"X=" + std::to_string(shape.x), "Y=" + std::to_string(shape.y), "Z=" + std::to_string(shape.z),
+             "LINEAR=" + std::to_string(shape.linear), "SIZE=" + std::to_string(size),
+             "MIPS=" + std::to_string(mip_count), "FIELDS=" + std::to_string(fields),
+             "CUBE_STEP=" + std::to_string(cube_step), "T=" + std::string(type), "TILE=" + std::to_string(tile),
+             "ID_BITS=" + std::to_string(id_bits), "HALF_WORD=" + std::to_string(half_word),
+             "ONLY=" + std::to_string(op != 0), "OP=" + std::string(op ? operations[op] : "ddx_coarse")},
+            !strcmp(type, "float16_t") ? std::vector<std::wstring>{L"-enable-16bit-types"} : std::vector<std::wstring>{}
+        );
+        if (!expect(!code.empty(), "%s %s HLSL", type, operations[op]))
+          return verdict();
+        variants.push_back({l, op, type, std::move(code)});
+      }
 
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4{};
+  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &options4, sizeof(options4)));
+  if (!expect(options4.Native16BitShaderOpsSupported, "native half capability"))
+    return verdict();
   D3D12_DESCRIPTOR_RANGE srvs{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3};
   D3D12_ROOT_PARAMETER params[2] = {{D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE}, {D3D12_ROOT_PARAMETER_TYPE_UAV}};
   params[0].DescriptorTable = {1, &srvs};
@@ -155,76 +210,118 @@ main(int argc, char **argv) {
   transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   CHECK(submit(device.Get(), queue.Get(), list.Get()));
 
-  unsigned failures = 0;
-  for (auto &l : layouts) {
-    const UINT threads = l.x * l.y * l.z, bytes = lods * threads * fields * 4;
-    auto name = std::to_string(l.x) + "x" + std::to_string(l.y) + "x" + std::to_string(l.z);
-    auto cs = compiler.compile(
-        hlsl, "cs", "cs_6_6",
-        {"X=" + std::to_string(l.x), "Y=" + std::to_string(l.y), "Z=" + std::to_string(l.z),
-         "LINEAR=" + std::to_string(l.linear), "SIZE=" + std::to_string(size), "MIPS=" + std::to_string(mip_count),
-         "FIELDS=" + std::to_string(fields), "CUBE_STEP=" + std::to_string(cube_step)}
-    );
-    if (cs.empty()) {
-      printf("failed: HLSL did not compile\n");
-      return 1;
-    }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(cs)};
+  D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+  D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument};
+  ComPtr<ID3D12CommandSignature> signature;
+  CHECK(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)));
+  auto indirect =
+      buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, sizeof(D3D12_DISPATCH_ARGUMENTS), D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!expect(bool(indirect), "indirect dispatch buffer"))
+    return verdict();
+  void *mapped;
+  CHECK(indirect->Map(0, nullptr, &mapped));
+  const D3D12_DISPATCH_ARGUMENTS dispatch{lods, 1, 1};
+  memcpy(mapped, &dispatch, sizeof(dispatch));
+  indirect->Unmap(0, nullptr);
+  for (auto &variant : variants) {
+    auto &l = layouts[variant.layout];
+    const UINT threads = l.x * l.y * l.z, bytes = lods * threads * fields * sizeof(UINT);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{rs.Get(), bytecode(variant.code)};
     ComPtr<ID3D12PipelineState> pso;
     CHECK(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso)));
     auto out = buffer(
-        device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
     );
+    auto initial = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
     auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
-    CHECK(allocator->Reset());
-    CHECK(list->Reset(allocator.Get(), pso.Get()));
-    ID3D12DescriptorHeap *heaps[] = {srv_heap.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootSignature(rs.Get());
-    list->SetComputeRootDescriptorTable(0, srv_heap->GetGPUDescriptorHandleForHeapStart());
-    list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
-    list->Dispatch(lods, 1, 1);
-    transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(readback.Get(), 0, out.Get(), 0, bytes);
-    CHECK(submit(device.Get(), queue.Get(), list.Get()));
-    UINT *o;
-    CHECK(readback->Map(0, nullptr, (void **)&o));
-
-    auto f = [](UINT x, UINT y) { return (float)(x * x + 3 * y * y + x * y); };
-    for (UINT k = 0; k < lods; k++) {
-      std::set<UINT> ids;
-      for (UINT i = 0; i < threads; i++) {
-        auto r = o + (k * threads + i) * fields;
-        auto expect = [&](UINT field, UINT want, const char *what) {
-          if (r[field] != want && failures++ < 8)
-            printf("%s, k %u, thread %u %s: %#x, want %#x\n", name.c_str(), k, i, what, r[field], want);
-        };
-        auto fp = [](float v) { return std::bit_cast<UINT>(v); };
-        ids.insert(r[0]);
-        expect(1, 1, "SV_GroupIndex and SV_DispatchThreadID match SV_GroupThreadID");
-        UINT x = r[2] & 0xff, y = r[2] >> 8;
-        // p's quad has its first lane at the even corner, and its lanes along x, then y
-        UINT x0 = x & ~1u, y0 = y & ~1u;
-        expect(3, fp(f(x0 + 1, y0) - f(x0, y0)), "ddx_coarse");
-        expect(4, fp(f(x0, y0 + 1) - f(x0, y0)), "ddy_coarse");
-        expect(5, fp(f(x0 + 1, y) - f(x0, y)), "ddx_fine");
-        expect(6, fp(f(x, y0 + 1) - f(x, y0)), "ddy_fine");
-        // one step of p is 2^k texels of mip 0: LOD k, clamped to the last mip
-        UINT last = mip_count - 1;
-        expect(7, fp((float)std::min(k, last)), "Sample");
-        expect(8, fp((float)std::min(k + 1, last)), "SampleBias");
-        expect(9, fp((float)std::min(k, last)), "CalculateLevelOfDetail");
-        expect(10, fp((float)k), "CalculateLevelOfDetailUnclamped");
-        expect(11, 1, "SampleCmp reads its LOD's mip, not a finer one");
-        expect(12, 0, "SampleCmp reads its LOD's mip, not a coarser one");
-        expect(13, fp((float)cube_lod), "cube CalculateLevelOfDetailUnclamped");
-      }
-      if (ids.size() != threads && failures++ < 8)
-        printf("%s, k %u: %zu distinct SV_GroupThreadIDs of %u\n", name.c_str(), k, ids.size(), threads);
+    if (!expect(out && initial && readback, "quad buffers"))
+      return verdict();
+    CHECK(initial->Map(0, nullptr, &mapped));
+    memset(mapped, 0xcd, bytes);
+    initial->Unmap(0, nullptr);
+    for (bool indirect_path : {false, true}) {
+      step("%s %s, %ux%ux%u, indirect=%d", variant.type, operations[variant.operation], l.x, l.y, l.z, indirect_path);
+      CHECK(forget(readback.Get()));
+      CHECK(allocator->Reset());
+      CHECK(list->Reset(allocator.Get(), pso.Get()));
+      list->CopyResource(out.Get(), initial.Get());
+      transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      ID3D12DescriptorHeap *heaps[] = {srv_heap.Get()};
+      list->SetDescriptorHeaps(1, heaps);
+      list->SetComputeRootSignature(rs.Get());
+      list->SetComputeRootDescriptorTable(0, srv_heap->GetGPUDescriptorHandleForHeapStart());
+      list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+      if (indirect_path)
+        list->ExecuteIndirect(signature.Get(), 1, indirect.Get(), 0, nullptr, 0);
+      else
+        list->Dispatch(lods, 1, 1);
+      transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->CopyResource(readback.Get(), out.Get());
+      transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+      CHECK(submit(device.Get(), queue.Get(), list.Get()));
+      const UINT *o;
+      CHECK(readback->Map(0, nullptr, (void **)&o));
+      auto f = [&](UINT x, UINT y) {
+        x %= tile;
+        y %= tile;
+        return float(int(x * x) - 3 * int(y * y) + int(x * y));
+      };
+      auto fp = [](float v) { return std::bit_cast<UINT>(v); };
+      for (UINT k = 0; k < lods; k++)
+        for (UINT i = 0; i < threads; i++) {
+          auto r = o + (k * threads + i) * fields;
+          UINT gx = i % l.x, gy = i / l.x % l.y, gz = i / (l.x * l.y);
+          UINT x = l.linear ? ((i & 1) | (i >> 2 << 1)) : gx, y = l.linear ? ((i >> 1) & 1) : gy;
+          UINT x0 = x & ~1u, y0 = y & ~1u;
+          UINT base = l.linear ? (i & ~3u) : (gz * l.y + (gy & ~1u)) * l.x + (gx & ~1u);
+          auto head = o + (k * threads + base) * fields;
+          bool valid = true;
+          auto same = [&](UINT field, UINT want, const char *what) {
+            valid &= expect(r[field] == want, "group %u thread %u %s: %#x, want %#x", k, i, what, r[field], want);
+          };
+          auto derivative = [&](UINT field, bool vertical, bool fine) {
+            float a = vertical ? f(x0, y0 + 1) - f(x0, y0) : f(x0 + 1, y0) - f(x0, y0);
+            float b = vertical ? f(x0 + 1, y0 + 1) - f(x0 + 1, y0) : f(x0 + 1, y0 + 1) - f(x0, y0 + 1);
+            if (fine)
+              same(field, fp(vertical ? f(x, y0 + 1) - f(x, y0) : f(x0 + 1, y) - f(x0, y)), "fine derivative");
+            else {
+              valid &= expect(
+                  r[field] == fp(a) || r[field] == fp(b), "group %u thread %u coarse derivative %#x, want %#x or %#x",
+                  k, i, r[field], fp(a), fp(b)
+              );
+              same(field, head[field], "coarse derivative shared by quad");
+            }
+          };
+          same(0, gx | gy << id_bits | gz << (2 * id_bits), "SV_GroupThreadID");
+          same(1, 1, "SV_GroupIndex and SV_DispatchThreadID");
+          same(2, x | y << half_word, "quad position");
+          same(14, variant.operation ? 0xcdcdcdcdu : (x & 1) | (y & 1) << 1, "wave lane within quad");
+          if (variant.operation) {
+            derivative(3, variant.operation == 2 || variant.operation == 4, variant.operation >= 3);
+            for (UINT field = 4; field < 14; field++)
+              same(field, 0xcdcdcdcdu, "untouched field");
+          } else {
+            derivative(3, false, false);
+            derivative(4, true, false);
+            derivative(5, false, true);
+            derivative(6, true, true);
+            UINT last = mip_count - 1;
+            same(7, fp(float(std::min(k, last))), "Sample");
+            same(8, fp(float(std::min(k + 1, last))), "SampleBias");
+            same(9, fp(float(std::min(k, last))), "CalculateLevelOfDetail");
+            same(10, fp(float(k)), "CalculateLevelOfDetailUnclamped");
+            same(11, 1, "SampleCmp lower reference");
+            same(12, 0, "SampleCmp upper reference");
+            same(13, fp(float(cube_lod)), "cube CalculateLevelOfDetailUnclamped");
+          }
+          if (!valid) {
+            readback->Unmap(0, nullptr);
+            return verdict();
+          }
+        }
+      readback->Unmap(0, nullptr);
     }
-    readback->Unmap(0, nullptr);
   }
-  printf("%s: %u mismatches over %zu layouts\n", failures ? "failed" : "passed", failures, std::size(layouts));
-  return failures != 0;
+  return verdict();
 }

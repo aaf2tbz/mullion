@@ -126,6 +126,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(getGlobalShaderFlag(pDevice));
   h.update(variant.gs_passthrough);
   h.update(variant.rasterization_disabled);
+  h.update(variant.clip_distance_varyings);
   if (variant.input_layout_handle)
     h.update(variant.input_layout_handle->sha1());
   auto variant_digest = h.final();
@@ -137,6 +138,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data_gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
     data_gs_passthrough.DataEncoded = variant.gs_passthrough;
     data_gs_passthrough.RasterizationDisabled = variant.rasterization_disabled;
+    data_gs_passthrough.ClipDistanceVaryings = variant.clip_distance_varyings;
     data_gs_passthrough.next = common;
     if (variant.input_layout_handle) {
       data_gs_passthrough.next = &data_ia_layout;
@@ -176,6 +178,10 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.disable_depth_output);
   h.update(variant.pixel_formats);
   h.update(variant.pipeline_statistics);
+  h.update(variant.alpha_to_coverage);
+  h.update(variant.centered_samples);
+  h.update(variant.single_raster_sample);
+  h.update(variant.clip_distances);
   auto variant_digest = h.final();
   std::string func_name = "ps_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
 
@@ -189,6 +195,10 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.unorm_output_reg_mask = variant.unorm_output_reg_mask;
     std::copy(variant.pixel_formats.begin(), variant.pixel_formats.end(), data.pixel_formats);
     data.pipeline_statistics = variant.pipeline_statistics;
+    data.alpha_to_coverage = variant.alpha_to_coverage;
+    data.centered_samples = variant.centered_samples;
+    data.single_raster_sample = variant.single_raster_sample;
+    data.clip_distances = variant.clip_distances;
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;
@@ -295,16 +305,18 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.max_potential_tess_factor);
   h.update(variant.mesh_vertex_size);
   h.update(variant.max_mesh_threadgroups);
+  h.update(variant.clip_distance_varyings);
   if (variant.geometry_shader_handle)
     h.update(variant.geometry_shader_handle->sha1());
   auto variant_digest = h.final();
   std::string func_name = "ds_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
   auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
-    // of this the domain stage takes only whether it rasterizes
+    // of this the domain stage takes only whether it rasterizes, and where its clip distances go
     SM50_SHADER_GS_PASS_THROUGH_DATA gs_passthrough{};
     SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess{};
     gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
     gs_passthrough.RasterizationDisabled = variant.rasterization_disabled;
+    gs_passthrough.ClipDistanceVaryings = variant.clip_distance_varyings;
     gs_passthrough.next = &pso_tess;
     pso_tess.type = SM50_SHADER_PSO_TESSELLATOR;
     pso_tess.next = common;
@@ -348,6 +360,7 @@ static void
 hash_stream_output(Sha1HashState &h, const ShaderVariantStreamOutput &variant) {
   h.update(variant.input_primitive);
   h.update(variant.pass_through);
+  h.update(variant.quad_lines);
   if (!variant.layout)
     return;
   h.update(variant.layout->Digest());
@@ -418,6 +431,8 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.vertex_shader_handle->sha1());
   h.update(variant.strip_topology);
   hash_stream_output(h, variant.stream_output);
+  h.update(variant.pipeline_statistics);
+  h.update(variant.clip_distance_varyings);
   auto variant_digest = h.final();
   std::string func_name = "gs_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
   auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
@@ -428,6 +443,9 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     geometry.strip_topology = variant.strip_topology;
     geometry.input_primitive = variant.stream_output.input_primitive;
     geometry.pass_through = variant.stream_output.pass_through;
+    geometry.quad_lines = variant.stream_output.quad_lines;
+    geometry.pipeline_statistics = variant.pipeline_statistics;
+    geometry.clip_distance_varyings = variant.clip_distance_varyings;
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;

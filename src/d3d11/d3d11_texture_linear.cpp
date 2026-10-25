@@ -60,15 +60,11 @@ TDynamicLinearTexture(
     D3D11_ASSERT(_.ptr() == nullptr);
 
     if (pInitialData) {
-      if (pInitialData->SysMemPitch != bytes_per_row_) {
-        for (unsigned row = 0; row < this->texture_->height(); row++) {
-          memcpy(
-              ptr_add(allocation->mappedMemory, row * bytes_per_row_),
-              ptr_add(pInitialData->pSysMem, row * pInitialData->SysMemPitch),
-              pInitialData->SysMemPitch);
-        }
-      } else {
-        memcpy(allocation->mappedMemory, pInitialData->pSysMem, bytes_per_image);
+      const UINT row_bytes = this->texture_->width() * MTLGetTexelSize(descriptor.pixel_format);
+      for (unsigned row = 0; row < this->texture_->height(); row++) {
+        memcpy(
+            ptr_add(allocation->mappedMemory, row * bytes_per_row_),
+            ptr_add(pInitialData->pSysMem, row * pInitialData->SysMemPitch), row_bytes);
       }
     }
     dynamic_ = new DynamicLinearTexture(this->texture_.ptr(), flags);

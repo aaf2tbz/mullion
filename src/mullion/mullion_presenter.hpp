@@ -11,6 +11,13 @@
 
 namespace mullion {
 
+// a copy the runtime makes from the previous frame onto the one a flip model swap chain presents: its destination,
+// and its source's offset from it
+struct PresentCopy {
+  RECT to;
+  POINT from;
+};
+
 // how a back buffer is put on its target: the part of it that is presented, from its origin, as a fraction of each
 // side; the target's size over the picture's, 1 for a picture stretched over the target; the back buffer's place for
 // a place in the picture (rows of a matrix, and what each adds), which turns a picture that the back buffer holds

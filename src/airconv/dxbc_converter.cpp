@@ -8,11 +8,13 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/FMF.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <bit>
 #include <memory>
 #include <string>
@@ -353,6 +355,36 @@ component_type_from_pixel_format(air::MTLPixelFormat format) {
   return RegisterComponentType::Unknown;
 }
 
+// each write to memory runs only while `live` holds; an atomic skipped returns 0, as one after a discard may
+// (D3D11.3 16.13)
+static void
+gate_writes(llvm::Function &function, llvm::Value *live) {
+  std::vector<llvm::Instruction *> writes;
+  for (auto &i : llvm::instructions(function)) {
+    if (auto store = llvm::dyn_cast<llvm::StoreInst>(&i); store && store->getPointerAddressSpace() == 1)
+      writes.push_back(store);
+    if (auto call = llvm::dyn_cast<llvm::CallInst>(&i); call && call->getCalledFunction()) {
+      auto name = call->getCalledFunction()->getName();
+      if (name.startswith("air.write_") || name.startswith("air.atomic_") ||
+          (name.startswith("air.atomic.global.") && !name.startswith("air.atomic.global.load.")))
+        writes.push_back(call);
+    }
+  }
+  for (auto write : writes) {
+    auto head = write->getParent();
+    auto then = llvm::SplitBlockAndInsertIfThen(
+        new llvm::LoadInst(llvm::Type::getInt1Ty(function.getContext()), live, "", write), write, false
+    );
+    write->moveBefore(then);
+    if (write->use_empty())
+      continue;
+    auto phi = llvm::PHINode::Create(write->getType(), 2, "", &*then->getSuccessor(0)->begin());
+    write->replaceAllUsesWith(phi);
+    phi->addIncoming(write, then->getParent());
+    phi->addIncoming(llvm::Constant::getNullValue(write->getType()), head);
+  }
+}
+
 llvm::Error convert_dxbc_pixel_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   llvm::LLVMContext &context, llvm::Module &module,
@@ -370,6 +402,7 @@ llvm::Error convert_dxbc_pixel_shader(
   bool pso_disable_depth_output = false;
   uint32_t pso_unorm_output_reg_mask = 0;
   uint32_t *pso_pixel_formats = nullptr;
+  bool pso_alpha_to_coverage = false;
   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pso_data = nullptr;
   if (args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pso_data)) {
     pso_dual_source_blending = pso_data->dual_source_blending;
@@ -377,6 +410,7 @@ llvm::Error convert_dxbc_pixel_shader(
     pso_unorm_output_reg_mask = pso_data->unorm_output_reg_mask;
     pso_sample_mask = pso_data->sample_mask;
     pso_pixel_formats = pso_data->pixel_formats;
+    pso_alpha_to_coverage = pso_data->alpha_to_coverage && (pShaderInternal->pso_valid_output_reg_mask & 1);
   }
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_FLAG shader_flags = {};
@@ -403,8 +437,10 @@ llvm::Error convert_dxbc_pixel_shader(
   {
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.dual_source_blending = pso_dual_source_blending;
-    sig_ctx.disable_depth_output = pso_disable_depth_output;
+    // a shader's depth is ignored once the tests ran before it (D3D11.3 16.12.1)
+    sig_ctx.disable_depth_output = pso_disable_depth_output || func_signature.EarlyFragmentTests();
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
+    sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
@@ -412,7 +448,11 @@ llvm::Error convert_dxbc_pixel_shader(
       p(sig_ctx);
     }
   }
-  if (pso_sample_mask != 0xffffffff) {
+  // an unwritten o1 leaves the second blend source undefined (Vulkan, Dual-Source Blending); Metal refuses the
+  // pipeline without one, so it is zero, as the epilogue starts every output
+  if (pso_dual_source_blending && !(pShaderInternal->pso_valid_output_reg_mask & 2))
+    func_signature.DefineOutput(air::OutputRenderTarget{.dual_source_blending = true, .index = 1, .type = air::msl_float4});
+  if (pso_sample_mask != 0xffffffff || pso_alpha_to_coverage || (pso_data && pso_data->clip_distances)) {
     auto assigned_index =
       func_signature.DefineOutput(air::OutputCoverageMask{});
     epilogue >> [=](pvalue value) -> IRValue {
@@ -420,15 +460,35 @@ llvm::Error convert_dxbc_pixel_shader(
         auto &builder = ctx.builder;
         if (ctx.resource.coverage_mask_reg)
           return value;
-        return builder.CreateInsertValue(
-          value, builder.getInt32(ctx.pso_sample_mask), {assigned_index}
-        );
+        pvalue mask = builder.getInt32(ctx.pso_sample_mask);
+        if (pso_alpha_to_coverage) {
+          // o0.a of 0 or less, or NaN, covers no sample, 1 or more all n, and between them the nearest count of
+          // samples (D3D11.3 17.18)
+          auto output = ctx.resource.output.ptr_float4;
+          auto output_ty = llvm::cast<llvm::PointerType>(output->getType())->getNonOpaquePointerElementType();
+          auto o0 = builder.CreateLoad(
+            output_ty->getArrayElementType(), builder.CreateConstInBoundsGEP2_32(output_ty, output, 0, 0)
+          );
+          auto alpha = builder.CreateExtractElement(o0, 3);
+          auto zero = llvm::ConstantFP::get(ctx.types._float, 0.0), one = llvm::ConstantFP::get(ctx.types._float, 1.0);
+          alpha = builder.CreateSelect(builder.CreateFCmpOGT(alpha, zero), alpha, zero);
+          alpha = builder.CreateSelect(builder.CreateFCmpOLT(alpha, one), alpha, one);
+          auto samples = builder.CreateUIToFP(ctx.air.CreateGetNumSamples(), ctx.types._float);
+          auto count = builder.CreateFPToUI(
+            builder.CreateFAdd(builder.CreateFMul(alpha, samples), llvm::ConstantFP::get(ctx.types._float, 0.5)),
+            builder.getInt64Ty()
+          );
+          auto coverage = builder.CreateSub(builder.CreateShl(builder.getInt64(1), count), builder.getInt64(1));
+          mask = builder.CreateAnd(mask, builder.CreateTrunc(coverage, builder.getInt32Ty()));
+        }
+        if (ctx.resource.clip_coverage)
+          mask = builder.CreateAnd(mask, ctx.resource.clip_coverage);
+        return builder.CreateInsertValue(value, mask, {assigned_index});
       });
     };
   }
 
   std::optional<uint32_t> statistics;
-  uint32_t sample = 0, coverage = 0;
   if (pso_data && pso_data->pipeline_statistics) {
     statistics = func_signature.DefineInput(air::ArgumentBindingBuffer{
         .buffer_size = sizeof(uint64_t),
@@ -439,12 +499,32 @@ llvm::Error convert_dxbc_pixel_shader(
         .type = air::msl_uint,
         .arg_name = "pipeline_statistics",
     });
-    // with a sample index input Metal runs the function once for each covered sample, each run given the pixel's
-    // coverage: the run of the first covered sample counts, unless the shader runs per sample itself, which its own
-    // sample index, declared before the counter, tells
-    sample = func_signature.DefineInput(air::InputSampleIndex{});
-    coverage = sample < *statistics ? ~0u : func_signature.DefineInput(air::InputInputCoverage{});
   }
+  // a shader runs once for its pixel (D3D11.3 16.2), but Metal runs one that writes memory, or has a sample index
+  // input, once for each covered sample, each run given the pixel's coverage, and under multisampling keeps a run's
+  // writes after its discard. the run of the first covered sample is the
+  // shader's, unless the shader runs per sample itself, which its own sample index tells
+  bool writes = std::any_of(shader_info->uavMap.begin(), shader_info->uavMap.end(), [](auto &uav) {
+    return uav.second.written || uav.second.with_counter;
+  });
+  uint32_t sample = ~0u, coverage = ~0u;
+  if (statistics || writes) {
+    auto defined = func_signature.InputCount();
+    sample = func_signature.DefineInput(air::InputSampleIndex{});
+    if (sample >= defined)
+      coverage = func_signature.DefineInput(air::InputInputCoverage{});
+  }
+  // D3D tests clip distances at each sample and never cuts the primitive (D3D11.3 15.4.1); Metal cuts it, and runs a
+  // pixel on the cut once for each piece. a pipeline whose runs are seen gives the distances here as varyings
+  uint32_t clips = pso_data ? pso_data->clip_distances : 0, input_coverage = ~0u;
+  std::vector<uint32_t> distances;
+  for (uint32_t i = 0; i < clips; i++)
+    distances.push_back(func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = clip_varying_name(i), .type = air::msl_float, .interpolation = air::Interpolation::center_perspective,
+        .pull_mode = true
+    }));
+  if (clips || pso_sample_mask != 0xffffffff)
+    input_coverage = func_signature.DefineInput(air::InputInputCoverage{});
 
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
@@ -471,15 +551,57 @@ llvm::Error convert_dxbc_pixel_shader(
   );
 
   setup_metal_version(module, metal_version);
+  air.CenteredSamples = pso_data && pso_data->centered_samples;
 
+  // the covered samples whose distances are all at least 0, which NaN never is
+  llvm::Value *kept = nullptr;
+  llvm::BasicBlock *clipped = nullptr;
+  if (clips) {
+    auto head = builder.GetInsertBlock(), test = llvm::BasicBlock::Create(context, "clip", function, epilogue_bb),
+         loop = llvm::BasicBlock::Create(context, "clip_sample", function, epilogue_bb);
+    clipped = llvm::BasicBlock::Create(context, "clipped", function, epilogue_bb);
+    builder.CreateBr(test);
+    builder.SetInsertPoint(test);
+    auto rest = builder.CreatePHI(builder.getInt32Ty(), 2), mask = builder.CreatePHI(builder.getInt32Ty(), 2);
+    builder.CreateCondBr(builder.CreateICmpNE(rest, builder.getInt32(0)), loop, clipped);
+    builder.SetInsertPoint(loop);
+    auto ctz = module.getOrInsertFunction(
+        "air.ctz.i32", llvm::FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty(), builder.getInt1Ty()}, false)
+    );
+    auto at = builder.CreateCall(ctz, {rest, builder.getFalse()});
+    llvm::Value *in = builder.getTrue();
+    for (auto d : distances)
+      in = builder.CreateAnd(in, builder.CreateFCmpOGE(air.CreateInterpolateAtSample(function->getArg(d), at, true),
+                                                       llvm::ConstantFP::get(types._float, 0.0)));
+    rest->addIncoming(function->getArg(input_coverage), head);
+    rest->addIncoming(builder.CreateAnd(rest, builder.CreateSub(rest, builder.getInt32(1))), loop);
+    mask->addIncoming(builder.getInt32(0), head);
+    mask->addIncoming(builder.CreateOr(mask, builder.CreateShl(builder.CreateZExt(in, builder.getInt32Ty()), at)), loop);
+    builder.CreateBr(test);
+    builder.SetInsertPoint(clipped);
+    kept = mask;
+  }
+  resource_map.clip_coverage = kept;
+  if (pso_sample_mask != 0xffffffff) {
+    air.CentroidCoverage = kept ? kept : function->getArg(input_coverage);
+    air.CentroidMask = builder.getInt32(pso_sample_mask);
+  }
+
+  llvm::Value *counts = builder.getTrue();
+  if (coverage != ~0u) {
+    auto before = builder.CreateSub(builder.CreateShl(builder.getInt32(1), function->getArg(sample)), builder.getInt32(1));
+    counts = builder.CreateICmpEQ(builder.CreateAnd(kept ? kept : function->getArg(coverage), before), builder.getInt32(0));
+  }
+  // a run counts for a kept sample only
+  if (kept && sample != ~0u)
+    counts = builder.CreateAnd(counts, builder.CreateTrunc(builder.CreateLShr(kept, function->getArg(sample)), builder.getInt1Ty()));
+  if (writes) {
+    air.Live = builder.CreateAlloca(builder.getInt1Ty());
+    builder.CreateStore(counts, air.Live);
+  }
   if (statistics) {
     // D3D11.3 20.4.7 counts executions even when an output depth fails the test.
     auto counter = function->getArg(*statistics);
-    llvm::Value *counts = builder.getTrue();
-    if (coverage != ~0u) {
-      auto before = builder.CreateSub(builder.CreateShl(builder.getInt32(1), function->getArg(sample)), builder.getInt32(1));
-      counts = builder.CreateICmpEQ(builder.CreateAnd(function->getArg(coverage), before), builder.getInt32(0));
-    }
     auto low = air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, counter, builder.CreateZExt(counts, builder.getInt32Ty()));
     air.CreateAtomicRMW(
         llvm::AtomicRMWInst::Add, builder.CreateConstGEP1_32(builder.getInt32Ty(), counter, 1),
@@ -518,6 +640,7 @@ llvm::Error convert_dxbc_pixel_shader(
       .resource = resource_map,
       .types = types,
       .pso_sample_mask = pso_sample_mask,
+      .pso_single_raster_sample = pso_data && pso_data->single_raster_sample,
       .shader_type = pShaderInternal->shader_type,
       .metal_version = metal_version,
       .simd_width = sm50_common ? sm50_common->simd_width : 0,
@@ -527,6 +650,9 @@ llvm::Error convert_dxbc_pixel_shader(
   if (auto err = prologue.build(ctx).takeError()) {
     return err;
   }
+  // SV_Coverage is the samples kept
+  if (kept && resource_map.coverage_mask_arg)
+    resource_map.coverage_mask_arg = kept;
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
@@ -545,6 +671,13 @@ llvm::Error convert_dxbc_pixel_shader(
     builder.CreateRet(value);
   }
 
+  // the registers set up after the clip test stay in the entry block, as static allocations
+  if (clipped)
+    for (auto &i : llvm::make_early_inc_range(*clipped))
+      if (llvm::isa<llvm::AllocaInst>(i))
+        i.moveBefore(&*entry_bb->getFirstInsertionPt());
+  if (air.Live)
+    gate_writes(*function, air.Live);
   module.getOrInsertNamedMetadata("air.fragment")
     ->addOperand(function_metadata);
 
@@ -719,8 +852,15 @@ llvm::Error convert_dxbc_vertex_shader(
   uint32_t base_instance_idx =
     func_signature.DefineInput(air::InputBaseInstance{});
 
+  // the clip distances' output, or their first varying's: the outputs a stage defines are in order
   uint32_t clip_distance_out_idx = ~0u;
-  if (pShaderInternal->clip_distance_scalars.size()) {
+  bool clip_varyings = gs_passthrough && gs_passthrough->ClipDistanceVaryings;
+  if (clip_varyings)
+    for (uint32_t i = 0; i < pShaderInternal->clip_distance_scalars.size(); i++) {
+      auto index = func_signature.DefineOutput(air::OutputVertex{.user = clip_varying_name(i), .type = air::msl_float});
+      clip_distance_out_idx = std::min(clip_distance_out_idx, index);
+    }
+  else if (pShaderInternal->clip_distance_scalars.size()) {
     clip_distance_out_idx = func_signature.DefineOutput(
       air::OutputClipDistance{pShaderInternal->clip_distance_scalars.size()}
     );
@@ -744,6 +884,7 @@ llvm::Error convert_dxbc_vertex_shader(
     va_idx_out = func_signature.DefineOutput(air::OutputViewportArrayIndex{});
   }
 
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(
     name, context, module, 0,
     rasterization_disabled
@@ -761,6 +902,7 @@ llvm::Error convert_dxbc_vertex_shader(
       },
       builder, nulldbg
   );
+  air.RasterScale = function->getArg(raster_scale);
 
   setup_metal_version(module, metal_version);
 
@@ -842,13 +984,16 @@ llvm::Error convert_dxbc_vertex_shader(
         {builder.getInt32(0), builder.getInt32(scalar.reg),
          builder.getInt32(scalar.component)}
       );
-      clip_distance_array = builder.CreateInsertValue(
-        clip_distance_array, builder.CreateLoad(types._float, src_ptr), {clip_distance_idx++}
-      );
+      auto distance = builder.CreateLoad(types._float, src_ptr);
+      if (clip_varyings)
+        value = builder.CreateInsertValue(value, distance, {clip_distance_out_idx + clip_distance_idx++});
+      else
+        clip_distance_array = builder.CreateInsertValue(clip_distance_array, distance, {clip_distance_idx++});
     }
-    value = builder.CreateInsertValue(
-      value, clip_distance_array, {clip_distance_out_idx}
-    );
+    if (!clip_varyings)
+      value = builder.CreateInsertValue(
+        value, clip_distance_array, {clip_distance_out_idx}
+      );
   };
 
   if (value == nullptr) {
@@ -1369,7 +1514,9 @@ AIRCONV_API int SM50Initialize(
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
-      pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0};
+      pRefl->PixelShader = {
+          sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0, sm50_shader->ps_has_coverage_input
+      };
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;
@@ -1381,6 +1528,7 @@ AIRCONV_API int SM50Initialize(
     }
     pRefl->NumOutputElement = sm50_shader->max_output_register;
     pRefl->CullDistances = sm50_shader->cull_distance_scalars.size();
+    pRefl->ClipDistances = sm50_shader->clip_distance_scalars.size();
     pRefl->ArgumentTableQwords = binding_table.Size();
   }
 

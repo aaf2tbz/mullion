@@ -155,7 +155,7 @@ struct D3D11RasterizerStageState {
   viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {{}};
   UINT NumScissorRects;
   UINT NumViewports;
-  IMTLD3D11RasterizerState* RasterizerState;
+  Com<IMTLD3D11RasterizerState, false> RasterizerState;
 };
 
 template <typename T> class D3D11StagesState: public std::array<T, 6> {
