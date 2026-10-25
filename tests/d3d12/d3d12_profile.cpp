@@ -560,6 +560,9 @@ main(int argc, char **argv) {
                                   : static_cast<long double>(sample - gpu0);
         return cpu0 + delta * (cpu1 - cpu0) / (gpu1 - gpu0);
       };
+      // the calibrations' host times come from a clock of 24 MHz on Apple silicon (mach_absolute_time), so a stage
+      // converted with them may land up to a tick, 41.7 ns, outside the command buffer's GPU times
+      const UINT64 host_tick = 42;
       expect(clocks == 2, "one clock pair per queue");
       expect(spans == frames + 1 && list_counts[2] == frames && list_counts[1] == 1, "execute spans lost list counts");
       // ID3D12CommandQueue::Wait: "waits until the specified fence reaches or exceeds the specified value": the
@@ -613,7 +616,8 @@ main(int argc, char **argv) {
             expect(a == ~UINT64(0) && b == ~UINT64(0), "partial stage sample");
             unsampled++;
           } else {
-            expect(a <= b && host_time(key, a) + rounding >= start && host_time(key, b) <= finish + rounding,
+            expect(a <= b && host_time(key, a) + rounding + host_tick >= start &&
+                       host_time(key, b) <= finish + rounding + host_tick,
                    "stage outside command buffer");
             gpu += b - a;
           }
@@ -678,8 +682,8 @@ main(int argc, char **argv) {
               UINT64(std::ceil(std::nextafter(double(finish) / 1e9, std::numeric_limits<double>::infinity()) * 1e9 -
                                finish)) +
               1;
-          expect(host_time(key, query_start) + rounding >= number(cmdbuf[5]) &&
-                     host_time(key, query_end) <= finish + rounding,
+          expect(host_time(key, query_start) + rounding + host_tick >= number(cmdbuf[5]) &&
+                     host_time(key, query_end) <= finish + rounding + host_tick,
                  "application queries do not share overflow command buffer");
         }
       expect(overflow_buffers == 1, "no intact overflow command buffer");
