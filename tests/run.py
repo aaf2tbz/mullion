@@ -8,6 +8,7 @@ every repeat: one that fails once, ends without a result or outlives its time ha
 """
 import argparse
 import atexit
+import concurrent.futures
 import contextlib
 import fcntl
 import json
@@ -17,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -26,8 +28,8 @@ RESULTS = {"passed": 0, "skipped": 77}
 signal.signal(signal.SIGTERM, lambda *_: sys.exit("ended"))
 # how long a test waits for a machine short of memory before the run gives up
 PATIENCE = 1800
-# after this many tests the machine's lock is left free for this many seconds
-TURNS, TURN = 6, 6
+# how long the machine's lock is left free for a job that waits for it
+TURN = 6
 # how long a test may say nothing after a fault of the GPU's before it counts as hung
 QUIET = 30
 # what says where a hung test's threads are, set by environment(): the Wine's binary and the build's program for it
@@ -93,45 +95,64 @@ def waiting(markers):
     return False
 
 
+# the tests of this run that hold the machine's lock, which the first takes and the last leaves (--jobs)
+HOLDERS = threading.Condition()
+HOLDERS.count = 0
+
+
 @contextlib.contextmanager
 def alone():
     """one GPU job at a time on a machine that has others: MULLION_TEST_LOCK names their lock, a directory that holds
-    its owner's process id and is taken over when the owner is gone. held for one test, so the others get their turn"""
+    its owner's process id and is taken over when the owner is gone. held for this run's tests, and let go between
+    two of them while another job waits for it"""
     lock = os.environ.get("MULLION_TEST_LOCK")
     # MULLION_TEST_URGENT marks a run that others let go first, for as long as it lives: a check of one change
     # waits for one test of a long run, not for its turns
     urgent = lock and os.environ.get("MULLION_TEST_URGENT")
-    if urgent and not hasattr(alone, "marker"):
-        alone.marker = Path(lock + ".urgent", str(os.getpid()))
-        alone.marker.parent.mkdir(exist_ok=True)
-        alone.marker.touch()
-        atexit.register(alone.marker.unlink, missing_ok=True)
-    while lock:
-        # the guard is never removed: publication and takeover must lock the same inode, including shell users
-        with open(lock + ".guard", "a") as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            if urgent or not waiting(lock + ".urgent"):
-                try:
-                    os.mkdir(lock)
-                    Path(lock, "pid").write_text(str(os.getpid()))
-                    break
-                except FileExistsError:
+    with HOLDERS:
+        # a waiter, which says so in the lock's .waiting directory (crossover/tools/lock.sh), gets the lock once the
+        # tests that hold it end
+        while lock and HOLDERS.count and not urgent and waiting(lock + ".waiting"):
+            HOLDERS.wait(1)
+        if urgent and not hasattr(alone, "marker"):
+            alone.marker = Path(lock + ".urgent", str(os.getpid()))
+            alone.marker.parent.mkdir(exist_ok=True)
+            alone.marker.touch()
+            atexit.register(alone.marker.unlink, missing_ok=True)
+        if lock and not HOLDERS.count:
+            asking = Path(lock + ".waiting", str(os.getpid()))
+            asking.parent.mkdir(exist_ok=True)
+            asking.touch()
+        while lock and not HOLDERS.count:
+            # the guard is never removed: publication and takeover must lock the same inode, including shell users
+            with open(lock + ".guard", "a") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX)
+                if urgent or not waiting(lock + ".urgent"):
                     try:
-                        os.kill(int(Path(lock, "pid").read_text()), 0)
-                    except (ProcessLookupError, FileNotFoundError, ValueError):
-                        shutil.rmtree(lock, ignore_errors=True)
-        time.sleep(5)
+                        os.mkdir(lock)
+                        Path(lock, "pid").write_text(str(os.getpid()))
+                        asking.unlink(missing_ok=True)
+                        break
+                    except FileExistsError:
+                        try:
+                            os.kill(int(Path(lock, "pid").read_text()), 0)
+                        except (ProcessLookupError, FileNotFoundError, ValueError):
+                            shutil.rmtree(lock, ignore_errors=True)
+            time.sleep(5)
+        HOLDERS.count += 1
     try:
         yield
     finally:
-        if lock:
-            with open(lock + ".guard", "a") as guard:
-                fcntl.flock(guard, fcntl.LOCK_EX)
-                shutil.rmtree(lock, ignore_errors=True)
-            # the others look for the lock every few seconds: every few tests it stays free long enough for them
-            alone.held = getattr(alone, "held", 0) + 1
-            if alone.held % TURNS == 0:
-                time.sleep(TURN)
+        with HOLDERS:
+            HOLDERS.count -= 1
+            if lock and not HOLDERS.count:
+                with open(lock + ".guard", "a") as guard:
+                    fcntl.flock(guard, fcntl.LOCK_EX)
+                    shutil.rmtree(lock, ignore_errors=True)
+                # the others look for the lock every few seconds: a waiter gets that long to take it
+                if waiting(lock + ".waiting"):
+                    time.sleep(TURN)
+            HOLDERS.notify_all()
 
 
 def finish(command, env, seconds, log):
@@ -331,6 +352,8 @@ def options(parser):
     parser.add_argument("--family", default="native,9,8,7",
                         help="the Apple GPU families to run as, 'native' for the GPU's own (default: %(default)s)")
     parser.add_argument("--repeat", type=int, default=1, help="how many times each test runs")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="how many tests run at once; one that fails beside others runs again alone")
     parser.add_argument("--late", type=int, help="delay each Metal command buffer's commit by this many milliseconds")
     parser.add_argument("--suite", action="append", default=[], help="only tests of this suite (may repeat)")
     parser.add_argument("--exact", action="store_true", help="match whole test names instead of prefixes")
@@ -363,32 +386,47 @@ def own(args, tests, builds, binary, base):
     logs.mkdir(parents=True, exist_ok=True)
     families = args.family.split(",")
     verdicts = {}
-    for family in families:
+    printing = threading.Lock()
+
+    def one(family, test, again=False):
         env = dict(base) if family == "native" else dict(base, MULLION_GPU_FAMILY=family)
-        for test in tests:
-            native = not test["cmd"][0].endswith(".exe")
-            # a test of the host's own does not meet the GPU
-            if native and family != families[0]:
-                continue
-            command = test["cmd"] if native else [binary] + test["cmd"]
-            test_env = dict(env, **test["env"])
-            if args.late is not None:
-                test_env["MULLION_TEST_LATE"] = str(args.late)
-            late = test_env.get("MULLION_TEST_LATE")
-            mode = f".late{late}" if late is not None else ""
-            verdict, said, seconds = "passed", "", 0.0
-            for attempt in range(args.repeat):
-                log = logs / f"{test['name']}.{family}{mode}.{attempt}.txt"
-                verdict, said, taken = run(command, test_env, test["timeout"], log)
-                seconds += taken
-                if verdict == "failed":
-                    break
-            verdicts[test["name"], family] = verdict
-            print(f"{family:>6}  {verdict:7}  {test['name']:32} {seconds:6.1f} s  "
-                  f"{f'late={late}ms ' if late is not None else ''}{said}", flush=True)
+        native = not test["cmd"][0].endswith(".exe")
+        command = test["cmd"] if native else [binary] + test["cmd"]
+        test_env = dict(env, **test["env"])
+        if args.late is not None:
+            test_env["MULLION_TEST_LATE"] = str(args.late)
+        late = test_env.get("MULLION_TEST_LATE")
+        mode = f".late{late}" if late is not None else ""
+        verdict, said, seconds = "passed", "", 0.0
+        for attempt in range(args.repeat):
+            log = logs / f"{test['name']}.{family}{mode}{'.alone' if again else ''}.{attempt}.txt"
+            verdict, said, taken = run(command, test_env, test["timeout"], log)
+            seconds += taken
             if verdict == "failed":
-                for line in explain(log.read_text(errors="replace").splitlines()) + [f"log: {log}"]:
-                    print(f"{'':17}{line}", flush=True)
+                break
+        verdicts[test["name"], family] = verdict
+        lines = [f"{family:>6}  {verdict:7}  {test['name']:32} {seconds:6.1f} s  "
+                 f"{'alone ' if again else ''}{f'late={late}ms ' if late is not None else ''}{said}"]
+        if verdict == "failed":
+            lines += [f"{'':17}{line}" for line in explain(log.read_text(errors="replace").splitlines()) + [f"log: {log}"]]
+        with printing:
+            print("\n".join(lines), flush=True)
+
+    # a test of the host's own does not meet the GPU
+    jobs = [(family, test) for family in families for test in tests
+            if test["cmd"][0].endswith(".exe") or family == families[0]]
+    with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
+        for done in concurrent.futures.as_completed([pool.submit(one, *job) for job in jobs]):
+            done.result()
+    # beside others a test shares the GPU, whose fault in one fails the work of all: each that failed beside others
+    # runs again alone, and its verdict is that run's
+    if args.jobs > 1:
+        again = [(family, test) for family, test in jobs if verdicts[test["name"], family] == "failed"]
+        for family, test in again:
+            one(family, test, again=True)
+        alone_only = [f"{family} {test['name']}" for family, test in again if verdicts[test["name"], family] != "failed"]
+        if alone_only:
+            print("\npassed alone after failing beside others: " + ", ".join(alone_only), flush=True)
 
     width = max(len(test["name"]) for test in tests)
     print("\n" + " " * width + "".join(f"  {family:>7}" for family in families))
