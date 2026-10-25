@@ -1038,10 +1038,10 @@ Converter::FirstBit(IntegerUnaryOp Op, llvm::Value *Value) {
 
 llvm::Value *
 Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
-  // Sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time, where D3D asks for
-  // their accuracy (in [-100 pi, 100 pi], D3D11.3 22.10.20). past it, and for an infinity or a NaN, a lane takes the
-  // precise ones, whose range reduction gives what D3D hardware does there, where the fast ones are 0 from 2^23 radians
-  // on and of an infinity. A tangent stays precise: Metal's fast one is NaN for large finite values. Sine and tangent
+  // sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time, where Metal bounds
+  // their error (2^-13 in [-pi, pi], MSL specification, accuracy with fast math), within what D3D asks (D3D11.3
+  // 22.10.20). past it, and for an infinity or a NaN, a lane takes the precise ones, whose range reduction gives what
+  // D3D hardware does there, where the fast ones are 0 from 2^23 radians on and of an infinity. A tangent stays precise: Metal's fast one is NaN for large finite values. Sine and tangent
   // of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3 22.10.20;
   // DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
   auto Type = Value->getType();
@@ -1063,7 +1063,7 @@ Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
     Result = compute(false);
   } else {
     Result = compute(true);
-    llvm::APFloat Limit(100 * 3.14159265358979323846);
+    llvm::APFloat Limit(3.14159265358979323846);
     bool Lost;
     Limit.convert(Scalar->getFltSemantics(), llvm::APFloat::rmTowardZero, &Lost);
     // the magnitude's bits order as the magnitudes do, an infinity's and a NaN's above every finite one's
