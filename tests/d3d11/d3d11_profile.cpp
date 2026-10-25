@@ -424,8 +424,11 @@ int main(int argc, char **argv) {
             1;
         for (size_t i = 7; i < row.size(); i += 2) {
           auto start = number(row[i]), end = number(row[i + 1]);
-          expect(start != ~UINT64(0) && end >= start && host_time(key, start) + rounding >= number(buffer[5]) &&
-                     host_time(key, end) <= finish + rounding,
+          // the calibrations' host times come from a clock of 24 MHz on Apple silicon (mach_absolute_time), so a
+          // stage converted with them may land up to a tick, 41.7 ns, outside the command buffer's GPU times
+          const UINT64 host_tick = 42;
+          expect(start != ~UINT64(0) && end >= start && host_time(key, start) + rounding + host_tick >= number(buffer[5]) &&
+                     host_time(key, end) <= finish + rounding + host_tick,
                  "GPU stage missing or outside command buffer");
           gpu += end - start;
         }
