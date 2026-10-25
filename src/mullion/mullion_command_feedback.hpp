@@ -46,6 +46,9 @@ public:
     do {
       memcpy(ctx_.setComputeBytes(2, sizeof(meta)), &meta, sizeof(meta));
       ctx_.dispatch(size);
+      // a pass's dispatches run unordered, and a record sets bits in the regions others clear
+      if (meta.clear)
+        ctx_.ctx.OrderDispatches();
     } while (meta.clear--);
     ctx_.endPass();
   }
