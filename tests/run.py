@@ -4,13 +4,16 @@
 the tests are the build's own (meson's intro-tests.json: what tests/*/meson.build declares), run in a Wine the
 build's libraries are installed into. a family other than the GPU's own lowers what the Metal bridge answers
 (MULLION_GPU_FAMILY: src/winemetal/unix), so the paths an older GPU takes run here. a test passes when it says so on
-every repeat: one that fails once, ends without a result or outlives its time has failed.
+every repeat: one that fails, ends without a result, outlives its time or answers differently on one repeat has failed.
+the run fails on a failure or skip that tests/known.txt does not have, by what the test said, and on a test it lists
+that passes.
 """
 import argparse
 import atexit
 import concurrent.futures
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -38,6 +41,9 @@ WHERE = {}
 # the Objective-C runtime keeps freed objects as zombies under the tests and says when one is messaged (Foundation,
 # NSDebug.h: NSZombieEnabled): an object released once too often names itself there, whatever its memory holds by then
 ZOMBIES = {"NSZombieEnabled": "YES"}
+# every failure and skip that is known, by what the test said, with its cause: one that is not there, or that says
+# something else, is new, whatever the test is called
+KNOWN = Path(__file__).with_name("known.txt")
 
 
 def libraries(builds):
@@ -350,11 +356,32 @@ def explain(lines, most=6):
     return said
 
 
+def signature(said, log):
+    """what a result is known by: what the test said, but for the time a hung one ran, and which results were wrong,
+    so two failures of one count are two failures"""
+    said = re.sub(r"^still running after \d+ s:.*", "still running", said)
+    wrong = sorted({line for line in log.read_text(errors="replace").splitlines() if line.startswith("wrong: ")})
+    return said + (f" [{hashlib.sha256(chr(10).join(wrong).encode()).hexdigest()[:8]}]" if wrong else "")
+
+
+def known():
+    """tests/known.txt: a line '<family> <test> <what it says> -- <cause>' for each failure or skip that is known. the
+    GPU's own family is 'native(<its chip>)', as another chip is other evidence"""
+    entries = {}
+    for number, line in enumerate(KNOWN.read_text().splitlines() if KNOWN.exists() else [], 1):
+        if line.strip() and not line.startswith("#"):
+            fields = re.fullmatch(r"(native\([^)]*\)|\S+) (\S+) (.+) -- (.*\S.*)", line)
+            if not fields:
+                sys.exit(f"{KNOWN}:{number}: not '<family> <test> <what it says> -- <cause>'")
+            entries[fields[1], fields[2]] = fields[3]
+    return entries
+
+
 def options(parser):
     """what says which of the build's tests run, and how"""
     parser.add_argument("--family", default="native,9,8,7",
                         help="the Apple GPU families to run as, 'native' for the GPU's own (default: %(default)s)")
-    parser.add_argument("--repeat", type=int, default=1, help="how many times each test runs")
+    parser.add_argument("--repeat", type=int, default=1, help="how many times each test runs, giving the same answer each time")
     parser.add_argument("--jobs", type=int, default=1,
                         help="how many tests run at once; one that fails beside others runs again alone")
     parser.add_argument("--late", type=int, help="delay each Metal command buffer's commit by this many milliseconds")
@@ -382,13 +409,13 @@ def chosen(args):
 
 
 def own(args, tests, builds, binary, base):
-    """runs the build's tests as each family; how many failed"""
+    """runs the build's tests as each family; how many results tests/known.txt does not hold"""
     if args.late is not None and args.late < 0:
         sys.exit("--late must be nonnegative milliseconds")
     logs = builds[0] / "meson-logs" / ("benchmarks" if getattr(args, "benchmark", False) else "tests")
     logs.mkdir(parents=True, exist_ok=True)
     families = args.family.split(",")
-    verdicts = {}
+    verdicts, said_by = {}, {}
     printing = threading.Lock()
 
     def one(family, test, again=False):
@@ -400,15 +427,19 @@ def own(args, tests, builds, binary, base):
             test_env["MULLION_TEST_LATE"] = str(args.late)
         late = test_env.get("MULLION_TEST_LATE")
         mode = f".late{late}" if late is not None else ""
-        verdict, said, seconds = "passed", "", 0.0
+        seconds, answers = 0.0, {}
         for attempt in range(args.repeat):
             log = logs / f"{test['name']}.{family}{mode}{'.alone' if again else ''}.{attempt}.txt"
             verdict, said, taken = run(command, test_env, test["timeout"], log)
             seconds += taken
-            if verdict == "failed":
-                break
+            answers.setdefault((verdict, signature(said, log)), said)
+        # a test gives one answer on every run: one that gives several has none
+        if len(answers) > 1:
+            verdict, said = "failed", "unstable: " + " / ".join(known for _, known in answers)
+            answers = {(verdict, said): said}
         verdicts[test["name"], family] = verdict
-        lines = [f"{family:>6}  {verdict:7}  {test['name']:32} {seconds:6.1f} s  "
+        said_by[test["name"], family] = next(iter(answers))[1]
+        lines =[f"{family:>6}  {verdict:7}  {test['name']:32} {seconds:6.1f} s  "
                  f"{'alone ' if again else ''}{f'late={late}ms ' if late is not None else ''}{said}"]
         if verdict == "failed":
             lines += [f"{'':17}{line}" for line in explain(log.read_text(errors="replace").splitlines()) + [f"log: {log}"]]
@@ -442,7 +473,20 @@ def own(args, tests, builds, binary, base):
         print(f"{test['name']:{width}}" + "".join(f"  {verdicts.get((test['name'], family), '-'):>7}" for family in families))
     counts = {word: sum(verdict == word for verdict in verdicts.values()) for word in ("passed", "failed", "skipped")}
     print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; logs in {logs}")
-    return counts["failed"]
+
+    chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+    listed = known()
+    ran = {(f"native({chip})" if family == "native" else family, name): (verdict, said_by[name, family])
+           for (name, family), verdict in verdicts.items()}
+    new = [f"{family} {name} {said}" + (f" (known: {listed[family, name]})" if (family, name) in listed else "")
+           for (family, name), (verdict, said) in ran.items() if verdict != "passed" and listed.get((family, name)) != said]
+    fixed = [f"{family} {name}" for (family, name) in listed if ran.get((family, name), ("",))[0] == "passed"]
+    print(f"{sum(verdict != 'passed' for verdict, _ in ran.values()) - len(new)} known, each with its cause in {KNOWN}")
+    for line in new:
+        print(f"new: {line}")
+    for line in fixed:
+        print(f"passes, still listed as known: {line}")
+    return len(new) + len(fixed)
 
 
 def main():
