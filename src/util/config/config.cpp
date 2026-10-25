@@ -387,6 +387,8 @@ namespace mullion {
       // help when debugging configuration issues
       Logger::info(str::format("Found config env: ", confLine));
 
+      // the environment applies to this executable, whichever section the file ended in
+      ctx.active = true;
       for(auto l : str::split(confLine, ";"))
         parseUserConfigLine(config, ctx, std::string(l.data(), l.size()));
     }

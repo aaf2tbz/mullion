@@ -14,7 +14,8 @@
 //   what is available is refused, and a budget event is set when registered, as Windows drivers do (DXVK's
 //   dxgi_adapter.cpp records both).
 // - the adapter has the GPU's name and, for applications that leave unless they know the vendor, AMD's vendor ID;
-//   the configuration names another (dxgi.customVendorId), Apple's own included, and changes nothing else.
+//   the configuration names another (dxgi.customVendorId), Apple's own included, and changes nothing else. the
+//   environment's (MULLION_CONFIG) overrides the file's, also after the file opens another executable's section.
 // - a gamma ramp is an output's, a monitor's (IDXGIOutput::SetGammaControl, GetGammaControl): set through one object
 //   of the output, it is what another one gets.
 //   gamma capabilities are "only supported while in full-screen mode" (IDXGIOutput::GetGammaControlCapabilities).
@@ -35,6 +36,15 @@ main(int argc, char **argv) {
   if (argc > 2) {
     vendor = strtoul(argv[2], nullptr, 16);
     SetEnvironmentVariableA("MULLION_CONFIG", (std::string("dxgi.customVendorId=") + argv[2]).c_str());
+  }
+  // a third names a file that sets NVIDIA's vendor and ends in another executable's section
+  char file[MAX_PATH] = {};
+  if (argc > 3) {
+    char dir[MAX_PATH];
+    FILE *conf = GetTempPathA(MAX_PATH, dir) && GetTempFileNameA(dir, "mul", 0, file) ? fopen(file, "w") : nullptr;
+    if (!conf || fputs("dxgi.customVendorId=10de\n[another.exe]\n", conf) < 0 || fclose(conf))
+      return printf("the configuration file\n"), 1;
+    SetEnvironmentVariableA("MULLION_CONFIG_FILE", file);
   }
   unsigned failures = 0, checks = 0;
   auto expect = [&](bool ok, const char *what) {
@@ -69,6 +79,8 @@ main(int argc, char **argv) {
   expect(desc.Description[0] && desc.DedicatedVideoMemory, "an adapter without a name or memory");
   // AMD's (PCI-SIG 0x1002), or the one the test is run with (argv: a vendor ID as the configuration takes it)
   expect(desc.VendorId == vendor, "the adapter's vendor is not the one expected");
+  if (*file)
+    DeleteFileA(file);
   expect(wcsstr(desc.Description, L"Apple"), "the adapter's name is not the GPU's");
 
   // each descriptor describes the same physical adapter (DXGI_ADAPTER_DESC, DESC1, DESC2 and DESC3).
