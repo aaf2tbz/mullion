@@ -925,6 +925,14 @@ public:
       return NotSupportedOnNode<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT>(pFeatureData, DataSize);
     case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT:
       return NotSupportedOnNode<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT>(pFeatureData, DataSize);
+    // D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT (Agility SDK 1.716): resources keep their 64 KiB placement alignment. Unity
+    // 6.3 asks for it with the Agility SDK runtime and falls back to D3D11 when the query fails (PEAK, 2026-10-24)
+    case D3D12_FEATURE(54): {
+      if (DataSize != sizeof(UINT))
+        return E_INVALIDARG;
+      *reinterpret_cast<UINT *>(pFeatureData) = 0; // D3D12_TIGHT_ALIGNMENT_TIER_NOT_SUPPORTED
+      return S_OK;
+    }
     case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES))
         return FAIL(E_INVALIDARG);
