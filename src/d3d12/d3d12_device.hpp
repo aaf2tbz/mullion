@@ -448,6 +448,8 @@ public:
   // a geometry-shader pipeline runs its vertex shader in the object stage and its geometry shader in the mesh stage,
   // in `pso` for list topologies and in `pso_strip` for strips (none for points)
   bool geometry_shader = false;
+  // a stage reads or writes a UAV: only then can a UAV barrier order anything a draw of it does inside a render pass
+  bool uses_uav = false;
   WMT::Reference<WMT::RenderPipelineState> pso_strip;
   // the vertex shader's output registers, which size a geometry pipeline's object threadgroups (get_gs_vertex_count)
   uint32_t vertex_registers = 0;

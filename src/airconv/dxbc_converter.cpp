@@ -1415,7 +1415,8 @@ AIRCONV_API int SM50Initialize(
       .Flags = flags,
       .StructurePtrOffset = uav.arg_index,
     });
-    binding_uav_mask |= (1ULL << range_id);
+    // a DXIL range id can pass 63; any UAV keeps the mask nonzero
+    binding_uav_mask |= range_id < 64 ? (1ULL << range_id) : (1ULL << 63);
   }
 
   declare_dispatch_origin(sm50_shader);

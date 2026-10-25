@@ -1142,6 +1142,9 @@ public:
     clip_data.DataEncoded = ~0u;
     clip_data.ClipDistanceVaryings = clips;
     clip_data.next = &common;
+    uses_uav = (mesh_shader ? ref_ms.UAVSlotMask | (AS.pShaderBytecode ? ref_as.UAVSlotMask : 0) : ref_vs.UAVSlotMask) ||
+               (tessellation && (ref_hs.UAVSlotMask || ref_ds.UAVSlotMask)) ||
+               (pDesc->GS.pShaderBytecode && ref_gs.UAVSlotMask) || (pDesc->PS.pShaderBytecode && ref_ps.UAVSlotMask);
 
     SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
     data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
