@@ -34,7 +34,11 @@ Direct3D 12 is supported at feature level 12_0 with shader models up to 6.7, inc
 
 The script copies the libraries into `<wine>/lib/wine`, where they replace Wine's Direct3D, and into each prefix named on the command line. Prefixes created later need nothing.
 
-In CrossOver, rename `CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt` to `dxmt-original`, put the unpacked release folder in its place under the name `dxmt`, and set the bottle's graphics to DXMT. Replace the whole folder: CrossOver's 32-bit DXMT cannot drive Mullion, and the release's empty `i386-windows` leaves 32-bit games on Wine's own Direct3D. On the first launch macOS blocks `winemetal.so`; allow it under System Settings, Privacy & Security, and start the game again. A CrossOver update brings back its own DXMT.
+In CrossOver, `./install.sh --crossover <bottle>` sets up that bottle and leaves CrossOver.app as it is. The bottle gets a CrossOver root of its own in `~/Library/Mullion/CrossOver`, made of links to CrossOver's files with Mullion as its DXMT, and its graphics are set to DXMT. Updates of CrossOver keep it; run the script again after one, so that files it adds are linked too. Give the path of CrossOver.app as a third argument if it is not in `/Applications` or `~/Applications`. To undo, put back the bottle's `cxbottle.conf.before-mullion`.
+
+Without the script, rename `CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt` to `dxmt-original`, put the unpacked release folder in its place under the name `dxmt`, and set the bottle's graphics to DXMT. Replace the whole folder: CrossOver's 32-bit DXMT cannot drive Mullion, and the release's empty `i386-windows` leaves 32-bit games on Wine's own Direct3D. A CrossOver update brings back its own DXMT this way.
+
+On the first launch macOS blocks `winemetal.so`; allow it under System Settings, Privacy & Security, and start the game again.
 
 The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`), so tools that install DXMT can install Mullion the same way. To install by hand, copy both directories into `<wine>/lib/wine`, and the DLLs of `x86_64-windows` into `drive_c/windows/system32` of each existing prefix.
 
