@@ -41,6 +41,9 @@ GetVersionDescriptionText(uint32_t ApiVersion, uint32_t FeatureLevel) {
   case 0xc100:
     feature_level_text = "12_1";
     break;
+  case 0xc200:
+    feature_level_text = "12_2";
+    break;
   }
   return str::format("Mullion D3D", ApiVersion, " FL_", feature_level_text, " ", MULLION_VERSION);
 }
