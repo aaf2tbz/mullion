@@ -163,6 +163,8 @@ PipelineRuns(Head head, Name name) {
       case WMTComputeCommandDispatchIndirect:
       case WMTComputeCommandDispatchThreads:
       case WMTComputeCommandDispatchPart:
+      // ExecuteIndirect's dispatches, over the range its resolver writes (d3d12_command_allocator.cpp)
+      case WMTComputeCommandExecuteCommandsInBufferIndirect:
         calls++;
         break;
       default:

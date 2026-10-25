@@ -231,6 +231,9 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     uint32_t query, first, count, binary;
   };
   std::vector<ActiveQuery> active_queries_;
+  // the open BeginEvent names, outermost first, and the innermost three joined: they name pipeline runs (RunName)
+  std::vector<std::string> events_;
+  std::string event_path_;
   std::vector<uint64_t> visibility_slots_;
   std::vector<std::pair<MTLD3D12QueryHeap *, OcclusionSum>> occlusion_sums_;
 
@@ -705,6 +708,8 @@ public:
   Reset(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState) {
     if (encoder_count == std::numeric_limits<size_t>::max())
       return E_FAIL;
+    events_.clear();
+    event_path_.clear();
     return FAILED(recording_error_) ? recording_error_ : Initialize(pAllocator, pInitialState);
   };
 
@@ -968,7 +973,7 @@ public:
       if (Logger::logLevel() == LogLevel::Trace)
         TRACE("pass ", allocator_->encoder_current->id, ": graphics pipeline ", pso_graphics_->name);
       if (device_->NamesPasses())
-        device_->NamePass(allocator_->encoder_current, pso_graphics_->name, pipeline);
+        device_->NamePass(allocator_->encoder_current, RunName(pso_graphics_->name, pipeline), pipeline);
 
       auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
       cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
@@ -1566,7 +1571,7 @@ public:
       if (Logger::logLevel() == LogLevel::Trace)
         TRACE("pass ", allocator_->encoder_current->id, ": compute pipeline ", pso_compute_->name);
       if (device_->NamesPasses())
-        device_->NamePass(allocator_->encoder_current, pso_compute_->name, pso_compute_->pso);
+        device_->NamePass(allocator_->encoder_current, RunName(pso_compute_->name, pso_compute_->pso), pso_compute_->pso);
     }
     BindComputeRootArguments(SkipResourceBinding);
     return true;
@@ -3013,10 +3018,74 @@ public:
   // annotations for capture tools, with no effect on rendering; D3D11 here treats them the same way
   void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {};
 
-  // annotations for capture tools, with no effect on rendering; D3D11 here treats them the same way
-  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {};
+  // annotations for capture tools, with no effect on rendering. when passes are named (MULLION_DIAG=profile,
+  // MULLION_D3D12_GPU_ERRORS), the events a pipeline runs inside name its runs: see RunName
+  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {
+    if (!device_->NamesPasses())
+      return;
+    events_.push_back(EventName(Metadata, data, size));
+    SetEventPath();
+  };
 
-  void STDMETHODCALLTYPE EndEvent() {};
+  void STDMETHODCALLTYPE EndEvent() {
+    if (!device_->NamesPasses() || events_.empty())
+      return;
+    events_.pop_back();
+    SetEventPath();
+  };
+
+  // the name of a BeginEvent: a UTF-16 string (metadata 0), an ANSI string (1), or a blob of WinPixEventRuntime's
+  // (2): words of the event and its color, the word that says how the string is stored, then the string, NUL-ended
+  static std::string
+  EventName(UINT Metadata, const void *Data, UINT Size) {
+    auto utf16 = [](const WCHAR *chars, size_t count) {
+      std::string name;
+      for (size_t i = 0; i < count && chars[i]; i++)
+        name += chars[i] >= 0x20 && chars[i] < 0x7f ? char(chars[i]) : '?';
+      return name;
+    };
+    auto ansi = [](const char *chars, size_t count) {
+      std::string name;
+      for (size_t i = 0; i < count && chars[i]; i++)
+        name += chars[i] >= 0x20 && chars[i] < 0x7f ? chars[i] : '?';
+      return name;
+    };
+    std::string name;
+    if (Data && Size) {
+      if (Metadata == 0)
+        name = utf16(static_cast<const WCHAR *>(Data), Size / sizeof(WCHAR));
+      else if (Metadata == 1)
+        name = ansi(static_cast<const char *>(Data), Size);
+      else if (Metadata == 2 && Size >= 4 * sizeof(uint64_t)) {
+        auto words = static_cast<const uint64_t *>(Data);
+        auto chars = Size - 3 * sizeof(uint64_t);
+        name = (words[2] >> 54) & 1 ? ansi(reinterpret_cast<const char *>(words + 3), chars)
+                                    : utf16(reinterpret_cast<const WCHAR *>(words + 3), chars / sizeof(WCHAR));
+      }
+    }
+    if (name.size() > 48)
+      name.resize(48);
+    return name.empty() ? "event" : name;
+  }
+
+  // the innermost events, outermost first
+  void
+  SetEventPath() {
+    event_path_.clear();
+    for (size_t i = events_.size() > 3 ? events_.size() - 3 : 0; i < events_.size(); i++) {
+      if (!event_path_.empty())
+        event_path_ += '/';
+      event_path_ += events_[i];
+    }
+  }
+
+  // what a pipeline's runs are called: the events it runs inside, then its name or Metal handle
+  std::string
+  RunName(const std::string &Pipeline, obj_handle_t Metal) {
+    if (event_path_.empty())
+      return Pipeline;
+    return event_path_ + '/' + (Pipeline.empty() ? str::format("pipeline ", Metal) : Pipeline);
+  }
 
   void STDMETHODCALLTYPE ExecuteIndirect(
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
@@ -4062,7 +4131,7 @@ public:
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
       StartComputePass();
     if (device_->NamesPasses())
-      device_->NamePass(allocator_->encoder_current, state_object_->name, pipeline);
+      device_->NamePass(allocator_->encoder_current, RunName(state_object_->name, pipeline), pipeline);
     auto &pso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
     pso.type = WMTComputeCommandSetPSO;
     pso.pso = pipeline;

@@ -510,6 +510,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     }
   };
 
+  // MULLION_DIAG=profile: an encoder is labelled with its pass's name (events and pipelines), for Metal's tools
+  template <typename Encoder>
+  void
+  LabelEncoder(Encoder &encoder, const char *kind, const EncoderData *pass) {
+    auto name = device_->PassName(pass, false);
+    if (!name.empty())
+      encoder.setLabel(WMT::String::string((kind + name).c_str(), WMTUTF8StringEncoding));
+  }
+
   struct CommittingScope {
     MTLD3D12CommandQueueImpl *queue;
     std::lock_guard<mullion::mutex> lock;
@@ -1088,6 +1097,8 @@ public:
           }
           if (current->type == EncoderType::Clear)
             encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
+          else if (profile_ && !record_totals_)
+            LabelEncoder(encoder, "render ", current);
           // the object and mesh stages read what earlier passes wrote as the vertex stage does
           encoder.waitForFence(fence_, WMTRenderStagePreRaster);
           if (sparse_mappings) {
@@ -1143,7 +1154,8 @@ public:
             auto label = "compute " + device_->PassName(current, !profile_);
             SnapshotGPURecords(records, current, label, scope.inflight->records);
             encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
-          }
+          } else if (profile_)
+            LabelEncoder(encoder, "compute ", current);
           encoder.waitForFence(fence_);
           if (sparse_mappings) {
             scope.inflight->sparse_mappings = sparse_mappings;
