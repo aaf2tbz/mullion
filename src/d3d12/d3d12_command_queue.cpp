@@ -1399,6 +1399,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   Wait(ID3D12Fence *pFence, UINT64 Value) {
     auto gate = std::make_shared<Gate>();
+    gate->device = device_;
     gate->closed = true;
     static_cast<MTLD3D12Fence *>(pFence)->Expect(Value, [gate] { gate->Open(); });
     auto work = [this, gate] {
