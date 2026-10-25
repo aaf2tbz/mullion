@@ -136,10 +136,14 @@ int main() {
         ComPtr<ID3D10Texture2D> target, positions, copied, staging;
         ComPtr<ID3D10RenderTargetView> rtv, copied_rtv;
         ComPtr<ID3D10ShaderResourceView> target_srv, positions_srv;
-        CHECK(device->CreateTexture2D(&td, nullptr, &target));
+        // a sample count the device reports is one it creates: a refusal is a wrong result, not the test's end
+        step("Direct3D10.1 center %u format %u count %u targets", centered, format, count);
+        if (!expect(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &target)), "render target was refused"))
+          continue;
         CHECK(device->CreateRenderTargetView(target.Get(), nullptr, &rtv));
         td.BindFlags = D3D10_BIND_SHADER_RESOURCE;
-        CHECK(device->CreateTexture2D(&td, nullptr, &positions));
+        if (!expect(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &positions)), "texture was refused"))
+          continue;
         D3D10_SHADER_RESOURCE_VIEW_DESC sd{format, D3D10_SRV_DIMENSION_TEXTURE2DMS};
         CHECK(device->CreateShaderResourceView(target.Get(), &sd, &target_srv));
         CHECK(device->CreateShaderResourceView(positions.Get(), &sd, &positions_srv));

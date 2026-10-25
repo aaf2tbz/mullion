@@ -493,7 +493,8 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
 
     def test_runner_known(self):
         # a failure or skip counts unless tests/known.txt has it by what the test said; a listed test that passes counts
-        # too, so a known line never outlives its cause and hides the next failure of that test
+        # too, so a known line never outlives its cause and hides the next failure of that test. a test that stopped
+        # early cannot be listed: it hides every case after where it stopped
         import run
         from argparse import Namespace
         said = {"same": "failed: 3 wrong results", "other": "failed: 3 wrong results", "fixed": "passed: 0 wrong results",
@@ -501,12 +502,15 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+            (root / "a.txt").write_text("wrong: a\n")
+            three, two, one = (run.signature(f"failed: {n} wrong results", root / "a.txt") for n in (3, 2, 1))
             run.KNOWN = root / "known.txt"
-            run.KNOWN.write_text(f"# a comment\nnative({chip}) same failed: 3 wrong results -- the cause\n"
-                                 f"native({chip}) other failed: 2 wrong results -- the cause\n"
-                                 f"native({chip}) fixed failed: 1 wrong results -- the cause\n"
-                                 "9 same failed: 3 wrong results -- another family's\n")
-            tests = [{"name": name, "cmd": [sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit({'passed': 0, 'skipped': 77}"
+            run.KNOWN.write_text(f"# a comment\nnative({chip}) same {three} -- the cause\n"
+                                 f"native({chip}) other {two} -- the cause\n"
+                                 f"native({chip}) fixed {one} -- the cause\n"
+                                 f"9 same {three} -- another family's\n")
+            tests = [{"name": name, "cmd": [sys.executable, "-c", "import sys; print(('wrong: a\\n' if 'wrong' in sys.argv[1] "
+                                            "else '') + sys.argv[1]); sys.exit({'passed': 0, 'skipped': 77}"
                                             ".get(sys.argv[1].split(':')[0], 1))", text],
                       "env": {}, "timeout": 2, "is_parallel": True} for name, text in said.items()]
             args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1)
@@ -516,11 +520,14 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             self.assertEqual(sorted(re.findall(r"^(?:new|passes, still listed as known): native\([^)]*\) (\S+)",
                                                out.getvalue(), re.M)), ["fixed", "fresh", "other", "skip"], out.getvalue())
             self.assertEqual(counted, 4)
-            self.assertIn(f"new: native({chip}) other failed: 3 wrong results (known: failed: 2 wrong results)", lines)
+            self.assertIn(f"new: native({chip}) other {three} (known: {two})", lines)
             self.assertIn("1 known, each with its cause in " + str(run.KNOWN), lines)
-            run.KNOWN.write_text("9 same failed: 3 wrong results\n")
-            with self.assertRaises(SystemExit):
-                run.known()
+            for line in [f"9 same {three}", "9 fresh failed: hr (line 280) -- the cause", "9 same failed: 3 wrong results -- the cause"]:
+                run.KNOWN.write_text(line + "\n")
+                with self.assertRaises(SystemExit, msg=line):
+                    run.known()
+            run.KNOWN.write_text("9 skip skipped: no 16x -- the cause\n")
+            self.assertEqual(run.known(), {("9", "skip"): "skipped: no 16x"})
 
     def test_runner_answers(self):
         # one count of wrong results is two failures when the results differ, and a test that answers differently on

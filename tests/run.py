@@ -366,13 +366,14 @@ def signature(said, log):
 
 def known():
     """tests/known.txt: a line '<family> <test> <what it says> -- <cause>' for each failure or skip that is known. the
-    GPU's own family is 'native(<its chip>)', as another chip is other evidence"""
+    GPU's own family is 'native(<its chip>)', as another chip is other evidence. only a test that ran to its verdict,
+    or was skipped, can be known: one that stopped early (a check, a fault, a hang) hides every case after it"""
     entries = {}
     for number, line in enumerate(KNOWN.read_text().splitlines() if KNOWN.exists() else [], 1):
         if line.strip() and not line.startswith("#"):
-            fields = re.fullmatch(r"(native\([^)]*\)|\S+) (\S+) (.+) -- (.*\S.*)", line)
+            fields = re.fullmatch(r"(native\([^)]*\)|\S+) (\S+) (failed: \d+ wrong results \[[0-9a-f]{8}\]|skipped: .+) -- (.*\S.*)", line)
             if not fields:
-                sys.exit(f"{KNOWN}:{number}: not '<family> <test> <what it says> -- <cause>'")
+                sys.exit(f"{KNOWN}:{number}: not '<family> <test> <verdict or skip> -- <cause>'")
             entries[fields[1], fields[2]] = fields[3]
     return entries
 

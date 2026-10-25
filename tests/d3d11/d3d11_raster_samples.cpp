@@ -180,10 +180,16 @@ int main() {
         ComPtr<ID3D11Texture2D> target, positions;
         ComPtr<ID3D11RenderTargetView> rtv;
         ComPtr<ID3D11ShaderResourceView> target_srv, positions_srv;
-        CHECK(device->CreateTexture2D(&td, nullptr, &target));
+        // a sample count the device reports is one it creates: a refusal is a wrong result, not the test's end
+        step("%ux center %u mode %u targets", count, centered, unsigned(mode));
+        if (!expect(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &target)), "%ux render target was refused",
+                    storage_count))
+          continue;
         CHECK(device->CreateRenderTargetView(target.Get(), nullptr, &rtv));
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        CHECK(device->CreateTexture2D(&td, nullptr, &positions));
+        if (!expect(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &positions)), "%ux texture was refused",
+                    storage_count))
+          continue;
         D3D11_SHADER_RESOURCE_VIEW_DESC sd{format, D3D11_SRV_DIMENSION_TEXTURE2DMS};
         CHECK(device->CreateShaderResourceView(target.Get(), &sd, &target_srv));
         CHECK(device->CreateShaderResourceView(positions.Get(), &sd, &positions_srv));
@@ -200,10 +206,15 @@ int main() {
         rd.DepthClipEnable = TRUE;
         rd.ForcedSampleCount = forced_msaa ? 1 : forced && mode != RenderMode::UavDefault ? count : 0;
         ComPtr<ID3D11RasterizerState1> states[4];
+        bool refused = false;
         for (unsigned flags = 0; flags < (forced ? 1u : std::size(states)); flags++) {
           rd.MultisampleEnable = flags & 1;
           rd.AntialiasedLineEnable = flags >> 1;
-          CHECK(device1->CreateRasterizerState1(&rd, &states[flags]));
+          // D3D11.3 3.5.6.1 requires every forced count up to 16: a refused state is a wrong result, and its mode is
+          // not drawn
+          step("forced %ux rasterizer state %u", rd.ForcedSampleCount, flags);
+          if ((refused = !expect(SUCCEEDED(device1->CreateRasterizerState1(&rd, &states[flags])), "it was refused")))
+            break;
           D3D11_RASTERIZER_DESC1 got{};
           states[flags]->GetDesc1(&got);
           expect(!memcmp(&got, &rd, sizeof(rd)), "GetDesc1 changed forced count or line fields");
@@ -216,6 +227,8 @@ int main() {
                    "GetDesc2 changed forced count or conservative default");
           }
         }
+        if (refused)
+          continue;
         for (auto context : {immediate.Get(), deferred.Get()}) {
           for (size_t n = 0; n < all.size(); n++) {
             auto &j = all[n];

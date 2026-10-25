@@ -176,12 +176,19 @@ int main(int argc, char **argv) {
                                D3D12_TEXTURE_LAYOUT_UNKNOWN,
                                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         ComPtr<ID3D12Resource> target, query;
-        CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                              nullptr, IID_PPV_ARGS(&target)));
+        // a sample count the device reports is one it creates: a refusal is a wrong result, not the test's end
+        step("%ux center %u mode %u targets", count, centered, unsigned(mode));
+        if (!expect(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+                                                              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                              IID_PPV_ARGS(&target))),
+                    "%ux render target was refused", storage_count))
+          continue;
         td.Flags = D3D12_RESOURCE_FLAG_NONE;
-        CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                                              IID_PPV_ARGS(&query)));
+        if (!expect(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+                                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                              IID_PPV_ARGS(&query))),
+                    "%ux texture was refused", storage_count))
+          continue;
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
         ComPtr<ID3D12DescriptorHeap> rtvs, srvs, cpu_uav;
         CHECK(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)));
@@ -219,7 +226,7 @@ int main(int argc, char **argv) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd{rs.Get(), bytecode(forced && !forced_msaa ? s.single_cs : s.cs)};
         CHECK(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&compute)));
         std::map<std::array<unsigned, 5>, ComPtr<ID3D12PipelineState>> pipelines;
-        bool optional_16_unavailable = false;
+        bool refused = false;
         for (unsigned path = 0; path < 3; path++) {
           CHECK(forget(readback.Get()));
           ComPtr<ID3D12CommandAllocator> allocator, bundle_allocator;
@@ -270,14 +277,17 @@ int main(int argc, char **argv) {
                                                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
               pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
               HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
-              // D3D12_RASTERIZER_DESC makes forced 16x optional, independently of texture sample counts.
-              if (forced && !forced_msaa && count == 16 && n == 0 &&
-                  (hr == E_INVALIDARG || hr == DXGI_ERROR_UNSUPPORTED)) {
-                printf("unsupported: forced 16x rasterization (HRESULT %#lx)\n", hr);
-                optional_16_unavailable = true;
+              // D3D12_RASTERIZER_DESC: ForcedSampleCount is 0, 1, 4, 8 or, optionally, 16, independently of texture
+              // sample counts. a refused pipeline is a wrong result, and its mode's other cases are not drawn
+              if (FAILED(hr)) {
+                if (forced && !forced_msaa && count == 16 && n == 0 &&
+                    (hr == E_INVALIDARG || hr == DXGI_ERROR_UNSUPPORTED))
+                  printf("unsupported: forced 16x rasterization (HRESULT %#lx)\n", hr);
+                else
+                  expect(false, "pipeline was refused (HRESULT %#lx)", hr);
+                refused = true;
                 break;
               }
-              CHECK(hr);
             }
             ID3D12DescriptorHeap *heaps[] = {srvs.Get()};
             list->SetDescriptorHeaps(1, heaps);
@@ -342,7 +352,7 @@ int main(int argc, char **argv) {
               transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                          D3D12_RESOURCE_STATE_RENDER_TARGET);
           }
-          if (optional_16_unavailable) {
+          if (refused) {
             CHECK(list->Close());
             break;
           }
