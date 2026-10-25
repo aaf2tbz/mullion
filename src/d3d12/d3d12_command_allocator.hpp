@@ -169,7 +169,21 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   // a list keeps its root's address until the queue has committed it, while later lists add roots
   std::deque<EncoderData> encoder_lists_;
 
-  small_vector<WMT::Reference<WMT::IndirectCommandBuffer>, 4> icb_;
+  // ExecuteIndirect's indirect command buffers: those the lists use, then, once the allocator is reset, a pool to take
+  // them from again. a game can run thousands each frame, and Metal makes each slowly (AcquireICB)
+  struct PooledICB {
+    WMT::Reference<WMT::IndirectCommandBuffer> icb;
+    uint64_t gpu_resource_id;
+    uint64_t key;
+    // what it was made with: the kind (with no padding and no resource ID), its size and its storage
+    WMTIndirectCommandBufferInfo kind;
+    uint64_t capacity;
+    WMTResourceOptions options;
+  };
+  small_vector<PooledICB, 4> icb_;
+  std::unordered_multimap<uint64_t, PooledICB> icb_pool_;
+  static constexpr size_t kICBPoolMax = 256;
+  WMT::IndirectCommandBuffer AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options);
   uint64_t visibility_address_ = 0;
   size_t visibility_used_ = kVisibilityWindow;
   // the acceleration structures the lists' commands name, some of them replaced at their addresses since
