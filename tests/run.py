@@ -364,16 +364,17 @@ def signature(said, log):
     return said + (f" [{hashlib.sha256(chr(10).join(wrong).encode()).hexdigest()[:8]}]" if wrong else "")
 
 
-def known():
+def known(path=None):
     """tests/known.txt: a line '<family> <test> <what it says> -- <cause>' for each failure or skip that is known. the
     GPU's own family is 'native(<its chip>)', as another chip is other evidence. only a test that ran to its verdict,
     or was skipped, can be known: one that stopped early (a check, a fault, a hang) hides every case after it"""
+    path = path or KNOWN
     entries = {}
-    for number, line in enumerate(KNOWN.read_text().splitlines() if KNOWN.exists() else [], 1):
+    for number, line in enumerate(path.read_text().splitlines() if path.exists() else [], 1):
         if line.strip() and not line.startswith("#"):
             fields = re.fullmatch(r"(native\([^)]*\)|\S+) (\S+) (failed: \d+ wrong results \[[0-9a-f]{8}\]|skipped: .+) -- (.*\S.*)", line)
             if not fields:
-                sys.exit(f"{KNOWN}:{number}: not '<family> <test> <verdict or skip> -- <cause>'")
+                sys.exit(f"{path}:{number}: not '<family> <test> <verdict or skip> -- <cause>'")
             entries[fields[1], fields[2]] = fields[3]
     return entries
 
@@ -388,6 +389,8 @@ def options(parser):
     parser.add_argument("--late", type=int, help="delay each Metal command buffer's commit by this many milliseconds")
     parser.add_argument("--suite", action="append", default=[], help="only tests of this suite (may repeat)")
     parser.add_argument("--exact", action="store_true", help="match whole test names instead of prefixes")
+    parser.add_argument("--known", type=Path, help="the failures and skips to compare with (default: %s)" % KNOWN.name)
+    parser.add_argument("--record", type=Path, help="write this run's failures and skips there, in the form --known reads")
     parser.add_argument("--benchmark", action="store_true", help="run declared benchmarks instead of correctness tests")
     parser.add_argument("tests", nargs="*", help="test name prefixes, or whole names with --exact")
 
@@ -403,6 +406,9 @@ def chosen(args):
              if (not args.tests or any(t["name"] == name if args.exact else t["name"].startswith(name)
                                        for name in args.tests))
              and (not args.suite or any(suite.split(":")[-1] in args.suite for suite in t["suite"]))]
+    unknown = [name for name in args.tests if args.exact and name not in {t["name"] for t in declared}]
+    if unknown:
+        sys.exit("no such test: " + ", ".join(unknown))
     missing = [t["cmd"][0] for t in tests if not Path(t["cmd"][0]).exists()]
     if missing or not tests:
         sys.exit("not built: " + ", ".join(missing) if missing else "no such test")
@@ -476,13 +482,19 @@ def own(args, tests, builds, binary, base):
     print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; logs in {logs}")
 
     chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
-    listed = known()
+    path = getattr(args, "known", None) or KNOWN
+    if path != KNOWN and not path.exists():
+        sys.exit(f"no such file: {path}")
+    listed = known(path)
     ran = {(f"native({chip})" if family == "native" else family, name): (verdict, said_by[name, family])
            for (name, family), verdict in verdicts.items()}
     new = [f"{family} {name} {said}" + (f" (known: {listed[family, name]})" if (family, name) in listed else "")
            for (family, name), (verdict, said) in ran.items() if verdict != "passed" and listed.get((family, name)) != said]
     fixed = [f"{family} {name}" for (family, name) in listed if ran.get((family, name), ("",))[0] == "passed"]
-    print(f"{sum(verdict != 'passed' for verdict, _ in ran.values()) - len(new)} known, each with its cause in {KNOWN}")
+    print(f"{sum(verdict != 'passed' for verdict, _ in ran.values()) - len(new)} known, each with its cause in {path}")
+    if getattr(args, "record", None):
+        args.record.write_text("".join(f"{family} {name} {said} -- what {builds[0].name} said\n"
+                                       for (family, name), (verdict, said) in ran.items() if verdict != "passed"))
     for line in new:
         print(f"new: {line}")
     for line in fixed:

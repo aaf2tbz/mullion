@@ -453,7 +453,11 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             from argparse import Namespace
             args = Namespace(build=[root], tests=["test"], suite=[], exact=True)
             self.assertEqual([t["name"] for t in run.chosen(args)], ["test"])
-            args.exact = False
+            # a whole name that is not a test is a mistake, not a smaller selection
+            args.tests = ["test", "tset"]
+            with self.assertRaises(SystemExit):
+                run.chosen(args)
+            args.tests, args.exact = ["test"], False
             self.assertEqual(len(run.chosen(args)), 2)
             (root / "meson-info/intro-benchmarks.json").write_text(json.dumps([
                 {"name": "test", "cmd": [str(exe), "bench"], "suite": []}]))
@@ -528,6 +532,10 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                     run.known()
             run.KNOWN.write_text("9 skip skipped: no 16x -- the cause\n")
             self.assertEqual(run.known(), {("9", "skip"): "skipped: no 16x"})
+            # a list to compare with that is not there is a mistake, not an empty list
+            with self.assertRaises(SystemExit), redirect_stdout(StringIO()):
+                run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, known=root / "none.txt"),
+                        tests[:1], [root], None, dict(os.environ))
 
     def test_runner_answers(self):
         # one count of wrong results is two failures when the results differ, and a test that answers differently on
@@ -549,21 +557,31 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                       "sys.exit(1 if said else 0)")
             tests = [{"name": name, "cmd": [sys.executable, "-c", script, name, str(root / name)], "env": {},
                       "timeout": 30, "is_parallel": True} for name in ["same", "twin", "flip"]]
-            args = Namespace(late=None, family="native", benchmark=False, repeat=2, jobs=1)
+            args = Namespace(late=None, family="native", benchmark=False, repeat=2, jobs=1, record=root / "record.txt")
             with redirect_stdout(StringIO()) as out:
                 counted = run.own(args, tests, [root], None, dict(os.environ))
             self.assertEqual(sorted(re.findall(r"^new: native\([^)]*\) (\S+)", out.getvalue(), re.M)), ["flip", "twin"],
                              out.getvalue())
+            # what a run records is what a later run compares with: every failure, the unstable one included, which
+            # cannot be compared with
+            recorded = args.record.read_text().splitlines()
+            self.assertEqual(sorted(re.match(r"native\([^)]*\) (\S+)", line)[1] for line in recorded), ["flip", "same", "twin"])
+            with self.assertRaises(SystemExit):
+                run.known(args.record)
+            args.record.write_text("".join(line + "\n" for line in recorded if " flip " not in line))
+            self.assertEqual(run.known(args.record)[f"native({chip})", "same"], known)
+            self.assertEqual(set(run.known(args.record)), {(f"native({chip})", "same"), (f"native({chip})", "twin")})
             self.assertEqual(counted, 2)
             self.assertRegex(out.getvalue(), r"failed +flip .*unstable: ")
             self.assertEqual([len((root / name).read_text()) for name in ["same", "twin", "flip"]], [2, 2, 2])
 
     def test_faults(self):
-        # a fault is caught only by a new answer of its test, not by the test's known failure, on a build of the faulted
-        # source alone: the fault before it is gone from the build, and one that does not apply, build or run is not caught
+        # a fault is caught only when its test answers differently than on the unfaulted build, whatever known.txt holds:
+        # a test that already fails, and fails the same with the fault, has not caught it. the fault is built from the
+        # faulted source alone, without the fault before it, and one that does not apply, build or run is not caught
         import faults
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source, breaks = root / "src", root / "src" / "tests" / "breaks"
             breaks.mkdir(parents=True)
             (source / "meson.build").write_text("project('t', 'c')\nexecutable('value', 'value.c')\n")
@@ -574,16 +592,23 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             (breaks / "t.2.patch").write_text("# a change the test does not see\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n")
             (breaks / "t.3.patch").write_text("# made for another source\n" + value("x").replace('"1"', '"3"', 1))
             (breaks / "u.patch").write_text("# does not compile\n" + value("int main(void) {"))
-            (breaks / "v.patch").write_text("# its test is not there\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+c\n")
+            (breaks / "v.patch").write_text("# its test does not run\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+c\n")
             subprocess.run(["meson", "setup", root / "lib", source, "-Dbuildtype=release"], check=True, capture_output=True)
+            subprocess.run(["ninja", "-C", root / "lib"], check=True, capture_output=True)
+            (root / "tests" / "meson-info").mkdir(parents=True)
+            (root / "tests" / "meson-info" / "intro-tests.json").write_text(json.dumps([{"name": n} for n in ["t", "t_dxil", "v"]]))
             calls = root / "calls"
+            # the unfaulted value 1 fails the test, as a known failure would; only another value is a new answer
             (root / "run.py").write_text(
                 "import subprocess, sys\n"
-                f"open({str(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
-                "if sys.argv[sys.argv.index('--exact') + 1] == 'v':\n    sys.exit('no such test')\n"
-                "said = subprocess.run([sys.argv[2] + '/value'], capture_output=True, text=True).stdout.strip()\n"
-                "print('     9  failed   t  0.1 s  failed: 1 wrong results\\n1 known, each with its cause in known.txt')\n"
-                "if said != '1':\n    print(f'new: 9 t failed: {said}')\n")
+                f"a = sys.argv; open({str(calls)!r}, 'a').write(' '.join(a[1:]) + '\\n')\n"
+                "if a[a.index('--exact') + 1] == 'v':\n    sys.exit('no such test')\n"
+                "said = subprocess.run([a[2] + '/value'], capture_output=True, text=True).stdout.strip()\n"
+                "answer = '' if said == '0' else f'9 t failed: {said}'\n"
+                "if '--record' in a:\n    open(a[a.index('--record') + 1], 'w').write(answer + ' -- before\\n' if answer else '')\n"
+                "known = open(a[a.index('--known') + 1]).read() if '--known' in a else ''\n"
+                "print('0 known, each with its cause in known.txt')\n"
+                "if answer and answer + ' -- before' not in known:\n    print('new: ' + answer)\n")
             faults.SOURCE, faults.RUN = source, root / "run.py"
             with redirect_stdout(StringIO()) as out:
                 missed = faults.main(["--build", str(root / "lib"), "--build", str(root / "tests"), "--wine", str(root),
@@ -593,10 +618,13 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                                                            "v.patch: did not run: no such test"])
             self.assertEqual(missed, 4)
             ran = calls.read_text().splitlines()
-            self.assertEqual(len(ran), 3)
-            self.assertIn("--build " + str(root / "tests"), ran[0])
-            self.assertIn("--family 9 --exact t t_dxil t_dxbc", ran[0])
-            self.assertIn("--family native --exact t t_dxil t_dxbc", ran[1])
+            self.assertEqual(len(ran), 5, ran)
+            self.assertTrue(ran[0].startswith("--build " + str(root / "lib") + " ") and "--record" in ran[0], ran[0])
+            self.assertTrue(ran[1].startswith("--build " + str(root / "lib-fault") + " ") and "--known" in ran[1], ran[1])
+            self.assertIn("--build " + str(root / "tests"), ran[1])
+            self.assertIn("--family 9 --known", ran[1])
+            self.assertTrue(ran[1].endswith("--exact t t_dxil"), ran[1])
+            self.assertIn("--family native --record", ran[2])
 
     def test_stop_and_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:
