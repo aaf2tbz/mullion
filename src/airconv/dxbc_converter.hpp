@@ -279,6 +279,9 @@ struct context {
   // the shader's groups work together through globallycoherent memory, which each group sync makes visible GPU-wide
   // (SM50_SHADER_FLAG_COHERENT_GROUP_SYNC)
   bool coherent_group_sync = false;
+  // the function is made from the shader's own signature, so it takes the SIMD-group inputs the shader defines; not
+  // so for a domain shader run inside a geometry shader's function, nor for a ray shader's visible function
+  bool own_signature = true;
 };
 
 template <typename S> IRValue make_irvalue(S &&fs) {

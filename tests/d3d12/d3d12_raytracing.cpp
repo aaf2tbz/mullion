@@ -51,6 +51,7 @@ RaytracingAccelerationStructure scene : register(t0);
 struct Result {
   uint status, instance, id, geometry, primitive, kind, record, local, flags, miss, called, secondary;
   float t; float2 attributes; float object_x, to_world_x, tcurrent; float2 sampled;
+  uint lanes;
 };
 RWStructuredBuffer<Result> results : register(u0);
 // what an intersection shader leaves a ray after ReportHit: two for each thread, its ray's and the ray's that a
@@ -97,6 +98,8 @@ void raygen() {
   Call c = { index.x };
   CallShader((index.x + index.y) % CALLABLES, c);
   p.r.called = c.value;
+  // a ray shader's SIMD group is the dispatch's: its width is the device's wave size
+  p.r.lanes = WaveGetLaneCount();
   results[thread] = p.r;
 }
 
@@ -195,6 +198,7 @@ static const char added_hlsl[] = R"hlsl(
 struct Result {
   uint status, instance, id, geometry, primitive, kind, record, local, flags, miss, called, secondary;
   float t; float2 attributes; float object_x, to_world_x, tcurrent; float2 sampled;
+  uint lanes;
 };
 struct Payload { Result r; uint depth; };
 // its record's first argument: this library's first constant buffer, as the case is the other library's
@@ -222,6 +226,7 @@ export uint beyond(uint value) { return value + miss_index; }
 struct Result {
   UINT status, instance, id, geometry, primitive, kind, record, local, flags, miss, called, secondary;
   float t, attributes[2], object_x, to_world_x, tcurrent, sampled[2];
+  UINT lanes;
 };
 
 struct Case {
@@ -300,6 +305,9 @@ main(int argc, char **argv) {
     printf("failed: ray tracing tier %d\n", options.RaytracingTier);
     return 1;
   }
+  // WaveGetLaneCount in a ray generation shader is the device's wave size
+  D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves)));
 
   // the global root signature: the scene, the results, the case, the row of texels and the marks; the local one: a
   // record's arguments, and the two samplers
@@ -739,6 +747,9 @@ main(int argc, char **argv) {
             marks_checked += ends || hit;
           }
         }
+        if (got.lanes != waves.WaveLaneCountMin && failures++ < 12)
+          printf("%s, case %u, ray %u,%u: WaveGetLaneCount %u, the device's waves have %u lanes\n", what, c, i % size,
+                 i / size, got.lanes, waves.WaveLaneCountMin);
         if (!same && failures++ < 12)
           printf(
               "%s, case %u, ray %u,%u: status %u instance %u id %u geometry %u primitive %u kind %#x record %u local %u "

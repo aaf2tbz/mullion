@@ -1109,6 +1109,8 @@ convert_dxbc_geometry_shader(
       .pso_sample_mask = 0xffffffff,
       .shader_type = pVertexStage->shader_type,
       .metal_version = metal_version,
+      .simd_width = sm50_common ? sm50_common->simd_width : 0,
+      .own_signature = false,
   };
   dxbc::Converter domain(air, domain_context, domain_map);
   pvalue workloads = nullptr;
