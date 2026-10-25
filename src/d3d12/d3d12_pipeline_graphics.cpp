@@ -123,7 +123,10 @@ constexpr WMTBlendFactor kBlendAlphaFactorMap[] = {
     WMTBlendFactorOneMinusSource1Color,
     WMTBlendFactorSource1Alpha,
     WMTBlendFactorOneMinusSource1Alpha,
+    WMTBlendFactorBlendAlpha, // ALPHA_FACTOR
+    WMTBlendFactorOneMinusBlendAlpha,
 };
+static_assert(std::size(kBlendAlphaFactorMap) == std::size(kBlendFactorMap));
 
 constexpr WMTColorWriteMask kColorWriteMaskMap[] = {
     // 0000
