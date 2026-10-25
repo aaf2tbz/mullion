@@ -201,7 +201,10 @@ public:
     pDesc->DedicatedVideoMemory =
         std::min<uint64_t>(device_.recommendedMaxWorkingSetSize(), std::numeric_limits<SIZE_T>::max());
     pDesc->DedicatedSystemMemory = 0;
-    pDesc->SharedSystemMemory = 0;
+    // the memory is unified (D3D12_FEATURE_DATA_ARCHITECTURE1::UMA), and applications size an integrated GPU's by its
+    // shared system memory, as Windows drivers of integrated GPUs report most of theirs: Unity's D3D12 device filter
+    // saw 0 MB and fell back to D3D11 (PEAK, 2026-10-24)
+    pDesc->SharedSystemMemory = pDesc->DedicatedVideoMemory;
     pDesc->AdapterLuid = adapter_luid_;
     pDesc->Flags = DXGI_ADAPTER_FLAG3_NONE;
     pDesc->GraphicsPreemptionGranularity = DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
