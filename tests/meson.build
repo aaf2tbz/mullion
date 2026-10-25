@@ -37,6 +37,7 @@ if get_option('enable_d3d12')
   configure_file(output: 'feature_levels.hpp', configuration: data)
   subdir('d3d12')
   subdir('dxgi')
+  subdir('perf')
 endif
 subdir('d3d11')
 subdir('d3d10')
