@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include "../dxbc_hash.hpp"
+#include "../temporary.hpp"
 #include "../trace.hpp"
 
 using Microsoft::WRL::ComPtr;

@@ -35,8 +35,7 @@ main() {
   char temporary[MAX_PATH], directory[MAX_PATH];
   auto length = GetTempPathA(sizeof(temporary), temporary);
   CHECK(length && length < sizeof(temporary) ? S_OK : E_FAIL);
-  CHECK(GetTempFileNameA(temporary, "gsp", 0, directory) ? S_OK : E_FAIL);
-  CHECK(DeleteFileA(directory) && CreateDirectoryA(directory, nullptr) ? S_OK : E_FAIL);
+  CHECK(temporary_directory(temporary, "gsp", directory) ? S_OK : E_FAIL);
   CHECK(SetEnvironmentVariableA("MULLION_LOG_PATH", directory) ? S_OK : E_FAIL);
   CHECK(SetEnvironmentVariableA("MULLION_MAX_MESH_THREADGROUPS", std::to_string(big).c_str()) ? S_OK : E_FAIL);
   ComPtr<ID3D11Device> device;

@@ -415,16 +415,21 @@ def own(args, tests, builds, binary, base):
         with printing:
             print("\n".join(lines), flush=True)
 
-    # a test of the host's own does not meet the GPU
+    # a test of the host's own does not meet the GPU. one meson declares not parallel, as one that compares the times
+    # its work takes, runs after the others, by itself
     jobs = [(family, test) for family in families for test in tests
             if test["cmd"][0].endswith(".exe") or family == families[0]]
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        for done in concurrent.futures.as_completed([pool.submit(one, *job) for job in jobs]):
+        for done in concurrent.futures.as_completed([pool.submit(one, *job) for job in jobs if job[1]["is_parallel"]]):
             done.result()
+    for job in jobs:
+        if not job[1]["is_parallel"]:
+            one(*job)
     # beside others a test shares the GPU, whose fault in one fails the work of all: each that failed beside others
     # runs again alone, and its verdict is that run's
     if args.jobs > 1:
-        again = [(family, test) for family, test in jobs if verdicts[test["name"], family] == "failed"]
+        again = [(family, test) for family, test in jobs
+                 if test["is_parallel"] and verdicts[test["name"], family] == "failed"]
         for family, test in again:
             one(family, test, again=True)
         alone_only = [f"{family} {test['name']}" for family, test in again if verdicts[test["name"], family] != "failed"]

@@ -149,10 +149,7 @@ main(int argc, char **argv) {
   };
   for (auto [range, directory_mode] : cases) {
     step("child with MULLION_D3D12_DUMP_FRAMES=%s", range ? range : "unset");
-    if (!expect(GetTempFileNameA(temporary, "frm", 0, directory), "no temporary name"))
-      return verdict();
-    DeleteFileA(directory);
-    if (!expect(CreateDirectoryA(directory, nullptr), "no temporary directory"))
+    if (!expect(temporary_directory(temporary, "frm", directory), "no temporary directory"))
       return verdict();
     SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
     SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");

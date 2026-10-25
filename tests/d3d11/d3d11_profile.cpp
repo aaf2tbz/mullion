@@ -276,10 +276,7 @@ int main(int argc, char **argv) {
   const char *settings[] = {nullptr, "profiles", "profile"};
   for (const char *setting : settings) {
     step("MULLION_DIAG=%s", setting ? setting : "unset");
-    if (!expect(GetTempFileNameA(temporary, "prf", 0, directory), "temporary name unavailable"))
-      return verdict();
-    DeleteFileA(directory);
-    if (!expect(CreateDirectoryA(directory, nullptr), "temporary directory unavailable"))
+    if (!expect(temporary_directory(temporary, "prf", directory), "temporary directory unavailable"))
       return verdict();
     WCHAR wide[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, directory, -1, wide, std::size(wide));

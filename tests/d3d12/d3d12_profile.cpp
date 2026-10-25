@@ -428,10 +428,7 @@ main(int argc, char **argv) {
     auto setting = settings[run];
     const bool profiling = setting && !strcmp(setting, "profile");
     step("child MULLION_DIAG=%s, run %u", setting ? setting : "unset", run);
-    if (!expect(GetTempFileNameA(temporary, "prf", 0, directory), "no temporary name"))
-      return verdict();
-    DeleteFileA(directory);
-    if (!expect(CreateDirectoryA(directory, nullptr), "no temporary directory"))
+    if (!expect(temporary_directory(temporary, "prf", directory), "no temporary directory"))
       return verdict();
     WCHAR wide[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, directory, -1, wide, std::size(wide));

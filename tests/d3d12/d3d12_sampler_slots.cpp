@@ -14,8 +14,7 @@ main() {
   char temporary[MAX_PATH], directory[MAX_PATH], exe[MAX_PATH], family[8] = {};
   auto length = GetTempPathA(sizeof(temporary), temporary);
   CHECK(length && length < sizeof(temporary) ? S_OK : E_FAIL);
-  CHECK(GetTempFileNameA(temporary, "smp", 0, directory) ? S_OK : E_FAIL);
-  CHECK(DeleteFileA(directory) && CreateDirectoryA(directory, nullptr) ? S_OK : E_FAIL);
+  CHECK(temporary_directory(temporary, "smp", directory) ? S_OK : E_FAIL);
   CHECK(SetEnvironmentVariableA("MULLION_LOG_PATH", directory) ? S_OK : E_FAIL);
   CHECK(GetModuleFileNameA(nullptr, exe, sizeof(exe)) ? S_OK : E_FAIL);
   GetEnvironmentVariableA("MULLION_GPU_FAMILY", family, sizeof(family));

@@ -61,10 +61,7 @@ main(int argc, char **argv) {
     char executable[MAX_PATH], temporary[MAX_PATH], directory[MAX_PATH];
     GetModuleFileNameA(nullptr, executable, sizeof(executable));
     GetTempPathA(sizeof(temporary), temporary);
-    if (!expect(GetTempFileNameA(temporary, "flg", 0, directory), "temporary log name"))
-      return verdict();
-    DeleteFileA(directory);
-    if (!expect(CreateDirectoryA(directory, nullptr), "log directory created"))
+    if (!expect(temporary_directory(temporary, "flg", directory), "log directory created"))
       return verdict();
     SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
     SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");

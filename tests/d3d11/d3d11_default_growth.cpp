@@ -75,9 +75,7 @@ main(int argc, char **argv) {
     char temporary[MAX_PATH], directory[MAX_PATH], exe[MAX_PATH];
     CHECK(GetTempPathA(sizeof(temporary), temporary) ? S_OK : E_FAIL);
     CHECK(GetModuleFileNameA(nullptr, exe, sizeof(exe)) ? S_OK : E_FAIL);
-    CHECK(GetTempFileNameA(temporary, "grw", 0, directory) ? S_OK : E_FAIL);
-    CHECK(DeleteFileA(directory) ? S_OK : E_FAIL);
-    CHECK(CreateDirectoryA(directory, nullptr) ? S_OK : E_FAIL);
+    CHECK(temporary_directory(temporary, "grw", directory) ? S_OK : E_FAIL);
     auto unix_name =
         (char *(__cdecl *)(const WCHAR *))GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_unix_file_name");
     CHECK(unix_name ? S_OK : E_FAIL);

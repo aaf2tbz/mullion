@@ -459,6 +459,36 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             args.benchmark = True
             self.assertEqual([t["cmd"] for t in run.chosen(args)], [[str(exe), "bench"]])
 
+    def test_runner_schedule(self):
+        # --jobs runs tests side by side, one meson declares not parallel after them by itself, and a test that failed
+        # beside others again alone, which a test already run alone is not
+        import run
+        from argparse import Namespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = ("import sys, time; name, at = sys.argv[1], sys.argv[2]; log = open(at + '/runs', 'a', buffering=1)\n"
+                      "log.write(f'start {name} {time.time()}\\n'); time.sleep(0.5)\n"
+                      "first = name != 'flaky' or not __import__('os').path.exists(at + '/flaky')\n"
+                      "name == 'flaky' and open(at + '/flaky', 'a'); log.write(f'end {name} {time.time()}\\n')\n"
+                      "ok = name != 'serial' and (name != 'flaky' or not first)\n"
+                      "print('passed: ok' if ok else 'failed: wrong'); sys.exit(0 if ok else 1)")
+            tests = [{"name": name, "cmd": [sys.executable, "-c", script, name, tmp], "env": {}, "timeout": 30,
+                      "is_parallel": name != "serial"} for name in ["a", "b", "flaky", "serial"]]
+            args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=len(tests))
+            with redirect_stdout(StringIO()) as out:
+                failed = run.own(args, tests, [root], None, dict(os.environ))
+            runs = [line.split() for line in (root / "runs").read_text().splitlines()]
+            at = {}
+            for word, name, t in runs:
+                at.setdefault((word, name), []).append(float(t))
+            self.assertEqual(failed, 1, out.getvalue())
+            self.assertLess(at["start", "b"][0], at["end", "a"][0])
+            self.assertLess(at["start", "a"][0], at["end", "b"][0])
+            self.assertGreaterEqual(at["start", "serial"][0],
+                                    max(at["end", name][0] for name in ["a", "b", "flaky"]))
+            self.assertEqual((len(at["start", "serial"]), len(at["start", "flaky"])), (1, 2))
+            self.assertIn("passed alone after failing beside others: native flaky", out.getvalue())
+
     def test_stop_and_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

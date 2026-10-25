@@ -951,10 +951,7 @@ processes(int argc, char **argv) {
   char temporary[MAX_PATH], directory[MAX_PATH], exe[MAX_PATH];
   GetTempPathA(sizeof(temporary), temporary);
   GetModuleFileNameA(nullptr, exe, sizeof(exe));
-  if (!expect(GetTempFileNameA(temporary, "sc", 0, directory), "no temporary name"))
-    return verdict();
-  DeleteFileA(directory);
-  if (!expect(CreateDirectoryA(directory, nullptr), "no temporary directory"))
+  if (!expect(temporary_directory(temporary, "sc", directory), "no temporary directory"))
     return verdict();
   auto unix_name = reinterpret_cast<char *(__cdecl *)(const WCHAR *)>(
       GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_unix_file_name")
