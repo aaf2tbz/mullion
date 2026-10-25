@@ -675,8 +675,8 @@ public:
     std::lock_guard<mutex_t> lock(mutex);
     if (unlikely(!pResource))
       return E_INVALIDARG;
-    // a failed call leaves the pointer null and the pitches as they were (Windows, as Wine's test_resource_map and
-    // test_deferred_context_map record)
+    // a failed Map leaves the pitches as they were and only the pointer null, as Windows does (Wine's
+    // test_resource_map and test_deferred_context_map); every Map that succeeds writes all three
     if (pMappedResource)
       pMappedResource->pData = nullptr;
     else if (!GetResourceCommon(pResource)->wrapped_resource || !GetTexture(pResource))

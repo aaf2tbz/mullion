@@ -20,6 +20,23 @@ main(int argc, char **argv) {
   CHECK(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
   SYSTEM_INFO system;
   GetSystemInfo(&system);
+  // the system's own write watch: one written page is one dirty page on Windows, but Wine on a host of larger pages
+  // (16KB, Apple silicon without 4KB pages) can only report each host page it saw written, its neighbors with it.
+  // there the write watch checks below cannot hold whatever the library does, and are left out
+  bool exact_write_watch = false;
+  if (auto probe = (BYTE *)VirtualAlloc(nullptr, system.dwAllocationGranularity, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                                        PAGE_READWRITE)) {
+    void *dirty[64];
+    ULONG_PTR count = std::size(dirty);
+    DWORD granularity;
+    ResetWriteWatch(probe, system.dwAllocationGranularity);
+    probe[system.dwPageSize] = 1;
+    exact_write_watch = !GetWriteWatch(0, probe, system.dwAllocationGranularity, dirty, &count, &granularity) &&
+                        count == 1 && dirty[0] == probe + system.dwPageSize;
+    VirtualFree(probe, 0, MEM_RELEASE);
+  }
+  if (!exact_write_watch)
+    printf("note: the system's write watch reports more than the written page; write watch heaps are not checked\n");
   for (SIZE_T size :
        {SIZE_T(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT), SIZE_T(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 3)}) {
     for (bool mapping : {false, true}) {
@@ -107,6 +124,8 @@ main(int argc, char **argv) {
         VirtualFree(address, 0, MEM_RELEASE);
     }
     for (bool placed : {false, true}) {
+      if (!exact_write_watch)
+        break;
       step("seed %u, write watch bytes %zu, placed %u", seed, size, placed);
       D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_UPLOAD};
       D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
