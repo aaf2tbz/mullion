@@ -130,7 +130,8 @@ main(int argc, char **argv) {
             const UINT count = descending ? ARRAYSIZE(levels) : ARRAYSIZE(ordered);
             const auto wanted = descending ? highest : ordered[0];
             HRESULT hr = D3D11On12CreateDevice(device12.Get(), 0, requested, count, queue_list, 1, 0,
-                                               device_output ? &device : nullptr, context_output ? &context : nullptr,
+                                               device_output ? device.ReleaseAndGetAddressOf() : nullptr,
+                                               context_output ? context.ReleaseAndGetAddressOf() : nullptr,
                                                level_output ? &chosen : nullptr);
             expect(SUCCEEDED(hr), "optional outputs: %#lx", hr);
             expect(!device_output || device, "device output missing");
