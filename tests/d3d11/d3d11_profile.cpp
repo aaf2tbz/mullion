@@ -22,6 +22,9 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+// the system counter mach_absolute_time reads on Apple silicon runs at 24 MHz (CNTFRQ_EL0, which a Windows program
+// cannot read)
+constexpr UINT64 host_hz = 24000000;
 
 static constexpr UINT width = 8, height = 4, frames = 40;
 static constexpr UINT indices[] = {0, 1, 2}, direct_instances[] = {1, 2};
@@ -425,8 +428,8 @@ int main(int argc, char **argv) {
         for (size_t i = 7; i < row.size(); i += 2) {
           auto start = number(row[i]), end = number(row[i + 1]);
           // the calibrations' host times come from a clock of 24 MHz on Apple silicon (mach_absolute_time), so a
-          // stage converted with them may land up to a tick, 41.7 ns, outside the command buffer's GPU times
-          const UINT64 host_tick = 42;
+          // stage converted with them may land up to a tick, outside the command buffer's GPU times
+          const UINT64 host_tick = (1000000000 + host_hz - 1) / host_hz;
           expect(start != ~UINT64(0) && end >= start && host_time(key, start) + rounding + host_tick >= number(buffer[5]) &&
                      host_time(key, end) <= finish + rounding + host_tick,
                  "GPU stage missing or outside command buffer");

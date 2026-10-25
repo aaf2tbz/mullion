@@ -20,6 +20,9 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+// the system counter mach_absolute_time reads on Apple silicon runs at 24 MHz (CNTFRQ_EL0, which a Windows program
+// cannot read)
+constexpr UINT64 host_hz = 24000000;
 
 static constexpr UINT frames = 4, concurrent_frames = 12, width = 8, height = 4, turns = 4096, threads = 32;
 static constexpr UINT indices[] = {0, 1, 2}, instances[] = {1, 2};
@@ -561,8 +564,8 @@ main(int argc, char **argv) {
         return cpu0 + delta * (cpu1 - cpu0) / (gpu1 - gpu0);
       };
       // the calibrations' host times come from a clock of 24 MHz on Apple silicon (mach_absolute_time), so a stage
-      // converted with them may land up to a tick, 41.7 ns, outside the command buffer's GPU times
-      const UINT64 host_tick = 42;
+      // converted with them may land up to a tick, outside the command buffer's GPU times
+      const UINT64 host_tick = (1000000000 + host_hz - 1) / host_hz;
       expect(clocks == 2, "one clock pair per queue");
       expect(spans == frames + 1 && list_counts[2] == frames && list_counts[1] == 1, "execute spans lost list counts");
       // ID3D12CommandQueue::Wait: "waits until the specified fence reaches or exceeds the specified value": the
