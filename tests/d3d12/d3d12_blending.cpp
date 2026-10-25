@@ -139,6 +139,9 @@ main(int argc, char **argv) {
       D3D12_VIEWPORT viewport{0, 0, float(width), 1, 0, 1};
       list->RSSetViewports(1, &viewport);
       std::vector<ComPtr<ID3D12GraphicsCommandList>> bundles;
+      // a list keeps its blend factor from draw to draw, so the direct path sets it only when it changes: a new
+      // pipeline alone must keep it right
+      const decltype(cases)::value_type *factor_set = nullptr;
       for (UINT i = 0; i < cases.size(); i++) {
         const auto &k = cases[i];
         if (k.special && (format.normalized || format.bits != 32))
@@ -185,7 +188,8 @@ main(int argc, char **argv) {
           commands->SetGraphicsRootSignature(rs.Get());
           const om::Color params[] = {k.source, k.secondary};
           commands->SetGraphicsRoot32BitConstants(0, param.Constants.Num32BitValues, params, 0);
-          commands->OMSetBlendFactor(k.null_factor ? nullptr : k.factor.data());
+          if (path || !factor_set || factor_set->null_factor != k.null_factor || factor_set->factor != k.factor)
+            commands->OMSetBlendFactor(k.null_factor ? nullptr : k.factor.data());
           commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
           if (path == 2)
             commands->ExecuteIndirect(signature.Get(), 1, indirect.Get(), 0, nullptr, 0);
@@ -202,6 +206,8 @@ main(int argc, char **argv) {
           list->ExecuteBundle(bundle.Get());
         } else
           record(list.Get());
+        if (!path)
+          factor_set = &k;
       }
       for (UINT slot = 0; slot < targets; slot++) {
         transition(

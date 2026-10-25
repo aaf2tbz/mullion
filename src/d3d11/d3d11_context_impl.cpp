@@ -5486,6 +5486,8 @@ public:
   }
   // whether the current pipeline draws lines as triangles, which the rasterizer state then takes as lines
   bool quad_lines_ = false;
+  // the pipeline draws with a blend color of 0 (MultiplyZeroWeights)
+  bool zero_blend_color_ = false;
 
   // after a geometry draw: whether the draw goes on as an ordinary one, which is so for stream output without a
   // geometry shader whose stream also rasterizes, unless the mesh stage already has. the ordinary pipeline is then
@@ -5582,6 +5584,14 @@ public:
     Desc.QuadLines = !GS && Desc.PassThrough && QuadLines();
     if (std::exchange(quad_lines_, Desc.QuadLines) != Desc.QuadLines)
       dirty_state.set(DirtyState::RasterizerState);
+    // what the pipeline's blend setup makes of its zero weights (MultiplyZeroWeights)
+    WMTRenderPipelineBlendInfo blend{};
+    for (unsigned i = 0; i < Desc.NumColorAttachments; i++)
+      blend.colors[i].pixel_format = Desc.ColorAttachmentFormats[i];
+    bool zero = Desc.BlendState->SetupMetalPipelineDescriptor(&blend, Desc.NumColorAttachments,
+                                                              PS ? PS->reflection().PSValidRenderTargets : 0);
+    if (std::exchange(zero_blend_color_, zero) != zero)
+      dirty_state.set(DirtyState::BlendFactorAndStencilRef);
     if (unlikely(Desc.GSPassthrough == ~0u && (Desc.GeometryShader != nullptr || Desc.SOLayout || Desc.PassThrough))) {
       Desc.GSStripTopology = is_strip_topology(state_.InputAssembler.Topology);
     } else {
@@ -5830,8 +5840,8 @@ public:
       });
     }
     if (dirty_state.any(DirtyState::BlendFactorAndStencilRef)) {
-      EmitST([r = state_.OutputMerger.BlendFactor[0], g = state_.OutputMerger.BlendFactor[1],
-            b = state_.OutputMerger.BlendFactor[2], a = state_.OutputMerger.BlendFactor[3],
+      const float zero[4] = {}, *factor = zero_blend_color_ ? zero : state_.OutputMerger.BlendFactor;
+      EmitST([r = factor[0], g = factor[1], b = factor[2], a = factor[3],
             stencil_ref = state_.OutputMerger.StencilRef](ArgumentEncodingContext &enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
         cmd.type = WMTRenderCommandSetBlendFactorAndStencilRef;

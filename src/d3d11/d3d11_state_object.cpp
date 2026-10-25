@@ -316,7 +316,7 @@ public:
   bool IsDualSourceBlending() { return dual_source_blending_; }
   bool IsAlphaToCoverage() { return desc_.AlphaToCoverageEnable; }
 
-  void SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *info, uint32_t num_rt, uint32_t valid_rt) {
+  bool SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *info, uint32_t num_rt, uint32_t valid_rt) {
     for (unsigned rt = 0; rt < num_rt; rt++) {
       if (!(valid_rt & (1 << rt)))
         continue;
@@ -357,6 +357,7 @@ public:
     // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
     info->alpha_to_coverage_enabled =
         desc_.AlphaToCoverageEnable && !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info->colors[0].pixel_format)));
+    return MultiplyZeroWeights(info->colors);
   }
 
 private:

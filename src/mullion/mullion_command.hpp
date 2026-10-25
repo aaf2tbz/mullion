@@ -99,6 +99,54 @@ RasterizeAsLines(State &state) {
   state.winding = WMTWindingCounterClockwise;
 }
 
+// Metal's blender drops the product of a Zero weight, where D3D propagates NaNs and signed zeros through it (D3D11.3
+// 17.2, "including 0.0 blend weights"), and multiplies by a weight of the blend color at 0. a float
+// target's Zero weights become that, when no target weighs by the blend color; the pipeline then draws with a blend
+// color of 0, which this says. Metal folds one weight of both sides into (s op d) * w, which loses the sign of a zero,
+// so the color channels' two take the blend color and its alpha; the alpha channel has no second weight that is 0
+inline bool
+MultiplyZeroWeights(std::span<WMTColorAttachmentBlendInfo> colors) {
+  auto constant = [](WMTBlendFactor f) {
+    return f == WMTBlendFactorBlendColor || f == WMTBlendFactorOneMinusBlendColor || f == WMTBlendFactorBlendAlpha ||
+           f == WMTBlendFactorOneMinusBlendAlpha;
+  };
+  auto floating = [](WMTPixelFormat f) {
+    switch (f) {
+    case WMTPixelFormatR16Float:
+    case WMTPixelFormatRG16Float:
+    case WMTPixelFormatRGBA16Float:
+    case WMTPixelFormatR32Float:
+    case WMTPixelFormatRG32Float:
+    case WMTPixelFormatRGBA32Float:
+    case WMTPixelFormatRG11B10Float:
+      return true;
+    default:
+      return false;
+    }
+  };
+  bool zero = false;
+  for (auto &c : colors)
+    if (c.blending_enabled) {
+      if (constant(c.src_rgb_blend_factor) || constant(c.dst_rgb_blend_factor) || constant(c.src_alpha_blend_factor) ||
+          constant(c.dst_alpha_blend_factor))
+        return false;
+      zero |= floating(c.pixel_format) &&
+              (c.src_rgb_blend_factor == WMTBlendFactorZero || c.dst_rgb_blend_factor == WMTBlendFactorZero ||
+               c.src_alpha_blend_factor == WMTBlendFactorZero || c.dst_alpha_blend_factor == WMTBlendFactorZero);
+    }
+  if (!zero)
+    return false;
+  for (auto &c : colors)
+    if (c.blending_enabled && floating(c.pixel_format))
+      for (auto [factor, by] : {std::pair{&c.src_rgb_blend_factor, WMTBlendFactorBlendColor},
+                                {&c.dst_rgb_blend_factor, WMTBlendFactorBlendAlpha},
+                                {&c.src_alpha_blend_factor, WMTBlendFactorBlendAlpha},
+                                {&c.dst_alpha_blend_factor, WMTBlendFactorBlendAlpha}})
+        if (*factor == WMTBlendFactorZero)
+          *factor = by;
+  return true;
+}
+
 struct TileBarrierPSOKey {
   WMTPixelFormat color_formats[8];
   unsigned raster_sample_count;

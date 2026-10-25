@@ -129,6 +129,10 @@ int main() {
         CHECK(device->CreateBlendState(&k.state, &blend));
         context->OMSetBlendState(
             blend.Get(), k.null_factor ? nullptr : k.factor.data(), ~0u);
+        // a draw without a pixel shader writes no target first, so the
+        // pipeline of the draw after it changes by its pixel shader alone
+        context->PSSetShader(nullptr, nullptr, 0);
+        context->Draw(3, 0);
         context->PSSetShader(ps[profile][k.dual      ? 1
                                          : k.special ? 2
                                                      : 0]

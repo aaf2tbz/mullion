@@ -450,6 +450,8 @@ public:
   bool geometry_shader = false;
   // a stage reads or writes a UAV: only then can a UAV barrier order anything a draw of it does inside a render pass
   bool uses_uav = false;
+  // its Zero blend weights are the blend color, which its draws set to 0 (MultiplyZeroWeights)
+  bool zero_blend_color = false;
   WMT::Reference<WMT::RenderPipelineState> pso_strip;
   // the vertex shader's output registers, which size a geometry pipeline's object threadgroups (get_gs_vertex_count)
   uint32_t vertex_registers = 0;

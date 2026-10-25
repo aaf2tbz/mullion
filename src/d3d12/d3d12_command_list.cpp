@@ -996,10 +996,11 @@ public:
     if (dirty_state_.test(DirtyState::BlendFactor)) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setblendcolor>();
       cmd.type = WMTRenderCommandSetBlendFactor;
-      cmd.red = blend_factor_[0];
-      cmd.green = blend_factor_[1];
-      cmd.blue = blend_factor_[2];
-      cmd.alpha = blend_factor_[3];
+      const float zero[4] = {}, *factor = pso_graphics_->zero_blend_color ? zero : blend_factor_;
+      cmd.red = factor[0];
+      cmd.green = factor[1];
+      cmd.blue = factor[2];
+      cmd.alpha = factor[3];
       dirty_state_.clr(DirtyState::BlendFactor);
     }
 
@@ -2129,6 +2130,8 @@ public:
         ((pso_graphics_->rtv_mask ^ graphics_pso->rtv_mask) & ((1u << num_rtvs) - 1)) ||
         (dsv.Texture && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
       allocator_->InvalidateCurrentPass();
+    if (!pso_graphics_ || pso_graphics_->zero_blend_color != graphics_pso->zero_blend_color)
+      dirty_state_.set(DirtyState::BlendFactor);
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;
     dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState, DirtyState::VertexBuffer);

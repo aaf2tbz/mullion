@@ -899,6 +899,7 @@ public:
     // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
     info.alpha_to_coverage_enabled = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
                                      !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info.colors[0].pixel_format)));
+    zero_blend_color = MultiplyZeroWeights(info.colors);
 
     return S_OK;
   }
