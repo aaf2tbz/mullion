@@ -547,6 +547,7 @@ public:
 
   llvm::Value *FirstBit(IntegerUnaryOp Op, llvm::Value *Value);
   llvm::Value *SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value);
+  llvm::Value *NaNIfNotFinite(llvm::Value *Source, llvm::Value *Result);
   std::pair<llvm::Value *, llvm::Value *> ReadTexel(
       const TextureResourceHandle &Tex, llvm::Value *Address, llvm::Value *ArrayIndex, llvm::Value *SampleIndex,
       llvm::Value *Level
