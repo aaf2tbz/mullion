@@ -559,6 +559,8 @@ public:
   // what shared fences need, made with the first: a D3DKMT device, and a listener for their events
   virtual D3DKMT_HANDLE GetLocalD3DKMT() = 0;
   virtual EventListener &GetEventListener() = 0;
+  // commits the global residency set's changes; queues call it before committing a command buffer
+  virtual void CommitResidency() = 0;
   // MULLION_D3D12_GPU_ERRORS: passes carry the names of their pipelines to Metal, whose report of a command buffer
   // the GPU failed then says which pass it was. `NamePass` adds a pipeline to a pass's name, `PassName` takes it
   virtual bool NamesPasses() = 0;
