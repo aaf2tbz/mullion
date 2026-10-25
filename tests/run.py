@@ -149,9 +149,12 @@ def alone():
                 with open(lock + ".guard", "a") as guard:
                     fcntl.flock(guard, fcntl.LOCK_EX)
                     shutil.rmtree(lock, ignore_errors=True)
-                # the others look for the lock every few seconds: a waiter gets that long to take it
-                if waiting(lock + ".waiting"):
-                    time.sleep(TURN)
+                # the others look for the lock every few seconds: a waiter gets that long to take it, and takes its
+                # mark away once it has
+                for _ in range(TURN * 10):
+                    if not waiting(lock + ".waiting"):
+                        break
+                    time.sleep(0.1)
             HOLDERS.notify_all()
 
 
