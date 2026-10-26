@@ -81,7 +81,7 @@ WMT::RenderPipelineState InternalCommandLibrary::ZeroWords() {
 
 WMT::RenderPipelineState
 InternalCommandLibrary::VertexPipeline(WMT::Reference<WMT::RenderPipelineState> &pipeline, const char *name) {
-  std::lock_guard lock(statistics_mutex_);
+  std::lock_guard lock(pipelines_mutex_);
   if (!pipeline) {
     WMTRenderPipelineInfo info;
     WMT::InitializeRenderPipelineInfo(info);
@@ -94,6 +94,22 @@ InternalCommandLibrary::VertexPipeline(WMT::Reference<WMT::RenderPipelineState> 
       ERR("Failed to create pipeline ", name, ": ", error.description().getUTF8String());
       abort();
     }
+  }
+  return pipeline;
+}
+
+WMT::Reference<WMT::ComputePipelineState>
+InternalCommandLibrary::ComputePipeline(const std::string &name) {
+  std::lock_guard lock(pipelines_mutex_);
+  auto &pipeline = compute_pipelines_[name];
+  if (!pipeline) {
+    auto function = library_.newFunction(name.c_str());
+    if (!function)
+      return {};
+    WMT::Reference<WMT::Error> err;
+    pipeline = device_.newComputePipelineState(function, err);
+    if (err)
+      ERR("Failed to create compute PSO: ", err.description().getUTF8String());
   }
   return pipeline;
 }

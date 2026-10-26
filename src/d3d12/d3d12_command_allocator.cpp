@@ -589,16 +589,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
 template <>
 WMT::Reference<WMT::ComputePipelineState>
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::getComputePipeline(std::string name) {
-  auto lib = ctx.device_->GetLib().getLibrary();
-  auto func = lib.newFunction(name.c_str());
-  if (!func)
-    return {};
-  WMT::Reference<WMT::Error> err;
-  auto pso = ctx.device_->GetMTLDevice().newComputePipelineState(func, err);
-  if (err) {
-    ERR("Failed to create compute PSO: ", err.description().getUTF8String());
-  }
-  return pso;
+  return ctx.device_->GetLib().ComputePipeline(name);
 }
 
 template <>

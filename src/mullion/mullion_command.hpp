@@ -187,6 +187,8 @@ public:
   WMT::RenderPipelineState PipelineStatistics(bool scan = false);
   // zeroes a stream output draw's scratch inside its render pass (zero_words)
   WMT::RenderPipelineState ZeroWords();
+  // the kernel `name` as a compute pipeline, made once for the device
+  WMT::Reference<WMT::ComputePipelineState> ComputePipeline(const std::string &name);
 
 private:
   // a vertex function that runs without rasterizing, made when first used
@@ -194,8 +196,9 @@ private:
 
   WMT::Reference<WMT::Library> library_;
   WMT::Device device_;
-  mullion::mutex statistics_mutex_;
+  mullion::mutex pipelines_mutex_;
   WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2], zero_words_;
+  std::unordered_map<std::string, WMT::Reference<WMT::ComputePipelineState>> compute_pipelines_;
 };
 
 class EmulatedCommandContext {

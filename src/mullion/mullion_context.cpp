@@ -2003,16 +2003,7 @@ ArgumentEncodingContext::isResolveSignatureMatched(RenderEncoderData *render, Re
 template <>
 WMT::Reference<WMT::ComputePipelineState>
 SimpleCommandContext<ArgumentEncodingContext>::getComputePipeline(std::string name) {
-  auto lib = ctx.lib.getLibrary();
-  auto func = lib.newFunction(name.c_str());
-  if (!func)
-    return {};
-  WMT::Reference<WMT::Error> err;
-  auto pso = ctx.device_.newComputePipelineState(func, err);
-  if (err) {
-    ERR("Failed to create compute PSO: ", err.description().getUTF8String());
-  }
-  return pso;
+  return ctx.lib.ComputePipeline(name);
 }
 
 template <>
