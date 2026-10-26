@@ -197,6 +197,9 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   WMT::Reference<WMT::ComputePipelineState> d24_copy_pso_[2];
   RGB32Copy<MTLD3D12CommandAllocatorImpl> rgb32_copy_{*this};
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
+  // a UAV clear joins the open compute pass, behind and before memory barriers, instead of a pass of its own
+  // (startComputePass, endPass)
+  bool share_compute_ = false;
   std::vector<Rc<Buffer>> sparse_clear_texels_;
   WMT::Reference<WMT::ComputePipelineState> sparse_clear_pso_;
   TranscodeFeedback<MTLD3D12CommandAllocatorImpl> transcode_feedback_;
