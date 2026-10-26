@@ -962,6 +962,7 @@ void ArgumentEncodingContext::countPipelineStatistics(PipelineStatisticsDraw dra
     query->statistics.emplace_back(statistics_page_, statistics_offset_);
   if (draw.first && draw.index_stride && ibuf_) {
     auto [indices, offset] = access<PipelineStage::Vertex>(ibuf_, 0, ibuf_->length(), ResourceAccess::Read);
+    makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(ibuf_.ptr());
     draw.start -= offset / draw.index_stride;
     draw.indices = indices->gpuAddress() + offset;
     draw.index_bytes = ibuf_->length();
@@ -1352,7 +1353,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         // indirect draws with stream output share the encoder's scratch area (encodeStreamOutputTargets)
         if (data->so_scratch) {
           encoder.useResource(data->so_scratch, WMTResourceUsageRead | WMTResourceUsageWrite, WMTRenderStageVertex);
-          encoder.useResource(so_scratch_overflow_, WMTResourceUsageWrite, WMTRenderStageVertex);
+          encoder.useResource(so_scratch_overflow_, WMTResourceUsageRead | WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         for (unsigned i = 0; i<task_count; i++) {
           auto & task = data->gs_arg_marshal_tasks[i];

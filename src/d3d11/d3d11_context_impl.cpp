@@ -1846,11 +1846,14 @@ public:
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
-        if (enc.pipelineStatisticsActive())
+        if (enc.pipelineStatisticsActive()) {
+          // the count's vertex function reads the arguments by address
+          enc.makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(ArgBuffer.ptr());
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive),
                                       IndexType == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t),
                                       IndexBufferOffset + index_sub_offset, 0,
                                      buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
+        }
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
@@ -1894,9 +1897,11 @@ public:
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
         );
-        if (enc.pipelineStatisticsActive())
+        if (enc.pipelineStatisticsActive()) {
+          enc.makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(ArgBuffer.ptr());
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive), 0, 0, 0,
                                      buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
+        }
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
