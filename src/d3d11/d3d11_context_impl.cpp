@@ -5489,8 +5489,8 @@ public:
   }
   // whether the current pipeline draws lines as triangles, which the rasterizer state then takes as lines
   bool quad_lines_ = false;
-  // the pipeline draws with a blend color of 0 (MultiplyZeroWeights)
-  bool zero_blend_color_ = false;
+  // the pipeline's pixel shader blends a target itself, reading the blend factor after the depth ranges (ShaderBlend)
+  bool shader_blend_ = false;
 
   // after a geometry draw: whether the draw goes on as an ordinary one, which is so for stream output without a
   // geometry shader whose stream also rasterizes, unless the mesh stage already has. the ordinary pipeline is then
@@ -5587,13 +5587,13 @@ public:
     Desc.QuadLines = !GS && Desc.PassThrough && QuadLines();
     if (std::exchange(quad_lines_, Desc.QuadLines) != Desc.QuadLines)
       dirty_state.set(DirtyState::RasterizerState);
-    // what the pipeline's blend setup makes of its zero weights (MultiplyZeroWeights)
+    // which targets the pipeline's pixel shader blends itself (ShaderBlend)
     WMTRenderPipelineBlendInfo blend{};
     for (unsigned i = 0; i < Desc.NumColorAttachments; i++)
       blend.colors[i].pixel_format = Desc.ColorAttachmentFormats[i];
-    bool zero = Desc.BlendState->SetupMetalPipelineDescriptor(&blend, Desc.NumColorAttachments,
-                                                              PS ? PS->reflection().PSValidRenderTargets : 0);
-    if (std::exchange(zero_blend_color_, zero) != zero)
+    auto blends = Desc.BlendState->SetupMetalPipelineDescriptor(&blend, Desc.NumColorAttachments,
+                                                                PS ? PS->reflection().PSValidRenderTargets : 0);
+    if ((shader_blend_ = std::any_of(blends.begin(), blends.end(), [](auto &b) { return b.blend; })))
       dirty_state.set(DirtyState::BlendFactorAndStencilRef);
     if (unlikely(Desc.GSPassthrough == ~0u && (Desc.GeometryShader != nullptr || Desc.SOLayout || Desc.PassThrough))) {
       Desc.GSStripTopology = is_strip_topology(state_.InputAssembler.Topology);
@@ -5843,7 +5843,7 @@ public:
       });
     }
     if (dirty_state.any(DirtyState::BlendFactorAndStencilRef)) {
-      const float zero[4] = {}, *factor = zero_blend_color_ ? zero : state_.OutputMerger.BlendFactor;
+      auto factor = state_.OutputMerger.BlendFactor;
       EmitST([r = factor[0], g = factor[1], b = factor[2], a = factor[3],
             stencil_ref = state_.OutputMerger.StencilRef](ArgumentEncodingContext &enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
@@ -5881,28 +5881,37 @@ public:
         enc.currentRenderEncoder()->viewports += viewports.size();
       });
     }
-    // with no viewport set, Metal's own has the range 0 to 1
-    if (dirty_state.any(DirtyState::Viewport)) {
-      static_assert(SM50_VIEWPORTS == D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
-      auto ranges = AllocateCommandData<float>(2 * viewport_count),
-           raster_scale = AllocateCommandData<float>(1 + 2 * SM50_VIEWPORTS);
-      raster_scale[0] = scale;
-      for (unsigned i = 0; i < SM50_VIEWPORTS; i++) {
+    static_assert(SM50_VIEWPORTS == D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+    // with no viewport set, Metal's own has the range 0 to 1. a pixel shader that blends itself reads the blend factor
+    // after all the viewports' ranges (SM50_SHADER_BLEND)
+    if (dirty_state.any(DirtyState::Viewport) || (shader_blend_ && dirty_state.any(DirtyState::BlendFactorAndStencilRef))) {
+      auto &factor = state_.OutputMerger.BlendFactor;
+      auto ranges = AllocateCommandData<float>(shader_blend_ ? 2 * SM50_VIEWPORTS + std::size(factor) : 2 * viewport_count);
+      for (unsigned i = 0; i < viewport_count; i++) {
         auto &d3dViewport = state_.Rasterizer.viewports[i < state_.Rasterizer.NumViewports ? i : 0];
-        if (i < viewport_count) {
-          ranges[2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.MinDepth : 0;
-          ranges[2 * i + 1] = state_.Rasterizer.NumViewports ? d3dViewport.MaxDepth : 1;
-        }
-        // with no viewport set, Metal's covers the pass
-        raster_scale[1 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Width : render_pass_width_;
-        raster_scale[2 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Height : render_pass_height_;
+        ranges[2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.MinDepth : 0;
+        ranges[2 * i + 1] = state_.Rasterizer.NumViewports ? d3dViewport.MaxDepth : 1;
       }
-      EmitST([ranges = std::move(ranges), raster_scale = std::move(raster_scale)](ArgumentEncodingContext &enc) {
+      if (shader_blend_)
+        std::copy_n(factor, std::size(factor), ranges.data() + 2 * SM50_VIEWPORTS);
+      EmitST([ranges = std::move(ranges)](ArgumentEncodingContext &enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setbytes>();
         cmd.type = WMTRenderCommandSetFragmentBytes;
         cmd.bytes.set(ranges.data());
         cmd.length = ranges.size() * sizeof(float);
         cmd.index = SM50_BINDING_INDEX_DEPTH_RANGES;
+      });
+    }
+    if (dirty_state.any(DirtyState::Viewport)) {
+      auto raster_scale = AllocateCommandData<float>(1 + 2 * SM50_VIEWPORTS);
+      raster_scale[0] = scale;
+      for (unsigned i = 0; i < SM50_VIEWPORTS; i++) {
+        auto &d3dViewport = state_.Rasterizer.viewports[i < state_.Rasterizer.NumViewports ? i : 0];
+        // with no viewport set, Metal's covers the pass
+        raster_scale[1 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Width : render_pass_width_;
+        raster_scale[2 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Height : render_pass_height_;
+      }
+      EmitST([raster_scale = std::move(raster_scale)](ArgumentEncodingContext &enc) {
         for (auto stage : {WMTRenderCommandSetVertexBytes, WMTRenderCommandSetMeshBytes}) {
           auto &bytes = enc.encodeRenderCommand<wmtcmd_render_setbytes>();
           bytes.type = stage;

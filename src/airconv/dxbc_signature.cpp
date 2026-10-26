@@ -630,7 +630,7 @@ void handle_signature_ps(
           type = sig_type;
         uint32_t assigned_index;
         if (ctx.dual_source_blending) {
-          if (reg > 1 || reg < 0)
+          if (reg > 1 || (reg == 1 && ctx.shader_blends_dual_source))
             return;
           assigned_index = ctx.func_signature.DefineOutput(OutputRenderTarget{
             .dual_source_blending = true,

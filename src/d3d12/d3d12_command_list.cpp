@@ -923,9 +923,22 @@ public:
     // a primitive names one of the viewports and scissors there may be (D3D11.3 15.8.1). a viewport that is not set
     // is of no size and a scissor that is not set is empty (15.6, 15.7): nothing is drawn through either, which an
     // empty scissor says to Metal, whatever viewport it has there
+    static_assert(SM50_VIEWPORTS == D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+    // the depth ranges, then the blend factor of a pixel shader that blends itself (SM50_SHADER_BLEND)
+    if (dirty_state_.test(DirtyState::Viewport) ||
+        (dirty_state_.test(DirtyState::BlendFactor) && pso_graphics_->shader_blend)) {
+      auto [ranges, ranges_offset] =
+          allocator_->AllocateGPUHeap((2 * count + std::size(blend_factor_)) * sizeof(float), alignof(float));
+      // with no viewport set, Metal's own has the range 0 to 1
+      for (auto i = 0u; i < count; i++) {
+        ((float *)ranges)[2 * i] = num_viewports ? viewports[i < num_viewports ? i : 0].MinDepth : 0;
+        ((float *)ranges)[2 * i + 1] = num_viewports ? viewports[i < num_viewports ? i : 0].MaxDepth : 1;
+      }
+      std::copy_n(blend_factor_, std::size(blend_factor_), (float *)ranges + 2 * count);
+      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, ranges_offset, SM50_BINDING_INDEX_DEPTH_RANGES);
+      depth_ranges_ = allocator_->gpu_heap_buffer_address_ + ranges_offset;
+    }
     if (dirty_state_.test(DirtyState::Viewport)) {
-      auto [ranges, ranges_offset] = allocator_->AllocateGPUHeap(2 * count * sizeof(float), alignof(float));
-      static_assert(SM50_VIEWPORTS == D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
       auto [scale, scale_offset] = allocator_->AllocateGPUHeap((1 + 2 * SM50_VIEWPORTS) * sizeof(float), alignof(float));
       *(float *)scale = 1;
       // with no viewport set, Metal's covers the pass
@@ -934,11 +947,6 @@ public:
         auto &viewport = viewports[i < num_viewports ? i : 0];
         ((float *)scale)[1 + 2 * i] = num_viewports ? viewport.Width : pass->render_target_width;
         ((float *)scale)[2 + 2 * i] = num_viewports ? viewport.Height : pass->render_target_height;
-      }
-      // with no viewport set, Metal's own has the range 0 to 1
-      for (auto i = 0u; i < count; i++) {
-        ((float *)ranges)[2 * i] = num_viewports ? viewports[i < num_viewports ? i : 0].MinDepth : 0;
-        ((float *)ranges)[2 * i + 1] = num_viewports ? viewports[i < num_viewports ? i : 0].MaxDepth : 1;
       }
       if (num_viewports) {
         auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(count);
@@ -955,10 +963,8 @@ public:
         cmd.viewport_count = count;
         static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
       }
-      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, ranges_offset, SM50_BINDING_INDEX_DEPTH_RANGES);
       EncodeBuffer(WMTRenderCommandSetVertexBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
       EncodeBuffer(WMTRenderCommandSetMeshBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
-      depth_ranges_ = allocator_->gpu_heap_buffer_address_ + ranges_offset;
       raster_scale_ = allocator_->gpu_heap_buffer_address_ + scale_offset;
       dirty_state_.clr(DirtyState::Viewport);
     }
@@ -996,11 +1002,10 @@ public:
     if (dirty_state_.test(DirtyState::BlendFactor)) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setblendcolor>();
       cmd.type = WMTRenderCommandSetBlendFactor;
-      const float zero[4] = {}, *factor = pso_graphics_->zero_blend_color ? zero : blend_factor_;
-      cmd.red = factor[0];
-      cmd.green = factor[1];
-      cmd.blue = factor[2];
-      cmd.alpha = factor[3];
+      cmd.red = blend_factor_[0];
+      cmd.green = blend_factor_[1];
+      cmd.blue = blend_factor_[2];
+      cmd.alpha = blend_factor_[3];
       dirty_state_.clr(DirtyState::BlendFactor);
     }
 
@@ -2132,7 +2137,7 @@ public:
         ((pso_graphics_->rtv_mask ^ graphics_pso->rtv_mask) & ((1u << num_rtvs) - 1)) ||
         (dsv.Texture && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
       allocator_->InvalidateCurrentPass();
-    if (!pso_graphics_ || pso_graphics_->zero_blend_color != graphics_pso->zero_blend_color)
+    if (graphics_pso->shader_blend)
       dirty_state_.set(DirtyState::BlendFactor);
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;

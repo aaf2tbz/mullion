@@ -2,11 +2,15 @@
 
 #include "Metal.hpp"
 #include "../airconv/airconv_public.h"
+#include "d3d12.h"
 #include "mullion_buffer.hpp"
 #include "mullion_command_constants.hpp"
+#include "mullion_format.hpp"
 #include "mullion_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
+#include <bit>
+#include <cfloat>
 #include <cmath>
 #include <span>
 #include <unordered_map>
@@ -99,52 +103,52 @@ RasterizeAsLines(State &state) {
   state.winding = WMTWindingCounterClockwise;
 }
 
-// Metal's blender drops the product of a Zero weight, where D3D propagates NaNs and signed zeros through it (D3D11.3
-// 17.2, "including 0.0 blend weights"), and multiplies by a weight of the blend color at 0. a float
-// target's Zero weights become that, when no target weighs by the blend color; the pipeline then draws with a blend
-// color of 0, which this says. Metal folds one weight of both sides into (s op d) * w, which loses the sign of a zero,
-// so the color channels' two take the blend color and its alpha; the alpha channel has no second weight that is 0
-inline bool
-MultiplyZeroWeights(std::span<WMTColorAttachmentBlendInfo> colors) {
-  auto constant = [](WMTBlendFactor f) {
-    return f == WMTBlendFactorBlendColor || f == WMTBlendFactorOneMinusBlendColor || f == WMTBlendFactorBlendAlpha ||
-           f == WMTBlendFactorOneMinusBlendAlpha;
-  };
-  auto floating = [](WMTPixelFormat f) {
-    switch (f) {
-    case WMTPixelFormatR16Float:
-    case WMTPixelFormatRG16Float:
-    case WMTPixelFormatRGBA16Float:
-    case WMTPixelFormatR32Float:
-    case WMTPixelFormatRG32Float:
-    case WMTPixelFormatRGBA32Float:
-    case WMTPixelFormatRG11B10Float:
-      return true;
-    default:
-      return false;
-    }
-  };
-  bool zero = false;
-  for (auto &c : colors)
-    if (c.blending_enabled) {
-      if (constant(c.src_rgb_blend_factor) || constant(c.dst_rgb_blend_factor) || constant(c.src_alpha_blend_factor) ||
-          constant(c.dst_alpha_blend_factor))
-        return false;
-      zero |= floating(c.pixel_format) &&
-              (c.src_rgb_blend_factor == WMTBlendFactorZero || c.dst_rgb_blend_factor == WMTBlendFactorZero ||
-               c.src_alpha_blend_factor == WMTBlendFactorZero || c.dst_alpha_blend_factor == WMTBlendFactorZero);
-    }
-  if (!zero)
-    return false;
-  for (auto &c : colors)
-    if (c.blending_enabled && floating(c.pixel_format))
-      for (auto [factor, by] : {std::pair{&c.src_rgb_blend_factor, WMTBlendFactorBlendColor},
-                                {&c.dst_rgb_blend_factor, WMTBlendFactorBlendAlpha},
-                                {&c.src_alpha_blend_factor, WMTBlendFactorBlendAlpha},
-                                {&c.dst_alpha_blend_factor, WMTBlendFactorBlendAlpha}})
-        if (*factor == WMTBlendFactorZero)
-          *factor = by;
-  return true;
+// the target the pixel shader blends itself (SM50_SHADER_BLEND), with Metal's blending off for it, where Metal's
+// blender keeps other results than D3D's: a blended float target, whose NaNs and signed zeros D3D keeps through every
+// weight (D3D11.3 17.5) and Metal's rewritten equation loses (it drops a Zero weight's product, folds a weight both
+// sides share, and reverse subtracts complementary weights into -0), and a UINT target's logic op (17.7), which Metal
+// offers only privately and saturates where D3D keeps the channel's bits. `desc` is a D3D11 or D3D12 render target blend description, whose
+// members and values agree
+template <typename Desc>
+inline SM50_SHADER_BLEND
+ShaderBlend(WMTColorAttachmentBlendInfo &color, const Desc &desc, bool logic) {
+  // a format without alpha reads its destination alpha as 1 into the blender (D3D11.3 19.3.4), where Metal reads the
+  // channel it stores the format with; SourceAlphaSaturated is min(As, 1 - Ad) for color and 1 for alpha
+  if (GET_SWIZZLE_ALPHA(color.pixel_format) == WMTTextureSwizzleOne)
+    for (auto [factor, saturated] : {std::pair{&color.src_rgb_blend_factor, WMTBlendFactorZero},
+                                     {&color.dst_rgb_blend_factor, WMTBlendFactorZero},
+                                     {&color.src_alpha_blend_factor, WMTBlendFactorOne},
+                                     {&color.dst_alpha_blend_factor, WMTBlendFactorOne}})
+      *factor = *factor == WMTBlendFactorDestinationAlpha             ? WMTBlendFactorOne
+                : *factor == WMTBlendFactorOneMinusDestinationAlpha ? WMTBlendFactorZero
+                : *factor == WMTBlendFactorSourceAlphaSaturated     ? saturated
+                                                                    : *factor;
+  SM50_SHADER_BLEND blend{};
+  auto format = WMTPixelFormat(ORIGINAL_FORMAT(color.pixel_format));
+  bool integer = IsIntegerFormat(format);
+  if (logic && integer) {
+    WMTClearColor high{FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
+    SanitizeRTVClearColor(format, high);
+    blend.logic = true;
+    blend.logic_op = desc.LogicOp;
+    for (auto [bits, value] : {std::pair{&blend.bits[0], high.r}, {&blend.bits[1], high.g}, {&blend.bits[2], high.b},
+                               {&blend.bits[3], high.a}})
+      *bits = std::bit_width(uint64_t(value));
+  } else {
+    MTL_DXGI_FORMAT_DESC description{};
+    description.PixelFormat = format;
+    if (!color.blending_enabled || integer || BorderColorRange(description)[1] <= 1)
+      return blend;
+    blend.blend = true;
+    blend.src = desc.SrcBlend;
+    blend.dst = desc.DestBlend;
+    blend.op = desc.BlendOp;
+    blend.src_alpha = desc.SrcBlendAlpha;
+    blend.dst_alpha = desc.DestBlendAlpha;
+    blend.op_alpha = desc.BlendOpAlpha;
+  }
+  color.blending_enabled = false;
+  return blend;
 }
 
 struct TileBarrierPSOKey {

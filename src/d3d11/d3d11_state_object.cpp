@@ -103,17 +103,6 @@ constexpr WMTBlendOperation kBlendOpMap[] = {
     WMTBlendOperationMax,
 };
 
-constexpr WMTLogicOperation kLogicOpMap[] = {
-    WMTLogicOperationClear,      WMTLogicOperationSet,
-    WMTLogicOperationCopy,       WMTLogicOperationCopyInverted,
-    WMTLogicOperationNoOp,       WMTLogicOperationInvert,
-    WMTLogicOperationAnd,        WMTLogicOperationNand,
-    WMTLogicOperationOr,         WMTLogicOperationNor,
-    WMTLogicOperationXor,        WMTLogicOperationEquiv,
-    WMTLogicOperationAndReverse, WMTLogicOperationAndInverted,
-    WMTLogicOperationOrReverse,  WMTLogicOperationOrInverted,
-};
-
 constexpr WMTBlendFactor kBlendFactorMap[] = {
     WMTBlendFactorZero, // padding 0
     WMTBlendFactorZero,
@@ -316,7 +305,17 @@ public:
   bool IsDualSourceBlending() { return dual_source_blending_; }
   bool IsAlphaToCoverage() { return desc_.AlphaToCoverageEnable; }
 
-  bool SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *info, uint32_t num_rt, uint32_t valid_rt) {
+  std::array<SM50_SHADER_BLEND, 8>
+  SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *info, uint32_t num_rt, uint32_t valid_rt) {
+    /*
+    D3D11.3 Spec:
+    Configuration of logic op is constrained in the following way:
+    (a) for logic ops to be used, IndependentBlendEnable must be set to false, so the logic op that has meaning comes
+        from the first RT blend desc and applies to all RTs.
+    (b) when logic blending all RenderTargets bound must have a UINT format (undefined rendering otherwise).
+    */
+    bool logic = !desc_.IndependentBlendEnable && desc_.RenderTarget[0].LogicOpEnable;
+    std::array<SM50_SHADER_BLEND, 8> blend{};
     for (unsigned rt = 0; rt < num_rt; rt++) {
       if (!(valid_rt & (1 << rt)))
         continue;
@@ -338,26 +337,13 @@ public:
         attachment_desc.dst_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.DestBlendAlpha];
         attachment_desc.dst_rgb_blend_factor = kBlendFactorMap[renderTarget.DestBlend];
       }
-    }
-    /*
-    D3D11.3 Spec:
-    Configuration of logic op is constrained in the following way:
-    (a) for logic ops to be used, IndependentBlendEnable must be set to false, so the logic op that has meaning comes
-        from the first RT blend desc and applies to all RTs.
-    (b) when logic blending all RenderTargets bound must have a UINT format (undefined rendering otherwise).
-    */
-    if (!desc_.IndependentBlendEnable && desc_.RenderTarget[0].LogicOpEnable) {
-#ifdef MULLION_NO_PRIVATE_API
-      ERR("OutputMerger LogicOp is not supported");
-#else
-      info->logic_operation_enabled = true;
-      info->logic_operation = kLogicOpMap[desc_.RenderTarget[0].LogicOp];
-#endif
+      if (attachment_desc.pixel_format != WMTPixelFormatInvalid)
+        blend[rt] = ShaderBlend(attachment_desc, renderTarget, logic);
     }
     // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
     info->alpha_to_coverage_enabled =
         desc_.AlphaToCoverageEnable && !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info->colors[0].pixel_format)));
-    return MultiplyZeroWeights(info->colors);
+    return blend;
   }
 
 private:

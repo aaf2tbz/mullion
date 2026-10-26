@@ -5,6 +5,7 @@
 #include "d3d11_device.hpp"
 #include "d3d11_device_child.hpp"
 #include "d3d11_input_layout.hpp"
+#include "d3d11_state_object.hpp"
 #include "sha1/sha1_util.hpp"
 #include "log/log.hpp"
 #include "mullion_shader_cache.hpp"
@@ -16,6 +17,12 @@ struct MTL_COMPILED_SHADER {
   */
   WMT::Function Function;
 };
+
+// a shader blend is its bytes, which have no padding
+inline bool
+operator==(const SM50_SHADER_BLEND &a, const SM50_SHADER_BLEND &b) {
+  return !memcmp(&a, &b, sizeof(a));
+}
 
 namespace mullion {
 class Shader;
@@ -116,6 +123,7 @@ struct ShaderVariantPixel {
   bool single_raster_sample = false;
   uint32_t clip_distances = 0;
   std::array<uint32_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
+  std::array<SM50_SHADER_BLEND, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.blend)> blend{};
   bool operator==(const this_type &rhs) const = default;
 };
 
@@ -217,8 +225,13 @@ public:
   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
-  CompiledShader *get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats) {
+  CompiledShader *
+  get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats, IMTLD3D11BlendState *blend) {
     variant.pixel_formats = PixelShaderOutputFormats(reflection().PixelShader, formats, variant.dual_source_blending);
+    WMTRenderPipelineBlendInfo targets{};
+    for (unsigned i = 0; i < formats.size(); i++)
+      targets.colors[i].pixel_format = formats[i];
+    variant.blend = blend->SetupMetalPipelineDescriptor(&targets, formats.size(), reflection().PSValidRenderTargets);
     variant.alpha_to_coverage &= !reflection().PixelShader.HasCoverageOutput && !formats.empty() &&
                                  IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(formats[0])));
     return get_shader(variant);

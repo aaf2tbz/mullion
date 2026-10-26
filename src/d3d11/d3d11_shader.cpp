@@ -182,6 +182,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.centered_samples);
   h.update(variant.single_raster_sample);
   h.update(variant.clip_distances);
+  h.update(variant.blend);
   auto variant_digest = h.final();
   std::string func_name = "ps_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
 
@@ -199,6 +200,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.centered_samples = variant.centered_samples;
     data.single_raster_sample = variant.single_raster_sample;
     data.clip_distances = variant.clip_distances;
+    std::copy(variant.blend.begin(), variant.blend.end(), data.blend);
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;

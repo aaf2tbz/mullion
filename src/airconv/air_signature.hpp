@@ -531,6 +531,11 @@ struct InputPrimitiveID {};
 struct InputFrontFacing {};
 struct InputInputCoverage {};
 struct InputSampleIndex {};
+// what a color attachment holds, read before the shader's output replaces it ([[color(index)]])
+struct InputRenderTarget {
+  uint32_t index;
+  MSLScalerOrVectorType type;
+};
 
 struct InputPayload {
   uint32_t size;
@@ -624,7 +629,7 @@ using FunctionInput = template_concat_t<
     /* fragment */
     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
     InputFrontFacing, InputPosition, InputSampleIndex, //
-    InputFragmentStageIn, InputInputCoverage,
+    InputFragmentStageIn, InputInputCoverage, InputRenderTarget,
     /* object & mesh */
     InputPayload, InputMeshGridProperties, InputMesh,
     /* kernel */

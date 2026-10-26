@@ -68,15 +68,6 @@ constexpr WMTBlendOperation kBlendOpMap[] = {
     WMTBlendOperationMin, WMTBlendOperationMax,
 };
 
-constexpr WMTLogicOperation kLogicOpMap[] = {
-    WMTLogicOperationClear,        WMTLogicOperationSet,         WMTLogicOperationCopy,
-    WMTLogicOperationCopyInverted, WMTLogicOperationNoOp,        WMTLogicOperationInvert,
-    WMTLogicOperationAnd,          WMTLogicOperationNand,        WMTLogicOperationOr,
-    WMTLogicOperationNor,          WMTLogicOperationXor,         WMTLogicOperationEquiv,
-    WMTLogicOperationAndReverse,   WMTLogicOperationAndInverted, WMTLogicOperationOrReverse,
-    WMTLogicOperationOrInverted,
-};
-
 constexpr WMTBlendFactor kBlendFactorMap[] = {
     WMTBlendFactorZero, // padding 0
     WMTBlendFactorZero,
@@ -405,9 +396,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
-      auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips] =
+      auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend] =
           *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
-      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips);
+      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -567,8 +558,12 @@ protected:
   };
   std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
   mullion::mutex render_targets_mutex_;
-  std::function<WMT::Reference<WMT::Function>()> statistics_pixel_shader_;
-  WMT::Reference<WMT::Function> statistics_ps_;
+  // the pixel shader made again when first needed: counting pipeline statistics, or blending only the targets a pass
+  // binds, as Metal refuses a pipeline whose shader reads a target it has no format for
+  std::function<WMT::Reference<WMT::Function>(bool statistics, uint32_t blends)> pixel_shader_;
+  std::unordered_map<uint32_t, WMT::Reference<WMT::Function>> pixel_shaders_;
+  // the targets the pixel shader blends itself (ShaderBlend)
+  uint32_t blend_mask_ = 0;
 
   template <typename Info>
   WMT::Reference<WMT::RenderPipelineState>
@@ -784,7 +779,10 @@ public:
 
   template <typename RenderPipelineInfo>
   HRESULT
-  InitializePSO(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, RenderPipelineInfo &info, bool &dual_source_blending) {
+  InitializePSO(
+      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, RenderPipelineInfo &info, bool &dual_source_blending,
+      SM50_SHADER_BLEND (&blend)[8]
+  ) {
     HRESULT hr;
     MTL_DXGI_FORMAT_DESC format_desc;
     uint32_t effective_dual_source_rtvs = 0;
@@ -838,22 +836,14 @@ public:
         rt.dst_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.DestBlendAlpha];
         rt.dst_rgb_blend_factor = kBlendFactorMap[renderTarget.DestBlend];
       }
+      if (ref_ps.PixelShader.ValidRenderTargets & (1u << i))
+        blend[i] = ShaderBlend(rt, renderTarget, renderTarget.LogicOpEnable);
       if (i < 2)
         effective_dual_source_rtvs++;
     }
 
     if (dual_source_blending && effective_dual_source_rtvs > 1)
       return FAIL(E_INVALIDARG);
-
-    // one logic op, the first target's, for all: independent blending cannot carry one
-    if (pDesc->BlendState.RenderTarget[0].LogicOpEnable) {
-#ifdef MULLION_NO_PRIVATE_API
-      return FAIL(E_INVALIDARG);
-#else
-      info.logic_operation_enabled = true;
-      info.logic_operation = kLogicOpMap[pDesc->BlendState.RenderTarget[0].LogicOp];
-#endif
-    }
 
     if (pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN) {
       if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->DSVFormat, format_desc))) {
@@ -899,7 +889,9 @@ public:
     // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
     info.alpha_to_coverage_enabled = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
                                      !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info.colors[0].pixel_format)));
-    zero_blend_color = MultiplyZeroWeights(info.colors);
+    for (unsigned i = 0; i < std::size(blend); i++)
+      blend_mask_ |= uint32_t(blend[i].blend) << i;
+    shader_blend = blend_mask_;
 
     return S_OK;
   }
@@ -1179,8 +1171,9 @@ public:
     WMTMeshRenderPipelineInfo mesh_info;
     WMT::InitializeMeshRenderPipelineInfo(mesh_info);
     bool dual_source_blending = false;
-    if (FAILED(hr = mesh ? InitializePSO(pDesc, mesh_info, dual_source_blending)
-                         : InitializePSO(pDesc, info, dual_source_blending)))
+    SM50_SHADER_BLEND blend[8] = {};
+    if (FAILED(hr = mesh ? InitializePSO(pDesc, mesh_info, dual_source_blending, blend)
+                         : InitializePSO(pDesc, info, dual_source_blending, blend)))
       return hr;
 
     if (pDesc->PS.pShaderBytecode) {
@@ -1206,6 +1199,7 @@ public:
       // one sample rasterizes at the pixel center, and the targets' samples with it (D3D11.3 3.5.6.2)
       data_ps.single_raster_sample = attached && pDesc->RasterizerState.ForcedSampleCount == 1;
       data_ps.clip_distances = clips;
+      std::copy(std::begin(blend), std::end(blend), data_ps.blend);
       data_ps.centered_samples =
           data_ps.single_raster_sample || pDesc->SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN;
 
@@ -1219,19 +1213,25 @@ public:
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       if (!(ps_func = function(shader_ps, pDesc->PS, root_signature(rootsig, &data_ps), ps_name.c_str())))
         return FAIL(E_INVALIDARG);
-      statistics_pixel_shader_ =
+      pixel_shader_ =
           [this, code = std::string((const char *)pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength),
-           signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common, ps_name]() mutable {
+           signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common,
+           ps_name](bool statistics, uint32_t blends) mutable {
             D3D12_SHADER_BYTECODE bytecode{code.data(), code.size()};
             SM50Shader shader;
             MTL_SHADER_REFLECTION reflection;
             if (FAILED(InitializeShader(device_, bytecode, &shader, &reflection)))
               return WMT::Reference<WMT::Function>{};
-            data_ps.pipeline_statistics = true;
-            data_ps.next = &common;
+            auto data = data_ps;
+            data.pipeline_statistics = statistics;
+            for (unsigned i = 0; i < std::size(data.blend); i++)
+              if (!(blends >> i & 1))
+                data.blend[i] = {};
+            data.next = &common;
             SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
-            auto arguments = RootSignature(rootsig, signature.ptr(), &data_ps);
-            return CompileFunction(device_, this, std::span(&bytecode, 1), arguments, (ps_name + "_statistics").c_str(),
+            auto arguments = RootSignature(rootsig, signature.ptr(), &data);
+            auto name = ps_name + "_" + std::to_string(blends | statistics << 8);
+            return CompileFunction(device_, this, std::span(&bytecode, 1), arguments, name.c_str(),
                                    [&shader](auto args, auto name, auto bitcode, auto error) {
                                      return SM50Compile(shader, args, name, bitcode, error);
                                    });
@@ -1257,7 +1257,8 @@ public:
       in->primitive = pDesc->PrimitiveTopologyType;
       WMT::InitializeMeshRenderPipelineInfo(in->info);
       bool dual_source = false;
-      if (FAILED(InitializePSO(pDesc, in->info, dual_source)))
+      SM50_SHADER_BLEND blend[8] = {};
+      if (FAILED(InitializePSO(pDesc, in->info, dual_source, blend)))
         in.reset();
       return in;
     };
@@ -1463,13 +1464,11 @@ public:
     // Graphics Rendering: Render Command Encoder, Creating and Configuring a Render Pipeline Descriptor)
     auto pipeline = std::visit(
         [&](auto info) {
-          if (Statistics && info.fragment_function) {
-            if (!statistics_ps_) {
-              if (!(statistics_ps_ = statistics_pixel_shader_()))
-                return WMT::Reference<WMT::RenderPipelineState>{};
-              statistics_pixel_shader_ = {};
-            }
-            info.fragment_function = statistics_ps_;
+          if (auto blends = blend_mask_ & Mask; info.fragment_function && (Statistics || blends != blend_mask_)) {
+            auto &ps = pixel_shaders_[blends | Statistics << 8];
+            if (!ps && !(ps = pixel_shader_(Statistics, blends)))
+              return WMT::Reference<WMT::RenderPipelineState>{};
+            info.fragment_function = ps;
           }
           if constexpr (std::is_same_v<decltype(info), WMTMeshRenderPipelineInfo>)
             if (Statistics && descriptor.statistics_geometry_shader) {

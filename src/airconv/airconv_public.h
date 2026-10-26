@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 75
+#define AIRCONV_VERSION 76
 
 #ifdef __cplusplus
 #include <string>
@@ -37,7 +37,8 @@ enum SM50_BINDING_INDEX: uint32_t {
   /* a geometry draw's first object threadgroup and instance (uint2): not zero where a draw runs in parts */
   SM50_BINDING_INDEX_DRAW_ORIGIN = 9,
   SM50_BINDING_INDEX_PIPELINE_STATISTICS = SM50_BINDING_INDEX_DRAW_ORIGIN + 1,
-  /* each viewport's MinDepth and MaxDepth (float2), for a pixel shader that writes depth */
+  /* each of the SM50_VIEWPORTS viewports' MinDepth and MaxDepth (float2), for a pixel shader that writes depth, then
+     the blend factor (float4), for one that blends with it (SM50_SHADER_BLEND) */
   SM50_BINDING_INDEX_DEPTH_RANGES = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 1,
   /* what the stage before the rasterizer multiplies a position's x and y by (float), the inverse of the factor
      Metal's viewports are larger by than the application's; then the width and height of each of the
@@ -429,6 +430,18 @@ struct SM50_SHADER_COMMON_DATA {
 #define SM50_PIXEL_FORMAT_CHANNELS (1u << 16)
 #define SM50_PIXEL_FORMAT_CHANNEL(format, channel) (((format) >> (8 + 2 * (channel))) & 3)
 
+/* a render target the pixel shader blends with what it holds, where Metal's blender cannot keep D3D's results: a
+   float target, through whose every weight D3D propagates NaNs and signed zeros (D3D11.3 17.5), and logic ops, whose
+   results keep the channel's own bits (D3D11.3 17.4). the operations and weights are D3D12_BLEND_OP, D3D12_BLEND and
+   D3D12_LOGIC_OP values, which D3D11's equal; a weight of the blend factor reads it after the depth ranges at
+   SM50_BINDING_INDEX_DEPTH_RANGES */
+struct SM50_SHADER_BLEND {
+  uint8_t blend, logic;
+  uint8_t src, dst, op, src_alpha, dst_alpha, op_alpha, logic_op;
+  /* the bits of each stored channel of a logic op's target, in the target's order */
+  uint8_t bits[4];
+};
+
 struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -448,6 +461,7 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   bool single_raster_sample;
   /* how many clip distances reach the shader as varyings, to test at each sample (D3D11.3 15.4.1) */
   uint32_t clip_distances;
+  struct SM50_SHADER_BLEND blend[8];
 };
 
 struct SM50_IA_INPUT_ELEMENT {

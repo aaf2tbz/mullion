@@ -474,6 +474,9 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
                        std::get<ArgumentBindingIndirectBuffer>(element.value())
                          .location_index;
               },
+              [&](const InputRenderTarget s) {
+                return s.index == std::get<InputRenderTarget>(element.value()).index;
+              },
               [](auto) { return true; }
             },
             input
@@ -845,6 +848,15 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("air.arg_name")
             ->string("mtl_primitive_id");
           return msl_uint.get_llvm_type(context);
+        },
+        [&](const InputRenderTarget &target) {
+          metadata_field.string("air.render_target")
+            ->integer(target.index)
+            ->string("air.arg_type_name")
+            ->string(get_name(target.type))
+            ->string("air.arg_name")
+            ->string("render_target_in_" + std::to_string(target.index));
+          return get_llvm_type(target.type, context);
         },
         [&](const InputInputCoverage &) {
           metadata_field.string("air.sample_mask_in")

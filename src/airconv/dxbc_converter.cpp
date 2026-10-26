@@ -2,6 +2,7 @@
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
+#include "d3d12.h"
 #include "../winemetal/winemetal.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
@@ -386,6 +387,132 @@ gate_writes(llvm::Function &function, llvm::Value *live) {
   }
 }
 
+// D3D12_BLEND_ALPHA_FACTOR and D3D12_BLEND_INV_ALPHA_FACTOR (d3d12.h of the Agility SDK), which the native headers
+// predate
+constexpr uint8_t blend_alpha_factor = 20, blend_inv_alpha_factor = 21;
+
+// whether a weight of the blend reads the blend factor
+static bool
+weighs_by_factor(const SM50_SHADER_BLEND &b) {
+  auto factor = [](uint8_t w) {
+    return w == D3D12_BLEND_BLEND_FACTOR || w == D3D12_BLEND_INV_BLEND_FACTOR || w == blend_alpha_factor ||
+           w == blend_inv_alpha_factor;
+  };
+  return b.blend && (factor(b.src) || factor(b.dst) || factor(b.src_alpha) || factor(b.dst_alpha));
+}
+
+// output register `reg` blended with what its target holds (`held`, in the target's channels), as D3D's output
+// merger does: each weight multiplies as written, so NaNs and signed zeros pass a weight of 0 (D3D11.3 17.5), MIN and
+// MAX take no weights (17.1), and a logic op's result keeps the bits of the target's channels (17.4). the register is
+// left in D3D's component order, which the epilogue stores
+static void
+blend_output(
+  struct context &ctx, const SM50_SHADER_BLEND &b, uint32_t reg, llvm::Value *held, llvm::Value *factors,
+  uint32_t format
+) {
+  auto &ir = ctx.builder;
+  // channel k of the target holds component order[k]
+  std::array<unsigned, 4> order{0, 1, 2, 3};
+  if (format & SM50_PIXEL_FORMAT_CHANNELS)
+    for (unsigned k = 0; k < 4; k++)
+      order[k] = SM50_PIXEL_FORMAT_CHANNEL(format, k);
+  std::array<llvm::Value *, 4> d;
+  std::array<uint8_t, 4> bits{};
+  for (unsigned k = 0; k < 4; k++)
+    d[order[k]] = ir.CreateExtractElement(held, k), bits[order[k]] = b.bits[k];
+  auto at = [&](llvm::Type *type, uint32_t r) {
+    auto file = type == ctx.types._int4 ? ctx.resource.output.ptr_int4 : ctx.resource.output.ptr_float4;
+    return ir.CreateConstInBoundsGEP2_32(llvm::ArrayType::get(type, ctx.resource.output_element_count), file, 0, r);
+  };
+  if (b.logic) {
+    auto s = ir.CreateLoad(ctx.types._int4, at(ctx.types._int4, reg));
+    llvm::Value *result = s;
+    for (unsigned c = 0; c < 4; c++) {
+      auto x = ir.CreateExtractElement(s, c), y = d[c];
+      llvm::Value *r = nullptr;
+      switch (b.logic_op) {
+      case D3D12_LOGIC_OP_CLEAR: r = ir.getInt32(0); break;
+      case D3D12_LOGIC_OP_SET: r = ir.getInt32(~0u); break;
+      case D3D12_LOGIC_OP_COPY: r = x; break;
+      case D3D12_LOGIC_OP_COPY_INVERTED: r = ir.CreateNot(x); break;
+      case D3D12_LOGIC_OP_NOOP: r = y; break;
+      case D3D12_LOGIC_OP_INVERT: r = ir.CreateNot(y); break;
+      case D3D12_LOGIC_OP_AND: r = ir.CreateAnd(x, y); break;
+      case D3D12_LOGIC_OP_NAND: r = ir.CreateNot(ir.CreateAnd(x, y)); break;
+      case D3D12_LOGIC_OP_OR: r = ir.CreateOr(x, y); break;
+      case D3D12_LOGIC_OP_NOR: r = ir.CreateNot(ir.CreateOr(x, y)); break;
+      case D3D12_LOGIC_OP_XOR: r = ir.CreateXor(x, y); break;
+      case D3D12_LOGIC_OP_EQUIV: r = ir.CreateNot(ir.CreateXor(x, y)); break;
+      case D3D12_LOGIC_OP_AND_REVERSE: r = ir.CreateAnd(x, ir.CreateNot(y)); break;
+      case D3D12_LOGIC_OP_AND_INVERTED: r = ir.CreateAnd(ir.CreateNot(x), y); break;
+      case D3D12_LOGIC_OP_OR_REVERSE: r = ir.CreateOr(x, ir.CreateNot(y)); break;
+      default: r = ir.CreateOr(ir.CreateNot(x), y); break; // D3D12_LOGIC_OP_OR_INVERTED
+      }
+      // the target stores a wider value saturated, where D3D keeps the channel's bits
+      if (bits[c] && bits[c] < 32)
+        r = ir.CreateAnd(r, ir.getInt32((1u << bits[c]) - 1));
+      result = ir.CreateInsertElement(result, r, c);
+    }
+    ir.CreateStore(result, at(ctx.types._int4, reg));
+    return;
+  }
+  auto s = ir.CreateLoad(ctx.types._float4, at(ctx.types._float4, reg));
+  // the second source of a dual-source blend is o1, which leaves through no target of its own
+  auto s1 = reg == 0 && ctx.resource.output_element_count > 1
+              ? ir.CreateLoad(ctx.types._float4, at(ctx.types._float4, 1))
+              : (llvm::Value *)llvm::ConstantAggregateZero::get(ctx.types._float4);
+  auto one = llvm::ConstantFP::get(ctx.types._float, 1.0);
+  auto factor = [&](unsigned c) {
+    return ir.CreateLoad(ctx.types._float, ir.CreateConstGEP1_32(ctx.types._float, factors, 2 * SM50_VIEWPORTS + c));
+  };
+  auto weight = [&](uint8_t w, unsigned c) -> llvm::Value * {
+    auto sc = ir.CreateExtractElement(s, c), sa = ir.CreateExtractElement(s, 3u);
+    auto s1c = ir.CreateExtractElement(s1, c), s1a = ir.CreateExtractElement(s1, 3u);
+    switch (w) {
+    case D3D12_BLEND_ZERO: return llvm::ConstantFP::get(ctx.types._float, 0.0);
+    case D3D12_BLEND_ONE: return one;
+    case D3D12_BLEND_SRC_COLOR: return sc;
+    case D3D12_BLEND_INV_SRC_COLOR: return ir.CreateFSub(one, sc);
+    case D3D12_BLEND_SRC_ALPHA: return sa;
+    case D3D12_BLEND_INV_SRC_ALPHA: return ir.CreateFSub(one, sa);
+    case D3D12_BLEND_DEST_ALPHA: return d[3];
+    case D3D12_BLEND_INV_DEST_ALPHA: return ir.CreateFSub(one, d[3]);
+    case D3D12_BLEND_DEST_COLOR: return d[c];
+    case D3D12_BLEND_INV_DEST_COLOR: return ir.CreateFSub(one, d[c]);
+    case D3D12_BLEND_SRC_ALPHA_SAT:
+      return c == 3 ? one
+                    : ctx.air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, sa, ir.CreateFSub(one, d[3]), false);
+    case D3D12_BLEND_BLEND_FACTOR: return factor(c);
+    case D3D12_BLEND_INV_BLEND_FACTOR: return ir.CreateFSub(one, factor(c));
+    case D3D12_BLEND_SRC1_COLOR: return s1c;
+    case D3D12_BLEND_INV_SRC1_COLOR: return ir.CreateFSub(one, s1c);
+    case D3D12_BLEND_SRC1_ALPHA: return s1a;
+    case D3D12_BLEND_INV_SRC1_ALPHA: return ir.CreateFSub(one, s1a);
+    case blend_alpha_factor: return factor(3);
+    default: return ir.CreateFSub(one, factor(3)); // blend_inv_alpha_factor
+    }
+  };
+  llvm::Value *result = s;
+  for (unsigned c = 0; c < 4; c++) {
+    bool alpha = c == 3;
+    auto op = alpha ? b.op_alpha : b.op;
+    auto x = ir.CreateExtractElement(s, c), y = d[c];
+    llvm::Value *r;
+    if (op == D3D12_BLEND_OP_MIN || op == D3D12_BLEND_OP_MAX) {
+      r = ctx.air.CreateFPBinOp(
+        op == D3D12_BLEND_OP_MIN ? llvm::air::AIRBuilder::fmin : llvm::air::AIRBuilder::fmax, x, y, false
+      );
+    } else {
+      auto a = ir.CreateFMul(x, weight(alpha ? b.src_alpha : b.src, c));
+      auto z = ir.CreateFMul(y, weight(alpha ? b.dst_alpha : b.dst, c));
+      r = op == D3D12_BLEND_OP_ADD ? ir.CreateFAdd(a, z) : op == D3D12_BLEND_OP_SUBTRACT ? ir.CreateFSub(a, z)
+                                                                                         : ir.CreateFSub(z, a);
+    }
+    result = ir.CreateInsertElement(result, r, c);
+  }
+  ir.CreateStore(result, at(ctx.types._float4, reg));
+}
+
 llvm::Error convert_dxbc_pixel_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   llvm::LLVMContext &context, llvm::Module &module,
@@ -438,6 +565,7 @@ llvm::Error convert_dxbc_pixel_shader(
   {
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.dual_source_blending = pso_dual_source_blending;
+    sig_ctx.shader_blends_dual_source = pso_dual_source_blending && pso_data->blend[0].blend;
     // a shader's depth is ignored once the tests ran before it (D3D11.3 16.12.1)
     sig_ctx.disable_depth_output = pso_disable_depth_output || func_signature.EarlyFragmentTests();
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
@@ -451,7 +579,7 @@ llvm::Error convert_dxbc_pixel_shader(
   }
   // an unwritten o1 leaves the second blend source undefined (Vulkan, Dual-Source Blending); Metal refuses the
   // pipeline without one, so it is zero, as the epilogue starts every output
-  if (pso_dual_source_blending && !(pShaderInternal->pso_valid_output_reg_mask & 2))
+  if (pso_dual_source_blending && !(pShaderInternal->pso_valid_output_reg_mask & 2) && !pso_data->blend[0].blend)
     func_signature.DefineOutput(air::OutputRenderTarget{.dual_source_blending = true, .index = 1, .type = air::msl_float4});
   if (pso_sample_mask != 0xffffffff || pso_alpha_to_coverage || (pso_data && pso_data->clip_distances)) {
     auto assigned_index =
@@ -534,6 +662,26 @@ llvm::Error convert_dxbc_pixel_shader(
                              : setup_binding_table2(shader_info, func_signature, module);
   if (!binding_map)
     return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
+
+  // the targets the shader blends itself take what they hold, and the blend factor when a weight is it
+  std::array<uint32_t, 8> held;
+  held.fill(~0u);
+  uint32_t factors = ~0u;
+  for (uint32_t rt = 0; pso_data && rt < 8; rt++) {
+    auto &b = pso_data->blend[rt];
+    if (!(b.blend || b.logic) || !(pShaderInternal->pso_valid_output_reg_mask & (1 << rt)))
+      continue;
+    held[rt] = func_signature.DefineInput(air::InputRenderTarget{rt, b.logic ? air::msl_uint4 : air::msl_float4});
+    if (weighs_by_factor(b))
+      factors = func_signature.DefineInput(air::ArgumentBindingBuffer{
+          .location_index = SM50_BINDING_INDEX_DEPTH_RANGES,
+          .array_size = 1,
+          .memory_access = air::MemoryAccess::read,
+          .address_space = air::AddressSpace::constant,
+          .type = air::msl_float,
+          .arg_name = "depth_ranges",
+      });
+  }
 
   auto [function, function_metadata] =
     func_signature.CreateFunction(name, context, module, 0, false);
@@ -661,6 +809,12 @@ llvm::Error convert_dxbc_pixel_shader(
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
+  for (uint32_t rt = 0; rt < 8; rt++)
+    if (held[rt] != ~0u)
+      blend_output(
+        ctx, pso_data->blend[rt], rt, function->getArg(held[rt]),
+        factors != ~0u ? function->getArg(factors) : nullptr, pso_pixel_formats ? pso_pixel_formats[rt] : 0
+      );
   auto epilogue_result = epilogue.build(ctx);
   if (auto err = epilogue_result.takeError()) {
     return err;

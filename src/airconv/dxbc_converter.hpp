@@ -376,6 +376,8 @@ struct SignatureContext {
   io_binding_map &resource;
   SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout;
   bool dual_source_blending;
+  // the shader blends target 0 itself, so its second source o1 leaves through no output
+  bool shader_blends_dual_source;
   bool disable_depth_output;
   bool skip_vertex_output;
   uint32_t pull_mode_reg_mask;
@@ -394,6 +396,7 @@ struct SignatureContext {
       resource(resource),
       ia_layout(nullptr),
       dual_source_blending(false),
+      shader_blends_dual_source(false),
       disable_depth_output(false),
       skip_vertex_output(false),
       pull_mode_reg_mask(0),
