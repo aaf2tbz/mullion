@@ -4043,6 +4043,54 @@ _WMTDiagWrite(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static int
+flight_order(const void *a, const void *b) {
+  uint64_t x = ((const struct WMTFlightEntry *)a)->time, y = ((const struct WMTFlightEntry *)b)->time;
+  return (x > y) - (x < y);
+}
+
+static NTSTATUS
+_WMTFlightWrite(void *obj) {
+  @autoreleasepool {
+    struct unixcall_wmtflight_write *params = obj;
+    static bool written;
+    struct WMTFlightEntry *entries = (struct WMTFlightEntry *)params->records.ptr;
+    const char *given = params->directory.ptr;
+    NSString *directory = *given ? [NSString stringWithUTF8String:given]
+                                 : [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Mullion"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil
+                                                    error:nil];
+    NSString *path = [directory
+        stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.flight", (const char *)params->executable.ptr]];
+    FILE *file = fopen(path.fileSystemRepresentation, written ? "a" : "w");
+    if (!file) {
+      perror("mullion: flight record");
+      return STATUS_SUCCESS;
+    }
+    written = true;
+    // stable: records a counter tick apart keep their thread's order, and the order the rings were read in otherwise
+    if (mergesort(entries, params->count, sizeof(*entries), flight_order))
+      perror("mullion: flight record order");
+    // a dump at the recorder's start has no time to scale its counter by: its records show in ticks
+    double frequency = params->frequency ? params->frequency : 1000;
+    fprintf(file, "== %s, process %d, %llu records (%llu overwritten, %llu lost), times in ms before the dump\n",
+            (const char *)params->reason.ptr, getpid(), params->count, params->overwritten, params->lost);
+    for (uint64_t i = 0; i < params->count; i++) {
+      struct WMTFlightEntry *entry = &entries[i];
+      fprintf(file, "%12.3f %6u ", ((double)params->now - (double)entry->time) * 1000 / frequency, entry->thread);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+      fprintf(file, (const char *)entry->site.ptr, entry->args[0], entry->args[1], entry->args[2], entry->args[3]);
+#pragma clang diagnostic pop
+      fputc('\n', file);
+    }
+    fclose(file);
+    fprintf(stderr, "mullion: flight record of %s in %s\n", (const char *)params->reason.ptr,
+            path.fileSystemRepresentation);
+    return STATUS_SUCCESS;
+  }
+}
+
 static NTSTATUS
 _WMTGPUStatistics(void *obj) {
   struct unixcall_wmtgpu_statistics *params = obj;
@@ -4273,6 +4321,7 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTGPUStatistics,
     &_MTLCommandBuffer_pushDebugGroup,
     &_MTLCommandBuffer_popDebugGroup,
+    &_WMTFlightWrite,
 };
 
 #ifndef MULLION_NATIVE
@@ -4454,6 +4503,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTGPUStatistics,
     &_MTLCommandBuffer_pushDebugGroup,
     &_MTLCommandBuffer_popDebugGroup,
+    &_WMTFlightWrite,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

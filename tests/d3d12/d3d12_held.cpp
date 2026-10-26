@@ -10,6 +10,7 @@
 #include "d3d12_test.hpp"
 #include <dxgi1_4.h>
 #include <cstring>
+#include <algorithm>
 
 static const char hlsl[] = R"hlsl(
 #ifndef SEED
@@ -64,8 +65,10 @@ pix_event(UINT metadata, UINT flags, const std::string &name) {
   return std::vector<char>((const char *)words.data(), (const char *)(words.data() + words.size()));
 }
 
-// pipelines the hitch frame makes, and how long the app frame sleeps
-static constexpr UINT made = 8, size = 64, buffers = 2;
+// the most pipelines the hitch frame may make: it makes them until it lasts three of the frames before it, whose
+// length the display can set (a frame waits for a drawable), so a hitch is one under any display; and how long the
+// app frame sleeps
+static constexpr UINT made = 64, size = 64, buffers = 2;
 static constexpr DWORD sleep_ms = 20;
 
 int
@@ -156,16 +159,20 @@ main(int argc, char **argv) {
     return time.QuadPart / qpc.QuadPart * 1000000000 + time.QuadPart % qpc.QuadPart * 1000000000 / qpc.QuadPart;
   };
   auto presented = now();
+  std::vector<long long> lengths;
   for (UINT f = 0; f < frames; f++) {
     if (mode == "app")
       Sleep(sleep_ms);
     if (mode == "hitch" && f == hitch) {
-      LARGE_INTEGER began, ended;
-      QueryPerformanceCounter(&began);
-      for (UINT seed = 1; seed <= made; seed++)
+      std::nth_element(lengths.begin(), lengths.begin() + lengths.size() / 2, lengths.end());
+      auto began = now(), median = lengths[lengths.size() / 2];
+      for (UINT seed = 1; seed <= made && now() - began < 3 * median; seed++)
         CHECK(pipeline(ps[seed], pso));
-      QueryPerformanceCounter(&ended);
-      printf("fact hitch %u %lld\n", f, (ended.QuadPart - began.QuadPart) * 1000000000 / qpc.QuadPart);
+      if (now() - began < 3 * median) {
+        printf("failed: %u pipelines took less than three frames of %lld ns\n", made, median);
+        return 1;
+      }
+      printf("fact hitch %u %lld\n", f, now() - began);
     }
     auto i = swapchain->GetCurrentBackBufferIndex();
     CHECK(allocator->Reset());
@@ -205,6 +212,8 @@ main(int argc, char **argv) {
     readback->Unmap(0, nullptr);
     printf("fact app %u %lld\n", f, now() - presented - waited);
     CHECK(swapchain->Present(0, 0));
+    lengths.push_back(now() - presented);
+    printf("fact frame %u %lld\n", f, lengths.back());
     presented = now();
     MSG msg;
     while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))

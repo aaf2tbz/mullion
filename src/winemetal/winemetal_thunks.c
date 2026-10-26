@@ -23,6 +23,8 @@
 
 #ifndef MULLION_NATIVE
 #include "winbase.h"
+#include "winnls.h"
+#include <intrin.h>
 
 int wmt_diag_calls;
 static struct WMTDiagCall diag_calls[WMTUnixCallCount];
@@ -62,6 +64,192 @@ WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]) {
     calls[code].count = InterlockedExchange64((LONG64 *)&diag_calls[code].count, 0);
     calls[code].ticks = InterlockedExchange64((LONG64 *)&diag_calls[code].ticks, 0);
     calls[code].name = diag_calls[code].name;
+  }
+}
+
+// a thread's ring holds about its last few frames of records. a ring outlives its thread, whose records it keeps
+// until the next thread that takes it writes over them
+enum { kFlightRecords = 4096 };
+struct flight_ring {
+  struct flight_ring *next;
+  DWORD owner;
+  int64_t written;
+  struct WMTFlightEntry entries[kFlightRecords];
+};
+static struct flight_ring *flight_rings;
+static DWORD flight_slot = TLS_OUT_OF_INDEXES;
+static int64_t flight_lost;
+static SRWLOCK flight_dump_lock = SRWLOCK_INIT;
+static LONG flight_dumps;
+// QueryPerformanceCounter is a system call in Wine on macOS (hundreds of ns a record), so records read the CPU's
+// counter, which the dump scales by the QueryPerformanceCounter time since the recorder started
+static uint64_t flight_started, flight_started_qpc;
+
+static inline uint64_t
+flight_ticks(void) {
+// ARM64EC code defines __x86_64__ too
+#if defined(__aarch64__) || defined(__arm64ec__)
+  uint64_t ticks;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+  return ticks;
+#elif defined(__x86_64__) || defined(__i386__)
+  return __rdtsc();
+#else
+#error "the flight recorder has no counter for this CPU"
+#endif
+}
+static const void *flight_exception_site;
+
+WINEMETAL_API const void *
+WMTFlightSite(const char *format) {
+  size_t size = strlen(format) + 1;
+  char *site = HeapAlloc(GetProcessHeap(), 0, size);
+  if (site)
+    memcpy(site, format, size);
+  return site;
+}
+
+static struct flight_ring *
+flight_take(void) {
+  DWORD self = GetCurrentThreadId();
+  struct flight_ring *ring;
+  for (ring = __atomic_load_n(&flight_rings, __ATOMIC_ACQUIRE); ring; ring = ring->next)
+    if (!__atomic_load_n(&ring->owner, __ATOMIC_RELAXED) && !InterlockedCompareExchange((LONG *)&ring->owner, self, 0))
+      break;
+  if (!ring) {
+    if (!(ring = VirtualAlloc(NULL, sizeof(*ring), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)))
+      return NULL;
+    ring->owner = self;
+    do
+      ring->next = __atomic_load_n(&flight_rings, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&flight_rings, &ring->next, ring, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+  }
+  TlsSetValue(flight_slot, ring);
+  return ring;
+}
+
+WINEMETAL_API void
+WMTFlightRecord(const void *site, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  struct flight_ring *ring = flight_slot == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(flight_slot);
+  if (!site || flight_slot == TLS_OUT_OF_INDEXES || (!ring && !(ring = flight_take()))) {
+    InterlockedIncrement64(&flight_lost);
+    return;
+  }
+  struct WMTFlightEntry *entry = &ring->entries[ring->written % kFlightRecords];
+  entry->time = flight_ticks();
+  WMT_MEMPTR_SET(entry->site, site);
+  entry->args[0] = a, entry->args[1] = b, entry->args[2] = c, entry->args[3] = d;
+  entry->thread = GetCurrentThreadId();
+  // a dump reads what is written before the count, and may read the one record being written torn
+  __atomic_store_n(&ring->written, ring->written + 1, __ATOMIC_RELEASE);
+}
+
+static int64_t
+flight_kept(int64_t written) {
+  return written < kFlightRecords ? written : kFlightRecords;
+}
+
+WINEMETAL_API void
+WMTFlightDump(const char *reason) {
+  AcquireSRWLockExclusive(&flight_dump_lock);
+  uint64_t count = 0, overwritten = 0;
+  struct flight_ring *rings = __atomic_load_n(&flight_rings, __ATOMIC_ACQUIRE), *ring;
+  for (ring = rings; ring; ring = ring->next)
+    count += flight_kept(__atomic_load_n(&ring->written, __ATOMIC_ACQUIRE));
+  struct WMTFlightEntry *entries =
+      count ? VirtualAlloc(NULL, count * sizeof(*entries), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : NULL;
+  if (count && !entries)
+    count = 0;
+  uint64_t at = 0;
+  for (ring = rings; ring && at < count; ring = ring->next) {
+    int64_t written = __atomic_load_n(&ring->written, __ATOMIC_ACQUIRE), kept = flight_kept(written);
+    for (int64_t i = written - kept; i < written && at < count; i++)
+      entries[at++] = ring->entries[i % kFlightRecords];
+    overwritten += written - kept;
+  }
+  WCHAR path[MAX_PATH];
+  char executable[3 * MAX_PATH] = "";
+  DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+  WCHAR *name = path + length;
+  while (name > path && name[-1] != '\\' && name[-1] != '/')
+    name--;
+  WideCharToMultiByte(CP_UTF8, 0, name, -1, executable, sizeof(executable), NULL, NULL);
+  LARGE_INTEGER frequency, now;
+  QueryPerformanceFrequency(&frequency);
+  QueryPerformanceCounter(&now);
+  uint64_t ticks = flight_ticks(), elapsed = now.QuadPart - flight_started_qpc;
+  // where MULLION_DIAG=profile writes its records, when it is set
+  char directory[MAX_PATH] = "";
+  if (GetEnvironmentVariableA("MULLION_DIAG_PATH", directory, sizeof(directory)) >= sizeof(directory))
+    directory[0] = 0;
+  struct unixcall_wmtflight_write params;
+  WMT_MEMPTR_SET(params.reason, reason);
+  WMT_MEMPTR_SET(params.directory, directory);
+  WMT_MEMPTR_SET(params.executable, executable);
+  WMT_MEMPTR_SET(params.records, entries);
+  params.count = at;
+  params.frequency = elapsed ? (double)(ticks - flight_started) * frequency.QuadPart / elapsed : 0;
+  params.now = ticks;
+  params.lost = __atomic_load_n(&flight_lost, __ATOMIC_RELAXED);
+  params.overwritten = overwritten;
+  UNIX_CALL(WMTUnixFlightWrite, &params);
+  flight_dumps++;
+  if (entries)
+    VirtualFree(entries, 0, MEM_RELEASE);
+  ReleaseSRWLockExclusive(&flight_dump_lock);
+}
+
+// the exceptions that end a process unless it catches them: the first dumps the records before its handlers run
+static LONG CALLBACK
+flight_exception(EXCEPTION_POINTERS *pointers) {
+  static LONG dumped;
+  EXCEPTION_RECORD *record = pointers->ExceptionRecord;
+  // informational and warning codes, such as OutputDebugString's, are not failures
+  if ((record->ExceptionCode >> 30) != 3)
+    return EXCEPTION_CONTINUE_SEARCH;
+  WMTFlightRecord(flight_exception_site, record->ExceptionCode, (uint64_t)(uintptr_t)record->ExceptionAddress,
+                  record->NumberParameters > 0 ? record->ExceptionInformation[0] : 0,
+                  record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0);
+  switch (record->ExceptionCode) {
+  case EXCEPTION_ACCESS_VIOLATION:
+  case EXCEPTION_ILLEGAL_INSTRUCTION:
+  case EXCEPTION_PRIV_INSTRUCTION:
+  case EXCEPTION_IN_PAGE_ERROR:
+  case EXCEPTION_STACK_OVERFLOW:
+  case EXCEPTION_INT_DIVIDE_BY_ZERO:
+  case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    if (!InterlockedExchange(&dumped, 1))
+      WMTFlightDump("exception");
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// a process that ends after a dump dumps what followed it, and MULLION_FLIGHT=exit dumps every process at its end
+void
+wmt_flight_main(DWORD reason, BOOL exiting) {
+  switch (reason) {
+  case DLL_PROCESS_ATTACH:
+    flight_slot = TlsAlloc();
+    LARGE_INTEGER started;
+    QueryPerformanceCounter(&started);
+    flight_started = flight_ticks();
+    flight_started_qpc = started.QuadPart;
+    flight_exception_site = WMTFlightSite("exception %#llx at %#llx, information %#llx %#llx");
+    AddVectoredExceptionHandler(1, flight_exception);
+    break;
+  case DLL_THREAD_DETACH: {
+    struct flight_ring *ring = TlsGetValue(flight_slot);
+    if (ring)
+      __atomic_store_n(&ring->owner, 0, __ATOMIC_RELEASE);
+    break;
+  }
+  case DLL_PROCESS_DETACH: {
+    char mode[8];
+    DWORD length = GetEnvironmentVariableA("MULLION_FLIGHT", mode, sizeof(mode));
+    if (exiting && (flight_dumps || (length < sizeof(mode) && !strcmp(mode, "exit"))))
+      WMTFlightDump("exit");
+    break;
+  }
   }
 }
 #endif

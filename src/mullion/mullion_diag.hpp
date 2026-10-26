@@ -12,6 +12,28 @@
 #include <utility>
 
 namespace mullion::diag {
+// the compiler checks a flight record's format against its arguments here, which must each be 64 bits
+[[gnu::format(printf, 1, 2)]] inline void
+FlightFormat(const char *, ...) {}
+
+template <typename T>
+uint64_t
+FlightWord(T value) {
+  static_assert(sizeof(T) == sizeof(uint64_t) || std::is_pointer_v<T>);
+  if constexpr (std::is_pointer_v<T>)
+    return uint64_t(uintptr_t(value));
+  else
+    return uint64_t(value);
+}
+
+template <typename... Args>
+void
+Flight(const void *site, Args... args) {
+  static_assert(sizeof...(Args) <= 4);
+  uint64_t words[4] = {FlightWord(args)...};
+  WMTFlightRecord(site, words[0], words[1], words[2], words[3]);
+}
+
 struct TimestampSamples {
   mullion::mutex mutex;
   mullion::condition_variable returned;
@@ -354,3 +376,12 @@ struct ProfileBuffer {
   std::vector<Pass> passes;
 };
 } // namespace mullion::diag
+
+// a record in the flight recorder (WMTFlightRecord), always on: a printf format of 64-bit integers, at most four
+#define FLIGHT(format, ...)                                                                                            \
+  do {                                                                                                                 \
+    static const void *const flight_site = WMTFlightSite(format);                                                      \
+    if (false)                                                                                                         \
+      ::mullion::diag::FlightFormat(format __VA_OPT__(, ) __VA_ARGS__);                                                \
+    ::mullion::diag::Flight(flight_site __VA_OPT__(, ) __VA_ARGS__);                                                   \
+  } while (0)

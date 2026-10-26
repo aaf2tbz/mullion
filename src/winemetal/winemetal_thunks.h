@@ -543,6 +543,11 @@ struct unixcall_wmtdiag_write {
   uint32_t ret;
 };
 
+struct unixcall_wmtflight_write {
+  struct WMTConstMemoryPointer reason, directory, executable, records;
+  uint64_t count, frequency, now, lost, overwritten;
+};
+
 #pragma pack(pop)
 
 #endif

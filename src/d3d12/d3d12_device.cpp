@@ -1322,6 +1322,8 @@ public:
         return;
       pending.swap(fences.values);
     }
+    FLIGHT("device %p is removed: %#llx", this, uint64_t(uint32_t(Reason)));
+    WMTFlightDump("a removed device");
     // RemoveDevice signals all fences to UINT64_MAX; late queue signals must not take them back.
     for (auto &fence : pending)
       fence->Reach(UINT64_MAX, true);

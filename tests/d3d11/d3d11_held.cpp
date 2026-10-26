@@ -6,6 +6,7 @@
 #include "d3d11_test.hpp"
 #include <d3d11_2.h>
 #include <dxgi.h>
+#include <algorithm>
 
 static const char hlsl[] = R"hlsl(
 #ifndef SEED
@@ -22,7 +23,9 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
   return float4(value & 255, 0, 0, 255) / 255;
 }
 )hlsl";
-static constexpr UINT made = 8, size = 64;
+// the most pipelines the hitch frame may make: it makes them until it lasts three of the frames before it, whose
+// length the display can set (a frame waits for a drawable), so a hitch is one under any display
+static constexpr UINT made = 64, size = 64;
 static constexpr DWORD sleep_ms = 20;
 
 template <typename T>
@@ -99,22 +102,26 @@ main(int argc, char **argv) {
     return time.QuadPart / qpc.QuadPart * 1000000000 + time.QuadPart % qpc.QuadPart * 1000000000 / qpc.QuadPart;
   };
   auto presented = now();
+  std::vector<long long> lengths;
   for (UINT f = 0; f < frames; f++) {
     if (mode == "app")
       Sleep(sleep_ms);
     if (mode == "hitch" && f == hitch) {
-      LARGE_INTEGER began, ended;
-      QueryPerformanceCounter(&began);
-      for (UINT seed = 1; seed <= made; seed++) {
+      std::nth_element(lengths.begin(), lengths.begin() + lengths.size() / 2, lengths.end());
+      auto began = now(), median = lengths[lengths.size() / 2];
+      for (UINT seed = 1; seed <= made && now() - began < 3 * median; seed++) {
         CHECK(shader(ps[seed].Get(), pixel));
         draw();
+        // a pipeline is made once its draw is encoded: the GPU finishing the draw says it was
+        context->End(end.Get());
+        UINT64 done;
+        wait(context.Get(), end.Get(), done);
       }
-      // the frame's pipelines are made once their draws are encoded: the GPU finishing them says they were
-      context->End(end.Get());
-      UINT64 done;
-      wait(context.Get(), end.Get(), done);
-      QueryPerformanceCounter(&ended);
-      printf("fact hitch %u %lld\n", f, (ended.QuadPart - began.QuadPart) * 1000000000 / qpc.QuadPart);
+      if (now() - began < 3 * median) {
+        printf("failed: %u pipelines took less than three frames of %lld ns\n", made, median);
+        return 1;
+      }
+      printf("fact hitch %u %lld\n", f, now() - began);
     }
     auto submitted = now();
     context->Begin(disjoint.Get());
@@ -145,6 +152,8 @@ main(int argc, char **argv) {
       printf("fact gpu %u %lld\n", f, (long long)((last - first) * 1000000000 / frequency.Frequency));
     printf("fact app %u %lld\n", f, now() - presented - waited);
     CHECK(swapchain->Present(0, 0));
+    lengths.push_back(now() - presented);
+    printf("fact frame %u %lld\n", f, lengths.back());
     presented = now();
     MSG msg;
     while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))

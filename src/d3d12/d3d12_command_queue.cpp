@@ -131,6 +131,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         *committed = diag::Now();
       if (device)
         device->CommitResidency();
+      FLIGHT("command buffer %#llx commits", buffer.handle);
       buffer.commit();
     }
   };
@@ -376,6 +377,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       WARN("command buffer ", seq, " of queue ", this, " has not completed for ", kStuckSeconds.count(),
           " s; Metal's status of it is ", uint64_t(inflight.cmdbuf.status()), " (2 committed, 3 scheduled); encoders by kind: ",
           encoders, inflight.presents ? "and a present" : "");
+      FLIGHT("queue %p: command buffer %llu has not completed in %lld s, status %llu", this, seq,
+             int64_t(kStuckSeconds.count()), uint64_t(inflight.cmdbuf.status()));
+      WMTFlightDump("a stuck command buffer");
       watch_changed_.wait(lock, [&] { return watch_stop_ || watched_seq_ != seq; });
     }
   }
@@ -421,6 +425,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       auto completed = profile_ ? diag::Now() : 0;
       Watched(0);
       Trace("command buffer ", internal_seq, " completed");
+      FLIGHT("queue %p: command buffer %llu completes, status %llu", this, internal_seq,
+             uint64_t(inflight.cmdbuf.status()));
       device_->CheckAtomicLocks();
       if (record_totals_)
         CompareGPURecords(inflight.records, record_totals_);
@@ -564,6 +570,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           ended, queue->profile_
                      ? &queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].committed
                      : nullptr);
+      FLIGHT("queue %p: command buffer %llu is %#llx", queue, queue->inflight_cmdbuf_seq_.load(), ended.handle);
       inflight = nullptr;
       queue->inflight_cmdbuf_seq_.fetch_add(1, std::memory_order_release);
       queue->inflight_cmdbuf_seq_.notify_one();
@@ -846,6 +853,7 @@ public:
         allocators[i]->pending++;
     }
     Trace("ExecuteCommandLists of ", Count);
+    FLIGHT("queue %p: ExecuteCommandLists of %llu", this, uint64_t(Count));
     auto work = [this, recorded = std::move(recorded), allocators = std::move(allocators)]() mutable {
       auto began = profile_ ? diag::Now() : 0;
       Commit(recorded, std::move(allocators));
@@ -1454,10 +1462,12 @@ public:
       std::lock_guard<mullion::mutex> lock(mutex_commit_);
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
+        FLIGHT("fence %p reaches %llu", fence.ptr(), Value);
         fence->Signaled(Value);
       });
     };
     Trace("Signal of fence ", pFence, " to ", Value);
+    FLIGHT("queue %p: Signal of fence %p to %llu", this, pFence, Value);
     if (!Hold(work))
       work();
     return S_OK;
@@ -1484,6 +1494,7 @@ public:
         StartCommitting();
     };
     Trace("Wait for fence ", pFence, " at ", Value, gate->closed ? ", which holds the queue" : ", which it has had");
+    FLIGHT("queue %p: Wait for fence %p at %llu, holding %llu", this, pFence, Value, uint64_t(bool(gate->closed)));
     if (gate->closed && !Hold(work))
       Hold(work, true);
     return S_OK;
@@ -1631,6 +1642,7 @@ public:
       const std::vector<PresentCopy> &copies
   ) {
     Trace("Present");
+    FLIGHT("queue %p: Present %llu", this, number);
     auto scope = StartCommitting();
     auto &cmdbuf = scope.inflight->cmdbuf;
     if (profile_)

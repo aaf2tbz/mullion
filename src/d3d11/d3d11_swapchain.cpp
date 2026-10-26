@@ -795,6 +795,7 @@ public:
         ((PresentFlags & DXGI_PRESENT_STEREO_PREFER_RIGHT) && !desc_.Stereo) ||
         (PresentFlags & (DXGI_PRESENT_STEREO_TEMPORARY_MONO | DXGI_PRESENT_RESTRICT_TO_OUTPUT)))
       return DXGI_ERROR_INVALID_CALL;
+    FLIGHT("swap chain %p: Present, interval %llu, flags %#llx", this, uint64_t(SyncInterval), uint64_t(PresentFlags));
 
     HRESULT hr = S_OK;
     follower_.follow(hWnd, native_view_);
