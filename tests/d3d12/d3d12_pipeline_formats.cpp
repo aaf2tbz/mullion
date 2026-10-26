@@ -14,6 +14,7 @@
 // a later declared integer target still refuses blending, even with a zero write mask (vkd3d-proton's
 // test_integer_blending_pipeline_state): a null slot must not stop validation of following slots.
 #include "d3d12_test.hpp"
+#include <algorithm>
 #include <bit>
 
 static const char hlsl[] = R"hlsl(
