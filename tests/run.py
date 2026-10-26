@@ -169,20 +169,40 @@ def alone():
             HOLDERS.notify_all()
 
 
+def pressure():
+    """the kernel's memory pressure level: 1 when normal"""
+    return int(subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], capture_output=True, text=True).stdout)
+
+
+def footprint(group):
+    """the memory a test's processes hold, as the kernel counts it against them (footprint(1))"""
+    pids = subprocess.run(["pgrep", "-g", str(group)], capture_output=True, text=True).stdout.split()
+    said = subprocess.run(["footprint", "-f", "bytes", "--noCategories", *(f"--pid={pid}" for pid in pids)],
+                          capture_output=True, text=True).stdout if pids else ""
+    return sum(map(int, re.findall(r"Footprint: (\d+) B", said)))
+
+
+# the process groups of the tests running now, of which the one that holds the most memory ends when the machine runs
+# short of it, and the lock that picks that one
+RUNNING = set()
+PRESSED = threading.Lock()
+
+
 def finish(command, env, seconds, log):
     """runs the command with its output in the log: its exit status, or None when it outlived its time. nothing
     starts on a machine short of memory (the kernel's pressure level, 1 when normal): a GPU test there can take the
-    machine down with it. the test waits for the memory, up to PATIENCE seconds, and not while it has the machine's
-    lock"""
+    machine down with it, and so can tests that grow together after they started. the test waits for the memory, up
+    to PATIENCE seconds, and not while it has the machine's lock; once the machine is short of it, the running test
+    that holds the most ends, and fails with that said"""
     for waited in range(0, PATIENCE + 1, 10):
         with alone():
-            level = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], capture_output=True, text=True).stdout.strip()
-            if level == "1":
+            if pressure() == 1:
                 with open(log, "wb") as out:
                     end = time.monotonic() + seconds
                     process = subprocess.Popen(
                         command, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
                     )
+                    RUNNING.add(process.pid)
                     # the test and what it started, which nothing else is in the session of, do not outlive their time
                     # or this runner: a test left behind would use the GPU without the lock
                     try:
@@ -190,20 +210,30 @@ def finish(command, env, seconds, log):
                         # quiet, nothing waits for it
                         while time.monotonic() < end:
                             try:
-                                return process.wait(QUIET)
+                                return process.wait(1)
                             except subprocess.TimeoutExpired:
-                                lines = log.read_text(errors="replace").splitlines()
-                                if time.time() - log.stat().st_mtime > QUIET and (
-                                        faults(lines) or any(line.startswith("wrong: ") for line in lines)):
-                                    break
+                                level = pressure()
+                                if level > 1:
+                                    with PRESSED:
+                                        if process.pid == max(set(RUNNING), key=footprint):
+                                            os.killpg(process.pid, signal.SIGKILL)
+                                            with open(log, "a") as note:
+                                                note.write(f"failed: ended at the kernel's memory pressure level {level}, "
+                                                           "holding the most memory of the tests running\n")
+                                            return process.wait()
+                                if time.time() - log.stat().st_mtime > QUIET:
+                                    lines = log.read_text(errors="replace").splitlines()
+                                    if faults(lines) or any(line.startswith("wrong: ") for line in lines):
+                                        break
                         where(command, env, process, log)
                         return None
                     finally:
+                        RUNNING.discard(process.pid)
                         if process.poll() is None:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
         time.sleep(10)
-    sys.exit(f"memory pressure level {level} for {PATIENCE} s: no test started")
+    sys.exit(f"memory pressure level {pressure()} for {PATIENCE} s: no test started")
 
 
 def compiler(builds):
