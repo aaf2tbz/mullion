@@ -198,7 +198,8 @@ ResourceInitializer::initWithZero(
   }
 
   bool is_3d_tex = texture->textureType() == WMTTextureType3D;
-  size_t texel_size = MTLGetTexelSize(texture->pixelFormat());
+  // a multisampled texel is its samples
+  size_t texel_size = MTLGetTexelSize(texture->pixelFormat()) * texture->sampleCount();
   size_t bytes_per_row_needed = texel_size * align(width_sub, block_size) / block_size;
   size_t bytes_per_image_needed = bytes_per_row_needed * align(height_sub, block_size) / block_size;
   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
