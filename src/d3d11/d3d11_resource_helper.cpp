@@ -423,7 +423,8 @@ CreateMTLTextureDescriptorInternal(
     if (BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
       metal_usage |= WMTTextureUsageRenderTarget;
     if (BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
-      metal_usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+      // a uint clear writes through a uint view; a written texture is not compressed anyway
+      metal_usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
       // NOTE: R32/RG32_TYPELESS format should be mapped to uint pixel format
       if (metal_format.PixelFormat == WMTPixelFormatR32Uint ||
           metal_format.PixelFormat == WMTPixelFormatR32Sint ||
@@ -441,6 +442,9 @@ CreateMTLTextureDescriptorInternal(
     // well this is necessary for passing validation layer
     metal_usage |= WMTTextureUsagePixelFormatView;
   }
+
+  if ((MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && MipmapFormat(pDescOut->pixel_format) != pDescOut->pixel_format)
+    metal_usage |= WMTTextureUsagePixelFormatView;
 
   if (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) {
     metal_usage |= WMTTextureUsageRenderTarget;

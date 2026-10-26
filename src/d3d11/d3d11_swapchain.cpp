@@ -530,8 +530,11 @@ public:
     std::vector<Com<D3D11ResourceCommon, false>> backbuffers(sequential ? desc.BufferCount : 1);
     for (UINT i = 0; i < backbuffers.size(); i++) {
       Com<D3D11ResourceCommon> buffer;
+      // a back buffer's views may take any format of its type group (D3D11_FORMAT_SUPPORT_BACK_BUFFER_CAST)
       HRESULT hr = mullion::CreateDeviceTexture2D(
-          device_, &backbuffer_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer)
+          device_, &backbuffer_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer),
+          CastsAcrossLayouts(device_->GetMTLDevice(), desc.Format, false) ? WMTTextureUsagePixelFormatView
+                                                                          : WMTTextureUsageUnknown
       );
       if (FAILED(hr))
         return hr;

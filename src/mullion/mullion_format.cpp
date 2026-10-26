@@ -1493,6 +1493,25 @@ IsIntegerFormat(WMTPixelFormat format) {
   return false;
 }
 
+bool
+CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed) {
+  MTL_DXGI_FORMAT_DESC own, other;
+  if (FAILED(MTLQueryDXGIFormat(device, format, own)))
+    return false;
+  // a float format is one not integer whose values pass 1
+  auto floating = [](const MTL_DXGI_FORMAT_DESC &desc) {
+    return !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(desc.PixelFormat))) && BorderColorRange(desc)[1] > 1;
+  };
+  auto layout = [](const MTL_DXGI_FORMAT_DESC &desc) { return Forget_sRGB(WMTPixelFormat(ORIGINAL_FORMAT(desc.PixelFormat))); };
+  uint32_t type = DXGIFormatType(format);
+  for (uint32_t member = type; DXGIFormatType(member) == type; member++)
+    if (SUCCEEDED(MTLQueryDXGIFormat(device, member, other)) && !(other.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+        !DepthStencilPlanarFlags(other.PixelFormat) && (!fully_typed || floating(own) == floating(other)) &&
+        layout(other) != layout(own))
+      return true;
+  return false;
+}
+
 double
 ClampFloatRTVClearColor(float val, float min, float max) {
   if (!std::isfinite(val) || val == 0)

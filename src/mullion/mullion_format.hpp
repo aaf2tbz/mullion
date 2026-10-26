@@ -47,6 +47,12 @@ Is_sRGBVariant(WMTPixelFormat format) {
 
 bool IsBlockCompressionFormat(WMTPixelFormat format);
 
+// mipmap generation of a8unorm is borked, so it goes through an r8unorm view
+inline WMTPixelFormat
+MipmapFormat(WMTPixelFormat format) {
+  return format == WMTPixelFormatA8Unorm ? WMTPixelFormatR8Unorm : format;
+}
+
 uint32_t DepthStencilPlanarFlags(WMTPixelFormat format);
 
 enum MTL_DXGI_FORMAT_FLAG {
@@ -96,6 +102,11 @@ WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);
 bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);
 
 bool IsIntegerFormat(WMTPixelFormat format);
+
+// whether a texture of the format may be viewed in another of its type group that Metal reinterprets only through a
+// pixel format view, which it waives for sRGB twins. `fully_typed` takes D3D12's casts of fully typed resources, which
+// keep _FLOAT and other formats apart (DirectX-Specs, D3D12 Relaxed Format Casting Rules)
+bool CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed);
 
 void SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color);
 

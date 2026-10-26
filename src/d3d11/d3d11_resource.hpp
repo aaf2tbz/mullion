@@ -650,7 +650,8 @@ HRESULT CreateDeviceTexture1D(MTLD3D11Device *pDevice,
 HRESULT CreateDeviceTexture2D(MTLD3D11Device *pDevice,
                               const D3D11_TEXTURE2D_DESC1 *pDesc,
                               const D3D11_SUBRESOURCE_DATA *pInitialData,
-                              ID3D11Texture2D1 **ppTexture);
+                              ID3D11Texture2D1 **ppTexture,
+                              WMTTextureUsage usage = WMTTextureUsageUnknown);
 
 HRESULT CreateDeviceTexture3D(MTLD3D11Device *pDevice,
                               const D3D11_TEXTURE3D_DESC1 *pDesc,

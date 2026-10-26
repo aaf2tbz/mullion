@@ -1558,7 +1558,7 @@ public:
   };
 
   // a copy between textures. Metal copies within one format: formats of one type group copy from a view of the source
-  // in the destination's. what has no such view (depth, and a reinterpret copy: CopyResource's Remarks) goes by its
+  // in the destination's, where the source has one. what has no such view (depth, and a reinterpret copy: CopyResource's Remarks) goes by its
   // bytes through a buffer, where a block of a compressed format is a texel of the other. `dst_extent` is the
   // destination level's
   void
@@ -1569,7 +1569,9 @@ public:
   ) {
     bool same = src->pixelFormat() == dst->pixelFormat();
     if (same || (DXGIFormatType(src_format.PlaneFormat) == DXGIFormatType(dst_format.PlaneFormat) &&
-                 !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat()))) {
+                 !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat()) &&
+                 (Forget_sRGB(src->pixelFormat()) == Forget_sRGB(dst->pixelFormat()) ||
+                  (src->usage() & WMTTextureUsagePixelFormatView)))) {
       auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
       cmd.type = WMTBlitCommandCopyFromTextureToTexture;
       cmd.src = same ? src->current()->texture()

@@ -398,12 +398,14 @@ template <typename tag>
 HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
                                     const typename tag::DESC1 *pDesc,
                                     const D3D11_SUBRESOURCE_DATA *pInitialData,
-                                    typename tag::COM_IMPL **ppTexture) {
+                                    typename tag::COM_IMPL **ppTexture,
+                                    WMTTextureUsage usage = WMTTextureUsageUnknown) {
   WMTTextureInfo info{};
   typename tag::DESC1 finalDesc;
   if (FAILED(CreateMTLTextureDescriptor(pDevice, pDesc, &finalDesc, &info))) {
     return E_INVALIDARG;
   }
+  info.usage = WMTTextureUsage(info.usage | usage);
   // a renamed texture would leave the Direct3D 12 resource Direct3D 11 on 12 makes of it
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
                             !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && !pDevice->shares_with_d3d12;
@@ -571,9 +573,10 @@ HRESULT
 CreateDeviceTexture2D(MTLD3D11Device *pDevice,
                       const D3D11_TEXTURE2D_DESC1 *pDesc,
                       const D3D11_SUBRESOURCE_DATA *pInitialData,
-                      ID3D11Texture2D1 **ppTexture) {
+                      ID3D11Texture2D1 **ppTexture,
+                      WMTTextureUsage usage) {
   return CreateDeviceTextureInternal<tag_texture_2d>(pDevice, pDesc,
-                                                     pInitialData, ppTexture);
+                                                     pInitialData, ppTexture, usage);
 }
 
 HRESULT
