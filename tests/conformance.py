@@ -156,7 +156,6 @@ def arguments(parser):
     parser.add_argument("--wine-build", type=Path, help="the build tree made from --wine-source")
     parser.add_argument("--vkd3d-proton", type=Path, help="a checkout of vkd3d-proton, for its Direct3D 12 tests")
     parser.add_argument("--update", action="store_true", help="record this run's verdicts in tests/conformance")
-    parser.add_argument("--jobs", type=int, default=1, help="how many tests run at once (default: %(default)s)")
     parser.add_argument("--seconds", type=int, default=120, help="how long one test may run (default: %(default)s)")
     parser.add_argument("--only", action="append", default=[], help="only this suite, test, or suite:test (may repeat)")
     parser.add_argument("--skip", action="append", default=[], help="not this suite, test, or suite:test (may repeat)")
@@ -222,6 +221,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     run.arguments(parser)
     arguments(parser)
+    # run.options() has it too, so tests/mullion-test, which takes both, gets it from there
+    parser.add_argument("--jobs", type=int, default=1, help="how many tests run at once (default: %(default)s)")
     args = parser.parse_args()
     with run.session(args) as runtime:
         sys.exit(conformance(args, *runtime) != 0)
