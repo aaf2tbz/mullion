@@ -2289,6 +2289,7 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool centered_samples;
   bool single_raster_sample;
   uint32_t clip_distances;
+  struct SM50_SHADER_BLEND blend[8];
   bool depth_bounds;
   bool late_tests;
 };
@@ -2384,6 +2385,7 @@ sm50_compilation_argument32_convert(
       data->centered_samples = src->centered_samples;
       data->single_raster_sample = src->single_raster_sample;
       data->clip_distances = src->clip_distances;
+      memcpy(data->blend, src->blend, sizeof(data->blend));
       data->depth_bounds = src->depth_bounds;
       data->late_tests = src->late_tests;
       break;
