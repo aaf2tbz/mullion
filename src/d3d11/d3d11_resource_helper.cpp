@@ -403,7 +403,8 @@ CreateMTLTextureDescriptorInternal(
   if ((BindFlags & D3D11_BIND_RENDER_TARGET) && !any_bit_set(capability & FormatCapability::Color))
     return E_INVALIDARG;
   if ((BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&
-      ((BindFlags & D3D11_BIND_DEPTH_STENCIL) || !any_bit_set(capability & FormatCapability::Write)))
+      ((BindFlags & D3D11_BIND_DEPTH_STENCIL) ||
+       !TypedUnorderedAccess(capability, pDevice->GetMTLPixelFormatCapability(metal_format.BufferPixelFormat))))
     return E_INVALIDARG;
   // a plane's format is the one a shader reads the depth stencil texture in
   if ((BindFlags & D3D11_BIND_SHADER_RESOURCE) && any_bit_set(capability & FormatCapability::DepthStencil) &&

@@ -97,6 +97,10 @@ uint32_t MTLGetTexelSize(WMTPixelFormat format);
 
 FormatCapability MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability capability);
 
+// a typed unordered access view is of a buffer as well as a texture: `texture` is the format's capability, `buffer`
+// its buffer pixel format's
+bool TypedUnorderedAccess(FormatCapability texture, FormatCapability buffer);
+
 WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);
 
 bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);

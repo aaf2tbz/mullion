@@ -1692,6 +1692,12 @@ MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability 
   return capability;
 }
 
+bool
+TypedUnorderedAccess(FormatCapability texture, FormatCapability buffer) {
+  return any_bit_set(texture & FormatCapability::Write) &&
+         any_bit_set(buffer & (FormatCapability::TextureBufferWrite | FormatCapability::TextureBufferReadWrite));
+}
+
 /* D3D11_FORMAT_SUPPORT and D3D11_FORMAT_SUPPORT2 bits, derived from Metal; D3D12_FORMAT_SUPPORT1 and 2 share their
    values. `GetMTLPixelFormatCapability` is the device's own capability table */
 int32_t
@@ -1843,10 +1849,7 @@ MTLQueryDXGIFormatSupport(
     Support1 |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
   }
 
-  // a typed unordered access view is of a buffer as well as a texture
-  if (any_bit_set(Capability & FormatCapability::Write) &&
-      any_bit_set(GetMTLPixelFormatCapability(metal_format.BufferPixelFormat) &
-                  (FormatCapability::TextureBufferWrite | FormatCapability::TextureBufferReadWrite))) {
+  if (TypedUnorderedAccess(Capability, GetMTLPixelFormatCapability(metal_format.BufferPixelFormat))) {
     Support1 |= D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
   }
 
