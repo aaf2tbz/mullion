@@ -1636,6 +1636,15 @@ RenderTargetWriteMask(WMTPixelFormat format, WMTColorWriteMask mask) {
   return WMTColorWriteMask(stored);
 }
 
+std::array<float, 4>
+RenderTargetColor(WMTPixelFormat format, const float color[4]) {
+  auto channels = RenderTargetChannels(format);
+  std::array<float, 4> stored{color[0], color[1], color[2], color[3]};
+  for (unsigned i = 0; i < channels.size(); i++)
+    stored[channels[i]] = color[i];
+  return stored;
+}
+
 std::array<float, 2>
 BorderColorRange(const MTL_DXGI_FORMAT_DESC &description) {
   // D24 is unorm on its float32 backing
@@ -1767,8 +1776,11 @@ MTLQueryDXGIFormatSupport(
     if (!(metal_format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
       if (!integer)
         Support1 |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
-      // a buffer's view has no swizzle to put a format's channels in their places
-      if (metal_format.PixelFormat == ORIGINAL_FORMAT(metal_format.PixelFormat))
+      // a buffer's view has no swizzle to put a format's channels in their places, and is a texture buffer
+      if (metal_format.PixelFormat == ORIGINAL_FORMAT(metal_format.PixelFormat) &&
+          any_bit_set(GetMTLPixelFormatCapability(metal_format.BufferPixelFormat) &
+                      (FormatCapability::TextureBufferRead | FormatCapability::TextureBufferWrite |
+                       FormatCapability::TextureBufferReadWrite)))
         Support1 |= D3D11_FORMAT_SUPPORT_BUFFER;
     }
 
@@ -1831,7 +1843,10 @@ MTLQueryDXGIFormatSupport(
     Support1 |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
   }
 
-  if (any_bit_set(Capability & FormatCapability::Write)) {
+  // a typed unordered access view is of a buffer as well as a texture
+  if (any_bit_set(Capability & FormatCapability::Write) &&
+      any_bit_set(GetMTLPixelFormatCapability(metal_format.BufferPixelFormat) &
+                  (FormatCapability::TextureBufferWrite | FormatCapability::TextureBufferReadWrite))) {
     Support1 |= D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
   }
 

@@ -837,7 +837,8 @@ public:
     if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
-    view_descriptor.format = metal_format.PixelFormat;
+    // a swizzled view is read only: an attachment stores the channels as they are (RenderTargetChannels)
+    view_descriptor.format = WMTPixelFormat(ORIGINAL_FORMAT(metal_format.PixelFormat));
 
     MTL_RENDER_TARGET_DESC RenderTargetDesc;
     RenderTargetDesc.DepthPlane = 0;
@@ -927,6 +928,7 @@ public:
 
     RenderTargetDesc.Texture = texture;
     RenderTargetDesc.View = View;
+    RenderTargetDesc.Format = metal_format.PixelFormat;
     RenderTargetDesc.Width = std::max<uint32_t>(1u, texture->width() >> view_descriptor.firstMiplevel);
     RenderTargetDesc.Height = std::max<uint32_t>(1u, texture->height() >> view_descriptor.firstMiplevel);
 

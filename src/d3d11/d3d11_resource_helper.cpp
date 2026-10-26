@@ -443,6 +443,11 @@ CreateMTLTextureDescriptorInternal(
     metal_usage |= WMTTextureUsagePixelFormatView;
   }
 
+  // a resolve Metal cannot do renders its destination, any single-sampled default texture (ResolveSubresource)
+  if (Usage == D3D11_USAGE_DEFAULT && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D && SampleCount == 1 &&
+      any_bit_set(capability & FormatCapability::Color))
+    metal_usage |= WMTTextureUsageRenderTarget;
+
   if ((MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && MipmapFormat(pDescOut->pixel_format) != pDescOut->pixel_format)
     metal_usage |= WMTTextureUsagePixelFormatView;
 

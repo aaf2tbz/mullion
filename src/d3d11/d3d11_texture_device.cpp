@@ -221,7 +221,10 @@ public:
     if (!ppView) {
       return S_FALSE;
     }
-    *ppView = ref(new TextureRTV(descriptor, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
+    // a swizzled view is read only: an attachment stores the channels as they are (RenderTargetChannels)
+    auto format = descriptor.format;
+    descriptor.format = WMTPixelFormat(ORIGINAL_FORMAT(format));
+    *ppView = ref(new TextureRTV(descriptor, format, &finalDesc, this, this->m_parent, attachment_desc));
     return S_OK;
   };
 

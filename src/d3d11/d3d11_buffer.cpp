@@ -261,6 +261,9 @@ public:
         return E_FAIL;
       }
 
+      UINT support = 0;
+      if (FAILED(m_parent->CheckFormatSupport(finalDesc.Format, &support)) || !(support & D3D11_FORMAT_SUPPORT_BUFFER))
+        return E_INVALIDARG;
       view_format = format.BufferPixelFormat;
       offset = finalDesc.Buffer.FirstElement * format.BytesPerTexel;
       size = finalDesc.Buffer.NumElements * format.BytesPerTexel;
@@ -344,6 +347,10 @@ public:
       if (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
         return E_INVALIDARG;
 
+      UINT support = 0;
+      if (FAILED(m_parent->CheckFormatSupport(finalDesc.Format, &support)) || !(support & D3D11_FORMAT_SUPPORT_BUFFER) ||
+          !(support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW))
+        return E_INVALIDARG;
       view_format = format.BufferPixelFormat;
       offset = finalDesc.Buffer.FirstElement * format.BytesPerTexel;
       size = finalDesc.Buffer.NumElements * format.BytesPerTexel;
@@ -355,7 +362,7 @@ public:
       return S_FALSE;
     }
 
-    auto viewId = buffer_->createView({.format = view_format});
+    auto viewId = buffer_->createView({.format = view_format, .write = true});
 
     auto srv = ref(new UAVWithCounter(
         &finalDesc, this, m_parent,

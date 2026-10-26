@@ -207,6 +207,10 @@ public:
       ERR("D3D12Buffer::CreateShaderResourceView: not an ordinary or packed format: ", ViewDesc.Format);
       return E_FAIL;
     }
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ViewDesc.Format};
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER))
+      return FAIL(E_INVALIDARG);
     BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
     Slice.firstElement = ViewDesc.Buffer.FirstElement * (Format.BytesPerTexel / MTLGetTexelSize(Format.BufferPixelFormat));
     Slice.elementCount = ViewDesc.Buffer.NumElements |
@@ -262,7 +266,12 @@ public:
     // R32G32B32 has no typed unordered access (Format support for Direct3D Feature Level 11.0 hardware)
     if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
       return FAIL(E_INVALIDARG);
-    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ViewDesc.Format};
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW))
+      return FAIL(E_INVALIDARG);
+    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat, true};
     Slice.firstElement = ViewDesc.Buffer.FirstElement;
     Slice.elementCount = ViewDesc.Buffer.NumElements;
     Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;

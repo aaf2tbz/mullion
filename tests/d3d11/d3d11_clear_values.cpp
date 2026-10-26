@@ -7,7 +7,8 @@
 // 3.2.2: "Round-to-zero must be used during conversion to another float format"; finite overflow gives
 // "the maximum representable (appropriately signed) value results, NOT including signed infinity".
 // 3.1.5/6 define five exponent bits and preserved denorms for 16/11/10-bit formats; unsigned negatives clamp to 0.
-// ClearView with null rectangles covers the full view: "NULL means clear the entire view." (5.2.3.3).
+// ClearView with null rectangles covers the full view: "NULL means clear the entire view." (5.2.3.3); two
+// rectangles that tile the view clear every texel of it as well.
 // SDK format names supply channel order and widths; every physical channel is checked over every texel.
 #include "d3d11_test.hpp"
 #include "../copy_formats.hpp"
@@ -88,9 +89,9 @@ main() {
               values.push_back(sign * std::nextafter(edge, infinity));
             }
         }
-    for (UINT method = 0; method < 5; method++) {
+    for (UINT method = 0; method < 6; method++) {
       const bool unordered = method == 0 || method == 1 || method == 2;
-      const bool clear_view = method == 2 || method == 4;
+      const bool clear_view = method == 2 || method >= 4;
       if (!(support & (unordered ? D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW :
                                    D3D11_FORMAT_SUPPORT_RENDER_TARGET)))
         continue;
@@ -133,7 +134,10 @@ main() {
             context->ClearUnorderedAccessViewUint(uav.Get(), bits.data());
           else if (method == 1)
             context->ClearUnorderedAccessViewFloat(uav.Get(), color.data());
-          else if (clear_view)
+          else if (method == 5) {
+            const D3D11_RECT halves[] = {{0, 0, LONG(width / 2), LONG(height)}, {LONG(width / 2), 0, LONG(width), LONG(height)}};
+            context->ClearView(view.Get(), color.data(), halves, UINT(std::size(halves)));
+          } else if (clear_view)
             context->ClearView(view.Get(), color.data(), nullptr, 0);
           else
             context->ClearRenderTargetView(rtv.Get(), color.data());

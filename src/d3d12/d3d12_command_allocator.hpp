@@ -226,7 +226,7 @@ public:
       return;
     }
     auto format = buffer->pixelFormat(view);
-    auto texel_view = texel->createView({format});
+    auto texel_view = texel->createView({format, true});
     clear_uav_.begin(color, texel.ptr(), texel_view);
     clear_uav_.clear(0, 0, 1, 1);
     clear_uav_.end();

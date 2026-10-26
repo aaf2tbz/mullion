@@ -116,6 +116,9 @@ std::array<uint8_t, 4> RenderTargetChannels(WMTPixelFormat format);
 
 WMTColorWriteMask RenderTargetWriteMask(WMTPixelFormat format, WMTColorWriteMask mask);
 
+// a clear color in the channels a render target stores
+std::array<float, 4> RenderTargetColor(WMTPixelFormat format, const float color[4]);
+
 // the range a border color clamps to before filtering (D3D11.3 7.18.9.1): normalized formats' own, the rest as their
 // clear colors clamp
 std::array<float, 2> BorderColorRange(const MTL_DXGI_FORMAT_DESC &description);

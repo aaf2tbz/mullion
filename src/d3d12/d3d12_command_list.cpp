@@ -2519,6 +2519,8 @@ public:
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
     if (!AttachmentDesc.Texture)
       return;
+    auto stored = RenderTargetColor(AttachmentDesc.Format, Color);
+    Color = stored.data();
     if (Rects) {
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
       for (unsigned i = 0; i < RectCount; i++) {

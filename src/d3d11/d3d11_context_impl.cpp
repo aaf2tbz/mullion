@@ -888,6 +888,7 @@ public:
         }
         return ClearRenderTargetView(rtv, Color);
       }
+      color = RenderTargetColor(rtv->pixelFormat(), Color);
       InvalidateCurrentPass(true);
       UseWrappedView(rtv, true);
       EmitST([texture = rtv->texture(), view = rtv->viewId(),
@@ -5186,7 +5187,8 @@ public:
     PrepareTextureUse({pRenderTargetView->texture()});
     InvalidateCurrentPass();
     UseWrappedView(pRenderTargetView, true);
-    auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
+    auto stored = RenderTargetColor(pRenderTargetView->pixelFormat(), ColorRGBA);
+    auto clear_color = WMTClearColor{stored[0], stored[1], stored[2], stored[3]};
     auto &props = pRenderTargetView->description();
 
     EmitOP([texture = pRenderTargetView->texture(), view = pRenderTargetView->viewId(),

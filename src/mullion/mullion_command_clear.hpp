@@ -158,6 +158,7 @@ public:
     if (view_format != uint_format) {
       BufferViewDescriptor view;
       view.format = uint_format;
+      view.write = true;
       clearing_view_ = buffer->createView(view);
     }
 
