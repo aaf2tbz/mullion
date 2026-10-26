@@ -44,6 +44,8 @@ ZOMBIES = {"NSZombieEnabled": "YES"}
 # every failure and skip that is known, by what the test said, with its cause: one that is not there, or that says
 # something else, is new, whatever the test is called
 KNOWN = Path(__file__).with_name("known.txt")
+# under Metal's validation (--validate) a test can also answer otherwise, so those runs have their own
+KNOWN_VALIDATED = Path(__file__).with_name("known-validated.txt")
 
 
 def libraries(builds):
@@ -392,7 +394,7 @@ def options(parser):
     parser.add_argument("--late", type=int, help="delay each Metal command buffer's commit by this many milliseconds")
     parser.add_argument("--suite", action="append", default=[], help="only tests of this suite (may repeat)")
     parser.add_argument("--exact", action="store_true", help="match whole test names instead of prefixes")
-    parser.add_argument("--known", type=Path, help="the failures and skips to compare with (default: %s)" % KNOWN.name)
+    parser.add_argument("--known", type=Path, help="the failures and skips to compare with (default: %s, %s with --validate)" % (KNOWN.name, KNOWN_VALIDATED.name))
     parser.add_argument("--record", type=Path, help="write this run's failures and skips there, in the form --known reads")
     parser.add_argument("--benchmark", action="store_true", help="run declared benchmarks instead of correctness tests")
     parser.add_argument("tests", nargs="*", help="test name prefixes, or whole names with --exact")
@@ -485,8 +487,9 @@ def own(args, tests, builds, binary, base):
     print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; logs in {logs}")
 
     chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
-    path = getattr(args, "known", None) or KNOWN
-    if path != KNOWN and not path.exists():
+    default = KNOWN_VALIDATED if getattr(args, "validate", False) else KNOWN
+    path = getattr(args, "known", None) or default
+    if path != default and not path.exists():
         sys.exit(f"no such file: {path}")
     listed = known(path)
     ran = {(f"native({chip})" if family == "native" else family, name): (verdict, said_by[name, family])

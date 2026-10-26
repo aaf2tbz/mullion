@@ -536,6 +536,14 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             with self.assertRaises(SystemExit), redirect_stdout(StringIO()):
                 run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, known=root / "none.txt"),
                         tests[:1], [root], None, dict(os.environ))
+            # a validated run is compared with its own list
+            run.KNOWN_VALIDATED = root / "known-validated.txt"
+            run.KNOWN_VALIDATED.write_text(f"native({chip}) skip skipped: no 16x -- the cause\n")
+            with redirect_stdout(StringIO()) as out:
+                counted = run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, validate=True),
+                                  [test for test in tests if test["name"] == "skip"], [root], None, dict(os.environ))
+            self.assertEqual(counted, 0, out.getvalue())
+            self.assertIn("1 known, each with its cause in " + str(run.KNOWN_VALIDATED), out.getvalue().splitlines())
 
     def test_runner_answers(self):
         # one count of wrong results is two failures when the results differ, and a test that answers differently on
