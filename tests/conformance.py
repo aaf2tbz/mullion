@@ -4,8 +4,9 @@ against the verdicts recorded in tests/conformance.
 
 the suites are not in this tree. Wine's own Direct3D tests (dlls/{d3d11,d3d10core,dxgi,d3d12}/tests) are built from
 a Wine source tree and the build tree made from it (--wine-source, --wine-build); vkd3d-proton's Direct3D 12 tests
-from a checkout of it with its khronos/Vulkan-Headers submodule (--vkd3d-proton). each test function runs in a
-process of its own, as Windows: neither harness then excuses what it knows Wine or vkd3d to get wrong.
+from a checkout of it with its khronos/Vulkan-Headers submodule (--vkd3d-proton); vkd3d's shader tests from a checkout
+of vkd3d (--vkd3d), each file through the build's Direct3D 12 and Direct3D 11. each test function or file runs in a
+process of its own, as Windows: no harness then excuses what it knows Wine or vkd3d to get wrong.
 
 a verdict is what the harness counted: 'passed', 'failed', 'partly' (nothing failed, and the test skipped some of
 itself, as for a feature the device does not report: no pass), 'skipped' (it ran no check), 'crashed' (it ended
@@ -121,6 +122,40 @@ def vkd3d_suite(checkout, builds, binary, env, out):
     return names, lambda name: ([exe], {"VKD3D_TEST_MATCH": name, "VKD3D_TEST_PLATFORM": "windows"})
 
 
+def shader_suite(checkout, dxcompiler, builds, env, out):
+    """vkd3d's shader tests (its .shader_test files), by the shader runner of its build for Windows (Makefile.am's
+    crosstest), with the expectations of Windows: the files, and how one runs through an executor, d3d12.dll or
+    d3d11.dll. shader model 6 compiles with Microsoft's DXC (--dxcompiler), lower ones with the Wine's d3dcompiler_47"""
+    cc, made = run.compiler(builds), makefile(checkout / "Makefile.am")
+    places = {"srcdir": checkout, "builddir": out}
+
+    def words(name):
+        text = re.sub(r"\$[({](\w+)[)}]", lambda m: str(places[m[1]]) if m[1] in places else " ".join(words(m[1])),
+                      " ".join(made[name]))
+        return text.split()
+
+    headers = words("widl_headers")
+    for header in headers:
+        (out / header).parent.mkdir(parents=True, exist_ok=True)
+    build([[cc[0].rsplit("-", 1)[0] + "-widl", f"-I{checkout / 'include'}", "-h", "-o", out / header,
+            checkout / Path(header).with_suffix(".idl")] for header in headers])
+    # configure's results: each macro the runner's sources test has a fallback for a compiler without it
+    (out / "include" / "config.h").write_text("")
+    exe = out / "shader_runner.exe"
+    # the crosstest rule's libraries, the toolchain's import library of d3d12.dll standing for crosslibs/d3d12
+    build([cc + words("CROSS_CFLAGS") + ["-w", "-o", exe, *words("shader_runner_cross_sources"),
+                                         "-ld3d12", "-ldxgi", "-lgdi32", "-ld3dcompiler_47"]])
+    for dll in dxcompiler.glob("*.dll"):
+        (out / dll.name).unlink(missing_ok=True)
+        (out / dll.name).symlink_to(dll)
+    # the drive the prefix maps the file system's root to, for the files' paths
+    root = next(d.name for d in (Path(env["WINEPREFIX"]) / "dosdevices").iterdir() if os.readlink(d) == "/")
+    tests = checkout / "tests"
+    names = [str(Path(path).relative_to("tests")) for path in words("vkd3d_shader_tests")]
+    return names, lambda executor: lambda name: (
+        [exe, f"{root}{tests / name}", "--filter-executor", executor], {"VKD3D_TEST_PLATFORM": "windows"})
+
+
 def verdict(status, text):
     counts = COUNTS.findall(text)
     if status is None:
@@ -155,6 +190,8 @@ def arguments(parser):
     parser.add_argument("--wine-source", type=Path, help="a Wine source tree, for Wine's Direct3D tests")
     parser.add_argument("--wine-build", type=Path, help="the build tree made from --wine-source")
     parser.add_argument("--vkd3d-proton", type=Path, help="a checkout of vkd3d-proton, for its Direct3D 12 tests")
+    parser.add_argument("--vkd3d", type=Path, help="a checkout of vkd3d, for its shader tests (needs --dxcompiler)")
+    parser.add_argument("--dxcompiler", type=Path, help="the directory of DXC's dxcompiler.dll for the build's machine")
     parser.add_argument("--update", action="store_true", help="record this run's verdicts in tests/conformance")
     parser.add_argument("--jobs", type=int, default=1, help="how many tests run at once (default: %(default)s)")
     parser.add_argument("--seconds", type=int, default=120, help="how long one test may run (default: %(default)s)")
@@ -172,6 +209,12 @@ def conformance(args, builds, binary, base):
             suites[f"wine-{dll}"] = wine_suite(dll, args.wine_source.resolve(), args.wine_build.resolve(), out / "wine")
     if args.vkd3d_proton:
         suites["vkd3d-proton-d3d12"] = vkd3d_suite(args.vkd3d_proton.resolve(), builds, binary, base, out / "vkd3d-proton")
+    if args.vkd3d:
+        if not args.dxcompiler:
+            sys.exit("--vkd3d needs --dxcompiler: its shader model 6 tests fail without DXC")
+        names, command = shader_suite(args.vkd3d.resolve(), args.dxcompiler.resolve(), builds, base, out / "vkd3d")
+        for executor in ("d3d12", "d3d11"):
+            suites[f"vkd3d-shader-{executor}"] = names, command(f"{executor}.dll")
     named = lambda suite, name, names: any(n in (suite, name, f"{suite}:{name}") for n in names)
     wanted = lambda suite, name: (not args.only or named(suite, name, args.only)) and not named(suite, name, args.skip)
     changed = 0
@@ -182,6 +225,7 @@ def conformance(args, builds, binary, base):
 
         def one(name):
             argv, env = command(name)
+            (logs / name).parent.mkdir(parents=True, exist_ok=True)
             status = run.finish([binary, *argv], dict(base, **env), args.seconds, logs / f"{name}.txt")
             text = (logs / f"{name}.txt").read_text(errors="replace")
             word, at = verdict(status, text), ""

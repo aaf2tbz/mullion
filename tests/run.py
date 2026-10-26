@@ -86,8 +86,11 @@ def install(wine, prefix, unix, pe):
 
 # what the library and Metal say when the GPU's work went wrong under a test: a command buffer that failed
 # (src/d3d12/d3d12_command_queue.cpp, src/mullion/mullion_command_queue.cpp), a rule of Metal's validation broken
-# (Metal's debug layer), a message to an Objective-C object that was freed (ZOMBIES)
-FAULTS = ("Device error", "failed assertion", "message sent to deallocated instance")
+# (Metal's debug layer), a shader's access that Metal's shader validation refused, which it reports and fills with zeros
+# while the command buffer still completes (VALIDATION), a message to an Objective-C object that was freed (ZOMBIES)
+FAULTS = ("Device error", "failed assertion", "Invalid Metal usage", "message sent to deallocated instance")
+# Metal's API and shader validation, with the shader's reports on stderr, in the test's log (metalvalidation(1))
+VALIDATION = {"MTL_DEBUG_LAYER": "1", "MTL_SHADER_VALIDATION": "1", "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1"}
 
 
 def waiting(markers):
@@ -283,7 +286,7 @@ def arguments(parser):
                         help="a meson build directory; with several, the first that has a library or the tests gives them")
     parser.add_argument("--wine", required=True, type=Path, help="a Wine's installation: the directory with bin/wine")
     parser.add_argument("--prefix", type=Path, help="the Wine prefix of the tests (made if missing); default: tests-prefix in the first build")
-    parser.add_argument("--validate", action="store_true", help="run under Metal's API validation")
+    parser.add_argument("--validate", action="store_true", help="run under Metal's API and shader validation")
     parser.add_argument("--no-install", action="store_true", help="leave the Wine's libraries as they are")
 
 
@@ -322,7 +325,7 @@ def environment(args):
     overrides += ["d3dcompiler_47=n,b"] + ([f"{','.join(own)}=b"] if own else []) + ["mscoree,mshtml,winedbg.exe=d"]
     base["WINEDLLOVERRIDES"] = ";".join(overrides)
     if args.validate:
-        base["MTL_DEBUG_LAYER"] = "1"
+        base.update(VALIDATION)
     binary = wine / "bin" / "wine"
     if not (prefix / "drive_c").exists():
         subprocess.run([binary, "wineboot", "-u"], env=base, stdin=subprocess.DEVNULL, check=True)
