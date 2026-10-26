@@ -2464,11 +2464,23 @@ enum WMTSampledEncoder {
 // appended calls keep the preceding bridge ABI indices
 enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixComputeMaxThreadsPerThreadgroup,
        WMTUnixDeviceSupports32BitFloatFiltering, WMTUnixDeviceMaxArgumentBufferSamplerCount,
-       WMTUnixDeviceSupports32BitMSAA, WMTUnixCallCount };
+       WMTUnixDeviceSupports32BitMSAA, WMTUnixPresentStatisticsNew, WMTUnixDrawableCountPresent,
+       WMTUnixPresentStatisticsGet, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
 WINEMETAL_API uint64_t DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size);
+
+// what a presenter's frames did on screen, in host seconds (CACurrentMediaTime): the number of the last frame shown
+// (frames count from 1) and when it was, when counting began, and the time the statistics were read
+struct WMTPresentStatistics {
+  uint64_t shown;
+  double shown_time, since, now;
+};
+WINEMETAL_API obj_handle_t WMTPresentStatistics_new(void);
+// frame `number` counts once it is on screen: a drawable's once Metal shows it, a null drawable's now
+WINEMETAL_API void MetalDrawable_countPresent(obj_handle_t drawable, obj_handle_t statistics, uint64_t number);
+WINEMETAL_API void WMTPresentStatistics_get(obj_handle_t statistics, struct WMTPresentStatistics *out);
 
 #endif

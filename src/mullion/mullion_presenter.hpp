@@ -100,6 +100,10 @@ public:
   // presentDrawableAfterMinimumDuration does); call it once that frame's command buffer has completed
   void drawToWindow(double after);
 
+  // the frames shown (IDXGISwapChain::GetFrameStatistics), counting refreshes at `refresh_rate` since the presenter
+  // was made
+  HRESULT frameStatistics(DXGI_FRAME_STATISTICS *stats, double refresh_rate);
+
 private:
   void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
 
@@ -129,7 +133,11 @@ private:
     WMT::Reference<WMT::Buffer> buffer;
     void *pixels;
     uint32_t width, height;
+    uint64_t number;
   };
+  WMT::Reference<WMT::PresentStatistics> statistics_ = WMT::MakePresentStatistics();
+  // the frames encoded
+  uint64_t frames_ = 0;
   std::deque<WindowFrame> window_frames_;
   std::chrono::steady_clock::time_point window_last_draw_;
   mullion::mutex window_mutex_;

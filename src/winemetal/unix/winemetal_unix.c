@@ -4054,6 +4054,54 @@ _WMTDiagWrite(void *obj) {
 }
 
 static NTSTATUS
+_WMTPresentStatistics_new(void *obj) {
+  struct unixcall_generic_obj_ret *params = obj;
+  struct WMTPresentStatistics statistics = {.since = CACurrentMediaTime()};
+  params->ret = (obj_handle_t)[[NSMutableData alloc] initWithBytes:&statistics length:sizeof(statistics)];
+  return STATUS_SUCCESS;
+}
+
+static void
+count_present(NSMutableData *data, uint64_t number, double time) {
+  @synchronized(data) {
+    struct WMTPresentStatistics *statistics = data.mutableBytes;
+    if (number > statistics->shown) {
+      statistics->shown = number;
+      statistics->shown_time = time;
+    }
+  }
+}
+
+static NTSTATUS
+_MetalDrawable_countPresent(void *obj) {
+  struct unixcall_generic_obj_obj_uint64_noret *params = obj;
+  NSMutableData *data = (NSMutableData *)params->arg0;
+  uint64_t number = params->arg1;
+  if (!params->handle) {
+    count_present(data, number, CACurrentMediaTime());
+    return STATUS_SUCCESS;
+  }
+  // the copied handler keeps `data` until it runs; a drawable that was never shown has a presentedTime of 0
+  [(id<MTLDrawable>)params->handle addPresentedHandler:^(id<MTLDrawable> drawable) {
+    if (drawable.presentedTime)
+      count_present(data, number, drawable.presentedTime);
+  }];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTPresentStatistics_get(void *obj) {
+  struct unixcall_generic_obj_ptr_noret *params = obj;
+  NSMutableData *data = (NSMutableData *)params->handle;
+  struct WMTPresentStatistics *out = params->arg.ptr;
+  @synchronized(data) {
+    *out = *(const struct WMTPresentStatistics *)data.bytes;
+  }
+  out->now = CACurrentMediaTime();
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _DispatchData_getBytes(void *obj) {
   struct unixcall_dispatchdata_bytes *params = obj;
   dispatch_data_t data = (dispatch_data_t)params->data;
@@ -4243,6 +4291,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_supports32BitFloatFiltering,
     &_MTLDevice_maxArgumentBufferSamplerCount,
     &_MTLDevice_supports32BitMSAA,
+    &_WMTPresentStatistics_new,
+    &_MetalDrawable_countPresent,
+    &_WMTPresentStatistics_get,
 };
 
 #ifndef MULLION_NATIVE
@@ -4421,6 +4472,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_supports32BitFloatFiltering,
     &_MTLDevice_maxArgumentBufferSamplerCount,
     &_MTLDevice_supports32BitMSAA,
+    &_WMTPresentStatistics_new,
+    &_MetalDrawable_countPresent,
+    &_WMTPresentStatistics_get,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

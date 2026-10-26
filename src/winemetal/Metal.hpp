@@ -651,12 +651,29 @@ public:
   }
 };
 
+// what a presenter's frames did on screen
+class PresentStatistics : public Object {
+public:
+  WMTPresentStatistics
+  get() const {
+    WMTPresentStatistics statistics;
+    WMTPresentStatistics_get(handle, &statistics);
+    return statistics;
+  }
+};
+
 class MetalDrawable : public Object {
 public:
   Texture
   texture() {
     return Texture{MetalDrawable_texture(handle)};
   };
+
+  // frame `number` counts in `statistics` once it is on screen, or now for a null drawable
+  void
+  countPresent(PresentStatistics statistics, uint64_t number) {
+    MetalDrawable_countPresent(handle, statistics.handle, number);
+  }
 };
 
 class MetalLayer : public Object {
@@ -1301,6 +1318,11 @@ public:
 inline Reference<Object>
 MakeAutoreleasePool() {
   return Reference<Object>(NSAutoreleasePool_alloc_init());
+}
+
+inline Reference<PresentStatistics>
+MakePresentStatistics() {
+  return Reference<PresentStatistics>(WMTPresentStatistics_new());
 }
 
 inline Reference<String>

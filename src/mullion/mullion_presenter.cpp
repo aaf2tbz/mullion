@@ -164,6 +164,9 @@ Presenter::encodeCommands(
   layer_.setColorSpace(state.colorspace);
 
   auto drawable = layer_ ? layer_.nextDrawable() : WMT::MetalDrawable{};
+  auto number = ++frames_;
+  if (drawable)
+    drawable.countPresent(statistics_, number);
   if (!drawable && (!window_target_ || window_target_.width() != width || window_target_.height() != height)) {
     WMTTextureInfo texture_info{};
     texture_info.type = WMTTextureType2D;
@@ -217,7 +220,7 @@ Presenter::encodeCommands(
 
   // a layer whose drawable timed out drops this frame; only a window without a layer takes frames through GDI
   if (!layer_) {
-    WindowFrame frame{{}, nullptr, (uint32_t)width, (uint32_t)height};
+    WindowFrame frame{{}, nullptr, (uint32_t)width, (uint32_t)height, number};
     WMTBufferInfo buffer_info{.length = frame.width * frame.height * 4ull, .options = WMTResourceStorageModeShared};
     buffer_info.memory.set(nullptr);
     frame.buffer = device_.newBuffer(buffer_info);
@@ -267,6 +270,24 @@ Presenter::drawToWindow(double after) {
   );
   ReleaseDC(window_, dc);
   window_last_draw_ = std::chrono::steady_clock::now();
+  WMT::MetalDrawable{}.countPresent(statistics_, frame.number);
+}
+
+HRESULT
+Presenter::frameStatistics(DXGI_FRAME_STATISTICS *stats, double refresh_rate) {
+  LARGE_INTEGER before, after, frequency;
+  QueryPerformanceCounter(&before);
+  auto shown = statistics_.get();
+  QueryPerformanceCounter(&after);
+  QueryPerformanceFrequency(&frequency);
+  if (!shown.shown)
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  // the host's clock was read between the two QPC reads
+  auto qpc = (before.QuadPart + after.QuadPart) / 2 - LONGLONG((shown.now - shown.shown_time) * frequency.QuadPart);
+  // the scheduler's last sample is the refresh the frame was shown at
+  UINT refresh = UINT(std::llround((shown.shown_time - shown.since) * refresh_rate));
+  *stats = {UINT(shown.shown), refresh, refresh, {.QuadPart = qpc}, {}};
+  return S_OK;
 }
 
 void

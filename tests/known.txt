@@ -22,5 +22,4 @@ native(Apple M5 Pro) d3d12_raster_dxil failed: 1086 wrong results [f7363309] -- 
 native(Apple M5 Pro) d3d12_raster_samples_dxbc failed: 26544 wrong results [a63cea30] -- forced sample counts with a 1x render target bound (RtvForced) rasterize at one sample: coverage 1, want 15 (lanes/2026-10-25-known)
 native(Apple M5 Pro) d3d12_raster_samples_dxil failed: 26544 wrong results [a63cea30] -- forced sample counts with a 1x render target bound (RtvForced) rasterize at one sample: coverage 1, want 15 (lanes/2026-10-25-known)
 native(Apple M5 Pro) dxgi_composition failed: 52 wrong results [0316c71e] -- composition swap chains are not implemented: creation returns E_NOTIMPL where descriptor checks want E_INVALIDARG
-native(Apple M5 Pro) dxgi_present failed: 22 wrong results [b092da44] -- frame statistics are not implemented for windowed bitblt swap chains and give no vblank QPC
 native(Apple M5 Pro) host_dxbc_hash skipped: no directories of shader containers named -- by design: no shader container directories are named in a plain run

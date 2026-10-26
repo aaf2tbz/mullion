@@ -723,13 +723,12 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
-    DEBUG("DXGISwapChain::GetFrameStatistics: stub");
-    stats->PresentCount = presentation_count_;
-    stats->SyncRefreshCount = presentation_count_;
-    stats->PresentRefreshCount = presentation_count_;
-    stats->SyncGPUTime = {};
-    stats->SyncQPCTime = {};
-    return S_OK;
+    if (!stats)
+      return E_INVALIDARG;
+    wsi::WsiMode mode;
+    if (!wsi::getCurrentDisplayMode(monitor_, &mode) || !mode.refreshRate.numerator || !mode.refreshRate.denominator)
+      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    return presenter->frameStatistics(stats, double(mode.refreshRate.numerator) / mode.refreshRate.denominator);
   };
 
   HRESULT

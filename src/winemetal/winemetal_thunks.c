@@ -1600,3 +1600,28 @@ DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size) {
   UNIX_CALL(WMTUnixDispatchDataBytes, &params);
   return params.ret;
 }
+
+WINEMETAL_API obj_handle_t
+WMTPresentStatistics_new(void) {
+  struct unixcall_generic_obj_ret params;
+  params.ret = NULL_OBJECT_HANDLE;
+  UNIX_CALL(WMTUnixPresentStatisticsNew, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MetalDrawable_countPresent(obj_handle_t drawable, obj_handle_t statistics, uint64_t number) {
+  struct unixcall_generic_obj_obj_uint64_noret params;
+  params.handle = drawable;
+  params.arg0 = statistics;
+  params.arg1 = number;
+  UNIX_CALL(WMTUnixDrawableCountPresent, &params);
+}
+
+WINEMETAL_API void
+WMTPresentStatistics_get(obj_handle_t statistics, struct WMTPresentStatistics *out) {
+  struct unixcall_generic_obj_ptr_noret params;
+  params.handle = statistics;
+  WMT_MEMPTR_SET(params.arg, out);
+  UNIX_CALL(WMTUnixPresentStatisticsGet, &params);
+}
