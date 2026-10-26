@@ -5,8 +5,9 @@
 // bounded by the smaller of physical memory and process address space in system allocation units.
 // "All APIs on ID3D12GraphicsCommandList do not hold references to the objects passed into those APIs"
 // (Creating and recording command lists and bundles). check COM counts and native backing separately: resource
-// counts do not count internal texture views. with no GPU work in flight, DXGI's CurrentUsage ("current video
-// memory usage, in bytes", DXGI_QUERY_VIDEO_MEMORY_INFO) returns to its baseline after resources go.
+// counts do not count internal texture views. once a submission completes, DXGI's CurrentUsage ("current video
+// memory usage, in bytes", DXGI_QUERY_VIDEO_MEMORY_INFO) returns to its baseline after resources go: before then
+// Metal may still hold them, as a residency set gives an allocation up at its next commit.
 // a valid native resolve followed by an invalid write mode must leave no view held, at Close, Reset or Release.
 // deferred post-build information also records on the queue: an exhausted private recording leaves the output
 // unchanged twice, then the same query on a fresh allocator writes the same bytes as its successful control.
@@ -29,12 +30,24 @@ main() {
   ComPtr<IDXGIAdapter3> adapter;
   CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
   CHECK(factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter)));
+  ComPtr<ID3D12CommandQueue> queue;
+  D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+  CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
+  ComPtr<ID3D12CommandAllocator> settling;
+  CHECK(device->CreateCommandAllocator(queue_desc.Type, IID_PPV_ARGS(&settling)));
+  ComPtr<ID3D12GraphicsCommandList> settle;
+  CHECK(device->CreateCommandList(0, queue_desc.Type, settling.Get(), nullptr, IID_PPV_ARGS(&settle)));
+  CHECK(settle->Close());
+  auto usage = [&](DXGI_QUERY_VIDEO_MEMORY_INFO &info) {
+    HRESULT hr = execute(device.Get(), queue.Get(), settle.Get());
+    return FAILED(hr) ? hr : adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info);
+  };
   for (bool invalid : {false, true})
     for (bool reset : {false, true}) {
       step("native resolve references: invalid Close %u, allocator Reset %u", invalid, reset);
       CHECK(allocator->Reset());
       DXGI_QUERY_VIDEO_MEMORY_INFO before{}, after{};
-      CHECK(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &before));
+      CHECK(usage(before));
       D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
       D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                {4, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
@@ -61,7 +74,7 @@ main() {
       source.Reset();
       destination.Reset();
       if (invalid) {
-        CHECK(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &after));
+        CHECK(usage(after));
         expect(after.CurrentUsage == before.CurrentUsage, "failed Close retains %llu bytes of texture backing",
                after.CurrentUsage - before.CurrentUsage);
         expect(list->Reset(allocator.Get(), nullptr) == E_INVALIDARG, "failed list Reset succeeded");
@@ -72,16 +85,13 @@ main() {
       } else {
         allocator.Reset();
       }
-      CHECK(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &after));
+      CHECK(usage(after));
       expect(after.CurrentUsage == before.CurrentUsage, "allocator cleanup retains %llu bytes of texture backing",
              after.CurrentUsage - before.CurrentUsage);
       if (!allocator)
         CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
     }
 
-  ComPtr<ID3D12CommandQueue> queue;
-  D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
-  CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
   D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};
   CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options, sizeof(options)));
   const bool raytracing = options.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
