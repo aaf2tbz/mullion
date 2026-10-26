@@ -1,0 +1,40 @@
+native(Apple M5 Pro) d3d10_blending failed: 28 wrong results [0ad0b1c9] -- untraced: a blend whose result is zero stores -0 in alpha (format 2, equations 1462 on)
+native(Apple M5 Pro) d3d10_block_values failed: 1 wrong results [99c99050] -- untraced: BC4_SNORM decodes a zero texel as -0.000123 (-1/8128)
+native(Apple M5 Pro) d3d10_depth_stencil failed: 80 wrong results [ae24203b] -- untraced: D24S8 (format 45) cases 31 on write color where the depth test should fail
+native(Apple M5 Pro) d3d10_format_blend failed: 1 wrong results [f0d36ff3] -- untraced: R32G32B32A32_FLOAT blend with ops 2,2 and factors 1,1 differs at row 1 pixel 8
+native(Apple M5 Pro) d3d10_raster failed: 580 wrong results [e2fc82b3] -- untraced: case 167, a triangle crossing the w = 0 plane, interpolates wrong attributes
+native(Apple M5 Pro) d3d10_raster_bias failed: 588 wrong results [f07ed9ab] -- untraced: depth bias case 130 on D32_FLOAT_S8X24 writes depth 1 where 0 is wanted
+native(Apple M5 Pro) d3d11_blending failed: 28 wrong results [8e7375db] -- untraced: a blend whose result is zero stores -0 in alpha (format 2, equations 1462 on)
+native(Apple M5 Pro) d3d11_block_values failed: 72 wrong results [18fbf2fe] -- untraced: BC4_SNORM decodes a zero texel as -0.000123 (-1/8128)
+native(Apple M5 Pro) d3d11_depth_stencil failed: 96 wrong results [2845c52d] -- untraced: D24S8 (format 45) cases 31 on write color where the depth test should fail
+native(Apple M5 Pro) d3d11_format_blend failed: 1 wrong results [204183ee] -- untraced: R32G32B32A32_FLOAT blend with ops 2,2 and factors 1,1 differs at row 1 pixel 8
+native(Apple M5 Pro) d3d11_format_logic failed: 1 wrong results [f4d75145] -- untraced: R10G10B10A2_UINT logic op 3 with mask 0x1 differs from the Boolean equation
+native(Apple M5 Pro) d3d11_logic failed: 16 wrong results [1f57aa1e] -- untraced: logic ops on format 25 (R10G10B10A2_UINT) write 0x3ff where 0 is wanted
+native(Apple M5 Pro) d3d11_raster failed: 2640 wrong results [2037792d] -- untraced: case 36 on, post-snap degenerate triangles and fill-rule ties cover the wrong pixels
+native(Apple M5 Pro) d3d11_raster_bias failed: 1176 wrong results [a894dee3] -- untraced: depth bias case 130 on D32_FLOAT_S8X24 writes depth 1 where 0 is wanted
+native(Apple M5 Pro) d3d11_raster_samples failed: 17698 wrong results [14b7f442] -- forced sample counts with a 1x render target bound (RtvForced) rasterize at one sample: coverage 1, want 15 (lanes/2026-10-25-known)
+native(Apple M5 Pro) d3d12_blending_dxbc failed: 42 wrong results [ef6453bb] -- untraced: a blend whose result is zero stores -0 in alpha (format 2, equations 1462 on)
+native(Apple M5 Pro) d3d12_blending_dxil failed: 42 wrong results [ef6453bb] -- untraced: a blend whose result is zero stores -0 in alpha (format 2, equations 1462 on)
+native(Apple M5 Pro) d3d12_block_values_dxbc failed: 108 wrong results [72890075] -- untraced: BC4_SNORM decodes a zero texel as -0.000123 (-1/8128)
+native(Apple M5 Pro) d3d12_block_values_dxil failed: 108 wrong results [72890075] -- untraced: BC4_SNORM decodes a zero texel as -0.000123 (-1/8128)
+native(Apple M5 Pro) d3d12_corpus_dxbc skipped: no directory of DXIL shaders named -- by design: no shader directory is named in a plain run
+native(Apple M5 Pro) d3d12_corpus_dxil skipped: no directory of DXIL shaders named -- by design: no shader directory is named in a plain run
+native(Apple M5 Pro) d3d12_depth_stencil_dxbc failed: 144 wrong results [92ecb69c] -- untraced: D24S8 (format 45) cases 31 on write color where the depth test should fail
+native(Apple M5 Pro) d3d12_depth_stencil_dxil failed: 144 wrong results [92ecb69c] -- untraced: D24S8 (format 45) cases 31 on write color where the depth test should fail
+native(Apple M5 Pro) d3d12_format_blend_dxbc failed: 1 wrong results [43b03dd7] -- untraced: R32G32B32A32_FLOAT blend with ops 2,2 and factors 1,1 differs at row 1 pixel 8
+native(Apple M5 Pro) d3d12_format_blend_dxil failed: 1 wrong results [43b03dd7] -- untraced: R32G32B32A32_FLOAT blend with ops 2,2 and factors 1,1 differs at row 1 pixel 8
+native(Apple M5 Pro) d3d12_format_logic_dxbc failed: 1 wrong results [da4f6fff] -- untraced: R10G10B10A2_UINT logic op 3 with mask 0x1 differs from the Boolean equation
+native(Apple M5 Pro) d3d12_format_logic_dxil failed: 1 wrong results [da4f6fff] -- untraced: R10G10B10A2_UINT logic op 3 with mask 0x1 differs from the Boolean equation
+native(Apple M5 Pro) d3d12_gather_dxbc failed: 1 wrong results [00c65ea2] -- untraced: gather comparison 3 (case 396) returns 0 for a texel that passes
+native(Apple M5 Pro) d3d12_gather_dxil failed: 1 wrong results [00c65ea2] -- untraced: gather comparison 3 (case 396) returns 0 for a texel that passes
+native(Apple M5 Pro) d3d12_logic_dxbc failed: 24 wrong results [c5ff85e8] -- untraced: logic ops on format 25 (R10G10B10A2_UINT) write 0x3ff where 0 is wanted
+native(Apple M5 Pro) d3d12_logic_dxil failed: 24 wrong results [c5ff85e8] -- untraced: logic ops on format 25 (R10G10B10A2_UINT) write 0x3ff where 0 is wanted
+native(Apple M5 Pro) d3d12_raster_bias_dxbc failed: 1807 wrong results [d1c73e91] -- untraced: depth bias case 130 on D32_FLOAT_S8X24 writes depth 1 where 0 is wanted
+native(Apple M5 Pro) d3d12_raster_bias_dxil failed: 1818 wrong results [00da576b] -- untraced: depth bias case 130 on D32_FLOAT_S8X24 writes depth 1 where 0 is wanted
+native(Apple M5 Pro) d3d12_raster_dxbc failed: 1086 wrong results [f7363309] -- untraced: case 36 on, post-snap degenerate triangles and fill-rule ties cover the wrong pixels
+native(Apple M5 Pro) d3d12_raster_dxil failed: 1086 wrong results [f7363309] -- untraced: case 36 on, post-snap degenerate triangles and fill-rule ties cover the wrong pixels
+native(Apple M5 Pro) d3d12_raster_samples_dxbc failed: 26544 wrong results [a63cea30] -- forced sample counts with a 1x render target bound (RtvForced) rasterize at one sample: coverage 1, want 15 (lanes/2026-10-25-known)
+native(Apple M5 Pro) d3d12_raster_samples_dxil failed: 26544 wrong results [a63cea30] -- forced sample counts with a 1x render target bound (RtvForced) rasterize at one sample: coverage 1, want 15 (lanes/2026-10-25-known)
+native(Apple M5 Pro) dxgi_composition failed: 52 wrong results [0316c71e] -- composition swap chains are not implemented: creation returns E_NOTIMPL where descriptor checks want E_INVALIDARG
+native(Apple M5 Pro) dxgi_present failed: 22 wrong results [b092da44] -- frame statistics are not implemented for windowed bitblt swap chains and give no vblank QPC
+native(Apple M5 Pro) host_dxbc_hash skipped: no directories of shader containers named -- by design: no shader container directories are named in a plain run
