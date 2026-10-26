@@ -2465,12 +2465,41 @@ enum WMTSampledEncoder {
 enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixComputeMaxThreadsPerThreadgroup,
        WMTUnixDeviceSupports32BitFloatFiltering, WMTUnixDeviceMaxArgumentBufferSamplerCount,
        WMTUnixDeviceSupports32BitMSAA, WMTUnixPresentStatisticsNew, WMTUnixDrawableCountPresent,
-       WMTUnixPresentStatisticsGet, WMTUnixCallCount };
+       WMTUnixPresentStatisticsGet, WMTUnixGPUStatistics, WMTUnixCommandBufferPushDebugGroup,
+       WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
+// MULLION_DIAG=profile: each bridge call's count and time in QueryPerformanceCounter ticks, by code, since the last
+// totals were taken; the bridge times calls once WMTDiagTimeCalls was called
+struct WMTDiagCall {
+  uint64_t count, ticks;
+  const char *name;
+};
+WINEMETAL_API void WMTDiagTimeCalls(void);
+WINEMETAL_API void WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]);
+WINEMETAL_API int64_t WMTDiagSemaphoreCount(void *semaphore);
+// the statistics the device's driver keeps in its IORegistry entry (PerformanceStatistics), as tab-separated
+// name=value pairs: their length, written to buffer when it holds them
+WINEMETAL_API uint64_t WMTGPUStatistics(obj_handle_t device, char *buffer, uint64_t size);
+WINEMETAL_API void MTLCommandBuffer_pushDebugGroup(obj_handle_t cmdbuf, obj_handle_t name);
+WINEMETAL_API void MTLCommandBuffer_popDebugGroup(obj_handle_t cmdbuf);
 WINEMETAL_API uint64_t DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size);
+// the flight recorder: each thread keeps its last records in memory, and a dump writes them, in time order and with
+// its reason, to <executable>.flight in MULLION_DIAG_PATH or else ~/Library/Logs/Mullion, the first of a process
+// anew and the others after it.
+// a site is a printf format of up to four 64-bit integer arguments, copied once; a record is a site with its
+// arguments, its thread and its time in the CPU's counter's ticks
+struct WMTFlightEntry {
+  uint64_t time;
+  struct WMTConstMemoryPointer site;
+  uint64_t args[4];
+  uint32_t thread;
+};
+WINEMETAL_API const void *WMTFlightSite(const char *format);
+WINEMETAL_API void WMTFlightRecord(const void *site, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+WINEMETAL_API void WMTFlightDump(const char *reason);
 
 // what a presenter's frames did on screen, in host seconds (CACurrentMediaTime): the number of the last frame shown
 // (frames count from 1) and when it was, when counting began, and the time the statistics were read

@@ -3712,16 +3712,19 @@ public:
     return annotation_.GetStatus();
   };
 
-  void STDMETHODCALLTYPE SetMarkerInt(const WCHAR *label, int data) override {
-    // no-op
-  };
+  // a marker is an instant, which no pass is named by
+  void STDMETHODCALLTYPE SetMarkerInt(const WCHAR *label, int data) override {};
 
   void STDMETHODCALLTYPE BeginEventInt(const WCHAR *label, int data) override {
-    // no-op
+    if (!diag::events)
+      return;
+    auto name = diag::EventName(0, label, label ? std::char_traits<WCHAR>::length(label) * sizeof(WCHAR) : 0);
+    EmitST([name = std::move(name)](ArgumentEncodingContext &enc) { diag::PushEvent(enc.events, name); });
   };
 
   void STDMETHODCALLTYPE EndEvent() override {
-    // no-op
+    if (diag::events)
+      EmitST([](ArgumentEncodingContext &enc) { diag::PopEvent(enc.events); });
   };
 
 #pragma endregion

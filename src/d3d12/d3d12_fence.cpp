@@ -165,7 +165,20 @@ public:
     if (Logger::logLevel() == LogLevel::Trace)
       TRACE("fence ", this, " at ", completion->value.load(), ": thread ", GetCurrentThreadId(),
             Event ? " sets an event at " : " waits for ", Value);
-    Event ? completion->Expect(Value, [Event] { SetEvent(Event); }) : completion->Expect(Value)->wait(false);
+    // the caller is taken to wait from here, as it does for a fence it waits on
+    auto waited = [began = diag::profile ? diag::Now() : 0, thread = GetCurrentThreadId()] {
+      if (began)
+        diag::Waited("fence", began, thread);
+    };
+    if (Event)
+      completion->Expect(Value, [Event, waited] {
+        waited();
+        SetEvent(Event);
+      });
+    else {
+      completion->Expect(Value)->wait(false);
+      waited();
+    }
     return S_OK;
   }
 

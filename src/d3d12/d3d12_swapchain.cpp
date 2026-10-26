@@ -244,6 +244,8 @@ public:
       static_cast<MTLDXGIOutput *>(target_.ptr())->SetFullscreen(false);
     WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
+    if (diag::profile)
+      diag::LatencyClosed(present_semaphore_);
     CloseHandle(present_semaphore_);
   };
 
@@ -798,6 +800,7 @@ public:
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
+    auto began = diag::profile ? diag::Now() : 0;
     // a window the picture keeps its size in may have another size by now
     if (settings_.Update(desc_, fullscreen_desc_.Windowed, hWnd, *presenter))
       ApplyLayerProps();
@@ -846,6 +849,10 @@ public:
 
     presentation_count_ += 1;
     current_buffer_ = (current_buffer_ + 1) % backbuffers_.size();
+    if (began) {
+      diag::Write(diag::Line("span", "present", "", GetCurrentThreadId(), began, diag::Now() - began));
+      diag::LatencyPresented(present_semaphore_);
+    }
 
     return hr;
   };
@@ -913,6 +920,8 @@ public:
       return FAIL(DXGI_ERROR_INVALID_CALL);
     }
     if (max_latency > frame_latency) {
+      if (diag::profile)
+        diag::LatencyReleased(present_semaphore_);
       ReleaseSemaphore(present_semaphore_, max_latency - frame_latency, nullptr);
     }
     frame_latency = max_latency;
@@ -942,6 +951,8 @@ public:
     if (!DuplicateHandle(processHandle, present_semaphore_, processHandle, &result, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
       return nullptr;
     }
+    if (diag::profile)
+      diag::LatencyTaken(present_semaphore_);
 
     return result;
   };

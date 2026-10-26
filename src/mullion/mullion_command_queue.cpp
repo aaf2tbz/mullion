@@ -118,7 +118,8 @@ CommandQueue::ProfilePass(EncoderData *pass, diag::ProfileBuffer *&profiled) {
     attachment = {samples.buffer, first, first + count - 1};
   }
   buffer.passes.push_back(
-      {seq, diag::Now(), kind, std::move(runs), std::move(targets), uint32_t(buffer.samples.size() - 1), first, count});
+      {seq, diag::Now(), kind, std::move(runs), std::move(targets), uint32_t(buffer.samples.size() - 1), first, count,
+       pass->event_path ? pass->event_path : ""});
   profiled = &buffer;
   return attachment;
 }
@@ -210,7 +211,7 @@ CommandQueue::CommitCurrentChunk() {
   if (profile_) {
     profile_->buffers[chunk_id % kCommandChunkCount].submitted = began;
     if (chunk.signal_frame_latency_fence_ != ~0ull)
-      diag::Frame(profile_->id, chunk_id);
+      diag::Frame(device, profile_->id, chunk_id);
   }
 #if ASYNC_ENCODING
   ready_for_encode.fetch_add(1, std::memory_order_release);
@@ -254,6 +255,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
     device.sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
     buffer.committed = diag::Now();
   }
+  FLIGHT("context queue %p: chunk %llu of frame %llu commits as %#llx", this, seq, chunk.frame_, cmdbuf.handle);
   cmdbuf.commit();
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
@@ -296,8 +298,14 @@ CommandQueue::WaitForFinishThread() {
       chunk.attached_cmdbuf.waitUntilCompleted();
     }
     auto completed = profile_ ? diag::Now() : 0;
+    FLIGHT("context queue %p: chunk %llu completes, status %llu", this, internal_seq,
+           uint64_t(chunk.attached_cmdbuf.status()));
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
+      // the first: Metal fails the command buffers after a fault too
+      static bool dumped;
+      if (!std::exchange(dumped, true))
+        WMTFlightDump("a command buffer error");
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {
       for (auto &log : logs.elements()) {
@@ -325,6 +333,8 @@ CommandQueue::WaitForFinishThread() {
         for (uint32_t i = 0; i < pass.count; i++)
           line += str::format('\t', pass.first == ~0u ? ~uint64_t(0) : clocks[pass.buffer][pass.first + i]);
         lines += line + '\n' + pass.targets;
+        if (!pass.event.empty())
+          lines += diag::Line("event", profile_->id, internal_seq, pass.id, pass.event);
       }
       diag::Write(lines);
       chunk.readback.timestamp.reset();

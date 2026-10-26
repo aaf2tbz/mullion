@@ -182,6 +182,10 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   EncoderData *encoder_last;
   EncoderData *encoder_current;
   size_t encoder_count_;
+public:
+  // the recording list's open events, which the passes it begins carry
+  const char *event = nullptr;
+private:
 
   // a list keeps its root's address until the queue has committed it, while later lists add roots
   std::deque<EncoderData> encoder_lists_;
@@ -293,6 +297,7 @@ public:
       return FAIL(E_INVALIDARG);
     *pStartEncoder = encoder_last = &encoder_lists_.emplace_back(EncoderType::Null, nullptr);
     so_scratch_size_ = 0;
+    event = nullptr;
     return S_OK;
   }
 
@@ -346,6 +351,7 @@ public:
     // what logs call the pass
     static std::atomic<uint64_t> passes;
     p->id = ++passes;
+    p->event_path = event;
     encoder_current = p;
     return p;
   };

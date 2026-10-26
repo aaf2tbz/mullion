@@ -755,6 +755,16 @@ public:
   }
 
   void
+  pushDebugGroup(String name) {
+    MTLCommandBuffer_pushDebugGroup(handle, name);
+  }
+
+  void
+  popDebugGroup() {
+    MTLCommandBuffer_popDebugGroup(handle);
+  }
+
+  void
   waitUntilCompleted() {
     return MTLCommandBuffer_waitUntilCompleted(handle);
   }

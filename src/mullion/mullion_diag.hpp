@@ -4,10 +4,36 @@
 #include "util_string.hpp"
 #include "thread.hpp"
 #include "log/log.hpp"
+#include <algorithm>
+#include <string_view>
 #include <vector>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 namespace mullion::diag {
+// the compiler checks a flight record's format against its arguments here, which must each be 64 bits
+[[gnu::format(printf, 1, 2)]] inline void
+FlightFormat(const char *, ...) {}
+
+template <typename T>
+uint64_t
+FlightWord(T value) {
+  static_assert(sizeof(T) == sizeof(uint64_t) || std::is_pointer_v<T>);
+  if constexpr (std::is_pointer_v<T>)
+    return uint64_t(uintptr_t(value));
+  else
+    return uint64_t(value);
+}
+
+template <typename... Args>
+void
+Flight(const void *site, Args... args) {
+  static_assert(sizeof...(Args) <= 4);
+  uint64_t words[4] = {FlightWord(args)...};
+  WMTFlightRecord(site, words[0], words[1], words[2], words[3]);
+}
+
 struct TimestampSamples {
   mullion::mutex mutex;
   mullion::condition_variable returned;
@@ -48,7 +74,8 @@ struct TimestampSamples {
   }
 };
 
-inline const bool profile = env::getEnvVar("MULLION_DIAG") == "profile";
+// the bridge times its calls from the first library that profiles
+inline const bool profile = env::getEnvVar("MULLION_DIAG") == "profile" && (WMTDiagTimeCalls(), true);
 inline const bool errors = !env::getEnvVar("MULLION_D3D12_GPU_ERRORS").empty();
 // MULLION_TRACE_ENCODERS: every D3D11 render pass is logged with its size and draws as it is encoded
 inline const bool trace_encoders = !env::getEnvVar("MULLION_TRACE_ENCODERS").empty();
@@ -83,12 +110,167 @@ Write(const std::string &lines) {
     ERR("Mullion profile: record could not be written");
 }
 
+// the bridge's calls since the frame before: a 'call' line naming each code once, then 'unix' with code:count:time
+inline std::string
+Calls() {
+  static bool named[WMTUnixCallCount];
+  WMTDiagCall calls[WMTUnixCallCount];
+  WMTDiagCallTotals(calls);
+  std::string lines, totals = "unix";
+  for (uint32_t code = 0; code < WMTUnixCallCount; code++) {
+    if (!calls[code].count)
+      continue;
+    if (!std::exchange(named[code], true))
+      lines += Line("call", code, calls[code].name);
+    totals += str::format('\t', code, ':', calls[code].count, ':', Nanoseconds(calls[code].ticks));
+  }
+  return lines + totals + '\n';
+}
+
+// the GPU's driver statistics at a frame's end, as the device's IORegistry entry has them
+inline std::string
+Statistics(WMT::Device device) {
+  std::string text;
+  for (uint64_t length = 0; text.size() != (length = WMTGPUStatistics(device.handle, text.data(), text.size()));)
+    text.resize(length);
+  return "gpu" + text + '\n';
+}
+
+// MULLION_DIAG=profile, or Metal's capture: the application's debug events name the passes recorded in them
+inline const bool events = profile || env::getEnvVar("MTL_CAPTURE_ENABLED") == "1";
+// ends each name in an event path; names never hold it, as EventName makes control characters spaces
+constexpr char kEventEnd = '\x1f';
+
+// the name D3D12's BeginEvent gives: a wide (metadata 0) or ANSI (1) string, or a PIX event, whose format string
+// is the name (pix3_win.h): 2 is PIXEventsLegacy.h's blob, WINPIX_EVENT_PIX3BLOB_V2 PIXEventsCommon.h's
+inline std::string
+EventName(UINT metadata, const void *data, UINT size) {
+  constexpr UINT pix3blob = 2, pix3blob_v2 = 6345127;
+  auto words = static_cast<const uint64_t *>(data);
+  size_t count = size / sizeof(uint64_t), at = 1;
+  bool ansi = metadata == 1;
+  if (metadata == pix3blob || metadata == pix3blob_v2) {
+    if (!count)
+      return {};
+    if (metadata == pix3blob)
+      at++; // the color
+    else {
+      auto flags = words[0] >> 12 & 0xff;
+      // PIX_EVENT_METADATA_HAS_COLOR: a color word follows; otherwise an index color is in the flags
+      at += (flags & 0xf0) == 0xf0;
+      // PIX_EVENT_METADATA_ON_CONTEXT: then the context pointer
+      at += flags & 0x1;
+    }
+    // the string's info word, a zero word for a null string; its bit 54 says ANSI
+    if (at >= count || !words[at])
+      return {};
+    ansi = words[at] >> 54 & 1;
+    data = words + ++at;
+    size = (count - at) * sizeof(uint64_t);
+  } else if (metadata > 1) {
+    return {};
+  }
+  std::string name;
+  if (ansi) {
+    name.assign(static_cast<const char *>(data), strnlen(static_cast<const char *>(data), size));
+  } else {
+    auto wide = static_cast<const WCHAR *>(data);
+    name = str::fromws(std::basic_string<WCHAR>(wide, std::find(wide, wide + size / sizeof(WCHAR), 0)).c_str());
+  }
+  std::replace_if(name.begin(), name.end(), [](unsigned char c) { return c < ' '; }, ' ');
+  return name;
+}
+
+inline void
+PushEvent(std::string &path, const std::string &name) {
+  path += name + kEventEnd;
+}
+
+// an end with no event open is the application's error, which ends nothing
+inline void
+PopEvent(std::string &path) {
+  if (path.empty())
+    return;
+  path.pop_back();
+  path.erase(path.find_last_of(kEventEnd) + 1);
+}
+
+// the events open on a command buffer as Metal debug groups, which Xcode's captures show around their passes
+struct DebugGroups {
+  std::string open;
+
+  // closes the groups the path is not in, and opens its events that are not open; "" closes all
+  void
+  Enter(WMT::CommandBuffer cmdbuf, std::string_view path) {
+    size_t kept = 0;
+    for (size_t end; (end = open.find(kEventEnd, kept)) != open.npos; kept = end + 1)
+      if (path.compare(kept, end + 1 - kept, open, kept, end + 1 - kept))
+        break;
+    for (auto i = kept; i < open.size(); i++)
+      if (open[i] == kEventEnd)
+        cmdbuf.popDebugGroup();
+    for (size_t end; (end = path.find(kEventEnd, kept)) != path.npos; kept = end + 1) {
+      std::string name(path.substr(kept, end - kept));
+      cmdbuf.pushDebugGroup(WMT::String::string(name.c_str(), WMTUTF8StringEncoding));
+    }
+    open = path;
+  }
+};
+
+// a wait of a thread for the GPU or Mullion's threads, from `began` until now: tools/mullion-diag follows a frame's
+// time through the waits of the thread that presents
+inline void
+Waited(const char *what, uint64_t began, DWORD thread = GetCurrentThreadId()) {
+  Write(Line("span", "wait", what, thread, began, Now() - began));
+}
+
+// the frame latency objects the application took, each with when it presented last and on which thread: a release
+// that finds an object's count at zero ends a wait the application is taken to have begun at that present
+struct LatencyWait {
+  uint64_t presented = 0;
+  DWORD thread = 0;
+};
+inline mullion::mutex latency_lock;
+inline std::unordered_map<HANDLE, LatencyWait> latency_waits;
+
+inline void
+LatencyTaken(HANDLE semaphore) {
+  std::lock_guard<mullion::mutex> lock(latency_lock);
+  latency_waits.try_emplace(semaphore);
+}
+
+inline void
+LatencyPresented(HANDLE semaphore) {
+  std::lock_guard<mullion::mutex> lock(latency_lock);
+  if (auto wait = latency_waits.find(semaphore); wait != latency_waits.end())
+    wait->second = {Now(), GetCurrentThreadId()};
+}
+
+// before the release
+inline void
+LatencyReleased(HANDLE semaphore) {
+  std::lock_guard<mullion::mutex> lock(latency_lock);
+  if (auto wait = latency_waits.find(semaphore);
+      wait != latency_waits.end() && wait->second.presented && !WMTDiagSemaphoreCount(semaphore))
+    Waited("latency", std::exchange(wait->second.presented, 0), wait->second.thread);
+}
+
+inline void
+LatencyClosed(HANDLE semaphore) {
+  std::lock_guard<mullion::mutex> lock(latency_lock);
+  latency_waits.erase(semaphore);
+}
+
 template <typename Queue>
 void
-Frame(const Queue &queue, uint64_t number) {
+Frame(WMT::Device device, const Queue &queue, uint64_t number) {
   static mullion::mutex lock;
   std::lock_guard<mullion::mutex> order(lock);
-  Write(Line("frame", queue, number, Now()));
+  // with Metal's host clock read beside it: how a Wine's QueryPerformanceCounter maps to it varies
+  auto now = Now();
+  uint64_t host, gpu;
+  device.sampleTimestamps(host, gpu);
+  Write(Line("frame", queue, number, now, host) + Statistics(device) + Calls());
 }
 
 template <typename Head, typename Name>
@@ -186,6 +368,7 @@ struct ProfileBuffer {
     const char *kind;
     std::string runs, targets;
     uint32_t buffer, first, count;
+    std::string event;
   };
   uint64_t submitted = 0, committed = 0, cpu_begin = 0, gpu_begin = 0;
   uint32_t presents = 0, timestamps = 0;
@@ -193,3 +376,12 @@ struct ProfileBuffer {
   std::vector<Pass> passes;
 };
 } // namespace mullion::diag
+
+// a record in the flight recorder (WMTFlightRecord), always on: a printf format of 64-bit integers, at most four
+#define FLIGHT(format, ...)                                                                                            \
+  do {                                                                                                                 \
+    static const void *const flight_site = WMTFlightSite(format);                                                      \
+    if (false)                                                                                                         \
+      ::mullion::diag::FlightFormat(format __VA_OPT__(, ) __VA_ARGS__);                                                \
+    ::mullion::diag::Flight(flight_site __VA_OPT__(, ) __VA_ARGS__);                                                   \
+  } while (0)

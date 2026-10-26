@@ -530,10 +530,22 @@ struct unixcall_mtlcommandbuffer_sampledcommandencoder {
   obj_handle_t ret;
   enum WMTSampledEncoder type;
 };
+struct unixcall_wmtgpu_statistics {
+  obj_handle_t device;
+  struct WMTMemoryPointer buffer;
+  uint64_t size;
+  uint64_t ret;
+};
+
 struct unixcall_wmtdiag_write {
   struct WMTConstMemoryPointer directory, lines;
   uint64_t length;
   uint32_t ret;
+};
+
+struct unixcall_wmtflight_write {
+  struct WMTConstMemoryPointer reason, directory, executable, records;
+  uint64_t count, frequency, now, lost, overwritten;
 };
 
 #pragma pack(pop)

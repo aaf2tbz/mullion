@@ -49,6 +49,8 @@ enum class QueryState {
 class MTLD3D11Query : public ID3D11Query1 {
 public:
   QueryState state_ = QueryState::Undefined;
+  // MULLION_DIAG=profile: when GetData first found the query unfinished in this frame, and the frame
+  uint64_t polled = 0, polled_frame = 0;
 
   // the context's hold on what is bound: without the application's count, which holds the device
   virtual void AddRefPrivate() = 0;

@@ -8,6 +8,10 @@ adapters = executable('d3d12_adapters', 'd3d12_adapters.cpp', dependencies: d3d1
 foreach front_end : ['dxil', 'dxbc']
   test('d3d12_adapters_' + front_end, adapters, args: [front_end], timeout: 600)
 endforeach
+# workloads tests/held.py profiles
+executable('d3d12_held', 'd3d12_held.cpp', dependencies: d3d12_test_deps)
+# runs tests/flight.py reads the flight recorder's dumps of
+executable('d3d12_flight', 'd3d12_flight.cpp', dependencies: d3d12_test_deps + [cpp.find_library('d3d11')])
 exe = executable('d3d12_d3d11on12', ['d3d12_d3d11on12.cpp'], dependencies: d3d12_test_deps + [cpp.find_library('d3d11')])
 test('d3d12_d3d11on12', exe, timeout: 600)
 exe = executable('d3d12_xrbias', ['d3d12_xrbias.cpp'], dependencies: d3d12_test_deps)
