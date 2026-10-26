@@ -139,6 +139,8 @@ struct BlitEncoderData : EncoderData {
 struct ComputeEncoderData : EncoderData {
   wmtcmd_compute_nop cmd_head;
   wmtcmd_base *cmd_tail;
+  // it dispatches rays, whose kernel reads the sparse buffer table even when there is none
+  bool rays = false;
 };
 
 // bindings recorded once; the queue submits each part before making the next

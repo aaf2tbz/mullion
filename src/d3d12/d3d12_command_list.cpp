@@ -4047,6 +4047,7 @@ public:
       return false;
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
       StartComputePass();
+    static_cast<ComputeEncoderData *>(allocator_->encoder_current)->rays = true;
     if (device_->NamesPasses())
       device_->NamePass(allocator_->encoder_current, state_object_->name, pipeline);
     auto &pso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();

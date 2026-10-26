@@ -1158,11 +1158,11 @@ public:
             encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
           }
           encoder.waitForFence(fence_);
-          if (sparse_mappings) {
+          if (sparse_mappings || data->rays) {
             scope.inflight->sparse_mappings = sparse_mappings;
             wmtcmd_compute_setbuffer binding{};
             binding.type = WMTComputeCommandSetBuffer;
-            binding.buffer = sparse_mappings;
+            binding.buffer = sparse_mappings ? sparse_mappings.handle : device_->GetNullBufferHandle();
             binding.index = kSparseBufferArgumentIndex;
             encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
           }
