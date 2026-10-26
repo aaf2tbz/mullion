@@ -3730,7 +3730,8 @@ public:
       count = allocator_->gpu_heap_buffer_;
       count_offset = offset;
     }
-    auto geometries = allocator_->AllocateCommandData<WMTAccelerationStructureGeometry>(top ? 0 : inputs.NumDescs);
+    auto geometries =
+        allocator_->AllocateCommandData<WMTAccelerationStructureGeometry>(top ? 0 : std::max(inputs.NumDescs, 1u));
     auto info = AccelerationStructureInfo(device_, inputs, geometries, true, 0, count, count_offset);
     // elements a stride of zero apart are one element, which Metal reads as many: it is repeated, twice as many with
     // each copy. elements of 16-bit components may lie at any even address ("D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC",

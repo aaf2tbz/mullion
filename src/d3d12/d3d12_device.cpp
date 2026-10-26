@@ -376,6 +376,11 @@ public:
     return null_buffer_address_;
   }
 
+  obj_handle_t
+  GetNullBufferHandle() {
+    return null_buffer_.handle;
+  }
+
   void
   CheckAtomicLocks() {
     if (__atomic_exchange_n(atomic_locks_given_up_, 0u, __ATOMIC_RELAXED)) {
@@ -1649,7 +1654,7 @@ public:
     // the sizes are Metal's: the structure's memory holds its header and stands for a Metal structure of that
     // size, and the scratch memory is what Metal builds in
     bool top = pDesc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-    std::vector<WMTAccelerationStructureGeometry> geometries(top ? 0 : pDesc->NumDescs);
+    std::vector<WMTAccelerationStructureGeometry> geometries(top ? 0 : std::max(pDesc->NumDescs, 1u));
     auto info = AccelerationStructureInfo(this, *pDesc, geometries.data(), false);
     GetMTLDevice().accelerationStructureSizes(info);
     bool updates = pDesc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;

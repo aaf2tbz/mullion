@@ -550,6 +550,8 @@ public:
   // past a view's end reads the view's start and drops what it read (dxbc_converter_base.cpp LoadBufferValue), and
   // an Apple GPU may fault on memory that is not there
   virtual uint64_t GetNullBuffer() = 0;
+  // the buffer of those zeros
+  virtual obj_handle_t GetNullBufferHandle() = 0;
   // removes the device if a 64-bit atomic gave up waiting for its lock (dxil_converter.cpp)
   virtual void CheckAtomicLocks() = 0;
 
