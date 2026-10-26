@@ -1,8 +1,11 @@
 // contract: the depth bounds test (D3D12 Depth Bounds Test spec, and its conformance tests). a pixel passes when the
 // depth buffer's stored value lies inside [min, max], inclusively; a pixel shader forced early writes neither its
-// target nor its UAV where it fails, and occlusion queries do not count it. the range may come from a bundle, a wide
+// target nor its UAV where it fails, and occlusion queries and pipeline statistics do not count it; a shader not
+// forced early runs before the tests ("must appear to have executed the Depth/Stencil Tests and Depth Bounds Test after
+// the Pixel Shader invocation"), and statistics count its runs even where they fail (D3D11.3 20.4.7). the range may come from a bundle, a wide
 // range passes all, an inverted one none, NaN counts as 0, and a pipeline without the test or a pass without a depth
-// buffer passes all. each case draws into its own band of pixels whose stored depths are `stored`.
+// buffer passes all. a draw that writes depth writes it only where it passes ("cannot affect the render target, depth,
+// or stencil buffer"). each case draws into its own band of pixels whose stored depths are `stored`.
 // "The default values are 0 and 1 for the minimum and maximum, respectively."
 // https://microsoft.github.io/DirectX-Specs/d3d/DepthBoundsTest.html
 #include "d3d12_test.hpp"
@@ -53,7 +56,7 @@ main(int argc, char **argv) {
   const UINT band = std::size(stored);
   struct Case {
     float min, max;
-    bool test, depth_buffer, bundle, late = false, initial = false, draw_bundle = false;
+    bool test, depth_buffer, bundle, late = false, initial = false, draw_bundle = false, write = false;
   } cases[] = {
       {0, 1, true, true, false, false, true},
       {0.3f, 0.6f, true, true, false},     {0.3f, 0.6f, true, true, true},  {-FLT_MAX, FLT_MAX, true, true, false},
@@ -66,6 +69,8 @@ main(int argc, char **argv) {
       {0.3f, 0.6f, true, true, false, false, false, true},
       {0.3f, 0.6f, true, true, true, false, false, true},
       {0.3f, 0.6f, true, true, false, true, false, true},
+      {0.3f, 0.6f, true, true, false, false, false, false, true},
+      {0.3f, 0.6f, true, true, false, true, false, false, true},
   };
   const UINT width = band * std::size(cases);
 
@@ -128,11 +133,15 @@ main(int argc, char **argv) {
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   // read back: the target's row, the UAV, then the occlusion counts
   const UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, row = (width * 4 + pitch - 1) / pitch * pitch;
-  const UINT64 counts_at = row + (width * 4 + 7) / 8 * 8;
-  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, counts_at + std::size(cases) * 8, D3D12_RESOURCE_STATE_COPY_DEST);
-  ComPtr<ID3D12QueryHeap> queries;
-  D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, (UINT)std::size(cases)};
+  const UINT64 counts_at = row + (width * 4 + 7) / 8 * 8, statistics_at = counts_at + std::size(cases) * 8,
+               depth_at = (statistics_at + std::size(cases) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) + pitch - 1) /
+                          pitch * pitch;
+  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, depth_at + row, D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12QueryHeap> queries, statistics;
+  D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, (UINT)std::size(cases)},
+      statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, (UINT)std::size(cases)};
   CHECK(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&queries)));
+  CHECK(device->CreateQueryHeap(&statistics_desc, IID_PPV_ARGS(&statistics)));
 
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12CommandAllocator> allocator, bundle_allocator;
@@ -173,7 +182,7 @@ main(int argc, char **argv) {
   for (UINT c = 0; c < std::size(cases); c++) {
     auto &k = cases[c];
     step("depth bounds case %u, late %u, bundle draw %u", c, k.late, k.draw_bundle);
-    auto &pso = psos.emplace_back(pipeline(false, k.test, k.depth_buffer, k.late));
+    auto &pso = psos.emplace_back(pipeline(k.write, k.test, k.depth_buffer, k.late));
     if (!pso) {
       printf("failed: pipeline of case %u\n", c);
       return 1;
@@ -182,6 +191,7 @@ main(int argc, char **argv) {
     list->OMSetRenderTargets(1, &rtv, FALSE, k.depth_buffer ? &dsv : nullptr);
     columns(c * band, band);
     list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, c);
+    list->BeginQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, c);
     if (!k.initial && !k.bundle) list->OMSetDepthBounds(k.min, k.max);
     if (k.bundle || k.draw_bundle) {
       auto &bundle = bundles.emplace_back();
@@ -198,9 +208,12 @@ main(int argc, char **argv) {
       list->ExecuteBundle(bundle.Get());
     }
     if (!k.draw_bundle) draw(list.Get(), 0, c + 1);
+    list->EndQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, c);
     list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, c);
   }
   list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, std::size(cases), readback.Get(), counts_at);
+  list->ResolveQueryData(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, std::size(cases), readback.Get(),
+                         statistics_at);
   transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
   transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -208,6 +221,10 @@ main(int argc, char **argv) {
   D3D12_TEXTURE_COPY_LOCATION src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
   list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   list->CopyBufferRegion(readback.Get(), row, out.Get(), 0, width * 4);
+  transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  dst.PlacedFootprint = {depth_at, {DXGI_FORMAT_R32_FLOAT, width, 1, 1, row}};
+  src.pResource = depth.Get();
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   CHECK(submit(device.Get(), queue.Get(), list.Get()));
 
   UINT *got;
@@ -223,11 +240,17 @@ main(int argc, char **argv) {
       passed += pass;
       UINT written = got[row / 4 + x];
       UINT want_uav = k.late || pass ? c + 1 : 0;
-      expect(got[x] == want && written == want_uav,
-             "stored %g: target %u/%u, UAV %u/%u", stored[i], got[x], want, written, want_uav);
+      float z = reinterpret_cast<float *>(reinterpret_cast<char *>(got) + depth_at)[x],
+            want_z = k.write && pass ? 0.0f : stored[i];
+      expect(got[x] == want && written == want_uav && z == want_z,
+             "stored %g: target %u/%u, UAV %u/%u, depth %g/%g", stored[i], got[x], want, written, want_uav, z, want_z);
     }
     UINT64 count = reinterpret_cast<UINT64 *>(reinterpret_cast<char *>(got) + counts_at)[c];
     expect(count == passed, "occlusion %llu, want %u", count, passed);
+    auto invocations =
+        reinterpret_cast<D3D12_QUERY_DATA_PIPELINE_STATISTICS *>(reinterpret_cast<char *>(got) + statistics_at)[c]
+            .PSInvocations;
+    expect(invocations == (k.late ? band : passed), "PSInvocations %llu, want %u", invocations, k.late ? band : passed);
   }
   readback->Unmap(0, nullptr);
   return verdict();

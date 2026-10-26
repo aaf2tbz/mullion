@@ -531,6 +531,7 @@ llvm::Error convert_dxbc_pixel_shader(
   uint32_t pso_unorm_output_reg_mask = 0;
   uint32_t *pso_pixel_formats = nullptr;
   bool pso_alpha_to_coverage = false;
+  bool early_tests = func_signature.EarlyFragmentTests();
   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pso_data = nullptr;
   if (args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pso_data)) {
     pso_dual_source_blending = pso_data->dual_source_blending;
@@ -539,6 +540,8 @@ llvm::Error convert_dxbc_pixel_shader(
     pso_sample_mask = pso_data->sample_mask;
     pso_pixel_formats = pso_data->pixel_formats;
     pso_alpha_to_coverage = pso_data->alpha_to_coverage && (pShaderInternal->pso_valid_output_reg_mask & 1);
+    if (pso_data->late_tests)
+      func_signature.UseLateFragmentTests();
   }
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_FLAG shader_flags = {};
@@ -567,7 +570,7 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.dual_source_blending = pso_dual_source_blending;
     sig_ctx.shader_blends_dual_source = pso_dual_source_blending && pso_data->blend[0].blend;
     // a shader's depth is ignored once the tests ran before it (D3D11.3 16.12.1)
-    sig_ctx.disable_depth_output = pso_disable_depth_output || func_signature.EarlyFragmentTests();
+    sig_ctx.disable_depth_output = pso_disable_depth_output || early_tests;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
@@ -581,7 +584,7 @@ llvm::Error convert_dxbc_pixel_shader(
   // pipeline without one, so it is zero, as the epilogue starts every output
   if (pso_dual_source_blending && !(pShaderInternal->pso_valid_output_reg_mask & 2) && !pso_data->blend[0].blend)
     func_signature.DefineOutput(air::OutputRenderTarget{.dual_source_blending = true, .index = 1, .type = air::msl_float4});
-  if (pso_sample_mask != 0xffffffff || pso_alpha_to_coverage || (pso_data && pso_data->clip_distances)) {
+  if (pso_sample_mask != 0xffffffff || pso_alpha_to_coverage || (pso_data && (pso_data->clip_distances || pso_data->depth_bounds))) {
     auto assigned_index =
       func_signature.DefineOutput(air::OutputCoverageMask{});
     epilogue >> [=](pvalue value) -> IRValue {
@@ -610,8 +613,8 @@ llvm::Error convert_dxbc_pixel_shader(
           auto coverage = builder.CreateSub(builder.CreateShl(builder.getInt64(1), count), builder.getInt64(1));
           mask = builder.CreateAnd(mask, builder.CreateTrunc(coverage, builder.getInt32Ty()));
         }
-        if (ctx.resource.clip_coverage)
-          mask = builder.CreateAnd(mask, ctx.resource.clip_coverage);
+        if (ctx.resource.kept_samples)
+          mask = builder.CreateAnd(mask, ctx.resource.kept_samples);
         return builder.CreateInsertValue(value, mask, {assigned_index});
       });
     };
@@ -654,6 +657,33 @@ llvm::Error convert_dxbc_pixel_shader(
     }));
   if (clips || pso_sample_mask != 0xffffffff)
     input_coverage = func_signature.DefineInput(air::InputInputCoverage{});
+
+  // the depth bounds test of a GPU without one: the pixel's position, whether the draw tests, and the samples that pass
+  uint32_t bounds_position = ~0u, bounds_enabled = ~0u, bounds_mask = ~0u;
+  if (pso_data && pso_data->depth_bounds) {
+    bounds_position =
+        func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
+    bounds_enabled = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = 8,
+        .location_index = SM50_BINDING_INDEX_DEPTH_BOUNDS,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::msl_uint2,
+        .arg_name = "depth_bounds",
+        .raster_order_group = {}
+    });
+    bounds_mask = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::device,
+        .type = air::msl_uint,
+        .arg_name = "depth_bounds_samples",
+        .raster_order_group = {}
+    });
+  }
 
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
@@ -704,11 +734,10 @@ llvm::Error convert_dxbc_pixel_shader(
 
   // the covered samples whose distances are all at least 0, which NaN never is
   llvm::Value *kept = nullptr;
-  llvm::BasicBlock *clipped = nullptr;
   if (clips) {
     auto head = builder.GetInsertBlock(), test = llvm::BasicBlock::Create(context, "clip", function, epilogue_bb),
          loop = llvm::BasicBlock::Create(context, "clip_sample", function, epilogue_bb);
-    clipped = llvm::BasicBlock::Create(context, "clipped", function, epilogue_bb);
+    auto clipped = llvm::BasicBlock::Create(context, "clipped", function, epilogue_bb);
     builder.CreateBr(test);
     builder.SetInsertPoint(test);
     auto rest = builder.CreatePHI(builder.getInt32Ty(), 2), mask = builder.CreatePHI(builder.getInt32Ty(), 2);
@@ -730,23 +759,73 @@ llvm::Error convert_dxbc_pixel_shader(
     builder.SetInsertPoint(clipped);
     kept = mask;
   }
-  resource_map.clip_coverage = kept;
+  // the samples in the depth bounds, all where the draw does not test them. a shader whose tests come first is
+  // discarded for a pixel of none before anything else; one whose tests follow it runs, and keeps its memory writes
+  // (DepthBoundsTest)
+  llvm::Value *bounded = nullptr;
+  if (bounds_position != ~0u) {
+    auto words = builder.CreateLoad(llvm::FixedVectorType::get(builder.getInt32Ty(), 2), function->getArg(bounds_enabled));
+    auto enabled = builder.CreateICmpNE(builder.CreateExtractElement(words, uint64_t(0)), builder.getInt32(0));
+    auto position = function->getArg(bounds_position);
+    auto x = builder.CreateFPToUI(builder.CreateExtractElement(position, uint64_t(0)), builder.getInt32Ty());
+    auto y = builder.CreateFPToUI(builder.CreateExtractElement(position, uint64_t(1)), builder.getInt32Ty());
+    auto head = builder.GetInsertBlock();
+    auto test = llvm::BasicBlock::Create(context, "depth_bounds", function, epilogue_bb);
+    auto tested = llvm::BasicBlock::Create(context, "depth_bounds_tested", function, epilogue_bb);
+    builder.CreateCondBr(enabled, test, tested);
+    builder.SetInsertPoint(test);
+    auto at = builder.CreateAdd(builder.CreateMul(y, builder.CreateExtractElement(words, uint64_t(1))), x);
+    auto bytes = builder.CreateBitCast(
+        function->getArg(bounds_mask),
+        builder.getInt8Ty()->getPointerTo(function->getArg(bounds_mask)->getType()->getPointerAddressSpace())
+    );
+    auto samples = builder.CreateZExt(
+        builder.CreateLoad(builder.getInt8Ty(), builder.CreateGEP(builder.getInt8Ty(), bytes, {at})), builder.getInt32Ty()
+    );
+    auto from = test;
+    if (early_tests) {
+      auto discard = llvm::BasicBlock::Create(context, "depth_bounds_discard", function, tested);
+      from = llvm::BasicBlock::Create(context, "depth_bounds_some", function, tested);
+      builder.CreateCondBr(builder.CreateICmpEQ(samples, builder.getInt32(0)), discard, from);
+      builder.SetInsertPoint(discard);
+      air.CreateDiscard();
+      builder.CreateBr(from);
+      builder.SetInsertPoint(from);
+    }
+    builder.CreateBr(tested);
+    builder.SetInsertPoint(tested);
+    auto phi = builder.CreatePHI(builder.getInt32Ty(), 2);
+    phi->addIncoming(builder.getInt32(~0u), head);
+    phi->addIncoming(samples, from);
+    bounded = phi;
+  }
+  resource_map.kept_samples = kept && bounded ? builder.CreateAnd(kept, bounded) : kept ? kept : bounded;
   if (pso_sample_mask != 0xffffffff) {
     air.CentroidCoverage = kept ? kept : function->getArg(input_coverage);
     air.CentroidMask = builder.getInt32(pso_sample_mask);
   }
 
-  llvm::Value *counts = builder.getTrue();
-  if (coverage != ~0u) {
-    auto before = builder.CreateSub(builder.CreateShl(builder.getInt32(1), function->getArg(sample)), builder.getInt32(1));
-    counts = builder.CreateICmpEQ(builder.CreateAnd(kept ? kept : function->getArg(coverage), before), builder.getInt32(0));
-  }
+  // whether this run is the one of the first of these covered samples, and of one of them
+  auto first = [&](llvm::Value *samples) {
+    llvm::Value *counts = builder.getTrue();
+    if (coverage != ~0u) {
+      auto before = builder.CreateSub(builder.CreateShl(builder.getInt32(1), function->getArg(sample)), builder.getInt32(1));
+      counts = builder.CreateICmpEQ(builder.CreateAnd(samples ? samples : function->getArg(coverage), before), builder.getInt32(0));
+    }
+    if (samples && sample != ~0u)
+      counts = builder.CreateAnd(counts, builder.CreateTrunc(builder.CreateLShr(samples, function->getArg(sample)), builder.getInt1Ty()));
+    return counts;
+  };
   // a run counts for a kept sample only
-  if (kept && sample != ~0u)
-    counts = builder.CreateAnd(counts, builder.CreateTrunc(builder.CreateLShr(kept, function->getArg(sample)), builder.getInt1Ty()));
+  llvm::Value *counts = first(kept);
   if (writes) {
     air.Live = builder.CreateAlloca(builder.getInt1Ty());
     builder.CreateStore(counts, air.Live);
+  }
+  // and the statistics leave out a run the tests before it discarded (DepthBoundsTest)
+  if (bounded && early_tests) {
+    llvm::Value *covered = kept ? kept : coverage != ~0u ? function->getArg(coverage) : nullptr;
+    counts = first(covered ? builder.CreateAnd(covered, bounded) : bounded);
   }
   if (statistics) {
     // D3D11.3 20.4.7 counts executions even when an output depth fails the test.
@@ -825,12 +904,15 @@ llvm::Error convert_dxbc_pixel_shader(
   } else {
     builder.CreateRet(value);
   }
+  // the registers' allocas made after the clip and depth bounds tests split the entry block go back to it, where SROA
+  // promotes them
+  for (auto &block : *function)
+    if (&block != entry_bb)
+      for (auto &instruction : llvm::make_early_inc_range(block))
+        if (auto alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+            alloca && llvm::isa<llvm::ConstantInt>(alloca->getArraySize()))
+          alloca->moveBefore(&*entry_bb->getFirstInsertionPt());
 
-  // the registers set up after the clip test stay in the entry block, as static allocations
-  if (clipped)
-    for (auto &i : llvm::make_early_inc_range(*clipped))
-      if (llvm::isa<llvm::AllocaInst>(i))
-        i.moveBefore(&*entry_bb->getFirstInsertionPt());
   if (air.Live)
     gate_writes(*function, air.Live);
   module.getOrInsertNamedMetadata("air.fragment")

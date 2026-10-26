@@ -2289,6 +2289,8 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool centered_samples;
   bool single_raster_sample;
   uint32_t clip_distances;
+  bool depth_bounds;
+  bool late_tests;
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -2382,6 +2384,8 @@ sm50_compilation_argument32_convert(
       data->centered_samples = src->centered_samples;
       data->single_raster_sample = src->single_raster_sample;
       data->clip_distances = src->clip_distances;
+      data->depth_bounds = src->depth_bounds;
+      data->late_tests = src->late_tests;
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {

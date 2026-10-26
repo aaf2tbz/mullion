@@ -596,8 +596,8 @@ void handle_signature_ps(
                 ctx.types._int, ctx.resource.coverage_mask_reg, 0
               )
             );
-            if (ctx.resource.clip_coverage)
-              odepth = ctx.builder.CreateAnd(odepth, ctx.resource.clip_coverage);
+            if (ctx.resource.kept_samples)
+              odepth = ctx.builder.CreateAnd(odepth, ctx.resource.kept_samples);
             return ctx.builder.CreateInsertValue(
               v,
               ctx.pso_sample_mask != 0xffffffff

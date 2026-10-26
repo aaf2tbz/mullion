@@ -664,6 +664,7 @@ public:
   uint32_t DefineMeshPrimitiveOutput(const MeshPrimitiveOutput &output);
   void UseEarlyFragmentTests() { early_fragment_tests = true; }
   bool EarlyFragmentTests() const { return early_fragment_tests; }
+  void UseLateFragmentTests() { early_fragment_tests = false; }
   void UseMaxWorkgroupSize(uint32_t size) { max_work_group_size = size; }
   void UseMaxMeshWorkgroupSize(uint32_t size) { max_mesh_work_group_size = size; }
 

@@ -199,8 +199,9 @@ struct io_binding_map {
   llvm::Value *thread_id_in_group_arg = nullptr;
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
   llvm::Value *coverage_mask_arg = nullptr;
-  // the samples a pixel shader's clip test kept (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
-  llvm::Value *clip_coverage = nullptr;
+  // the samples a pixel shader's output keeps: those of its clip test (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
+  // in the depth bounds (depth_bounds)
+  llvm::Value *kept_samples = nullptr;
 
   llvm::Value *domain = nullptr;
   llvm::Value *patch_id = nullptr;

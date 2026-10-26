@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 76
+#define AIRCONV_VERSION 77
 
 #ifdef __cplusplus
 #include <string>
@@ -44,6 +44,11 @@ enum SM50_BINDING_INDEX: uint32_t {
      Metal's viewports are larger by than the application's; then the width and height of each of the
      SM50_VIEWPORTS viewports, as the application gave them */
   SM50_BINDING_INDEX_RASTER_SCALE = SM50_BINDING_INDEX_DEPTH_RANGES + 1,
+  /* the depth bounds test of a GPU without one, a pixel shader's (SM50_SHADER_PSO_PIXEL_SHADER_DATA's depth_bounds):
+     whether the draw has it and the row pitch of the samples that pass it, two uints, then those samples, a byte for
+     each pixel */
+  SM50_BINDING_INDEX_DEPTH_BOUNDS = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 2,
+  SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES = SM50_BINDING_INDEX_DEPTH_BOUNDS + 1,
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
@@ -462,6 +467,14 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   /* how many clip distances reach the shader as varyings, to test at each sample (D3D11.3 15.4.1) */
   uint32_t clip_distances;
   struct SM50_SHADER_BLEND blend[8];
+  /* the depth bounds test, which a GPU without it has the pixel shader do: at SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES a
+     byte for each pixel holds, a bit for each sample, the samples whose depth is in the bounds, and at
+     SM50_BINDING_INDEX_DEPTH_BOUNDS whether the draw tests and the bytes' row pitch; a pixel of none is discarded and
+     the others keep only those samples */
+  bool depth_bounds;
+  /* the depth and stencil tests after the shader, whatever it declares: a discard then takes a sample out of an
+     occlusion query, which the test of depth_bounds must do */
+  bool late_tests;
 };
 
 struct SM50_IA_INPUT_ELEMENT {
