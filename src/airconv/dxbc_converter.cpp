@@ -928,6 +928,10 @@ llvm::Error convert_dxbc_vertex_shader(
   resource_map.output.ptr_int4 =
     builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register)
     );
+  // a varying's component the shader leaves unwritten leaves as 0: Metal's GPU behaviour is undefined for an INF or
+  // a NaN in an interpolant (MetalValidation(1), MTL_SHADER_VALIDATION_NAN_INF), which an undefined value may be
+  builder.CreateStore(llvm::ConstantAggregateZero::get(llvm::ArrayType::get(types._int4, max_output_register)),
+                      resource_map.output.ptr_int4);
   resource_map.output.ptr_float4 = builder.CreateBitCast(
     resource_map.output.ptr_int4,
     llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo()

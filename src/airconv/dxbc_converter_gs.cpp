@@ -696,6 +696,9 @@ convert_dxbc_geometry_shader(
   resource_map.input_element_count = pVertexStage->max_output_register;
 
   resource_map.output.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register));
+  // as a vertex shader's (convert_dxbc_vertex_shader)
+  builder.CreateStore(llvm::ConstantAggregateZero::get(llvm::ArrayType::get(types._int4, max_output_register)),
+                      resource_map.output.ptr_int4);
   resource_map.output.ptr_float4 = builder.CreateBitCast(
       resource_map.output.ptr_int4, llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo()
   );
