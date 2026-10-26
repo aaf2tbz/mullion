@@ -608,6 +608,7 @@ public:
       Texture.SingleSample = ir.CreateICmpNE(
           ir.CreateAnd(Descriptor.Metadata, SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE), ir.getInt64(0)
       );
+    Texture.Unbound = ir.CreateICmpNE(ir.CreateAnd(Descriptor.Metadata, SM50_TEXTURE_METADATA_UNBOUND), ir.getInt64(0));
     return {
         Texture,
         Descriptor.ResourceKindLogical,
@@ -649,7 +650,10 @@ public:
 
   llvm::Value *
   DecodeTextureBufferElement(llvm::Value *Metadata) {
-    return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(Metadata, 32uLL), air.getIntTy()), ~SM50_TEXEL_BUFFER_METADATA_RGB32);
+    return ir.CreateAnd(
+        ir.CreateTrunc(ir.CreateLShr(Metadata, 32uLL), air.getIntTy()),
+        ~(SM50_TEXEL_BUFFER_METADATA_RGB32 | uint32_t(SM50_TEXTURE_METADATA_UNBOUND >> 32))
+    );
   }
 
   llvm::Value *

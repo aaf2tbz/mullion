@@ -76,6 +76,30 @@ TextureMetadata(uint32_t array_length, float min_lod) {
   return ((uint64_t)array_length << 32) | (uint64_t)std::bit_cast<uint32_t>(min_lod);
 }
 
+// the Metal texture type a shader reads a view of `dimension` as: 1D and 2D views as 2D arrays
+// (lowering_texture_to_array). an unordered access view's dimensions have the same values
+static WMTTextureType
+TextureType(D3D12_SRV_DIMENSION dimension) {
+  static_assert(UINT(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) == D3D12_SRV_DIMENSION_TEXTURE2DARRAY &&
+                UINT(D3D12_UAV_DIMENSION_TEXTURE3D) == D3D12_SRV_DIMENSION_TEXTURE3D);
+  switch (dimension) {
+  case D3D12_SRV_DIMENSION_BUFFER:
+    return WMTTextureTypeTextureBuffer;
+  case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+    return WMTTextureType2DMultisample;
+  case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+    return WMTTextureType2DMultisampleArray;
+  case D3D12_SRV_DIMENSION_TEXTURE3D:
+    return WMTTextureType3D;
+  case D3D12_SRV_DIMENSION_TEXTURECUBE:
+    return WMTTextureTypeCube;
+  case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    return WMTTextureTypeCubeArray;
+  default:
+    return WMTTextureType2DArray;
+  }
+}
+
 class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHeap> {
 
   D3D12_DESCRIPTOR_HEAP_DESC desc_;
@@ -353,9 +377,6 @@ public:
       return FAIL(E_INVALIDARG);
     if (!pDesc)
       return FAIL(E_INVALIDARG);
-    /**
-     * TODO: support null descriptor properly (respect different view dimensions)
-     */
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
     if (mapped_argument_buffer_) {
@@ -364,6 +385,8 @@ public:
       if (pDesc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
           (pDesc->Format == DXGI_FORMAT_UNKNOWN || pDesc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW))
         gpu_storage.SRVBuffer.pointer = device_->GetNullBuffer();
+      else
+        AddUnboundTexture(gpu_storage, TextureType(pDesc->ViewDimension), pDesc->Format, false);
     }
     return S_OK;
   }
@@ -374,9 +397,6 @@ public:
       return FAIL(E_INVALIDARG);
     if (!pDesc)
       return FAIL(E_INVALIDARG);
-    /**
-     * TODO: support null descriptor properly (respect different view dimensions)
-     */
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
     if (mapped_argument_buffer_) {
@@ -385,8 +405,32 @@ public:
       if (pDesc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER &&
           (pDesc->Format == DXGI_FORMAT_UNKNOWN || pDesc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW))
         gpu_storage.UAVBuffer.pointer = device_->GetNullBuffer();
+      else
+        AddUnboundTexture(gpu_storage, TextureType(D3D12_SRV_DIMENSION(pDesc->ViewDimension)), pDesc->Format, true);
     }
     return S_OK;
+  }
+
+  // a null texture view's stand-in, of `type` and of the type a shader reads `Format` as
+  // (InternalCommandLibrary::UnboundTexture). a texture and a texel buffer descriptor have one layout
+  void
+  AddUnboundTexture(ShaderVisibleDescriptorGPUStorage &gpu_storage, WMTTextureType type, DXGI_FORMAT Format, bool write) {
+    static_assert(sizeof(SRVTextureGPUStorage) == sizeof(UAVTexelBufferGPUStorage));
+    MTL_DXGI_FORMAT_DESC format;
+    auto pixel = SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format))
+                     ? WMTPixelFormat(ORIGINAL_FORMAT(format.PixelFormat))
+                     : WMTPixelFormatInvalid;
+    auto sample = !IsIntegerFormat(pixel)                       ? SM50_SAMPLE_FLOAT
+                  : MTLGetUnsignedIntegerFormat(pixel) == pixel ? SM50_SAMPLE_UINT
+                                                                : SM50_SAMPLE_INT;
+    auto stand_in = device_->GetLib().UnboundTexture(type, sample, write);
+    if (stand_in.fresh) {
+      device_->RegisterResidency(stand_in.texture);
+      if (stand_in.backing)
+        device_->RegisterResidency(stand_in.backing);
+    }
+    gpu_storage.SRVTexture.resource_id = stand_in.id;
+    gpu_storage.SRVTexture.metadata = SM50_TEXTURE_METADATA_UNBOUND;
   }
 
   virtual ShaderVisibleDescriptorCPUStorage const &

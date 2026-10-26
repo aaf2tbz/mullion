@@ -1156,6 +1156,24 @@ bool CheckGSSignatureIsPassThrough(
   return true;
 };
 
+// a texture argument's stand-in for an unbound texture (MTL_SM50_SHADER_ARGUMENT_TEXTURE_TYPE_SHIFT): the Metal texture
+// type of `kind`, as the binding declares it (lowering_texture_1d_to_2d), and the type the shader reads and writes it as
+static uint32_t
+stand_in_flags(llvm::air::Texture::ResourceKind kind, mullion::shader::common::ScalerDataType scaler) {
+  using mullion::shader::common::ScalerDataType;
+  auto &info = llvm::air::AIRBuilder::getTextureInfo(kind);
+  // MTLTextureType
+  uint32_t type = kind == llvm::air::Texture::texture_buffer ? 9
+                  : info.is_ms                                ? (info.is_array ? 8 : 4)
+                  : info.is_cube                              ? (info.is_array ? 6 : 5)
+                  : info.coord_dimension == 3                 ? 7
+                                                              : (info.coord_dimension - 1) * 2 + info.is_array;
+  uint32_t sample = scaler == ScalerDataType::Uint  ? SM50_SAMPLE_UINT
+                    : scaler == ScalerDataType::Int ? SM50_SAMPLE_INT
+                                                    : SM50_SAMPLE_FLOAT;
+  return type << MTL_SM50_SHADER_ARGUMENT_TEXTURE_TYPE_SHIFT | sample << MTL_SM50_SHADER_ARGUMENT_SAMPLE_TYPE_SHIFT;
+}
+
 AIRCONV_API int SM50Initialize(
   const void *pBytecode, size_t BytecodeSize, sm50_shader_t *ppShader,
   MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
@@ -1339,6 +1357,8 @@ AIRCONV_API int SM50Initialize(
     if (srv.read || srv.sampled || srv.compared) {
       flags |= MTL_SM50_SHADER_ARGUMENT_READ_ACCESS;
     }
+    if (srv.resource_type != ResourceType::NonApplicable)
+      flags |= (MTL_SM50_SHADER_ARGUMENT_FLAG)stand_in_flags(lowering_texture_1d_to_2d(to_air_resource_type(srv.resource_type, srv.compared)), srv.scaler_type);
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::SRV,
       .SM50BindingSlot = range_id,
@@ -1409,6 +1429,8 @@ AIRCONV_API int SM50Initialize(
     if (uav.with_counter) {
       flags |= MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER;
     }
+    if (uav.resource_type != ResourceType::NonApplicable)
+      flags |= (MTL_SM50_SHADER_ARGUMENT_FLAG)stand_in_flags(lowering_texture_1d_to_2d(to_air_resource_type(uav.resource_type)), uav.scaler_type);
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::UAV,
       .SM50BindingSlot = range_id,

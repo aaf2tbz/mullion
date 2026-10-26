@@ -90,6 +90,26 @@ AIRBuilder::getTypeOverloadSuffix(Type *Ty, Signedness Sign) {
   return Ret;
 }
 
+// an unbound slot reads 0 and its queries answer 0 (D3D11.3 22.4.22: "If there is no resource bound to the specified
+// slot, 0 is returned"). Metal leaves a null texture's functions undefined, so the runtime binds a texture of the
+// slot's type in its place and a select drops what it answers: a branch round each call costs a sampling shader more
+Value *
+AIRBuilder::CreateTextureCall(const Texture &Texture, FunctionCallee Fn, ArrayRef<Value *> Ops) {
+  Value *Call = builder.CreateCall(Fn, Ops);
+  if (!Texture.Unbound || Call->getType()->isVoidTy())
+    return Call;
+  auto Drop = [&](Value *Answer) {
+    return builder.CreateSelect(Texture.Unbound, Constant::getNullValue(Answer->getType()), Answer);
+  };
+  auto Struct = dyn_cast<StructType>(Call->getType());
+  if (!Struct)
+    return Drop(Call);
+  Value *Answer = PoisonValue::get(Struct);
+  for (unsigned i = 0; i < Struct->getNumElements(); i++)
+    Answer = builder.CreateInsertValue(Answer, Drop(builder.CreateExtractValue(Call, i)), i);
+  return Answer;
+}
+
 Value *
 AIRBuilder::CreateAtomicRMW(
     const Texture &Texture, Value *Handle, AtomicRMWInst::BinOp Op, Value *Pos, Value *ValVec4, Value *ArrayIndex
@@ -195,7 +215,7 @@ AIRBuilder::CreateAtomicRMW(
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getTexelType(Texture), Tys, false), Attrs);
 
-  return builder.CreateCall(Fn, Ops);
+  return CreateTextureCall(Texture, Fn, Ops);
 }
 
 std::pair<Value *, Value *>
@@ -268,9 +288,10 @@ AIRBuilder::CreateAtomicCmpXchg(
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getBoolTy(), Tys, false), Attrs);
 
-  auto Ret = builder.CreateCall(Fn, Ops);
+  auto Ret = CreateTextureCall(Texture, Fn, Ops);
 
-  return {builder.CreateLoad(TyTexel, Ptr), Ret};
+  auto Old = builder.CreateLoad(TyTexel, Ptr);
+  return {Texture.Unbound ? builder.CreateSelect(Texture.Unbound, Constant::getNullValue(TyTexel), Old) : Old, Ret};
 }
 
 Type *
@@ -423,7 +444,7 @@ AIRBuilder::CreateSampleCommon(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -515,7 +536,7 @@ AIRBuilder::CreateSampleCmpCommon(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -627,7 +648,7 @@ AIRBuilder::CreateSampleGrad(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 }
@@ -734,7 +755,7 @@ AIRBuilder::CreateRead(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 }
@@ -885,7 +906,7 @@ AIRBuilder::CreateGather(
       FnName, FunctionType::get(getTextureGatherResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -969,7 +990,7 @@ AIRBuilder::CreateGatherCompare(
       FnName, FunctionType::get(getTextureGatherResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -1053,25 +1074,7 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getIntTy(), Tys, false), Attrs);
 
-  // no texture answers 0 ("If there is no resource bound to the specified slot, 0 is returned", D3D11.3 22.4.22),
-  // and is not queried: Metal leaves a null texture's functions undefined. the branch is in a function of its own,
-  // inlined later (runOptimizationPasses), so that a caller stays in the block it is in
-  auto Guarded = getModule()->getFunction(FnName + ".bound");
-  if (!Guarded) {
-    Guarded = Function::Create(Fn.getFunctionType(), GlobalValue::InternalLinkage, FnName + ".bound", getModule());
-    Guarded->addFnAttr(Attribute::AlwaysInline);
-    auto Bound = BasicBlock::Create(getContext(), "", Guarded), None = BasicBlock::Create(getContext(), "", Guarded);
-    IRBuilder<> B(BasicBlock::Create(getContext(), "", Guarded, Bound));
-    B.CreateCondBr(B.CreateIsNull(Guarded->getArg(0)), None, Bound);
-    B.SetInsertPoint(None);
-    B.CreateRet(B.getInt32(0));
-    B.SetInsertPoint(Bound);
-    SmallVector<Value *> Args;
-    for (auto &Arg : Guarded->args())
-      Args.push_back(&Arg);
-    B.CreateRet(B.CreateCall(Fn, Args));
-  }
-  return builder.CreateCall(Guarded, Ops);
+  return CreateTextureCall(Texture, Fn, Ops);
 }
 
 std::pair<Value *, Value *>
@@ -1126,7 +1129,7 @@ AIRBuilder::CreateCalculateLOD(const Texture &Texture, Value *Handle, Value *Sam
   auto FnUnclamped =
       getModule()->getOrInsertFunction(FnUnclampedName, FunctionType::get(getFloatTy(), Tys, false), Attrs);
 
-  return {builder.CreateCall(Fn, Ops), builder.CreateCall(FnUnclamped, Ops)};
+  return {CreateTextureCall(Texture, Fn, Ops), CreateTextureCall(Texture, FnUnclamped, Ops)};
 }
 
 CallInst *

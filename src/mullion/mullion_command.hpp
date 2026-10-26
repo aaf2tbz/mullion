@@ -190,6 +190,17 @@ public:
   // the kernel `name` as a compute pipeline, made once for the device
   WMT::Reference<WMT::ComputePipelineState> ComputePipeline(const std::string &name);
 
+  // a texture of `type` that a shader reads and writes as `sample`, bound in place of an unbound one: Metal leaves a
+  // null texture's functions undefined. its metadata carries SM50_TEXTURE_METADATA_UNBOUND, and the shader drops what
+  // it answers. `fresh` is set when it was made by this call, and `backing` is a texture buffer's buffer
+  struct StandIn {
+    WMT::Texture texture;
+    uint64_t id;
+    WMT::Buffer backing;
+    bool fresh;
+  };
+  StandIn UnboundTexture(WMTTextureType type, SM50_SAMPLE_TYPE sample, bool write);
+
 private:
   // a vertex function that runs without rasterizing, made when first used
   WMT::RenderPipelineState VertexPipeline(WMT::Reference<WMT::RenderPipelineState> &pipeline, const char *name);
@@ -199,6 +210,12 @@ private:
   mullion::mutex pipelines_mutex_;
   WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2], zero_words_;
   std::unordered_map<std::string, WMT::Reference<WMT::ComputePipelineState>> compute_pipelines_;
+  struct Unbound {
+    WMT::Reference<WMT::Texture> texture;
+    uint64_t id;
+    WMT::Reference<WMT::Buffer> backing;
+  };
+  std::unordered_map<uint32_t, Unbound> unbound_textures_;
 };
 
 class EmulatedCommandContext {

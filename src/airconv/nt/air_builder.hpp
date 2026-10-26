@@ -85,6 +85,8 @@ public:
   enum SampleType sample_type;
   enum MemoryAccess memory_access;
   Value *SingleSample = nullptr;
+  // true where the texture stands for an unbound one (SM50_TEXTURE_METADATA_UNBOUND): what it answers is dropped
+  Value *Unbound = nullptr;
 };
 
 enum class Signedness { DontCare, Signed, Unsigned };
@@ -603,6 +605,9 @@ public:
 protected:
   raw_ostream &debug;
   AIRBuilderOptions options;
+
+  // calls `Fn` of `Texture`, answering 0 where the texture stands for an unbound one
+  Value *CreateTextureCall(const Texture &Texture, FunctionCallee Fn, ArrayRef<Value *> Ops);
 
   Value *
   GetOffset(const Texture &Texture, const int32_t ImmOffset[3]) {

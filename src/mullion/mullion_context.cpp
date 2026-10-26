@@ -365,9 +365,21 @@ void
 ArgumentEncodingContext::encodeShaderResources(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t offset
 ) {
+
   auto BindingCount = reflection->NumArguments;
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
-
+  // an unbound texture's stand-in, of the type the argument names (InternalCommandLibrary::UnboundTexture)
+  auto unbound = [&](const MTL_SM50_SHADER_ARGUMENT &arg, bool write) {
+    auto stand_in = lib.UnboundTexture(
+        WMTTextureType((arg.Flags >> MTL_SM50_SHADER_ARGUMENT_TEXTURE_TYPE_SHIFT) & 0xf),
+        SM50_SAMPLE_TYPE((arg.Flags >> MTL_SM50_SHADER_ARGUMENT_SAMPLE_TYPE_SHIFT) & 0x3), write
+    );
+    makeResident<stage, kind>(stand_in.texture, GetResidencyMask<kind>(stage, true, write));
+    if (stand_in.backing)
+      makeResident<stage, kind>(stand_in.backing, GetResidencyMask<kind>(stage, true, write));
+    encoded_buffer[arg.StructurePtrOffset] = stand_in.id;
+    encoded_buffer[arg.StructurePtrOffset + 1] = SM50_TEXTURE_METADATA_UNBOUND;
+  };
   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
 
   for (unsigned i = 0; i < BindingCount; i++) {
@@ -421,21 +433,22 @@ ArgumentEncodingContext::encodeShaderResources(
           // none, and a fetch gives what no texture gives (D3D11.3 5.8.5)
           TextureViewKey key(viewIdChecked);
           float clamp = srv.texture->minLOD - key.mip_start;
-          encoded_buffer[arg.StructurePtrOffset] =
-              clamp > key.mip_end - key.mip_start - 1
-                  ? 0
-                  : access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
-          encoded_buffer[arg.StructurePtrOffset + 1] =
-              TextureMetadata(srv.texture->arrayLength(viewIdChecked), std::max(0.0f, clamp));
-          if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE)
+          if (clamp > key.mip_end - key.mip_start - 1) {
+            unbound(arg, false);
+          } else {
+            encoded_buffer[arg.StructurePtrOffset] =
+                access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
             encoded_buffer[arg.StructurePtrOffset + 1] =
-                TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0) |
-                (srv.texture->sampleCount() == 1 ? SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE : 0) |
-                (srv.texture->centered ? SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED : 0);
-          makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
+                TextureMetadata(srv.texture->arrayLength(viewIdChecked), std::max(0.0f, clamp));
+            if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE)
+              encoded_buffer[arg.StructurePtrOffset + 1] =
+                  TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0) |
+                  (srv.texture->sampleCount() == 1 ? SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE : 0) |
+                  (srv.texture->centered ? SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED : 0);
+            makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
+          }
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
-          encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          unbound(arg, false);
         }
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
@@ -480,8 +493,7 @@ ArgumentEncodingContext::encodeShaderResources(
               uav.w_range ? uav.w_range : TextureMetadata(uav.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read, write);
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
-          encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          unbound(arg, true);
         }
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {

@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 72
+#define AIRCONV_VERSION 73
 
 #ifdef __cplusplus
 #include <string>
@@ -66,6 +66,16 @@ enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
   MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE = 1 << 7,
   MTL_SM50_SHADER_ARGUMENT_READ_ACCESS = 1 << 10,
   MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS = 1 << 11,
+};
+
+// a texture argument's stand-in for an unbound texture: its Metal texture type (MTLTextureType) and the type it is
+// read and written as, which name the texture the runtime binds in its place
+#define MTL_SM50_SHADER_ARGUMENT_TEXTURE_TYPE_SHIFT 16
+#define MTL_SM50_SHADER_ARGUMENT_SAMPLE_TYPE_SHIFT 20
+enum SM50_SAMPLE_TYPE : uint32_t {
+  SM50_SAMPLE_FLOAT,
+  SM50_SAMPLE_UINT,
+  SM50_SAMPLE_INT,
 };
 
 struct MTL_SM50_SHADER_ARGUMENT {
@@ -337,6 +347,9 @@ enum SM50_SHADER_METAL_VERSION {
    no 96-bit pixel format, so an R32G32B32 view is one of R32 texels, three to an element, marked by the count's top
    bit: a view has at most 2^27 elements (D3D11_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP) */
 #define SM50_TEXEL_BUFFER_METADATA_RGB32 (1u << 31)
+// a texture's or texel buffer's metadata: its texture stands for an unbound one, and what it answers is dropped. the
+// bit is above every array length, W slice and element count the metadata holds
+#define SM50_TEXTURE_METADATA_UNBOUND (1ull << 62)
 
 /* the sampler metadata qword that shaders read next to the sampler states: MipLODBias as a signed 16-bit LOD in
    bits 0-15, then whether the minification, magnification and mip filters are linear and MaxAnisotropy (1 unless the
