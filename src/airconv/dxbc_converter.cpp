@@ -2,6 +2,7 @@
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
+#include "../winemetal/winemetal.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -1162,12 +1163,12 @@ static uint32_t
 stand_in_flags(llvm::air::Texture::ResourceKind kind, mullion::shader::common::ScalerDataType scaler) {
   using mullion::shader::common::ScalerDataType;
   auto &info = llvm::air::AIRBuilder::getTextureInfo(kind);
-  // MTLTextureType
-  uint32_t type = kind == llvm::air::Texture::texture_buffer ? 9
-                  : info.is_ms                                ? (info.is_array ? 8 : 4)
-                  : info.is_cube                              ? (info.is_array ? 6 : 5)
-                  : info.coord_dimension == 3                 ? 7
-                                                              : (info.coord_dimension - 1) * 2 + info.is_array;
+  WMTTextureType type = kind == llvm::air::Texture::texture_buffer ? WMTTextureTypeTextureBuffer
+                       : info.is_ms   ? (info.is_array ? WMTTextureType2DMultisampleArray : WMTTextureType2DMultisample)
+                       : info.is_cube ? (info.is_array ? WMTTextureTypeCubeArray : WMTTextureTypeCube)
+                       : info.coord_dimension == 3 ? WMTTextureType3D
+                       : info.coord_dimension == 2 ? (info.is_array ? WMTTextureType2DArray : WMTTextureType2D)
+                                                   : (info.is_array ? WMTTextureType1DArray : WMTTextureType1D);
   uint32_t sample = scaler == ScalerDataType::Uint  ? SM50_SAMPLE_UINT
                     : scaler == ScalerDataType::Int ? SM50_SAMPLE_INT
                                                     : SM50_SAMPLE_FLOAT;

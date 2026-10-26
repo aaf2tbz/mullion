@@ -33,6 +33,7 @@
 #include "air_samplepos.h"
 #include "air_tessellation.h"
 
+#include "transforms/guard_out_of_bounds.hpp"
 #include "transforms/lower_16bit_texread.hpp"
 #include "transforms/simdgroup_implicit_membarrier.hpp"
 
@@ -153,6 +154,7 @@ runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
     // MULLION_AIRCONV_SKIP names what the converter leaves out, to find the one a shader goes wrong with
     if (auto skip = (getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP")); !skip || !strstr(skip, "simdgroup-barrier"))
       GlobalCleanupPM.addPass(air::SimdgroupImplicitMemBarrierPass());
+    GlobalCleanupPM.addPass(air::GuardOutOfBoundsPass());
 
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(GlobalCleanupPM), true /* ? */));
   }
