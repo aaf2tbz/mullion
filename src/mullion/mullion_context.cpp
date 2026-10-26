@@ -1137,8 +1137,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
 
   unsigned metal_encoder_count = 0;
   WMTSampleBufferAttachmentInfo timestamp_sample{};
+  diag::DebugGroups groups;
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
+    if (diag::events)
+      groups.Enter(cmdbuf, current->event_path ? current->event_path : "");
     diag::ProfileBuffer *profiled = nullptr;
     WMTSampleBufferAttachmentInfo samples{};
     if constexpr (Profile)
@@ -1632,6 +1635,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         profiled->passes.back().encoding = diag::Now() - profiled->passes.back().encoding;
     encoder_index--;
   }
+  if (diag::events)
+    groups.Enter(cmdbuf, {});
   encoder_head.next = nullptr;
   encoder_last = &encoder_head;
   encoder_count_ = 0;

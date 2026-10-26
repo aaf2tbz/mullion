@@ -309,7 +309,10 @@ public:
     // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering 
     if (likely(frame_count > max_latency_)) {
       auto t0 = clock::now();
+      auto began = diag::profile && frame_latency_fence_.signaledValue() < frame_count - max_latency_ ? diag::Now() : 0;
       frame_latency_fence_.wait(frame_count - max_latency_);
+      if (began)
+        diag::Waited("latency", began);
       auto t1 = clock::now();
       statistics.at(frame_count).present_latency_interval += (t1 - t0);
     }
@@ -323,7 +326,10 @@ public:
 
   void
   WaitCPUFence(uint64_t seq) {
+    auto began = diag::profile && cpu_coherent.signaledValue() < seq ? diag::Now() : 0;
     cpu_coherent.wait(seq);
+    if (began)
+      diag::Waited("cpu", began);
   };
 
   std::tuple<WMT::Buffer, uint64_t>

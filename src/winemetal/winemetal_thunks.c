@@ -21,6 +21,51 @@
 
 #define PtrToUInt64(v) ((uint64_t)(uintptr_t)(v))
 
+#ifndef MULLION_NATIVE
+#include "winbase.h"
+
+int wmt_diag_calls;
+static struct WMTDiagCall diag_calls[WMTUnixCallCount];
+
+NTSTATUS
+wmt_diag_call(unsigned int code, void *args, const char *name) {
+  LARGE_INTEGER began, ended;
+  QueryPerformanceCounter(&began);
+  NTSTATUS status = WINE_UNIX_CALL_UNTIMED(code, args);
+  QueryPerformanceCounter(&ended);
+  // the name before the counts: whoever takes a count sees its name
+  diag_calls[code].name = name;
+  InterlockedIncrement64((LONG64 *)&diag_calls[code].count);
+  InterlockedAdd64((LONG64 *)&diag_calls[code].ticks, ended.QuadPart - began.QuadPart);
+  return status;
+}
+
+WINEMETAL_API void
+WMTDiagTimeCalls(void) {
+  wmt_diag_calls = 1;
+}
+
+/* ntdll's (Wine's winternl.h): 0 is SemaphoreBasicInformation, a SEMAPHORE_BASIC_INFORMATION */
+NTSYSAPI NTSTATUS WINAPI NtQuerySemaphore(HANDLE, int, void *, ULONG, ULONG *);
+
+WINEMETAL_API int64_t
+WMTDiagSemaphoreCount(void *semaphore) {
+  struct {
+    LONG current, maximum;
+  } info;
+  return NtQuerySemaphore(semaphore, 0, &info, sizeof(info), NULL) ? -1 : info.current;
+}
+
+WINEMETAL_API void
+WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]) {
+  for (unsigned int code = 0; code < WMTUnixCallCount; code++) {
+    calls[code].count = InterlockedExchange64((LONG64 *)&diag_calls[code].count, 0);
+    calls[code].ticks = InterlockedExchange64((LONG64 *)&diag_calls[code].ticks, 0);
+    calls[code].name = diag_calls[code].name;
+  }
+}
+#endif
+
 WINEMETAL_API void
 NSObject_retain(obj_handle_t obj) {
   UNIX_CALL(0, &obj);
@@ -1588,6 +1633,32 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
   params.ret = 0;
   UNIX_CALL(WMTUnixDiagWrite, &params);
   return params.ret;
+}
+
+WINEMETAL_API uint64_t
+WMTGPUStatistics(obj_handle_t device, char *buffer, uint64_t size) {
+  struct unixcall_wmtgpu_statistics params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.buffer, buffer);
+  params.size = size;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixGPUStatistics, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_pushDebugGroup(obj_handle_t cmdbuf, obj_handle_t name) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = cmdbuf;
+  params.arg = name;
+  UNIX_CALL(WMTUnixCommandBufferPushDebugGroup, &params);
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_popDebugGroup(obj_handle_t cmdbuf) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = cmdbuf;
+  UNIX_CALL(WMTUnixCommandBufferPopDebugGroup, &params);
 }
 
 WINEMETAL_API uint64_t

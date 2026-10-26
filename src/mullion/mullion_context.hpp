@@ -132,6 +132,8 @@ struct EncoderData {
   FenceSet fence_wait;
   FenceSet fence_update;
   EncoderBarrierState barrier_state;
+  // the path of the application's events the pass began in, each name ended by diag::kEventEnd (diag::events)
+  const char *event_path = nullptr;
 };
 
 struct GSDispatchArgumentsMarshal {
@@ -758,8 +760,16 @@ public:
   template <typename T>
   T *
   allocate() {
-    return (new (allocate_cpu_heap(sizeof(T), alignof(T))) T());
+    auto data = new (allocate_cpu_heap(sizeof(T), alignof(T))) T();
+    if constexpr (std::is_base_of_v<EncoderData, T>)
+      if (!events.empty())
+        data->event_path = strcpy(static_cast<char *>(allocate_cpu_heap(events.size() + 1, 1)), events.c_str());
+    return data;
   };
+
+  // the path of the application's open events, which the passes begun in them carry; it outlives a chunk, so each
+  // pass carries a copy in the chunk's memory
+  std::string events;
 
   void present(
       Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, Presenter::PresentState state

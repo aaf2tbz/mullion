@@ -197,6 +197,8 @@ public:
     device_context_->WaitUntilGPUIdle();
     WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
+    if (diag::profile)
+      diag::LatencyClosed(present_semaphore_);
     CloseHandle(present_semaphore_);
   };
 
@@ -867,6 +869,8 @@ public:
         scaler_info.output_height = upscaled->height();
         ctx.upscale(backbuffer, eye, upscaled, scaler);
         ctx.present(upscaled, upscaled->fullView, presenter, vsync_duration, std::move(state));
+        if (diag::profile)
+          diag::LatencyReleased(present_semaphore_);
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
@@ -877,6 +881,8 @@ public:
         backbuffer = backbuffers_[0]->texture(), eye
       ](ArgumentEncodingContext &ctx) mutable {
         ctx.present(backbuffer, eye, presenter, vsync_duration, std::move(state));
+        if (diag::profile)
+          diag::LatencyReleased(present_semaphore_);
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
@@ -902,8 +908,10 @@ public:
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
     cmd_queue.PresentBoundary();
-    if (diag::profile)
+    if (diag::profile) {
       diag::Write(diag::Line("span", "present", "", GetCurrentThreadId(), began, diag::Now() - began));
+      diag::LatencyPresented(present_semaphore_);
+    }
 
     return hr;
   };
@@ -1016,6 +1024,8 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     }
     if (max_latency > frame_latency) {
+      if (diag::profile)
+        diag::LatencyReleased(present_semaphore_);
       ReleaseSemaphore(present_semaphore_, max_latency - frame_latency,
                        nullptr);
     }
@@ -1045,6 +1055,8 @@ public:
                          &result, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
       return nullptr;
     }
+    if (diag::profile)
+      diag::LatencyTaken(present_semaphore_);
 
     return result;
   };

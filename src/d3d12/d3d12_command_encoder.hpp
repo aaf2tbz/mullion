@@ -52,6 +52,8 @@ struct EncoderData {
   EncoderData *next = nullptr;
   uint64_t id;
   Stamp *stamps = nullptr;
+  // the path of the application's events the pass began in, each name ended by diag::kEventEnd (diag::events)
+  const char *event_path = nullptr;
 };
 
 struct RenderEncoderColorAttachmentData {

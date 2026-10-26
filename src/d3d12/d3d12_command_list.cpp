@@ -632,6 +632,7 @@ public:
     predicated_.clear();
     predication_region_ = nullptr;
     left_for_later_ = false;
+    events_.clear();
 
     encoder_count = std::numeric_limits<size_t>::max();
     return allocator_->StartRecord(&entry);
@@ -2953,13 +2954,33 @@ public:
     allocator_->InvalidateCurrentPass();
   };
 
-  // annotations for capture tools, with no effect on rendering; D3D11 here treats them the same way
+  // a marker is an instant, between passes or inside one, which no pass is named by
   void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {};
 
-  // annotations for capture tools, with no effect on rendering; D3D11 here treats them the same way
-  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {};
+  void STDMETHODCALLTYPE
+  BeginEvent(UINT Metadata, const void *data, UINT size) {
+    if (!diag::events)
+      return;
+    auto bytes = static_cast<const char *>(data);
+    if (Record([=, blob = std::vector<char>(bytes, bytes + size)](auto *l) { l->BeginEvent(Metadata, blob.data(), size); }))
+      return;
+    std::string path = events_.empty() ? "" : events_.back();
+    diag::PushEvent(path, diag::EventName(Metadata, data, size));
+    auto copy = static_cast<char *>(allocator_->AllocateCPUHeap(path.size() + 1, 1));
+    allocator_->event = events_.emplace_back(strcpy(copy, path.c_str()));
+  };
 
-  void STDMETHODCALLTYPE EndEvent() {};
+  void STDMETHODCALLTYPE
+  EndEvent() {
+    if (!diag::events || Record([](auto *l) { l->EndEvent(); }) || events_.empty())
+      return;
+    events_.pop_back();
+    allocator_->event = events_.empty() ? nullptr : events_.back();
+  };
+
+  // the paths of the open events, in the allocator's memory as the passes that carry them are; a pass that goes on
+  // past an event's start or end keeps the path it began in
+  std::vector<const char *> events_;
 
   void STDMETHODCALLTYPE ExecuteIndirect(
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,

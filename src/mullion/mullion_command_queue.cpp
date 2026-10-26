@@ -118,7 +118,8 @@ CommandQueue::ProfilePass(EncoderData *pass, diag::ProfileBuffer *&profiled) {
     attachment = {samples.buffer, first, first + count - 1};
   }
   buffer.passes.push_back(
-      {seq, diag::Now(), kind, std::move(runs), std::move(targets), uint32_t(buffer.samples.size() - 1), first, count});
+      {seq, diag::Now(), kind, std::move(runs), std::move(targets), uint32_t(buffer.samples.size() - 1), first, count,
+       pass->event_path ? pass->event_path : ""});
   profiled = &buffer;
   return attachment;
 }
@@ -210,7 +211,7 @@ CommandQueue::CommitCurrentChunk() {
   if (profile_) {
     profile_->buffers[chunk_id % kCommandChunkCount].submitted = began;
     if (chunk.signal_frame_latency_fence_ != ~0ull)
-      diag::Frame(profile_->id, chunk_id);
+      diag::Frame(device, profile_->id, chunk_id);
   }
 #if ASYNC_ENCODING
   ready_for_encode.fetch_add(1, std::memory_order_release);
@@ -325,6 +326,8 @@ CommandQueue::WaitForFinishThread() {
         for (uint32_t i = 0; i < pass.count; i++)
           line += str::format('\t', pass.first == ~0u ? ~uint64_t(0) : clocks[pass.buffer][pass.first + i]);
         lines += line + '\n' + pass.targets;
+        if (!pass.event.empty())
+          lines += diag::Line("event", profile_->id, internal_seq, pass.id, pass.event);
       }
       diag::Write(lines);
       chunk.readback.timestamp.reset();

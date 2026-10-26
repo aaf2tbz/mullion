@@ -4044,6 +4044,43 @@ _WMTDiagWrite(void *obj) {
 }
 
 static NTSTATUS
+_WMTGPUStatistics(void *obj) {
+  struct unixcall_wmtgpu_statistics *params = obj;
+  io_service_t entry = IOServiceGetMatchingService(
+      kIOMainPortDefault, IORegistryEntryIDMatching([(id<MTLDevice>)params->device registryID])
+  );
+  NSDictionary *statistics =
+      entry ? (NSDictionary *)IORegistryEntryCreateCFProperty(entry, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0)
+            : nil;
+  NSMutableString *text = [[NSMutableString alloc] init];
+  for (NSString *name in statistics)
+    if ([statistics[name] isKindOfClass:[NSNumber class]])
+      [text appendFormat:@"\t%@=%lld", name, [statistics[name] longLongValue]];
+  params->ret = strlen(text.UTF8String);
+  if (params->buffer.ptr && params->size >= params->ret)
+    memcpy(params->buffer.ptr, text.UTF8String, params->ret);
+  [text release];
+  [statistics release];
+  if (entry)
+    IOObjectRelease(entry);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_pushDebugGroup(void *args) {
+  struct unixcall_generic_obj_obj_noret *params = args;
+  [(id<MTLCommandBuffer>)params->handle pushDebugGroup:(NSString *)params->arg];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_popDebugGroup(void *args) {
+  struct unixcall_generic_obj_noret *params = args;
+  [(id<MTLCommandBuffer>)params->handle popDebugGroup];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _DispatchData_getBytes(void *obj) {
   struct unixcall_dispatchdata_bytes *params = obj;
   dispatch_data_t data = (dispatch_data_t)params->data;
@@ -4233,6 +4270,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_supports32BitFloatFiltering,
     &_MTLDevice_maxArgumentBufferSamplerCount,
     &_MTLDevice_supports32BitMSAA,
+    &_WMTGPUStatistics,
+    &_MTLCommandBuffer_pushDebugGroup,
+    &_MTLCommandBuffer_popDebugGroup,
 };
 
 #ifndef MULLION_NATIVE
@@ -4411,6 +4451,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_supports32BitFloatFiltering,
     &_MTLDevice_maxArgumentBufferSamplerCount,
     &_MTLDevice_supports32BitMSAA,
+    &_WMTGPUStatistics,
+    &_MTLCommandBuffer_pushDebugGroup,
+    &_MTLCommandBuffer_popDebugGroup,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

@@ -2464,11 +2464,26 @@ enum WMTSampledEncoder {
 // appended calls keep the preceding bridge ABI indices
 enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixComputeMaxThreadsPerThreadgroup,
        WMTUnixDeviceSupports32BitFloatFiltering, WMTUnixDeviceMaxArgumentBufferSamplerCount,
-       WMTUnixDeviceSupports32BitMSAA, WMTUnixCallCount };
+       WMTUnixDeviceSupports32BitMSAA, WMTUnixGPUStatistics,
+       WMTUnixCommandBufferPushDebugGroup, WMTUnixCommandBufferPopDebugGroup, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
+// MULLION_DIAG=profile: each bridge call's count and time in QueryPerformanceCounter ticks, by code, since the last
+// totals were taken; the bridge times calls once WMTDiagTimeCalls was called
+struct WMTDiagCall {
+  uint64_t count, ticks;
+  const char *name;
+};
+WINEMETAL_API void WMTDiagTimeCalls(void);
+WINEMETAL_API void WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]);
+WINEMETAL_API int64_t WMTDiagSemaphoreCount(void *semaphore);
+// the statistics the device's driver keeps in its IORegistry entry (PerformanceStatistics), as tab-separated
+// name=value pairs: their length, written to buffer when it holds them
+WINEMETAL_API uint64_t WMTGPUStatistics(obj_handle_t device, char *buffer, uint64_t size);
+WINEMETAL_API void MTLCommandBuffer_pushDebugGroup(obj_handle_t cmdbuf, obj_handle_t name);
+WINEMETAL_API void MTLCommandBuffer_popDebugGroup(obj_handle_t cmdbuf);
 WINEMETAL_API uint64_t DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size);
 
 #endif

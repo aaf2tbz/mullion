@@ -21,6 +21,8 @@ foreach part : ['creation', 'wrapped', 'wait', 'unwrap', 'swapchain', 'lifetime'
   endforeach
 endif
 # no test: the runner's way to see where the threads of a test that outlived its time are
+# workloads tests/held.py profiles
+executable('d3d11_held', 'd3d11_held.cpp', dependencies : d3d11_test_deps)
 executable('where', ['where.cpp'], dependencies : [cpp.find_library('dbghelp')])
 # 'window' tests present to a real window
 test('d3d11_xrbias', executable('d3d11_xrbias', ['d3d11_xrbias.cpp'],

@@ -20,14 +20,25 @@ bridge totals cover the intervals recorded at presents; the trailing frame has n
 buffer records give creation time, Metal handle and length for each successful BufferAllocation creation, including
 heap and sparse buffers. resource_buffers counts these events in their creation frame, including the trailing one;
 reuse makes no event. internal scratch, staging arenas and query buffers are outside this count.
+event records name the application's debug events (D3D12 BeginEvent, D3D11 annotations) a pass began in, outermost
+first, each name ended by the unit separator; MULLION_DIAG=profile writes them, and Metal captures show them as
+debug groups. an event's GPU time includes the events in it.
+the verdict follows the thread that presents. its waits (span records of work "wait": a fence, a query polled within
+a frame, a CPU or latency wait inside Mullion, a frame latency object) are held by what the GPU and Mullion's threads
+did meanwhile; its own calls into Mullion are Mullion's; the rest of the frame is the application's, whatever other
+threads do then. a wait on a frame latency object is taken to begin at the present before it, as the application
+cannot be seen to call WaitForSingleObject; a release finding the object's count at zero ends one. D3D12 lists record
+their commands while the application records them, so that work is the application's.
 """
 import argparse
 import re
 import statistics
 from bisect import bisect_left
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
+# ends each name of an event record's path (mullion_diag.hpp, kEventEnd)
+EVENT_END = "\x1f"
 # an unsampled GPU timestamp (Mullion profile record contract, pass)
 NO_SAMPLE = 18446744073709551615
 
@@ -77,7 +88,10 @@ class Record:
         self.path = Path(path)
         self.calls, self.passes, self.cmdbufs, self.frames, self.spans, self.unix = {}, [], {}, [], [], []
         self.targets = defaultdict(list)
-        self.resource_buffers = []
+        self.events = {}
+        self.resource_buffers, self.offsets, self.statistics = [], [], []
+        # (thread, work, start, end) of Mullion's spans, and (thread, start, end) of the waits threads made
+        self.threads, self.waited = [], []
         calibrations = {}
         with self.path.open() as file:
             for line in file:
@@ -98,16 +112,27 @@ class Record:
                     calibrations[key] = cpu0, gpu0, cpu1, gpu1
                 elif kind == "pass":
                     self.passes.append(Pass(*rest))
+                elif kind == "event":
+                    queue, cmdbuf, number, path = rest
+                    self.events[queue, int(cmdbuf), int(number)] = tuple(path.split(EVENT_END)[:-1])
                 elif kind == "target":
                     queue, cmdbuf, number, *target = rest
                     self.targets[queue, int(cmdbuf), int(number)].append(tuple(target))
                 elif kind == "frame":
                     self.frames.append(int(rest[2]))
+                    if len(rest) > 3:
+                        self.offsets.append(int(rest[2]) - int(rest[3]))
+                elif kind == "gpu":
+                    self.statistics.append({name: int(value) for name, value in (field.split("=", 1) for field in rest)})
                 elif kind == "buffer":
                     began, handle, length = map(int, rest)
                     self.resource_buffers.append((began, handle, length))
                 elif kind == "span":
                     work, of, thread, began, took, *calls = rest
+                    if work == "wait":
+                        self.waited.append((thread, int(began), int(began) + int(took)))
+                        continue
+                    self.threads.append((thread, work, int(began), int(began) + int(took)))
                     self.spans.append((work, of.strip(), int(began), int(took),
                                        {int(code): int(time) for code, time in (call.split(":") for call in calls)}))
                 elif kind == "unix":
@@ -220,6 +245,104 @@ def frame_rows(record):
     return rows
 
 
+# what held a frame: the GPU running, or the GPU waiting for a command buffer that Mullion was still translating
+# (an execute or encode span), that no thread of Mullion was making (the application's time: its own work, a load,
+# a wait), or that was committed and had not started
+CAUSES = ("gpu", "mullion", "application", "queued")
+
+
+def merged(intervals):
+    out = []
+    for start, end in sorted(intervals):
+        if out and start <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], end)
+        else:
+            out.append([start, end])
+    return out
+
+
+def timeline(record):
+    """the record's time from its first frame on, as segments (start, end, cause) on the frames' clock"""
+    if not record.offsets or not record.frames:
+        return []
+    # Metal's host clock to the frames' (a Wine's QueryPerformanceCounter): what each frame read of both
+    offset = statistics.median(record.offsets)
+    ran = sorted((start + offset, end + offset, committed)
+                 for committed, completed, start, end, *_ in record.cmdbufs.values() if end > start)
+    encoding = merged((began, began + took) for kind, of, began, took, calls in record.spans
+                      if kind in ("execute", "encode"))
+    starts = [start for start, _ in encoding]
+
+    def idle(a, b, cause):
+        """[a, b) split where Mullion was encoding"""
+        i = max(bisect_left(starts, a) - 1, 0)
+        while a < b:
+            while i < len(encoding) and encoding[i][1] <= a:
+                i += 1
+            inside = i < len(encoding) and encoding[i][0] <= a
+            until = min(b, encoding[i][1] if inside else encoding[i][0] if i < len(encoding) else b)
+            segments.append((a, until, "mullion" if inside else cause))
+            a = until
+
+    segments, cursor = [], record.frames[0]
+    for start, end, committed in ran:
+        if end <= cursor:
+            continue
+        if start > cursor:
+            idle(cursor, min(committed, start), "application")
+            if max(committed, cursor) < start:
+                segments.append((max(committed, cursor), start, "queued"))
+        segments.append((max(start, cursor), end, "gpu"))
+        cursor = end
+    if cursor < record.frames[-1]:
+        idle(cursor, record.frames[-1], "application")
+    return segments
+
+
+def held(segments, starts, a, b):
+    """how long each cause held [a, b); starts are the segments' starts"""
+    found = dict.fromkeys(CAUSES, 0)
+    i = max(bisect_left(starts, a) - 1, 0)
+    for start, end, cause in segments[i:]:
+        if start >= b:
+            break
+        found[cause] += max(0, min(end, b) - max(start, a))
+    return found
+
+
+def covered(intervals, a, b):
+    """how much of [a, b) the merged intervals cover"""
+    return sum(max(0, min(end, b) - max(start, a)) for start, end in intervals)
+
+
+def bounds(record):
+    """each frame from the second: its length, what held it, the cause that held it longest, and whether it is a
+    hitch (more than twice the median frame). a frame is the time of the thread that presents: while it waits, what
+    the GPU and Mullion's threads did then holds it (timeline); its own calls into Mullion are Mullion's; the rest is
+    the application's"""
+    segments = timeline(record)
+    presenters = Counter(thread for thread, work, *_ in record.threads if work == "present")
+    if not segments or not presenters:
+        return []
+    thread = presenters.most_common(1)[0][0]
+    waits = merged((a, b) for t, a, b in record.waited if t == thread)
+    calls = merged((a, b) for t, work, a, b in record.threads if t == thread)
+    lengths = [b - a for a, b in zip(record.frames, record.frames[1:])]
+    median, starts = statistics.median(lengths), [start for start, _, _ in segments]
+    rows = []
+    for n, (a, b) in enumerate(zip(record.frames, record.frames[1:]), 1):
+        causes = dict.fromkeys(CAUSES, 0)
+        waited = [(max(x, a), min(y, b)) for x, y in waits if x < b and y > a]
+        for x, y in waited:
+            for cause, time in held(segments, starts, x, y).items():
+                causes[cause] += time
+        causes["mullion"] += covered(calls, a, b) - sum(covered(calls, x, y) for x, y in waited)
+        causes["application"] += b - a - sum(causes.values())
+        rows.append(dict(frame=n, length=b - a, causes=causes, bound=max(causes, key=causes.get),
+                         hitch=b - a > 2 * median))
+    return rows
+
+
 def frame_stats(record, first=0, last=None):
     last = len(record.frames) - 1 if last is None else min(last, len(record.frames) - 1)
     times = [later - earlier for earlier, later in zip(record.frames[first:last], record.frames[first + 1:last + 1])]
@@ -253,8 +376,40 @@ def table(title, rows, top):
         print(f"  {ms(rest):>10}  {100 * rest / whole:5.1f}%  {count} more")
 
 
+def verdict(record, top):
+    """what bounds the record's frames, the hitches and what held them, and the GPU driver's own statistics"""
+    rows = bounds(record)
+    if not rows:
+        print("no verdict: the record has no frame with Metal's host clock beside it, or no frame at all")
+        return
+    whole = sum(row["length"] for row in rows)
+    shares = {cause: sum(row["causes"][cause] for row in rows) for cause in CAUSES}
+    counts = {cause: sum(row["bound"] == cause for row in rows) for cause in CAUSES}
+    print(f"what held the {len(rows)} frames after the first ({ms(whole / len(rows))} ms a frame):")
+    for cause in CAUSES:
+        print(f"  {cause:12} {100 * shares[cause] / whole:5.1f}% of the time, longest in {counts[cause]} frames")
+    hitches = sorted((row for row in rows if row["hitch"]), key=lambda row: row["length"], reverse=True)
+    print(f"{len(hitches)} hitches (frames over twice the median)")
+    for row in hitches[:top]:
+        n = row["frame"]
+        calls = record.unix[n] if n < len(record.unix) else {}
+        busiest = sorted(((time, code) for code, (count, time) in calls.items()), reverse=True)[:3]
+        print(f"  frame {n}: {ms(row['length'])} ms, " + ", ".join(f"{cause} {ms(time)}" for cause, time in
+              row["causes"].items() if time) + "; longest bridge calls: " +
+              (", ".join(f"{record.calls.get(code, code)} {ms(time)}" for time, code in busiest) or "none recorded"))
+    if record.statistics:
+        print("the GPU driver's statistics over the frames (mean, IORegistry PerformanceStatistics):")
+        for name in sorted({name for frame in record.statistics for name in frame if name.endswith("%")}):
+            values = [frame[name] for frame in record.statistics if name in frame]
+            print(f"  {name}: {statistics.mean(values):.1f}")
+        recoveries = [frame["recoveryCount"] for frame in record.statistics if "recoveryCount" in frame]
+        if recoveries and recoveries[-1] != recoveries[0]:
+            print(f"  the GPU recovered {recoveries[-1] - recoveries[0]} times during the record (a hang or fault)")
+
+
 def report(record, top=15, frame=None):
     print(f"{record.path}")
+    verdict(record, top)
     print("frames (ms; draws includes dispatches): n/a means no preceding present or no bridge interval; "
           "the trailing frame has no bridge totals")
     keys = ("frame", "since", "passes", "resource_buffers", "gpu_sum", "gpu_clock", "draws", "vertices", "indices",
@@ -275,11 +430,21 @@ def report(record, top=15, frame=None):
         rows.append((time, f"{name}: {count} passes, {draws} draws, {vertices} vertices, {indices} indices"
                      + (f"; pipeline totals across selected passes: {own}" if names else "")))
     table("GPU time by pipeline (a shared pass counts under its pipelines together)", rows, top)
+    events = defaultdict(lambda: [0, 0])
+    for p in passes:
+        path = record.events.get((p.queue, p.cmdbuf, p.number), ())
+        for depth in range(1, len(path) + 1) or [0]:
+            event = events[" / ".join(path[:depth]) if depth else "(in no event)"]
+            event[0] += p.gpu
+            event[1] += 1
+    table("GPU time by application event (an event includes those in it)",
+          [(time, f"{name}: {count} passes") for name, (time, count) in events.items()], top)
     table("GPU time by pass", [(p.gpu, f"queue {p.queue} command buffer {p.cmdbuf} pass {p.number} {p.kind} "
                                f"[{', '.join(ms(end - start) for start, end in p.stages)} ms] {p.what()}: "
                                f"{p.draws} {'dispatches' if p.kind == 'Compute' else 'draws'}, "
                                f"{p.tile_dispatches} tile dispatches, {p.vertices} vertices, {p.indices} indices; "
-                               f"CPU encoding {ms(p.encoding)} ms; targets "
+                               f"CPU encoding {ms(p.encoding)} ms; "
+                               f"event {' / '.join(record.events.get((p.queue, p.cmdbuf, p.number), ())) or '-'}; targets "
                                f"{record.targets.get((p.queue, p.cmdbuf, p.number), [])}") for p in passes], top)
     work, made, bridge = cpu_totals(record, frame)
     table("CPU time by work", [(time, f"{kind}: {count} spans") for kind, (time, count) in work.items()], top)
