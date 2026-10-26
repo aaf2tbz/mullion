@@ -20,6 +20,16 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+// a call that makes an object returns it retained, and drains what Metal autoreleased while making it: the calling
+// thread may have no pool, and then all of that, a texture's validation records with the texture among them, leaks
+#define CREATES(name)                                                                                                \
+  name##_made(void *obj);                                                                                            \
+  static NTSTATUS name(void *obj) {                                                                                  \
+    @autoreleasepool {                                                                                               \
+      return name##_made(obj);                                                                                       \
+    }                                                                                                                \
+  }                                                                                                                  \
+  static NTSTATUS name##_made
 
 static int64_t test_late_ns;
 static dispatch_queue_t test_late_commits;
@@ -118,7 +128,7 @@ _NSString_getCString(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newCommandQueue(void *obj) {
+CREATES(_MTLDevice_newCommandQueue)(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newCommandQueueWithMaxCommandBufferCount:params->arg];
   return STATUS_SUCCESS;
@@ -188,7 +198,7 @@ _MTLCommandBuffer_status(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newSharedEvent(void *obj) {
+CREATES(_MTLDevice_newSharedEvent)(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
   params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newSharedEvent];
   return STATUS_SUCCESS;
@@ -209,7 +219,7 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newBuffer(void *obj) {
+CREATES(_MTLDevice_newBuffer)(void *obj) {
   struct unixcall_mtldevice_newbuffer *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTBufferInfo *info = params->info.ptr;
@@ -229,7 +239,7 @@ _MTLDevice_newBuffer(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newSamplerState(void *obj) {
+CREATES(_MTLDevice_newSamplerState)(void *obj) {
   struct unixcall_mtldevice_newsamplerstate *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTSamplerInfo *info = params->info.ptr;
@@ -258,7 +268,7 @@ _MTLDevice_newSamplerState(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newDepthStencilState(void *obj) {
+CREATES(_MTLDevice_newDepthStencilState)(void *obj) {
   struct unixcall_mtldevice_newdepthstencilstate *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   const struct WMTDepthStencilInfo *info = params->info.ptr;
@@ -326,7 +336,7 @@ extract_texture_descriptor(id<MTLTexture> desc, struct WMTTextureInfo *info) {
 };
 
 static NTSTATUS
-_MTLDevice_newTexture(void *obj) {
+CREATES(_MTLDevice_newTexture)(void *obj) {
   struct unixcall_mtldevice_newtexture *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTTextureInfo *info = params->info.ptr;
@@ -343,7 +353,7 @@ _MTLDevice_newTexture(void *obj) {
 }
 
 static NTSTATUS
-_MTLBuffer_newTexture(void *obj) {
+CREATES(_MTLBuffer_newTexture)(void *obj) {
   struct unixcall_mtlbuffer_newtexture *params = obj;
   id<MTLBuffer> buffer = (id<MTLBuffer>)params->buffer;
   struct WMTTextureInfo *info = params->info.ptr;
@@ -370,7 +380,7 @@ to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat f
 }
 
 static NTSTATUS
-_MTLTexture_newTextureView(void *obj) {
+CREATES(_MTLTexture_newTextureView)(void *obj) {
   struct unixcall_mtltexture_newtextureview *params = obj;
   id<MTLTexture> texture = (id<MTLTexture>)params->texture;
 
@@ -393,7 +403,7 @@ _MTLDevice_minimumLinearTextureAlignmentForPixelFormat(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newLibrary(void *obj) {
+CREATES(_MTLDevice_newLibrary)(void *obj) {
   struct unixcall_mtldevice_newlibrary *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   NSError *err = NULL;
@@ -403,7 +413,7 @@ _MTLDevice_newLibrary(void *obj) {
 }
 
 static NTSTATUS
-_MTLLibrary_newFunction(void *obj) {
+CREATES(_MTLLibrary_newFunction)(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   id<MTLLibrary> library = (id<MTLLibrary>)params->handle;
   NSString *name = [[NSString alloc] initWithCString:(char *)params->arg encoding:NSUTF8StringEncoding];
@@ -427,7 +437,7 @@ _NSObject_description(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newComputePipelineState(void *obj) {
+CREATES(_MTLDevice_newComputePipelineState)(void *obj) {
   struct unixcall_mtldevice_newcomputepso *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   const struct WMTComputePipelineInfo *info = params->info.ptr;
@@ -601,7 +611,7 @@ MTLMeshRenderPipelineDescriptor ()
 #endif
 
 static NTSTATUS
-_MTLDevice_newRenderPipelineState(void *obj) {
+CREATES(_MTLDevice_newRenderPipelineState)(void *obj) {
   struct unixcall_mtldevice_newrenderpso *params = obj;
   const struct WMTRenderPipelineInfo *info = params->info.ptr;
   MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -685,7 +695,7 @@ empty_fragment_function(id<MTLDevice> device) {
 static unsigned emulated_family(void);
 
 static NTSTATUS
-_MTLDevice_newMeshRenderPipelineState(void *obj) {
+CREATES(_MTLDevice_newMeshRenderPipelineState)(void *obj) {
   struct unixcall_mtldevice_newmeshrenderpso *params = obj;
   const struct WMTMeshRenderPipelineInfo *info = params->info.ptr;
   // family emulation must also reject requests that the host GPU accepts (Metal Feature Set Tables, mesh draws in ICBs)
@@ -1675,7 +1685,7 @@ static const int SIGNALS[] = {
 };
 
 static NTSTATUS
-_MTLDevice_newTemporalScaler(void *obj) {
+CREATES(_MTLDevice_newTemporalScaler)(void *obj) {
   struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
   MTLFXTemporalScalerDescriptor *desc = [[MTLFXTemporalScalerDescriptor alloc] init];
   const struct WMTFXTemporalScalerInfo *info = params->info.ptr;
@@ -1718,7 +1728,7 @@ _MTLDevice_newTemporalScaler(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newSpatialScaler(void *obj) {
+CREATES(_MTLDevice_newSpatialScaler)(void *obj) {
   struct unixcall_mtldevice_newfxspatialscaler *params = obj;
   MTLFXSpatialScalerDescriptor *desc = [[MTLFXSpatialScalerDescriptor alloc] init];
   const struct WMTFXSpatialScalerInfo *info = params->info.ptr;
@@ -2853,7 +2863,7 @@ _MetalLayer_getEDRValue(void *obj) {
 }
 
 static NTSTATUS
-_MTLLibrary_newFunctionWithConstants(void *obj) {
+CREATES(_MTLLibrary_newFunctionWithConstants)(void *obj) {
   struct unixcall_mtllibrary_newfunction_with_constants *params = obj;
   id<MTLLibrary> library = (id<MTLLibrary>)params->library;
   NSString *name = [[NSString alloc] initWithCString:(char *)params->name.ptr encoding:NSUTF8StringEncoding];
@@ -3068,14 +3078,14 @@ _SharedEventListener_destroy(void *obj) {
 #endif
 
 static NTSTATUS
-_MTLDevice_newFence(void *obj) {
+CREATES(_MTLDevice_newFence)(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
   params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newFence];
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-_MTLDevice_newEvent(void *obj) {
+CREATES(_MTLDevice_newEvent)(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
   params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newEvent];
   return STATUS_SUCCESS;
@@ -3101,7 +3111,7 @@ _WMTGetOSVersion(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newBinaryArchive(void *obj) {
+CREATES(_MTLDevice_newBinaryArchive)(void *obj) {
   struct unixcall_mtldevice_newbinaryarchive *params = obj;
   NSString *path_str = NULL;
   NSURL *url = NULL;
@@ -3150,7 +3160,7 @@ _DispatchData_alloc_init(void *obj) {
 @end
 
 static NTSTATUS
-_MTLDevice_newSharedTexture(void *obj) {
+CREATES(_MTLDevice_newSharedTexture)(void *obj) {
   struct unixcall_mtldevice_newtexture *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTTextureInfo *info = params->info.ptr;
@@ -3220,7 +3230,7 @@ _WMTBootstrapLookUp(void *obj) {
 @end
 
 static NTSTATUS
-_MTLSharedEvent_createMachPort(void *obj) {
+CREATES(_MTLSharedEvent_createMachPort)(void *obj) {
   struct unixcall_mtlsharedevent_createmachport *params = obj;
   id<MTLSharedEvent> event = (id<MTLSharedEvent>)params->event;
   MTLSharedEventHandle *handle = [event newSharedEventHandle];
@@ -3237,7 +3247,7 @@ _MTLSharedEvent_createMachPort(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newSharedEventWithMachPort(void *obj) {
+CREATES(_MTLDevice_newSharedEventWithMachPort)(void *obj) {
   struct unixcall_mtldevice_newsharedeventwithmachport *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   id<MTLDeviceSPI> deviceSPI = (id<MTLDeviceSPI>)device;
@@ -3312,7 +3322,7 @@ _MTLDevice_sparseTileSize(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newPlacementSparseBuffer(void *obj) {
+CREATES(_MTLDevice_newPlacementSparseBuffer)(void *obj) {
   struct unixcall_new_placement_sparse_buffer *params = obj;
   id<MTLBuffer> buffer = nil;
   if (@available(macOS 26.0, *))
@@ -3334,7 +3344,7 @@ _MTLTexture_sparseTail(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newMTL4CommandQueue(void *obj) {
+CREATES(_MTLDevice_newMTL4CommandQueue)(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = 0;
   if (@available(macOS 26.0, *))
@@ -3436,7 +3446,7 @@ _MTLSharedEvent_waitUntilSignaledValue(void *obj) {
 }
 
 static NTSTATUS
-_MTLCounterSampleBuffer_newTimestampBuffer(void *obj) {
+CREATES(_MTLCounterSampleBuffer_newTimestampBuffer)(void *obj) {
   struct unixcall_mtlcountersamplebuffer_newtimestampbuffer *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
 
@@ -3520,7 +3530,7 @@ _MTLCommandBuffer_property(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newTileRenderPipelineState(void *obj) {
+CREATES(_MTLDevice_newTileRenderPipelineState)(void *obj) {
   struct unixcall_mtldevice_newrenderpso *params = obj;
   const struct WMTTileRenderPipelineInfo *info = params->info.ptr;
   MTLTileRenderPipelineDescriptor *descriptor = [[MTLTileRenderPipelineDescriptor alloc] init];
@@ -3569,7 +3579,7 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newResidencySet(void *obj) {
+CREATES(_MTLDevice_newResidencySet)(void *obj) {
   struct unixcall_mtldevice_newresidencyset *params = obj;
   NSError *err = NULL;
   MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
@@ -3622,7 +3632,7 @@ _MTLCommandQueue_addResidencySet(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newHeap(void *obj) {
+CREATES(_MTLDevice_newHeap)(void *obj) {
   struct unixcall_mtldevice_newheap *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTHeapInfo const *info = params->info.ptr;
@@ -3667,7 +3677,7 @@ _MTLDevice_heapTextureSizeAndAlign(void *obj) {
 }
 
 static NTSTATUS
-_MTLHeap_newBuffer(void *obj) {
+CREATES(_MTLHeap_newBuffer)(void *obj) {
   struct unixcall_mtlheap_newbuffer *params = obj;
   id<MTLHeap> heap = (id<MTLHeap>)params->heap;
   struct WMTBufferInfo *info = params->info.ptr;
@@ -3685,7 +3695,7 @@ _MTLHeap_newBuffer(void *obj) {
 }
 
 static NTSTATUS
-_MTLHeap_newTexture(void *obj) {
+CREATES(_MTLHeap_newTexture)(void *obj) {
   struct unixcall_mtlheap_newtexture *params = obj;
   id<MTLHeap> heap = (id<MTLHeap>)params->heap;
   struct WMTTextureInfo *info = params->info.ptr;
@@ -3706,7 +3716,7 @@ _MTLHeap_newTexture(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newIndirectCommandBuffer(void *obj) {
+CREATES(_MTLDevice_newIndirectCommandBuffer)(void *obj) {
   struct unixcall_mtldevice_newicb *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
 
@@ -3750,7 +3760,7 @@ _MTLDevice_newIndirectCommandBuffer(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newLibraryWithSource(void *obj) {
+CREATES(_MTLDevice_newLibraryWithSource)(void *obj) {
   struct unixcall_mtldevice_newlibrarywithsource *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   NSString *source =
@@ -3867,7 +3877,7 @@ _MTLDevice_accelerationStructureSizes(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newAccelerationStructure(void *obj) {
+CREATES(_MTLDevice_newAccelerationStructure)(void *obj) {
   struct unixcall_mtldevice_newaccelerationstructure *params = obj;
   id<MTLAccelerationStructure> structure =
       [(id<MTLDevice>)params->device newAccelerationStructureWithSize:params->size];
