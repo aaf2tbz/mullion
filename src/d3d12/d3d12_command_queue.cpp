@@ -83,6 +83,96 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   WMT::Reference<WMT::CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
+
+  // MULLION_D3D12_PASS_OVERLAP (on unless 0): a pass waits for the passes before the last ordering point before it,
+  // not for those since (EncoderData::overlap). passes from one ordering point to the next are a group, each with a
+  // fence of its own from one half of group_fences_, the next group's from the other: a group's passes wait for the
+  // fences of the group before, and those waited for theirs. fence_ stands for all work before the last encoder that
+  // updated it, which waited for every pass (WaitAll). a group has at most kGroupPasses passes
+  static constexpr unsigned kGroupPasses = 8;
+  std::array<WMT::Reference<WMT::Fence>, 2 * kGroupPasses> group_fences_;
+  // the half of group_fences_ the current group's passes update, how many have, and how many of the group before did
+  unsigned group_half_ = 0, group_count_ = 0, previous_count_ = 0;
+  // a pass that orders itself after all before it encoded nothing (a list's first, which is no pass of Metal's): the
+  // next that does is ordered in its place
+  bool order_next_ = false;
+
+  static bool
+  PassesOverlap() {
+    static const bool overlap = env::getEnvVar("MULLION_D3D12_PASS_OVERLAP") != "0";
+    return overlap;
+  }
+
+  // what a pass waits for and updates: `waits` before it begins (a render pass's before its vertices), `pixels`
+  // before its fragments
+  struct PassSync {
+    std::array<WMT::Fence, kGroupPasses + 1> waits;
+    unsigned wait_count = 0;
+    std::array<WMT::Fence, kGroupPasses> pixels;
+    unsigned pixel_count = 0;
+    WMT::Fence update;
+  };
+
+  // whether a pass's encoder surely does something: a fence update in one that Metal may leave out would leave the
+  // fence's last update the older one, which a later pass would then wait for instead
+  static bool
+  Encodes(const EncoderData *pass) {
+    switch (pass->type) {
+    case EncoderType::Clear:
+    case EncoderType::Render:
+    case EncoderType::Resolve:
+      return true;
+    case EncoderType::Blit:
+      return pass->stamps || static_cast<const BlitEncoderData *>(pass)->cmd_head.next.ptr;
+    case EncoderType::Compute:
+    case EncoderType::ComputeParts:
+      return pass->stamps || static_cast<const ComputeEncoderData *>(pass)->cmd_head.next.ptr;
+    default:
+      return false;
+    }
+  }
+
+  // the next pass's waits and update, in the order the passes are submitted. a pass that may do nothing (and a pass
+  // of no encoder) neither waits nor updates: it has no work to order
+  PassSync
+  NextSync(const EncoderData *pass) {
+    PassSync sync;
+    if (!PassesOverlap()) {
+      sync.waits[sync.wait_count++] = fence_;
+      sync.update = fence_;
+      return sync;
+    }
+    if (!Encodes(pass)) {
+      order_next_ |= pass->overlap == PassOverlap::Ordered;
+      return sync;
+    }
+    sync.waits[sync.wait_count++] = fence_;
+    auto overlap = std::exchange(order_next_, false) ? PassOverlap::Ordered : pass->overlap;
+    if (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses) {
+      overlap = PassOverlap::Ordered;
+      previous_count_ = group_count_;
+      group_half_ ^= 1;
+      group_count_ = 0;
+    }
+    for (unsigned i = 0; i < previous_count_; i++)
+      sync.waits[sync.wait_count++] = group_fences_[(group_half_ ^ 1) * kGroupPasses + i];
+    if (overlap == PassOverlap::Shared)
+      for (unsigned i = 0; i < group_count_; i++)
+        sync.pixels[sync.pixel_count++] = group_fences_[group_half_ * kGroupPasses + i];
+    sync.update = group_fences_[group_half_ * kGroupPasses + group_count_++];
+    return sync;
+  }
+
+  // an encoder that waits for all work before it: fence_ and the current group's passes, which waited for the group
+  // before. it updates fence_, which then stands for them all
+  template <typename Wait>
+  void
+  WaitAll(Wait &&wait) {
+    wait(WMT::Fence(fence_));
+    for (unsigned i = 0; i < group_count_; i++)
+      wait(WMT::Fence(group_fences_[group_half_ * kGroupPasses + i]));
+    group_count_ = previous_count_ = 0;
+  }
   // a Signal and a timestamp resolve wait here for a command buffer the completion thread is done with
   Reached retired_{};
 
@@ -563,6 +653,26 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             line += str::format('\t', pass.first == ~0u ? ~uint64_t(0)
                                                        : clock[i + 1 == pass.count ? pass.last : pass.first + i]);
           lines += line + '\n';
+          // the attachments of a render or clear pass, as D3D11's profile has them, and how each is loaded and stored
+          if (pass.type == EncoderType::Render || pass.type == EncoderType::Clear) {
+            auto data = static_cast<const RenderEncoderData *>(pass.pass);
+            auto target = [&](const char *binding, unsigned slot, WMT::Texture texture, unsigned level, unsigned slice,
+                              WMTLoadAction load, WMTStoreAction store) {
+              if (texture)
+                lines += diag::Line("target", profile_->id, internal_seq, pass.id, binding, slot, texture.handle,
+                                    texture.width(), texture.height(), uint64_t(texture.pixelFormat()), level, slice,
+                                    texture.arrayLength(), uint32_t(load), uint32_t(store));
+            };
+            for (unsigned i = 0; i < data->colors.size(); i++) {
+              auto &color = data->colors[i];
+              target("color", i, color.attachment.texture(), color.level, color.slice, color.load_action,
+                     color.store_action);
+            }
+            target("depth", 0, data->depth.attachment.texture(), data->depth.level, data->depth.slice,
+                   data->depth.load_action, data->depth.store_action);
+            target("stencil", 0, data->stencil.attachment.texture(), data->stencil.level, data->stencil.slice,
+                   data->stencil.load_action, data->stencil.store_action);
+          }
         }
         diag::Write(lines);
         buffer = {};
@@ -753,6 +863,9 @@ public:
     gate_->device = device_;
 
     fence_ = metal_device.newFence();
+    for (auto &fence : group_fences_)
+      if (!(fence = metal_device.newFence()))
+        return E_FAIL;
     if (profile_) {
       UINT64 cpu, gpu;
       GetClockCalibration(&gpu, &cpu);
@@ -952,7 +1065,12 @@ public:
   // but its fence. false when the device is lost
   bool
   EncodePass(WMT::CommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo attachment,
-             WMT::Buffer sparse_mappings, InflightCommandBuffer &inflight, const GPUListRecords *records) {
+             WMT::Buffer sparse_mappings, InflightCommandBuffer &inflight, const GPUListRecords *records,
+             const PassSync &sync) {
+    auto wait = [&](auto &encoder) {
+      for (unsigned i = 0; i < sync.wait_count; i++)
+        encoder.waitForFence(sync.waits[i]);
+    };
     switch (current->type) {
     case EncoderType::Clear:
     case EncoderType::Render: {
@@ -1007,9 +1125,10 @@ public:
       }
       if (data->before_head.next.get()) {
         auto before = cmdbuf.computeCommandEncoder(true);
-        before.waitForFence(fence_);
+        wait(before);
         before.encodeCommands(&data->before_head);
-        before.updateFence(fence_);
+        if (sync.update.handle)
+          before.updateFence(sync.update);
         before.endEncoding();
         if (data->omitted) {
           size_t count = 0;
@@ -1023,13 +1142,15 @@ public:
           }
           // a replay may overwrite the resolver's words before the completion thread runs
           auto copy = cmdbuf.blitCommandEncoder();
-          copy.waitForFence(fence_);
+          if (sync.update.handle)
+            copy.waitForFence(sync.update);
           size_t offset = 0;
           for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
             copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset, omitted->words * sizeof(uint32_t));
             offset += omitted->words * sizeof(uint32_t);
           }
-          copy.updateFence(fence_);
+          if (sync.update.handle)
+            copy.updateFence(sync.update);
           copy.endEncoding();
           inflight.omitted.emplace_back(
               std::move(buffer), std::span(static_cast<const uint32_t *>(info.memory.get()), count)
@@ -1049,8 +1170,14 @@ public:
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
       else if (profile_ && !record_totals_)
         LabelEncoder(encoder, "render ", current);
-      // the object and mesh stages read what earlier passes wrote as the vertex stage does
-      encoder.waitForFence(fence_, WMTRenderStagePreRaster);
+      // the object and mesh stages read what earlier passes wrote as the vertex stage does. a pass that draws to what
+      // one of its group drew to waits for that one's pixels before its own
+      for (unsigned i = 0; i < sync.wait_count; i++)
+        encoder.waitForFence(sync.waits[i], WMTRenderStagePreRaster);
+      if (data->before_head.next.get() && sync.update.handle)
+        encoder.waitForFence(sync.update, WMTRenderStagePreRaster);
+      for (unsigned i = 0; i < sync.pixel_count; i++)
+        encoder.waitForFence(sync.pixels[i], WMTRenderStageFragment);
       if (sparse_mappings) {
         inflight.sparse_mappings = sparse_mappings;
         encoder.setVertexBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
@@ -1059,7 +1186,8 @@ public:
         encoder.setMeshBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
       }
       encoder.encodeCommands(&data->cmd_head);
-      encoder.updateFence(fence_, WMTRenderStageFragment);
+      if (sync.update.handle)
+        encoder.updateFence(sync.update, WMTRenderStageFragment);
       encoder.endEncoding();
       break;
     }
@@ -1067,9 +1195,10 @@ public:
       auto data = static_cast<BlitEncoderData *>(current);
       auto encoder = attachment.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1)
                                               : cmdbuf.blitCommandEncoder();
-      encoder.waitForFence(fence_);
+      wait(encoder);
       encoder.encodeCommands(&data->cmd_head);
-      encoder.updateFence(fence_);
+      if (sync.update.handle)
+        encoder.updateFence(sync.update);
       encoder.endEncoding();
       break;
     }
@@ -1084,7 +1213,7 @@ public:
         encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
       } else if (profile_)
         LabelEncoder(encoder, "compute ", current);
-      encoder.waitForFence(fence_);
+      wait(encoder);
       if (sparse_mappings) {
         inflight.sparse_mappings = sparse_mappings;
         wmtcmd_compute_setbuffer binding{};
@@ -1094,7 +1223,8 @@ public:
         encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
       }
       encoder.encodeCommands(&data->cmd_head);
-      encoder.updateFence(fence_);
+      if (sync.update.handle)
+        encoder.updateFence(sync.update);
       encoder.endEncoding();
       break;
     }
@@ -1107,7 +1237,7 @@ public:
       assert(pipeline->type == WMTComputeCommandSetPSO);
       auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true)
                                               : cmdbuf.computeCommandEncoder(true);
-      encoder.waitForFence(fence_);
+      wait(encoder);
       if (sparse_mappings) {
         inflight.sparse_mappings = sparse_mappings;
         wmtcmd_compute_setbuffer binding{};
@@ -1139,7 +1269,8 @@ public:
         encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&barrier));
       };
       parts(parts, {}, extent);
-      encoder.updateFence(fence_);
+      if (sync.update.handle)
+        encoder.updateFence(sync.update);
       encoder.endEncoding();
       break;
     }
@@ -1155,9 +1286,11 @@ public:
 
       auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(info, attachment)
                                               : cmdbuf.renderCommandEncoder(info);
-      encoder.waitForFence(fence_, WMTRenderStageFragment);
+      for (unsigned i = 0; i < sync.wait_count; i++)
+        encoder.waitForFence(sync.waits[i], WMTRenderStageFragment);
       encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
-      encoder.updateFence(fence_, WMTRenderStageFragment);
+      if (sync.update.handle)
+        encoder.updateFence(sync.update, WMTRenderStageFragment);
       encoder.endEncoding();
 
       break;
@@ -1334,7 +1467,7 @@ public:
         case EncoderType::Compute:
         case EncoderType::ComputeParts:
         case EncoderType::Resolve:
-          if (!EncodePass(cmdbuf, current, attachment, sparse_mappings, *scope.inflight, records))
+          if (!EncodePass(cmdbuf, current, attachment, sparse_mappings, *scope.inflight, records, NextSync(current)))
             return;
           break;
         case EncoderType::AccelerationStructure: {
@@ -1353,7 +1486,7 @@ public:
           }
           auto encoder = attachment.sample_buffer ? cmdbuf.accelerationStructureCommandEncoder(attachment)
                                                   : cmdbuf.accelerationStructureCommandEncoder();
-          encoder.waitForFence(fence_);
+          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
           encoder.encodeCommands(&data->cmd_head);
           encoder.updateFence(fence_);
           encoder.endEncoding();
@@ -1380,7 +1513,7 @@ public:
           if (data->memory)
             break;
           auto encoder = cmdbuf.blitCommandEncoder();
-          encoder.waitForFence(fence_);
+          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
           encoder.copyFromBuffer(staging, 0, data->dst, data->dst_offset, data->count * sizeof(uint64_t));
           encoder.updateFence(fence_);
           encoder.endEncoding();
@@ -1407,7 +1540,7 @@ public:
             WMTBufferInfo info{length, WMTResourceStorageModeShared};
             auto staging = device_->GetMTLDevice().newBuffer(info);
             auto encoder = cmdbuf.blitCommandEncoder();
-            encoder.waitForFence(fence_);
+            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
             if (allocation)
               encoder.copyFromBuffer(allocation->buffer(), offset, staging, 0, length);
             encoder.updateFence(fence_);
@@ -1527,6 +1660,11 @@ public:
         bounds.push_back(i + 1);
     bounds.push_back(passes.size());
     parts = bounds.size() - 1;
+    // the passes' waits and updates are the queue's, in their order
+    std::vector<PassSync> syncs;
+    syncs.reserve(passes.size());
+    for (auto &[pass, _] : passes)
+      syncs.push_back(NextSync(pass));
     std::vector<WMT::Reference<WMT::CommandBuffer>> buffers(parts);
     buffers[0] = scope.inflight->cmdbuf;
     for (unsigned k = 1; k < parts; k++)
@@ -1537,7 +1675,7 @@ public:
     auto part = [&](unsigned k) {
       InflightCommandBuffer unused;
       for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++)
-        if (!EncodePass(buffers[k], passes[i].first, {}, sparse_mappings, unused, nullptr))
+        if (!EncodePass(buffers[k], passes[i].first, {}, sparse_mappings, unused, nullptr, syncs[i]))
           lost = true;
     };
     {
@@ -1790,7 +1928,7 @@ public:
     copy.dst = buffer.handle;
     copy.bytes_per_row = footprint.Footprint.RowPitch;
     auto blit = inflight.cmdbuf.blitCommandEncoder();
-    blit.waitForFence(fence_);
+    WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
     blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
     blit.updateFence(fence_);
     blit.endEncoding();
@@ -1831,7 +1969,9 @@ public:
 
     auto drawable = presenter->encodeCommands(
         cmdbuf, view.texture, state,
-        [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
+        [&](auto encoder) {
+          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence, WMTRenderStageFragment); });
+        },
         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
     );
 

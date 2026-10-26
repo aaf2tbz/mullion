@@ -94,6 +94,12 @@ public:
 
     WMTHeapInfo info;
     info.options = {}; // FIXME: ensure this agrees with {Buffer|Texture}AllocationFlag?
+    // render targets and depth buffers placed in a heap that holds no buffers and that the CPU never reaches are
+    // private, as committed ones are: Metal keeps a private texture compressed from the start (MTLD3D12Texture)
+    private_storage = (pDesc->Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) && !(pDesc->Flags & D3D12_HEAP_FLAG_SHARED) &&
+                      !IsCpuVisibleHeap(&desc_.Properties);
+    if (private_storage)
+      info.options = WMTResourceStorageModePrivate;
     info.size = size_aligned;
     // the tiles of reserved resources can live in any heap
     info.sparse_page_size = device_->GetSparsePageSize();

@@ -222,6 +222,10 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   WMT::Reference<WMT::ResidencySet> residency_set_;
   // allocations were added or removed since the set was last committed (CommitResidency)
   bool residency_dirty_ = false;
+  // the buffers by GPU address and the sparse ones' mapped tiles, under a lock of their own: every index buffer, root
+  // view and immediate write looks an address up, and none of them should wait on residency_lock_, which a queue holds
+  // across the residency set's commit (a kernel call)
+  mullion::shared_mutex va_lock_;
   std::map<uint64_t, BufferAllocation *> interval_map_;
   std::map<uint64_t, std::vector<uint64_t>> sparse_buffer_mappings_;
   // what a null acceleration structure is to a ray query: a top-level structure of nothing
@@ -2022,14 +2026,17 @@ public:
 
   HRESULT
   RegisterResidencyAndVA(BufferAllocation *allocation) {
-    std::unique_lock<mullion::mutex> lock(residency_lock_);
-    interval_map_.emplace(allocation->gpuAddress(), allocation);
-    if (allocation->sparse_tile_bytes)
-      sparse_buffer_mappings_.emplace(
-          allocation->gpuAddress(), std::vector<uint64_t>(allocation->sparse_tile_count)
-      );
+    {
+      std::unique_lock<mullion::shared_mutex> lock(va_lock_);
+      interval_map_.emplace(allocation->gpuAddress(), allocation);
+      if (allocation->sparse_tile_bytes)
+        sparse_buffer_mappings_.emplace(
+            allocation->gpuAddress(), std::vector<uint64_t>(allocation->sparse_tile_count)
+        );
+    }
     if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
       return S_OK;
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     auto buffer = allocation->buffer();
     residency_set_.addAllocations(&buffer, 1);
     residency_dirty_ = true;
@@ -2041,7 +2048,7 @@ public:
     // the buffer's acceleration structures, up to the next buffer's address, end with it and after the locks: they
     // give back what they hold
     std::vector<std::shared_ptr<AccelerationStructure>> ended;
-    std::unique_lock<mullion::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::shared_mutex> va_lock(va_lock_);
     auto next = interval_map_.upper_bound(allocation->gpuAddress());
     {
       std::unique_lock<mullion::mutex> lock(acceleration_structure_lock_);
@@ -2054,8 +2061,10 @@ public:
     }
     interval_map_.erase(allocation->gpuAddress());
     sparse_buffer_mappings_.erase(allocation->gpuAddress());
+    va_lock.unlock();
     if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
       return S_OK;
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
     auto buffer = allocation->buffer();
     residency_set_.removeAllocations(&buffer, 1);
     residency_dirty_ = true;
@@ -2063,21 +2072,25 @@ public:
   }
 
   BufferAllocation *
-  LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) {
-    std::unique_lock<mullion::mutex> lock(residency_lock_);
+  LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pEnd) {
+    std::shared_lock<mullion::shared_mutex> lock(va_lock_);
     auto iter = interval_map_.upper_bound(VA);
+    if (pEnd)
+      *pEnd = iter == interval_map_.end() ? ~0ull : iter->first;
     if (iter == interval_map_.begin()) {
       *pOffset = 0;
       return {};
     }
     --iter;
+    if (pEnd)
+      *pEnd = std::min(*pEnd, iter->first + iter->second->info().length);
     *pOffset = VA - iter->first;
     return iter->second;
   }
 
   void
   UpdateSparseBufferMappings(BufferAllocation *buffer, const std::vector<WMTSparseBufferMapping> &ranges) {
-    std::unique_lock<mullion::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::shared_mutex> lock(va_lock_);
     auto &tiles = sparse_buffer_mappings_.at(buffer->gpuAddress());
     for (auto &range : ranges)
       std::fill_n(tiles.begin() + range.first_tile, range.tile_count, range.mode == WMTSparseMappingModeMap);
@@ -2087,7 +2100,7 @@ public:
   CopySparseBufferMappings(
       BufferAllocation *src, BufferAllocation *dst, const std::vector<WMTSparseBufferMappingCopy> &ranges
   ) {
-    std::unique_lock<mullion::mutex> lock(residency_lock_);
+    std::unique_lock<mullion::shared_mutex> lock(va_lock_);
     auto &from = sparse_buffer_mappings_.at(src->gpuAddress());
     auto &to = sparse_buffer_mappings_.at(dst->gpuAddress());
     for (auto &range : ranges)
@@ -2096,7 +2109,7 @@ public:
 
   std::vector<uint64_t>
   SparseBufferMappings() {
-    std::unique_lock<mullion::mutex> lock(residency_lock_);
+    std::shared_lock<mullion::shared_mutex> lock(va_lock_);
     if (sparse_buffer_mappings_.empty())
       return {};
     std::vector<uint64_t> words{sparse_buffer_mappings_.size()};

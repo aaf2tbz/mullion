@@ -47,11 +47,23 @@ struct Stamp {
   Stamp *next;
 };
 
+// how a pass is ordered with the passes before it (MULLION_D3D12_PASS_OVERLAP, MTLD3D12CommandQueue's PassSync):
+// Ordered waits for all of them; Independent, a draw's or dispatch's pass right after another with nothing that orders
+// work between (a barrier, a copy, a clear, a query...), waits only for what came before that ordering point; Shared
+// is an Independent render pass that draws to what an earlier one since the ordering point drew to, whose pixels
+// then wait for that one's
+enum class PassOverlap : uint8_t {
+  Ordered,
+  Independent,
+  Shared,
+};
+
 struct EncoderData {
   EncoderType type;
   EncoderData *next = nullptr;
   uint64_t id;
   Stamp *stamps = nullptr;
+  PassOverlap overlap = PassOverlap::Ordered;
 };
 
 struct RenderEncoderColorAttachmentData {
