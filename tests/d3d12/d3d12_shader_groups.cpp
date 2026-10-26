@@ -53,7 +53,12 @@ main(int argc, char **argv)
   CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
   CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
   CHECK(list->Close());
+  unsigned skipped = 0;
   for (auto &c : cases) {
+    if (!shader_groups::runs(c.words, D3D12_CS_TGSM_REGISTER_COUNT)) {
+      skipped++;
+      continue;
+    }
     const UINT bytes =
         shader_groups::group_count * shader_groups::rounds * c.words * shader_groups::components * sizeof(uint32_t);
     auto output = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -92,5 +97,5 @@ main(int argc, char **argv)
       readback->Unmap(0, nullptr);
     }
   }
-  return verdict();
+  return shader_groups::verdict(skipped);
 }

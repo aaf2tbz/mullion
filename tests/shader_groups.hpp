@@ -6,6 +6,9 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -53,6 +56,25 @@ void cs(uint3 local_id : SV_GroupThreadID, uint3 group_id : SV_GroupID,
   }
 }
 )hlsl";
+
+// Metal's shader validation keeps a record beside threadgroup memory, so a kernel's doubles under it (measured: 4096
+// words take 32768 bytes, 8191 take 65532), and a group past half of the limit, also Metal's maximum, cannot run there
+inline bool
+runs(uint32_t words, uint32_t limit_words)
+{
+  auto validation = getenv("MTL_SHADER_VALIDATION");
+  return !validation || !strcmp(validation, "0") || 2 * words <= limit_words;
+}
+
+// the verdict, or a skip when every group that ran was right and some could not run
+inline int
+verdict(unsigned skipped)
+{
+  if (!skipped || trace::wrong)
+    return ::verdict();
+  printf("skipped: %u groups past half of threadgroup memory, which Metal's shader validation doubles\n", skipped);
+  return 77;
+}
 
 inline std::vector<std::string>
 defines(Shape s, uint32_t words)

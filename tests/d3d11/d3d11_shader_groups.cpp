@@ -26,7 +26,12 @@ main()
   CHECK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr,
                           &immediate));
   CHECK(device->CreateDeferredContext(0, &deferred));
+  unsigned skipped = 0;
   for (auto &c : cases) {
+    if (!shader_groups::runs(c.words, D3D11_CS_TGSM_REGISTER_COUNT)) {
+      skipped++;
+      continue;
+    }
     const UINT bytes =
         shader_groups::group_count * shader_groups::rounds * c.words * shader_groups::components * sizeof(uint32_t);
     D3D11_BUFFER_DESC desc{bytes,
@@ -60,5 +65,5 @@ main()
         shader_groups::check(got.data(), c.shape, c.words);
     }
   }
-  return verdict();
+  return shader_groups::verdict(skipped);
 }
