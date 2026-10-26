@@ -1053,7 +1053,25 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getIntTy(), Tys, false), Attrs);
 
-  return builder.CreateSelect(builder.CreateIsNull(Handle), builder.getInt32(0), builder.CreateCall(Fn, Ops));
+  // no texture answers 0 ("If there is no resource bound to the specified slot, 0 is returned", D3D11.3 22.4.22),
+  // and is not queried: Metal leaves a null texture's functions undefined. the branch is in a function of its own,
+  // inlined later (runOptimizationPasses), so that a caller stays in the block it is in
+  auto Guarded = getModule()->getFunction(FnName + ".bound");
+  if (!Guarded) {
+    Guarded = Function::Create(Fn.getFunctionType(), GlobalValue::InternalLinkage, FnName + ".bound", getModule());
+    Guarded->addFnAttr(Attribute::AlwaysInline);
+    auto Bound = BasicBlock::Create(getContext(), "", Guarded), None = BasicBlock::Create(getContext(), "", Guarded);
+    IRBuilder<> B(BasicBlock::Create(getContext(), "", Guarded, Bound));
+    B.CreateCondBr(B.CreateIsNull(Guarded->getArg(0)), None, Bound);
+    B.SetInsertPoint(None);
+    B.CreateRet(B.getInt32(0));
+    B.SetInsertPoint(Bound);
+    SmallVector<Value *> Args;
+    for (auto &Arg : Guarded->args())
+      Args.push_back(&Arg);
+    B.CreateRet(B.CreateCall(Fn, Args));
+  }
+  return builder.CreateCall(Guarded, Ops);
 }
 
 std::pair<Value *, Value *>
