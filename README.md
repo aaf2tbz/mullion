@@ -19,7 +19,7 @@ Both columns were measured on the same Mac. The God of War numbers are premature
 | ![Black Myth: Wukong benchmark result on Mullion](docs/wukong-mullion.jpg) | ![The same benchmark on D3DMetal](docs/wukong-d3dmetal.jpg) |
 | ![God of War Ragnarök on Mullion](docs/gow-mullion.jpg) | ![The same place on D3DMetal](docs/gow-d3dmetal.jpg) |
 
-Direct3D 12 is supported at feature level 12_0 with shader models up to 6.7, including ray tracing at tier 1.1, mesh and amplification shaders, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats, and D3D11On12. Direct3D 10 and 11 are supported at feature level 11_1. Next for Direct3D 12 are feature level 12_1, a Metal 4 backend, and more work on performance and reliability.
+Direct3D 12 is supported at feature level 12_2 with shader models up to 6.7, including ray tracing at tier 1.1, mesh and amplification shaders, conservative rasterization at tier 3, variable rate shading at tier 2, tiled resources at tier 3, the depth bounds test, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats, and D3D11On12. On macOS 26 it runs on Metal 4, and on Metal 3 before that. Direct3D 10 and 11 are supported at feature level 11_1. Next for Direct3D 12 is more work on performance and reliability.
 
 ## Requirements
 
@@ -47,6 +47,7 @@ The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`)
 | | |
 |---|---|
 | `MULLION_LOG_PATH=<directory>` | Writes a log file for each DLL. Attach it to bug reports. |
+| `MULLION_D3D12_METAL4=0` | Keeps Direct3D 12 on Metal 3 on macOS 26. If a game draws differently there than on Metal 3, please report it. |
 | `MULLION_CONFIG="dxgi.customVendorId=106b"` | Reports Apple's vendor ID. By default Mullion reports the GPU's own name with AMD's vendor ID, because some games exit at startup when they do not know the vendor. |
 
 Options can also go in a `mullion.conf` next to the game's executable, or in the file `MULLION_CONFIG_FILE` names. The `mullion.conf` in this repository lists them. The `DXMT_` names and `dxmt.conf` of earlier builds still work.
