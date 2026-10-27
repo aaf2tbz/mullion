@@ -32,6 +32,9 @@ foreach t : [['d3d12_metal4_passes', []], ['d3d12_atomic64_forms', [], ['dxil']]
       test(t[0] + '_predicated_' + front_end, exe, args: [front_end, 'predicated'], timeout: 600)
       benchmark(t[0] + '_' + front_end, exe, args: [front_end, 'bench'], timeout: 600)
     endif
+    if t[0] == 'd3d12_pass_overlap'
+      benchmark(t[0] + '_' + front_end, exe, args: [front_end, 'bench'], timeout: 600)
+    endif
     if t[0] == 'd3d12_indirect'
       test(t[0] + '_zero_' + front_end, exe, args: [front_end, 'zero'], timeout: 600)
     endif
