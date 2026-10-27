@@ -3,7 +3,8 @@
 
 the tests are the build's own (meson's intro-tests.json: what tests/*/meson.build declares), run in a Wine the
 build's libraries are installed into. a family other than the GPU's own lowers what the Metal bridge answers
-(MULLION_GPU_FAMILY: src/winemetal/unix), so the paths an older GPU takes run here. a test passes when it says so on
+(MULLION_GPU_FAMILY: src/winemetal/unix), so the paths an older GPU takes run here; a family ending in -metal3 also
+keeps Direct3D 12 off Metal 4 (MULLION_D3D12_METAL4=0), as on macOS 15. a test passes when it says so on
 every repeat: one that fails, ends without a result, outlives its time or answers differently on one repeat has failed.
 the run fails on a failure or skip that tests/known.txt does not have, by what the test said, and on a test it lists
 that passes.
@@ -348,6 +349,7 @@ def environment(args):
     else:
         base.update(ZOMBIES)
     base.pop("MULLION_GPU_FAMILY", None)
+    base.pop("MULLION_D3D12_METAL4", None)
     # the build's libraries in place of the Wine's own, the shader compiler the prefix has (Wine's own when it has
     # none: winetricks' d3dcompiler_47 is x86 only, so an arm64 Wine's ARM64 tests have no other), and no installer or
     # debugger that asks in a dialog
@@ -416,8 +418,10 @@ def known(path=None):
 
 def options(parser):
     """what says which of the build's tests run, and how"""
-    parser.add_argument("--family", default="native,9,8,7",
-                        help="the Apple GPU families to run as, 'native' for the GPU's own (default: %(default)s)")
+    # Metal 4 needs macOS 26, which runs on every family here; macOS 15 runs the M1 to M4 families on Metal 3
+    parser.add_argument("--family", default="native,9,8,7,9-metal3,8-metal3,7-metal3",
+                        help="the Apple GPU families to run as, 'native' for the GPU's own, '-metal3' for Direct3D 12 "
+                             "without Metal 4 (default: %(default)s)")
     parser.add_argument("--repeat", type=int, default=1, help="how many times each test runs, giving the same answer each time")
     parser.add_argument("--jobs", type=int, default=1,
                         help="how many tests run at once; one that fails beside others runs again alone")
@@ -461,7 +465,10 @@ def own(args, tests, builds, binary, base):
     printing = threading.Lock()
 
     def one(family, test, again=False):
-        env = dict(base) if family == "native" else dict(base, MULLION_GPU_FAMILY=family)
+        apple = family.removesuffix("-metal3")
+        env = dict(base) if apple == "native" else dict(base, MULLION_GPU_FAMILY=apple)
+        if family.endswith("-metal3"):
+            env["MULLION_D3D12_METAL4"] = "0"
         native = not test["cmd"][0].endswith(".exe")
         command = test["cmd"] if native else [binary] + test["cmd"]
         test_env = dict(env, **test["env"])
@@ -510,9 +517,10 @@ def own(args, tests, builds, binary, base):
             print("\npassed alone after failing beside others: " + ", ".join(alone_only), flush=True)
 
     width = max(len(test["name"]) for test in tests)
-    print("\n" + " " * width + "".join(f"  {family:>7}" for family in families))
+    column = max(len(family) for family in families + ["skipped"])
+    print("\n" + " " * width + "".join(f"  {family:>{column}}" for family in families))
     for test in tests:
-        print(f"{test['name']:{width}}" + "".join(f"  {verdicts.get((test['name'], family), '-'):>7}" for family in families))
+        print(f"{test['name']:{width}}" + "".join(f"  {verdicts.get((test['name'], family), '-'):>{column}}" for family in families))
     counts = {word: sum(verdict == word for verdict in verdicts.values()) for word in ("passed", "failed", "skipped")}
     print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; logs in {logs}")
 

@@ -1884,3 +1884,74 @@ WMTPresentStatistics_get(obj_handle_t statistics, struct WMTPresentStatistics *o
   WMT_MEMPTR_SET(params.arg, out);
   UNIX_CALL(WMTUnixPresentStatisticsGet, &params);
 }
+
+WINEMETAL_API obj_handle_t
+MTL4CommandBuffer_new(
+    obj_handle_t queue, obj_handle_t fence, obj_handle_t event, uint64_t value, obj_handle_t residency,
+    struct WMTMetal4BindingCounts bindings
+) {
+  struct unixcall_metal4_new p = {
+      .queue = queue, .fence = fence, .event = event, .residency = residency, .value = value, .bindings = bindings
+  };
+  UNIX_CALL(WMTUnixMetal4NewBuffer, &p);
+  return p.ret;
+}
+WINEMETAL_API obj_handle_t
+MTL4CommandBuffer_encoder(
+    obj_handle_t buffer, enum WMTMetal4Stream kind, const struct WMTRenderPassInfo *render,
+    struct WMTSampleBufferAttachmentInfo *samples
+) {
+  struct unixcall_metal4_encoder p = {.buffer = buffer, .kind = kind};
+  WMT_MEMPTR_SET(p.render, render);
+  WMT_MEMPTR_SET(p.samples, samples);
+  UNIX_CALL(WMTUnixMetal4Encoder, &p);
+  return p.ret;
+}
+WINEMETAL_API void
+MTL4CommandEncoder_encodeCommands(obj_handle_t encoder, enum WMTMetal4Stream kind, const struct wmtcmd_base *head) {
+  struct unixcall_metal4_commands p = {.encoder = encoder, .kind = kind};
+  WMT_MEMPTR_SET(p.head, head);
+  UNIX_CALL(WMTUnixMetal4Commands, &p);
+}
+WINEMETAL_API void
+MTL4CommandEncoder_endEncoding(obj_handle_t encoder, bool segment) {
+  struct unixcall_generic_obj_uint64_noret p = {encoder, segment};
+  UNIX_CALL(WMTUnixMetal4EndEncoder, &p);
+}
+WINEMETAL_API void
+MTL4CommandBuffer_commit(obj_handle_t buffer) {
+  UNIX_CALL(WMTUnixMetal4Commit, &buffer);
+}
+WINEMETAL_API struct WMTMetal4Feedback
+MTL4CommandBuffer_feedback(obj_handle_t buffer) {
+  struct unixcall_metal4_feedback p = {.buffer = buffer};
+  UNIX_CALL(WMTUnixMetal4Feedback, &p);
+  return p.ret;
+}
+WINEMETAL_API void
+MTL4CommandBuffer_waitUntilCompleted(obj_handle_t buffer) {
+  UNIX_CALL(WMTUnixMetal4Wait, &buffer);
+}
+WINEMETAL_API obj_handle_t
+MTL4CounterHeap_new(obj_handle_t device, uint64_t count) {
+  struct unixcall_generic_obj_uint64_obj_ret p = {.handle = device, .arg = count};
+  UNIX_CALL(WMTUnixMetal4CounterHeap, &p);
+  return p.ret;
+}
+WINEMETAL_API uint64_t
+MTLDevice_queryTimestampFrequency(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret p = {.handle = device};
+  UNIX_CALL(WMTUnixMetal4Frequency, &p);
+  return p.ret;
+}
+WINEMETAL_API void
+MTL4CommandBuffer_present(obj_handle_t buffer, obj_handle_t drawable, double after) {
+  struct unixcall_generic_obj_obj_double_noret p = {buffer, drawable, after};
+  UNIX_CALL(WMTUnixMetal4Present, &p);
+}
+
+WINEMETAL_API void
+MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value) {
+  struct unixcall_mtl4_event p = {.queue = buffer, .event = event, .value = value};
+  UNIX_CALL(WMTUnixMetal4WaitEvent, &p);
+}

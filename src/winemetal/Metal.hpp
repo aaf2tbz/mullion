@@ -400,11 +400,21 @@ public:
 // set come to somewhat more (tests/native/pass_arrays.swift and .txt)
 constexpr uint32_t kPassRectangles = 65535;
 
-class RenderCommandEncoder : public CommandEncoder {
+template <bool Metal4> class RenderCommandEncoderBase : public CommandEncoder {
 public:
   void
+  endEncoding() {
+    if constexpr (Metal4)
+      MTL4CommandEncoder_endEncoding(handle, false);
+    else
+      CommandEncoder::endEncoding();
+  }
+  void
   encodeCommands(const wmtcmd_render_nop *cmd_head) {
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)cmd_head);
+    if constexpr (Metal4)
+      MTL4CommandEncoder_encodeCommands(handle, WMTMetal4Render, (const wmtcmd_base *)cmd_head);
+    else
+      MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)cmd_head);
   }
 
   void
@@ -415,7 +425,7 @@ public:
     cmd.buffer = buffer;
     cmd.offset = offset;
     cmd.index = index;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -426,7 +436,7 @@ public:
     cmd.buffer = buffer;
     cmd.offset = offset;
     cmd.index = index;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -437,7 +447,7 @@ public:
     cmd.buffer = buffer;
     cmd.offset = offset;
     cmd.index = index;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -448,7 +458,7 @@ public:
     cmd.buffer = buffer;
     cmd.offset = offset;
     cmd.index = index;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -459,7 +469,7 @@ public:
     cmd.scope = scope;
     cmd.stages_before = stages_before;
     cmd.stages_after = stages_after;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -470,7 +480,7 @@ public:
     cmd.resource = resource;
     cmd.usage = usage;
     cmd.stages = stages;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   };
 
   void
@@ -479,7 +489,7 @@ public:
     cmd.type = WMTRenderCommandSetPSO;
     cmd.next.set(nullptr);
     cmd.pso = pso;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -492,7 +502,7 @@ public:
     cmd.vertex_count = vertex_count;
     cmd.base_instance = 0;
     cmd.instance_count = 1;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -502,7 +512,7 @@ public:
     cmd.next.set(nullptr);
     cmd.texture = texture;
     cmd.index = index;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   };
 
   void
@@ -513,7 +523,7 @@ public:
     cmd.bytes.set((void *)buf);
     cmd.length = length;
     cmd.index = index;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -523,7 +533,7 @@ public:
     cmd.next.set(nullptr);
     cmd.viewports.set(&viewport);
     cmd.viewport_count = 1;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   };
 
   void
@@ -533,7 +543,7 @@ public:
     cmd.next.set(nullptr);
     cmd.fence = fence.handle;
     cmd.stages = before;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 
   void
@@ -543,9 +553,12 @@ public:
     cmd.next.set(nullptr);
     cmd.fence = fence.handle;
     cmd.stages = after;
-    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+    encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&cmd));
   }
 };
+
+using RenderCommandEncoder = RenderCommandEncoderBase<false>;
+using Metal4RenderCommandEncoder = RenderCommandEncoderBase<true>;
 
 class BlitCommandEncoder : public CommandEncoder {
 public:
@@ -867,6 +880,129 @@ public:
       Fence fence, const WMTFXTemporalScalerProps &props
   ) {
     MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+  }
+};
+
+class Metal4ComputeCommandEncoder : public CommandEncoder {
+public:
+  void
+  encodeCommands(const wmtcmd_compute_nop *head) {
+    MTL4CommandEncoder_encodeCommands(handle, WMTMetal4Compute, reinterpret_cast<const wmtcmd_base *>(head));
+  }
+  void
+  encodeCommands(const wmtcmd_blit_nop *head) {
+    MTL4CommandEncoder_encodeCommands(handle, WMTMetal4Blit, reinterpret_cast<const wmtcmd_base *>(head));
+  }
+  void
+  encodeCommands(const wmtcmd_accelerationstructure_nop *head) {
+    MTL4CommandEncoder_encodeCommands(
+        handle, WMTMetal4AccelerationStructure, reinterpret_cast<const wmtcmd_base *>(head)
+    );
+  }
+  void
+  endEncoding() {
+    MTL4CommandEncoder_endEncoding(handle, false);
+  }
+  void
+  endSegment() {
+    MTL4CommandEncoder_endEncoding(handle, true);
+  }
+  void
+  copyFromBuffer(
+      Buffer source, uint64_t source_offset, Buffer destination, uint64_t destination_offset, uint64_t size
+  ) {
+    wmtcmd_blit_copy_from_buffer_to_buffer cmd{};
+    cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+    cmd.src = source;
+    cmd.src_offset = source_offset;
+    cmd.dst = destination;
+    cmd.dst_offset = destination_offset;
+    cmd.copy_length = size;
+    encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&cmd));
+  }
+};
+
+class Metal4CommandBuffer : public Object {
+public:
+  void
+  pushDebugGroup(String name) {
+    MTLCommandBuffer_pushDebugGroup(handle, name);
+  }
+  void
+  popDebugGroup() {
+    MTLCommandBuffer_popDebugGroup(handle);
+  }
+  void
+  encodeWaitForEvent(Event event, uint64_t value) {
+    MTL4CommandBuffer_waitForEvent(handle, event, value);
+  }
+  void
+  commit() {
+    MTL4CommandBuffer_commit(handle);
+  }
+  void
+  waitUntilCompleted() {
+    MTL4CommandBuffer_waitUntilCompleted(handle);
+  }
+  WMTMetal4Feedback
+  feedback() {
+    return MTL4CommandBuffer_feedback(handle);
+  }
+  WMTCommandBufferStatus
+  status() {
+    return WMTCommandBufferStatus(feedback().status);
+  }
+  Error
+  error() {
+    return Error{feedback().error};
+  }
+  uint64_t
+  gpuStartTime() {
+    return feedback().gpu_start;
+  }
+  uint64_t
+  gpuEndTime() {
+    return feedback().gpu_end;
+  }
+  Metal4RenderCommandEncoder
+  renderCommandEncoder(WMTRenderPassInfo &info) {
+    return Metal4RenderCommandEncoder{MTL4CommandBuffer_encoder(handle, WMTMetal4Render, &info, nullptr)};
+  }
+  Metal4RenderCommandEncoder
+  renderCommandEncoder(WMTRenderPassInfo &info, WMTSampleBufferAttachmentInfo &sample) {
+    return Metal4RenderCommandEncoder{MTL4CommandBuffer_encoder(handle, WMTMetal4Render, &info, &sample)};
+  }
+  Metal4ComputeCommandEncoder
+  computeCommandEncoder(bool) {
+    return Metal4ComputeCommandEncoder{MTL4CommandBuffer_encoder(handle, WMTMetal4Compute, nullptr, nullptr)};
+  }
+  Metal4ComputeCommandEncoder
+  computeCommandEncoder(WMTSampleBufferAttachmentInfo &sample, bool = false) {
+    return Metal4ComputeCommandEncoder{MTL4CommandBuffer_encoder(handle, WMTMetal4Compute, nullptr, &sample)};
+  }
+  Metal4ComputeCommandEncoder
+  blitCommandEncoder() {
+    return computeCommandEncoder(false);
+  }
+  Metal4ComputeCommandEncoder
+  blitCommandEncoderWithSampleBuffers(WMTSampleBufferAttachmentInfo *sample, uint64_t) {
+    return computeCommandEncoder(*sample);
+  }
+  Metal4ComputeCommandEncoder
+  accelerationStructureCommandEncoder() {
+    return computeCommandEncoder(false);
+  }
+  Metal4ComputeCommandEncoder
+  accelerationStructureCommandEncoder(WMTSampleBufferAttachmentInfo &sample) {
+    return computeCommandEncoder(sample);
+  }
+  void
+  presentDrawable(MetalDrawable drawable) {
+    MTL4CommandBuffer_present(handle, drawable, 0);
+  }
+  void
+  presentDrawableAfterMinimumDuration(MetalDrawable drawable, double after) {
+    MTL4CommandBuffer_present(handle, drawable, after);
   }
 };
 

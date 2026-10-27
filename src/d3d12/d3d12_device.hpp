@@ -586,6 +586,12 @@ public:
   virtual void PipelineMade(const std::string &name, const char *kind, std::chrono::steady_clock::time_point start) = 0;
   virtual void ReportPipelineTotals() = 0;
 
+  bool
+  UsesMetal4() {
+    static const bool enabled = env::getEnvVar("MULLION_D3D12_METAL4") != "0";
+    return enabled && GetMTLDevice().supportsFamily(WMTGPUFamilyMetal4);
+  }
+
   virtual HRESULT RegisterResidency(WMT::Allocation allocation) = 0;
 
   virtual HRESULT UnregisterResidency(WMT::Allocation allocation) = 0;

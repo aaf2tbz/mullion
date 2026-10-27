@@ -42,11 +42,16 @@ struct TimestampSamples {
   // the most samples Metal lets a buffer hold
   uint32_t limit = 0;
 
+  // `metal4`: a Metal 4 counter heap in place of a counter sample buffer
   WMT::Reference<WMT::CounterSampleBuffer>
-  Take(WMT::Device metal, bool wait = true) {
+  Take(WMT::Device metal, bool wait = true, bool metal4 = false) {
+    auto make = [&](uint64_t count) {
+      return metal4 ? WMT::Reference<WMT::CounterSampleBuffer>(MTL4CounterHeap_new(metal, count))
+                    : metal.newCounterSampleBuffer(count);
+    };
     std::unique_lock<mullion::mutex> lock(mutex);
     if (!made)
-      for (limit = 1; metal.newCounterSampleBuffer(limit * 2); limit *= 2)
+      for (limit = 1; make(limit * 2); limit *= 2)
         ;
     for (;;) {
       if (!free.empty()) {
@@ -54,7 +59,7 @@ struct TimestampSamples {
         free.pop_back();
         return buffer;
       }
-      if (auto buffer = metal.newCounterSampleBuffer(limit)) {
+      if (auto buffer = make(limit)) {
         made++;
         return buffer;
       }
@@ -200,8 +205,9 @@ struct DebugGroups {
   std::string open;
 
   // closes the groups the path is not in, and opens its events that are not open; "" closes all
+  template <typename CommandBuffer>
   void
-  Enter(WMT::CommandBuffer cmdbuf, std::string_view path) {
+  Enter(CommandBuffer cmdbuf, std::string_view path) {
     size_t kept = 0;
     for (size_t end; (end = open.find(kEventEnd, kept)) != open.npos; kept = end + 1)
       if (path.compare(kept, end + 1 - kept, open, kept, end + 1 - kept))

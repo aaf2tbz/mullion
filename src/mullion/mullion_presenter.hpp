@@ -89,11 +89,16 @@ public:
     presentation_ = presentation;
   }
 
+  // on a Metal 3 or a Metal 4 command buffer
+  template <
+      typename CommandBuffer,
+      typename Encoder =
+          decltype(std::declval<CommandBuffer>().renderCommandEncoder(std::declval<WMTRenderPassInfo &>()))>
   WMT::MetalDrawable encodeCommands(
-      WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
-      std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-      std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
-      uint64_t seq_id = 0, unsigned *encoder_count = nullptr
+      CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
+      std::type_identity_t<std::function<void(Encoder)>> &&wait_fences,
+      std::type_identity_t<std::function<void(Encoder)>> &&update_fences, uint64_t seq_id = 0,
+      unsigned *encoder_count = nullptr
   );
 
   // draws the oldest frame encoded without a layer, at least `after` seconds after the previous one (as

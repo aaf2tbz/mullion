@@ -36,6 +36,7 @@
 #include <iomanip>
 #include <limits>
 #include <span>
+#include <type_traits>
 #include <sstream>
 #include "d3d10_1.h"
 #include "d3d11_4.h"
@@ -78,12 +79,23 @@ const GUID kD3D12CommandQueueDownlevelUUID = {
     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
 };
 
+template <bool Metal4>
 class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory> {
 
   D3D12_COMMAND_QUEUE_DESC desc_;
 
-  WMT::Reference<WMT::CommandQueue> queue_;
+  using MetalCommandBuffer = std::conditional_t<Metal4, WMT::Metal4CommandBuffer, WMT::CommandBuffer>;
+  using MetalCommandQueue = std::conditional_t<Metal4, WMT::MTL4CommandQueue, WMT::CommandQueue>;
+  WMT::Reference<MetalCommandQueue> queue_;
+  WMT::Reference<WMT::SharedEvent> completion_event_;
   WMT::Reference<WMT::Fence> fence_;
+  // the clock of the timestamps the queue's work writes: Metal 3 samples nanoseconds, a Metal 4 counter heap ticks
+  // (MTLDevice.h queryTimestampFrequency: "the frequency of the GPU timestamp in ticks per second")
+  uint64_t timestamp_frequency_ = kGPUTimestampFrequency;
+  static uint64_t
+  Rescale(uint64_t time, uint64_t to, uint64_t from) {
+    return uint64_t((unsigned __int128)time * to / from);
+  }
   CaptureState capture_;
   // a Signal and a timestamp resolve wait here for a command buffer the completion thread is done with
   Reached retired_{};
@@ -102,12 +114,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     mullion::mutex mutex;
     std::atomic<bool> closed;
     bool cancelled = false;
-    std::vector<std::pair<WMT::Reference<WMT::CommandBuffer>, uint64_t *>> buffers;
+    std::vector<std::pair<WMT::Reference<MetalCommandBuffer>, uint64_t *>> buffers;
     // the device, whose residency set changes are committed before each command buffer
     MTLD3D12Device *device = nullptr;
 
     void
-    Commit(WMT::CommandBuffer buffer, uint64_t *committed) {
+    Commit(MetalCommandBuffer buffer, uint64_t *committed) {
       std::lock_guard<mullion::mutex> lock(mutex);
       closed ? (void)buffers.emplace_back(buffer, committed) : Run(buffer, committed);
     }
@@ -124,9 +136,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   private:
     void
-    Run(WMT::CommandBuffer buffer, uint64_t *committed) {
+    Run(MetalCommandBuffer buffer, uint64_t *committed) {
       if (cancelled)
         return;
+      if constexpr (Metal4)
+        if (!buffer)
+          return;
       if (committed)
         *committed = diag::Now();
       if (device)
@@ -237,6 +252,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       mapped_->wait(mapping_value_);
       // a GPU wait orders mapping memory across queues (Metal, Resource synchronization: events)
       scope.Start();
+      if constexpr (Metal4)
+        if (!scope.inflight->cmdbuf)
+          return;
       scope.inflight->cmdbuf.encodeWaitForEvent(mapped_->sharedEvent(), mapping_value_);
       Trace("tile mappings: done");
     };
@@ -295,7 +313,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::shared_ptr<GPURecordChecks> own_checks_;
 
   struct InflightCommandBuffer {
-    WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+    WMT::Reference<MetalCommandBuffer> cmdbuf{};
     WMT::Reference<WMT::Buffer> sparse_mappings{};
     std::shared_ptr<Gate> gate{};
     std::shared_ptr<GPURecordChecks> records{};
@@ -324,6 +342,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::array<uint16_t, size_t(EncoderType::AccelerationStructure) + 1> encoders{};
     bool presents = false;
     diag::DebugGroups groups{};
+    std::array<uint32_t, WMTMetal4AccelerationStructure + 1> physical{};
   };
 
   struct ProfileBuffer {
@@ -420,7 +439,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       Trace("waits for command buffer ", internal_seq);
       Watched(internal_seq);
-      if (profile_ || inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
+      if constexpr (Metal4)
+        inflight.cmdbuf.waitUntilCompleted();
+      else if (profile_ || inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
         inflight.cmdbuf.waitUntilCompleted();
       auto completed = profile_ ? diag::Now() : 0;
       Watched(0);
@@ -477,9 +498,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             runs = diag::PipelineRuns(static_cast<const ComputeEncoderData *>(pass.pass)->cmd_head, name);
           auto line = diag::Line("pass", profile_->id, internal_seq, pass.id, kind, pass.encoding, runs);
           line.pop_back();
-          for (uint32_t i = 0; i < pass.count; i++)
-            line += str::format('\t', pass.first == ~0u ? ~uint64_t(0)
-                                                       : clock[i + 1 == pass.count ? pass.last : pass.first + i]);
+          // the profile's clock is nanoseconds, the queries' the queue's frequency
+          for (uint32_t i = 0; i < pass.count; i++) {
+            auto time = pass.first == ~0u ? ~uint64_t(0) : clock[i + 1 == pass.count ? pass.last : pass.first + i];
+            line += str::format('\t', time == ~uint64_t(0) ? time : Rescale(time, kGPUTimestampFrequency, timestamp_frequency_));
+          }
           lines += line + '\n';
           if (!pass.event.empty())
             lines += diag::Line("event", profile_->id, internal_seq, pass.id, pass.event);
@@ -554,18 +577,43 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       auto seq = queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
       inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
       pool = WMT::MakeAutoreleasePool();
-      inflight->cmdbuf = queue->queue_.commandBuffer();
+      if constexpr (Metal4) {
+        inflight->cmdbuf = WMT::Reference<MetalCommandBuffer>(MTL4CommandBuffer_new(
+            queue->queue_, queue->fence_, queue->completion_event_, seq, queue->device_->GetGlobalResidencySet(),
+            {kCustomBufferArgumentIndex0 + 1, D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+             D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT}
+        ));
+        if (!inflight->cmdbuf)
+          queue->device_->LoseDevice();
+      } else {
+        inflight->cmdbuf = queue->queue_.commandBuffer();
+      }
       if (queue->profile_) {
         auto &buffer = queue->profile_->buffers[seq % kCommandQueueSize];
         queue->device_->GetMTLDevice().sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
       }
     };
 
-    WMT::Reference<WMT::CommandBuffer>
+    WMT::Reference<MetalCommandBuffer>
     End() {
       auto ended = inflight->cmdbuf;
       if (diag::events)
         inflight->groups.Enter(ended, {});
+      if (diag::trace_encoders) {
+        auto &counts = inflight->physical;
+        uint32_t render = counts[WMTMetal4Render], compute = counts[WMTMetal4Compute], blit = counts[WMTMetal4Blit];
+        if constexpr (Metal4) {
+          auto feedback = ended.feedback();
+          render = feedback.render_passes;
+          compute = feedback.compute_passes;
+          blit = 0;
+        }
+        Logger::info(
+            str::format(
+                "D3D12 encoders Metal", Metal4 ? 4 : 3, ": render=", render, " compute=", compute, " blit=", blit
+            )
+        );
+      }
       (inflight->gate = queue->gate_)->Commit(
           ended, queue->profile_
                      ? &queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].committed
@@ -660,10 +708,19 @@ public:
     desc_.NodeMask = 1; // typically 1 GPU only
 
     auto metal_device = device_->GetMTLDevice();
-    queue_ = metal_device.newCommandQueue(kCommandQueueSize);
+    if constexpr (Metal4) {
+      queue_ = metal_device.newMTL4CommandQueue();
+      completion_event_ = metal_device.newSharedEvent();
+      if (!completion_event_)
+        return E_OUTOFMEMORY;
+      timestamp_frequency_ = MTLDevice_queryTimestampFrequency(metal_device);
+    } else {
+      queue_ = metal_device.newCommandQueue(kCommandQueueSize);
+    }
     if (!queue_)
       return FAIL(E_FAIL);
-    queue_.addResidencySet(device_->GetGlobalResidencySet());
+    if constexpr (!Metal4)
+      queue_.addResidencySet(device_->GetGlobalResidencySet());
     gate_->device = device_;
 
     fence_ = metal_device.newFence();
@@ -672,7 +729,7 @@ public:
     if (profile_) {
       UINT64 cpu, gpu;
       GetClockCalibration(&gpu, &cpu);
-      diag::Write(diag::Line("clock", diag::Nanoseconds(cpu), gpu));
+      diag::Write(diag::Line("clock", diag::Nanoseconds(cpu), Rescale(gpu, kGPUTimestampFrequency, timestamp_frequency_)));
     }
 
     return S_OK;
@@ -874,6 +931,9 @@ public:
       std::vector<Com<MTLD3D12CommandAllocator>> allocators;
       ~Keeps() { scope.inflight->allocators = std::move(allocators); }
     } keeps{scope, std::move(allocators)};
+    if constexpr (Metal4)
+      if (!scope.inflight->cmdbuf)
+        return;
     WMT::Reference<WMT::Buffer> sparse_mappings;
     auto mappings = device_->SparseBufferMappings();
     // another queue's mappings change the table, and a Wait may be for them: it is read past the Wait's fence
@@ -891,7 +951,7 @@ public:
       sparse_mappings.updateContents(0, mappings.data(), info.length);
     }
     static const bool isolate = !env::getEnvVar("MULLION_D3D12_ISOLATE").empty();
-    WMT::CommandBuffer cmdbuf = scope.inflight->cmdbuf;
+    MetalCommandBuffer cmdbuf = scope.inflight->cmdbuf;
     uint64_t queries = 0;
     if (profile_)
       for (auto list : recorded)
@@ -977,7 +1037,7 @@ public:
           SnapshotGPURecords(records, current, "unlabelled", scope.inflight->records);
         scope.inflight->encoders[size_t(current->type)]++;
         WMTSampleBufferAttachmentInfo attachment{};
-        ProfileBuffer::Pass *profiled = nullptr;
+        typename ProfileBuffer::Pass *profiled = nullptr;
         auto &pool = device_->timestamp_samples;
         // a command buffer has one buffer of samples: when it is full the next begins
         if (current->stamps && scope.inflight->samples && scope.inflight->sampled.size() == pool.limit) {
@@ -995,7 +1055,7 @@ public:
              current->type == EncoderType::Resolve || current->type == EncoderType::AccelerationStructure)) {
           auto &buffer = profile_->buffers[inflight_cmdbuf_seq_.load() % kCommandQueueSize];
           if (!scope.inflight->samples && buffer.passes.empty())
-            scope.inflight->samples = pool.Take(device_->GetMTLDevice(), false);
+            scope.inflight->samples = pool.Take(device_->GetMTLDevice(), false, Metal4);
           auto count = current->type == EncoderType::Render ? WMTRenderTimestampSamples : WMTTimestampSamplesPerStage;
           uint32_t first = ~0u;
           // queries keep their slots; extra profile passes stay unsampled instead of splitting a command buffer
@@ -1013,7 +1073,7 @@ public:
         if (current->stamps) {
           if (profile_)
             queries--;
-          if (!scope.inflight->samples && !(scope.inflight->samples = pool.Take(device_->GetMTLDevice()))) {
+          if (!scope.inflight->samples && !(scope.inflight->samples = pool.Take(device_->GetMTLDevice(), true, Metal4))) {
             ERR("EndQuery: Metal has no counter sample buffer for a timestamp");
           } else {
             // the profile's sample of the pass's end is the queries' too
@@ -1081,11 +1141,18 @@ public:
             render_pass_info.visibility_buffer = data->visibility_buffer;
           }
           if (data->before_head.next.get()) {
+            if (diag::trace_encoders)
+              scope.inflight->physical[WMTMetal4Compute]++;
             auto before = cmdbuf.computeCommandEncoder(true);
-            before.waitForFence(fence_);
+            if constexpr (!Metal4)
+              before.waitForFence(fence_);
             before.encodeCommands(&data->before_head);
-            before.updateFence(fence_);
-            before.endEncoding();
+            if constexpr (!Metal4)
+              before.updateFence(fence_);
+            if constexpr (Metal4)
+              before.endSegment();
+            else
+              before.endEncoding();
             if (data->omitted) {
               size_t count = 0;
               for (auto omitted = data->omitted; omitted; omitted = omitted->next)
@@ -1097,8 +1164,11 @@ public:
                 return;
               }
               // a replay may overwrite the resolver's words before the completion thread runs
+              if (diag::trace_encoders)
+                scope.inflight->physical[WMTMetal4Blit]++;
               auto copy = cmdbuf.blitCommandEncoder();
-              copy.waitForFence(fence_);
+              if constexpr (!Metal4)
+                copy.waitForFence(fence_);
               size_t offset = 0;
               for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
                 copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset * sizeof(uint32_t), omitted->words * sizeof(uint32_t));
@@ -1108,10 +1178,16 @@ public:
                 );
                 offset += omitted->words;
               }
-              copy.updateFence(fence_);
-              copy.endEncoding();
+              if constexpr (!Metal4)
+                copy.updateFence(fence_);
+              if constexpr (Metal4)
+                copy.endSegment();
+              else
+                copy.endEncoding();
             }
           }
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Render]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
                                                   : cmdbuf.renderCommandEncoder(render_pass_info);
           if (record_totals_ && current->type == EncoderType::Render) {
@@ -1139,12 +1215,19 @@ public:
         }
         case EncoderType::Blit: {
           auto data = static_cast<BlitEncoderData *>(current);
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Blit]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1)
                                                   : cmdbuf.blitCommandEncoder();
-          encoder.waitForFence(fence_);
+          if constexpr (!Metal4)
+            encoder.waitForFence(fence_);
           encoder.encodeCommands(&data->cmd_head);
-          encoder.updateFence(fence_);
-          encoder.endEncoding();
+          if constexpr (!Metal4)
+            encoder.updateFence(fence_);
+          if constexpr (Metal4)
+            encoder.endSegment();
+          else
+            encoder.endEncoding();
           break;
         }
         case EncoderType::AccelerationStructure: {
@@ -1161,16 +1244,25 @@ public:
             else
               structure.inputs = nullptr;
           }
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4AccelerationStructure]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.accelerationStructureCommandEncoder(attachment)
                                                   : cmdbuf.accelerationStructureCommandEncoder();
-          encoder.waitForFence(fence_);
+          if constexpr (!Metal4)
+            encoder.waitForFence(fence_);
           encoder.encodeCommands(&data->cmd_head);
-          encoder.updateFence(fence_);
-          encoder.endEncoding();
+          if constexpr (!Metal4)
+            encoder.updateFence(fence_);
+          if constexpr (Metal4)
+            encoder.endSegment();
+          else
+            encoder.endEncoding();
           break;
         }
         case EncoderType::Compute: {
           auto data = static_cast<ComputeEncoderData *>(current);
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Compute]++;
           bool concurrent = DispatchesOverlap(reinterpret_cast<const wmtcmd_base *>(&data->cmd_head));
           auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, concurrent)
                                                   : cmdbuf.computeCommandEncoder(concurrent);
@@ -1179,7 +1271,8 @@ public:
             SnapshotGPURecords(records, current, label, scope.inflight->records);
             encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
           }
-          encoder.waitForFence(fence_);
+          if constexpr (!Metal4)
+            encoder.waitForFence(fence_);
           if (sparse_mappings || data->rays) {
             scope.inflight->sparse_mappings = sparse_mappings;
             wmtcmd_compute_setbuffer binding{};
@@ -1189,8 +1282,12 @@ public:
             encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
           }
           encoder.encodeCommands(&data->cmd_head);
-          encoder.updateFence(fence_);
-          encoder.endEncoding();
+          if constexpr (!Metal4)
+            encoder.updateFence(fence_);
+          if constexpr (Metal4)
+            encoder.endSegment();
+          else
+            encoder.endEncoding();
           break;
         }
         case EncoderType::ComputeParts: {
@@ -1200,9 +1297,12 @@ public:
           const std::array<uint64_t, 3> extent{size.width, size.height, size.depth};
           auto pipeline = reinterpret_cast<const wmtcmd_compute_setpso *>(data->cmd_head.next.ptr);
           assert(pipeline->type == WMTComputeCommandSetPSO);
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Compute]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true)
                                                   : cmdbuf.computeCommandEncoder(true);
-          encoder.waitForFence(fence_);
+          if constexpr (!Metal4)
+            encoder.waitForFence(fence_);
           if (sparse_mappings) {
             scope.inflight->sparse_mappings = sparse_mappings;
             wmtcmd_compute_setbuffer binding{};
@@ -1234,8 +1334,12 @@ public:
             encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&barrier));
           };
           parts(parts, {}, extent);
-          encoder.updateFence(fence_);
-          encoder.endEncoding();
+          if constexpr (!Metal4)
+            encoder.updateFence(fence_);
+          if constexpr (Metal4)
+            encoder.endSegment();
+          else
+            encoder.endEncoding();
           break;
         }
         case EncoderType::ResolveTimestamps: {
@@ -1258,11 +1362,18 @@ public:
           cmdbuf = scope.inflight->cmdbuf;
           if (data->memory)
             break;
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Blit]++;
           auto encoder = cmdbuf.blitCommandEncoder();
-          encoder.waitForFence(fence_);
+          if constexpr (!Metal4)
+            encoder.waitForFence(fence_);
           encoder.copyFromBuffer(staging, 0, data->dst, data->dst_offset, data->count * sizeof(uint64_t));
-          encoder.updateFence(fence_);
-          encoder.endEncoding();
+          if constexpr (!Metal4)
+            encoder.updateFence(fence_);
+          if constexpr (Metal4)
+            encoder.endSegment();
+          else
+            encoder.endEncoding();
           break;
         }
         case EncoderType::Settle:
@@ -1285,12 +1396,19 @@ public:
             auto allocation = device_->LookupBufferByVA(address, &offset);
             WMTBufferInfo info{length, WMTResourceStorageModeShared};
             auto staging = device_->GetMTLDevice().newBuffer(info);
+            if (diag::trace_encoders)
+              scope.inflight->physical[WMTMetal4Blit]++;
             auto encoder = cmdbuf.blitCommandEncoder();
-            encoder.waitForFence(fence_);
+            if constexpr (!Metal4)
+              encoder.waitForFence(fence_);
             if (allocation)
               encoder.copyFromBuffer(allocation->buffer(), offset, staging, 0, length);
-            encoder.updateFence(fence_);
-            encoder.endEncoding();
+            if constexpr (!Metal4)
+              encoder.updateFence(fence_);
+            if constexpr (Metal4)
+              encoder.endSegment();
+            else
+              encoder.endEncoding();
             settle();
             auto bytes = static_cast<const char *>(info.memory.get());
             return std::vector<char>(bytes, bytes + length);
@@ -1336,6 +1454,8 @@ public:
           info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
           info.colors[0].resolve_texture = data->dst.texture();
 
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Render]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(info, attachment)
                                                   : cmdbuf.renderCommandEncoder(info);
           encoder.waitForFence(fence_, WMTRenderStageFragment);
@@ -1346,8 +1466,12 @@ public:
           break;
         }
         }
-        if (profiled)
+        if (profiled) {
           profiled->encoding = diag::Now() - profiled->encoding;
+          // Metal 4 may start the pass with the sample the pass before it ended with
+          if (profiled->first != ~0u)
+            profiled->first = uint32_t(attachment.start_of_encoder_sample_index);
+        }
         current = current->next;
         // what an application's pass has filled may be what a deserialized top-level structure waited for
         for (size_t i = 0; !own && i < unresolved_.size();) {
@@ -1504,7 +1628,7 @@ public:
   GetTimestampFrequency(UINT64 *pFrequency) {
     if (!pFrequency)
       return FAIL(E_INVALIDARG);
-    *pFrequency = kGPUTimestampFrequency;
+    *pFrequency = timestamp_frequency_;
     return S_OK;
   };
 
@@ -1517,6 +1641,7 @@ public:
     uint64_t metal_cpu;
     QueryPerformanceCounter(&before);
     device_->GetMTLDevice().sampleTimestamps(metal_cpu, *gpu_timestamp);
+    *gpu_timestamp = Rescale(*gpu_timestamp, timestamp_frequency_, kGPUTimestampFrequency);
     QueryPerformanceCounter(&after);
     *cpu_timestamp = before.QuadPart + (after.QuadPart - before.QuadPart) / 2;
     return S_OK;
@@ -1609,10 +1734,14 @@ public:
     copy.size = {uint32_t(desc.Width), desc.Height, 1};
     copy.dst = buffer.handle;
     copy.bytes_per_row = footprint.Footprint.RowPitch;
+    if (diag::trace_encoders)
+      inflight.physical[WMTMetal4Blit]++;
     auto blit = inflight.cmdbuf.blitCommandEncoder();
-    blit.waitForFence(fence_);
+    if constexpr (!Metal4)
+      blit.waitForFence(fence_);
     blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
-    blit.updateFence(fence_);
+    if constexpr (!Metal4)
+      blit.updateFence(fence_);
     blit.endEncoding();
     inflight.completed = [present = std::move(inflight.completed), buffer, pixels = info.memory.get(),
                           cmdbuf = inflight.cmdbuf, desc, footprint, row, number, path]() mutable {
@@ -1645,6 +1774,9 @@ public:
     FLIGHT("queue %p: Present %llu", this, number);
     auto scope = StartCommitting();
     auto &cmdbuf = scope.inflight->cmdbuf;
+    if constexpr (Metal4)
+      if (!cmdbuf)
+        return device_->GetDeviceRemovedReason();
     if (profile_)
       diag::Frame(device_->GetMTLDevice(), profile_->id, inflight_cmdbuf_seq_.load());
 
@@ -1653,7 +1785,8 @@ public:
     if (!copies.empty()) {
       auto p = reinterpret_cast<MTLD3D12Resource *>(previous);
       auto blit = cmdbuf.blitCommandEncoder();
-      blit.waitForFence(fence_);
+      if constexpr (!Metal4)
+        blit.waitForFence(fence_);
       for (auto [to, from] : copies)
         for (uint32_t eye = 0; eye < g->texture->arrayLength(); eye++) {
           wmtcmd_blit_copy_from_texture_to_texture copy{.type = WMTBlitCommandCopyFromTextureToTexture};
@@ -1666,15 +1799,25 @@ public:
           copy.dst_origin = {uint32_t(to.left), uint32_t(to.top), 0};
           blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
         }
-      blit.updateFence(fence_);
-      blit.endEncoding();
+      if constexpr (Metal4) {
+        blit.endSegment();
+      } else {
+        blit.updateFence(fence_);
+        blit.endEncoding();
+      }
     }
 
+    unsigned present_encoders = 0;
     auto drawable = presenter->encodeCommands(
-        cmdbuf, g->texture->view(shown).texture, state,
+        MetalCommandBuffer(cmdbuf), g->texture->view(shown).texture, state,
         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
-        [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
+        [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }, inflight_cmdbuf_seq_.load(),
+        diag::trace_encoders ? &present_encoders : nullptr
     );
+    if (diag::trace_encoders) {
+      scope.inflight->physical[WMTMetal4Render]++;
+      scope.inflight->physical[WMTMetal4Blit] += present_encoders - 1;
+    }
 
     if (!drawable)
       scope.inflight->completed = [presenter = Rc(presenter), after] { presenter->drawToWindow(after); };
@@ -1695,11 +1838,14 @@ public:
 
 HRESULT
 CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue) {
-  auto command_queue = Com(new MTLD3D12CommandQueueImpl(pDevice));
-  HRESULT hr = command_queue->Initialize(pDesc);
-  if (FAILED(hr))
-    return hr;
-  return command_queue->QueryInterface(riid, ppCommandQueue);
+  auto create = [&]<bool Metal4>() -> HRESULT {
+    auto command_queue = Com(new MTLD3D12CommandQueueImpl<Metal4>(pDevice));
+    HRESULT hr = command_queue->Initialize(pDesc);
+    if (FAILED(hr))
+      return hr;
+    return command_queue->QueryInterface(riid, ppCommandQueue);
+  };
+  return pDevice->UsesMetal4() ? create.template operator()<true>() : create.template operator()<false>();
 };
 
 } // namespace mullion

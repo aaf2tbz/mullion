@@ -150,12 +150,12 @@ Presenter::synchronizeLayerProperties() {
   return {metadata, layer_props_, final_colorspace, gamma_lut_texture_, present_blit_, present_scale_};
 }
 
+template <typename CommandBuffer, typename Encoder>
 WMT::MetalDrawable
 Presenter::encodeCommands(
-    WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
-    std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-    std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
-    uint64_t seq_id, unsigned *encoder_count
+    CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
+    std::type_identity_t<std::function<void(Encoder)>> &&wait_fences,
+    std::type_identity_t<std::function<void(Encoder)>> &&update_fences, uint64_t seq_id, unsigned *encoder_count
 ) {
   const auto &metadata = state.metadata;
   double width = state.layer_props.drawable_width;
@@ -242,6 +242,16 @@ Presenter::encodeCommands(
   }
   return drawable;
 }
+
+template WMT::MetalDrawable Presenter::encodeCommands(
+    WMT::CommandBuffer, WMT::Texture, const PresentState &, std::function<void(WMT::RenderCommandEncoder)> &&,
+    std::function<void(WMT::RenderCommandEncoder)> &&, uint64_t, unsigned *
+);
+template WMT::MetalDrawable Presenter::encodeCommands(
+    WMT::Metal4CommandBuffer, WMT::Texture, const PresentState &,
+    std::function<void(WMT::Metal4RenderCommandEncoder)> &&, std::function<void(WMT::Metal4RenderCommandEncoder)> &&,
+    uint64_t, unsigned *
+);
 
 void
 Presenter::drawToWindow(double after) {

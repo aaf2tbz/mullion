@@ -4225,6 +4225,1438 @@ _DispatchData_getBytes(void *obj) {
   return STATUS_SUCCESS;
 }
 
+API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
+@public
+  id<MTLDevice> device;
+  id<MTL4CommandQueue> queue;
+  id<MTL4CommandBuffer> buffer;
+  id<MTL4CommandAllocator> allocator;
+  id<MTLSharedEvent> event;
+  id<MTLFence> fence;
+  id<MTLResidencySet> residency;
+  NSMutableSet *allocations;
+  NSMutableSet *objects;
+  id<MTLBuffer> bytes;
+  uint64_t bytes_used;
+  id<MTLIndirectCommandBuffer> parts;
+  NSUInteger parts_used;
+  id compute;
+  uint64_t value;
+  struct WMTMetal4BindingCounts bindings;
+  struct WMTMetal4Feedback feedback;
+  bool finished;
+  dispatch_group_t feedback_ready;
+  id<MTLDrawable> drawable;
+  id<MTLEvent> wait_event;
+  uint64_t wait_value;
+  double after;
+  // the sample the open compute encoder's last pass ended with
+  obj_handle_t stamp_heap;
+  uint64_t stamp_index;
+}
+- (void)closeCompute;
+- (void)fail:(NSError *)error;
+@end
+
+enum {
+  Metal4VertexBinding,
+  Metal4FragmentBinding,
+  Metal4ObjectBinding,
+  Metal4MeshBinding,
+  Metal4ComputeBinding,
+  Metal4BindingStageCount
+};
+
+API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
+@public
+  MullionMetal4Buffer *owner;
+  id<MTL4CommandEncoder> encoder;
+  id<MTL4ArgumentTable> tables[Metal4BindingStageCount];
+  MTLGPUAddress *bases;
+  MTLSize threadgroup;
+  struct WMTSampleBufferAttachmentInfo samples;
+  bool render;
+}
+@end
+
+@implementation MullionMetal4Encoder
+- (void)setLabel:(NSString *)label {
+  [encoder setLabel:label];
+}
+- (void)dealloc {
+  for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
+    [tables[i] release];
+  free(bases);
+  [encoder release];
+  [super dealloc];
+}
+@end
+
+@implementation MullionMetal4Buffer
+// a debug group is the command buffer's, so none of its encoders is open
+- (void)pushDebugGroup:(NSString *)name {
+  [self closeCompute];
+  [buffer pushDebugGroup:name];
+}
+- (void)popDebugGroup {
+  [self closeCompute];
+  [buffer popDebugGroup];
+}
+- (void)fail:(NSError *)error {
+  if (!error)
+    error = [NSError errorWithDomain:MTL4CommandQueueErrorDomain code:MTL4CommandQueueErrorOutOfMemory userInfo:nil];
+  @synchronized(self) {
+    if (!feedback.error)
+      feedback.error = (obj_handle_t)[error retain];
+  }
+}
+- (void)closeCompute {
+  MullionMetal4Encoder *state = compute;
+  if (!state)
+    return;
+  [state->encoder updateFence:fence afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+  [state->encoder endEncoding];
+  compute = nil;
+  stamp_heap = 0;
+}
+- (void)dealloc {
+  dispatch_release(feedback_ready);
+  [objects release];
+  [allocations release];
+  [residency release];
+  [allocator release];
+  [buffer release];
+  [event release];
+  [fence release];
+  [queue release];
+  [drawable release];
+  [wait_event release];
+  [(NSError *)feedback.error release];
+  [super dealloc];
+}
+@end
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_resident(MullionMetal4Buffer *state, id<MTLAllocation> resource) {
+  if (resource && ![state->allocations containsObject:resource]) {
+    [state->allocations addObject:resource];
+    [state->residency addAllocation:resource];
+  }
+}
+
+static MTLGPUAddress
+API_AVAILABLE(macos(26.0)) metal4_address(MullionMetal4Buffer *state, obj_handle_t buffer) {
+  metal4_resident(state, (id<MTLBuffer>)buffer);
+  return [(id<MTLBuffer>)buffer gpuAddress];
+}
+
+static MTL4BufferRange
+API_AVAILABLE(macos(26.0)) metal4_range(MullionMetal4Buffer *state, obj_handle_t buffer, uint64_t offset) {
+  return MTL4BufferRangeMake(
+      buffer ? metal4_address(state, buffer) + offset : 0, buffer ? [(id<MTLBuffer>)buffer length] - offset : 0
+  );
+}
+
+static id<MTL4ArgumentTable>
+API_AVAILABLE(macos(26.0)) metal4_table(MullionMetal4Encoder *state, unsigned stage) {
+  if (!state->tables[stage]) {
+    MTL4ArgumentTableDescriptor *desc = [[MTL4ArgumentTableDescriptor alloc] init];
+    desc.maxBufferBindCount = state->owner->bindings.buffers;
+    desc.maxTextureBindCount = state->owner->bindings.textures;
+    desc.maxSamplerStateBindCount = state->owner->bindings.samplers;
+    desc.initializeBindings = YES;
+    NSError *error = nil;
+    state->tables[stage] = [state->owner->device newArgumentTableWithDescriptor:desc error:&error];
+    [desc release];
+    if (!state->tables[stage]) {
+      [state->owner fail:error];
+      return nil;
+    }
+    if (state->render) {
+      const MTLRenderStages stages[] = {
+          MTLRenderStageVertex, MTLRenderStageFragment, MTLRenderStageObject, MTLRenderStageMesh
+      };
+      [(id<MTL4RenderCommandEncoder>)state->encoder setArgumentTable:state->tables[stage] atStages:stages[stage]];
+    } else {
+      [(id<MTL4ComputeCommandEncoder>)state->encoder setArgumentTable:state->tables[stage]];
+    }
+  }
+  return state->tables[stage];
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_buffer(
+    MullionMetal4Encoder *state, unsigned stage, obj_handle_t buffer, uint64_t offset, unsigned index
+) {
+  MTLGPUAddress base = metal4_address(state->owner, buffer);
+  state->bases[stage * state->owner->bindings.buffers + index] = base;
+  [metal4_table(state, stage) setAddress:base ? base + offset : 0 atIndex:index];
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_offset(MullionMetal4Encoder *state, unsigned stage, uint64_t offset, unsigned index) {
+  MTLGPUAddress base = state->bases[stage * state->owner->bindings.buffers + index];
+  [metal4_table(state, stage) setAddress:base ? base + offset : 0 atIndex:index];
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_bytes(
+    MullionMetal4Encoder *state, unsigned stage, const void *bytes, uint64_t length, unsigned index
+) {
+  // a command buffer's bytes share buffers it keeps until it completes, each twice the last, at offsets that suit
+  // any type: a device argument's offset is aligned "to the data type's size", which is at most 16 bytes
+  // (MTLComputeCommandEncoder setBuffer:offset:atIndex:)
+  MullionMetal4Buffer *owner = state->owner;
+  uint64_t at = (owner->bytes_used + 15) & ~15ull;
+  if (!owner->bytes || at + length > [owner->bytes length]) {
+    id<MTLBuffer> buffer = [owner->device newBufferWithLength:MAX(MAX(length, 2 * [owner->bytes length]), vm_page_size)
+                                                      options:MTLResourceStorageModeShared];
+    if (!buffer) {
+      [owner fail:nil];
+      return;
+    }
+    [owner->objects addObject:buffer];
+    [buffer release];
+    owner->bytes = buffer;
+    at = 0;
+  }
+  memcpy((char *)[owner->bytes contents] + at, bytes, length);
+  owner->bytes_used = at + length;
+  metal4_buffer(state, stage, (obj_handle_t)owner->bytes, at, index);
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_texture(
+    MullionMetal4Encoder *state, unsigned stage, obj_handle_t texture, unsigned index
+) {
+  metal4_resident(state->owner, (id<MTLTexture>)texture);
+  [metal4_table(state, stage) setTexture:[(id<MTLTexture>)texture gpuResourceID] atIndex:index];
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_new(void *obj) {
+  struct unixcall_metal4_new *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *state = [[MullionMetal4Buffer alloc] init];
+    if (!state)
+      return STATUS_SUCCESS;
+    state->queue = [(id<MTL4CommandQueue>)p->queue retain];
+    state->device = [state->queue device];
+    state->buffer = [state->device newCommandBuffer];
+    state->allocator = [state->device newCommandAllocator];
+    state->fence = [(id<MTLFence>)p->fence retain];
+    state->event = [(id<MTLSharedEvent>)p->event retain];
+    state->value = p->value;
+    state->bindings = p->bindings;
+    state->allocations = [[NSMutableSet alloc] init];
+    state->objects = [[NSMutableSet alloc] init];
+    state->feedback_ready = dispatch_group_create();
+    state->residency =
+        [state->device newResidencySetWithDescriptor:[[[MTLResidencySetDescriptor alloc] init] autorelease] error:nil];
+    if (!state->buffer || !state->allocator || !state->residency || !state->objects || !state->allocations) {
+      [state fail:nil];
+      p->ret = (obj_handle_t)state;
+      return STATUS_SUCCESS;
+    }
+    [state->buffer beginCommandBufferWithAllocator:state->allocator];
+    [state->buffer useResidencySet:(id<MTLResidencySet>)p->residency];
+    [state->buffer useResidencySet:state->residency];
+    p->ret = (obj_handle_t)state;
+  }
+  return STATUS_SUCCESS;
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_begin_samples(
+    MullionMetal4Encoder *state, const struct WMTSampleBufferAttachmentInfo *sample
+) {
+  state->samples = (struct WMTSampleBufferAttachmentInfo){0};
+  if (sample)
+    state->samples = *(const struct WMTSampleBufferAttachmentInfo *)sample;
+  if (state->samples.sample_buffer && state->samples.start_of_encoder_sample_index != MTLCounterDontSample) {
+    uint64_t first = state->samples.start_of_encoder_sample_index;
+    if (state->render) {
+      bool vertex = state->samples.end_of_encoder_sample_index - first + 1 == WMTRenderTimestampSamples;
+      if (vertex)
+        [(id<MTL4RenderCommandEncoder>)state->encoder
+            writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                               afterStage:MTLRenderStageVertex
+                                 intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
+                                  atIndex:first];
+      [(id<MTL4RenderCommandEncoder>)state->encoder
+          writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                             afterStage:MTLRenderStageFragment
+                               intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
+                                atIndex:vertex ? first + 2 : first];
+    } else {
+      [(id<MTL4ComputeCommandEncoder>)state->encoder
+          writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                               intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
+                                atIndex:first];
+    }
+  }
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_encoder(void *obj) {
+  struct unixcall_metal4_encoder *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *owner = (MullionMetal4Buffer *)p->buffer;
+    if (p->kind != WMTMetal4Render && owner->compute) {
+      MullionMetal4Encoder *state = owner->compute;
+      [(id<MTL4ComputeCommandEncoder>)state->encoder
+          barrierAfterEncoderStages:[(id<MTL4ComputeCommandEncoder>)state->encoder stages]
+                beforeEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure
+                  visibilityOptions:MTL4VisibilityOptionDevice];
+      // the barrier starts this pass where that sample ended the last, and Metal drops a timestamp that follows
+      // another with no work between
+      struct WMTSampleBufferAttachmentInfo *sample = p->samples.ptr, start = {0};
+      if (sample)
+        start = *sample;
+      if (sample && sample->sample_buffer && sample->sample_buffer == owner->stamp_heap &&
+          sample->start_of_encoder_sample_index != MTLCounterDontSample) {
+        start.start_of_encoder_sample_index = MTLCounterDontSample;
+        sample->start_of_encoder_sample_index = owner->stamp_index;
+      }
+      owner->stamp_heap = 0;
+      metal4_begin_samples(state, sample ? &start : NULL);
+      p->ret = (obj_handle_t)state;
+      return STATUS_SUCCESS;
+    }
+    MullionMetal4Encoder *state = [[[MullionMetal4Encoder alloc] init] autorelease];
+    if (!state) {
+      [owner fail:nil];
+      return STATUS_SUCCESS;
+    }
+    state->owner = owner;
+    state->render = p->kind == WMTMetal4Render;
+    [owner->objects addObject:state];
+    p->ret = (obj_handle_t)state;
+    if (owner->feedback.error)
+      return STATUS_SUCCESS;
+    state->bases =
+        calloc(owner->bindings.buffers * (sizeof(state->tables) / sizeof(state->tables[0])), sizeof(MTLGPUAddress));
+    if (!state->bases) {
+      [owner fail:nil];
+      return STATUS_SUCCESS;
+    }
+    if (state->render) {
+      [owner closeCompute];
+      const struct WMTRenderPassInfo *info = p->render.ptr;
+      MTL4RenderPassDescriptor *descriptor = [[MTL4RenderPassDescriptor alloc] init];
+      for (unsigned i = 0; i < sizeof(info->colors) / sizeof(info->colors[0]); i++) {
+        descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
+            info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
+            info->colors[i].clear_color.a
+        );
+        descriptor.colorAttachments[i].level = info->colors[i].level;
+        descriptor.colorAttachments[i].slice = info->colors[i].slice;
+        descriptor.colorAttachments[i].depthPlane = info->colors[i].depth_plane;
+        descriptor.colorAttachments[i].texture = (id<MTLTexture>)info->colors[i].texture;
+        descriptor.colorAttachments[i].loadAction = (MTLLoadAction)info->colors[i].load_action;
+        descriptor.colorAttachments[i].storeAction = (MTLStoreAction)info->colors[i].store_action;
+        descriptor.colorAttachments[i].resolveTexture = (id<MTLTexture>)info->colors[i].resolve_texture;
+        descriptor.colorAttachments[i].resolveLevel = info->colors[i].resolve_level;
+        descriptor.colorAttachments[i].resolveSlice = info->colors[i].resolve_slice;
+        descriptor.colorAttachments[i].resolveDepthPlane = info->colors[i].resolve_depth_plane;
+      }
+
+      if (info->depth.texture) {
+        descriptor.depthAttachment.clearDepth = info->depth.clear_depth;
+        descriptor.depthAttachment.depthPlane = info->depth.depth_plane;
+        descriptor.depthAttachment.level = info->depth.level;
+        descriptor.depthAttachment.slice = info->depth.slice;
+        descriptor.depthAttachment.texture = (id<MTLTexture>)info->depth.texture;
+        descriptor.depthAttachment.loadAction = (MTLLoadAction)info->depth.load_action;
+        descriptor.depthAttachment.storeAction = (MTLStoreAction)info->depth.store_action;
+      }
+
+      if (info->stencil.texture) {
+        descriptor.stencilAttachment.clearStencil = info->stencil.clear_stencil;
+        descriptor.stencilAttachment.depthPlane = info->stencil.depth_plane;
+        descriptor.stencilAttachment.level = info->stencil.level;
+        descriptor.stencilAttachment.slice = info->stencil.slice;
+        descriptor.stencilAttachment.texture = (id<MTLTexture>)info->stencil.texture;
+        descriptor.stencilAttachment.loadAction = (MTLLoadAction)info->stencil.load_action;
+        descriptor.stencilAttachment.storeAction = (MTLStoreAction)info->stencil.store_action;
+      }
+
+      descriptor.defaultRasterSampleCount = info->default_raster_sample_count;
+      descriptor.renderTargetArrayLength = info->render_target_array_length;
+      descriptor.renderTargetHeight = info->render_target_height;
+      descriptor.renderTargetWidth = info->render_target_width;
+      descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
+
+      if (info->tile_height && info->tile_width) {
+        descriptor.tileWidth = info->tile_width;
+        descriptor.tileHeight = info->tile_height;
+      }
+
+      for (unsigned i = 0; i < sizeof(info->colors) / sizeof(info->colors[0]); i++) {
+        metal4_resident(owner, (id<MTLTexture>)info->colors[i].texture);
+        metal4_resident(owner, (id<MTLTexture>)info->colors[i].resolve_texture);
+      }
+      metal4_resident(owner, (id<MTLTexture>)info->depth.texture);
+      metal4_resident(owner, (id<MTLTexture>)info->stencil.texture);
+      metal4_resident(owner, (id<MTLBuffer>)info->visibility_buffer);
+      state->encoder = [[owner->buffer renderCommandEncoderWithDescriptor:descriptor] retain];
+      [descriptor release];
+    } else {
+      state->encoder = [[owner->buffer computeCommandEncoder] retain];
+      [state->encoder waitForFence:owner->fence
+               beforeEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+      owner->compute = state;
+    }
+    if (!state->encoder) {
+      [owner fail:[NSError errorWithDomain:MTL4CommandQueueErrorDomain
+                                      code:MTL4CommandQueueErrorOutOfMemory
+                                  userInfo:nil]];
+      return STATUS_SUCCESS;
+    }
+    if (state->render)
+      owner->feedback.render_passes++;
+    else
+      owner->feedback.compute_passes++;
+    metal4_begin_samples(state, p->samples.ptr);
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandEncoder_endEncoding(void *obj) {
+  struct unixcall_generic_obj_uint64_noret *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Encoder *state = (MullionMetal4Encoder *)p->handle;
+    if (!state)
+      return STATUS_SUCCESS;
+    if (state->samples.sample_buffer) {
+      if (state->render) {
+        if (state->samples.end_of_encoder_sample_index - state->samples.start_of_encoder_sample_index + 1 ==
+            WMTRenderTimestampSamples)
+          [(id<MTL4RenderCommandEncoder>)state->encoder
+              writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                 afterStage:MTLRenderStageVertex
+                                   intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
+                                    atIndex:state->samples.start_of_encoder_sample_index + 1];
+        [(id<MTL4RenderCommandEncoder>)state->encoder
+            writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                               afterStage:MTLRenderStageFragment
+                                 intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
+                                  atIndex:state->samples.end_of_encoder_sample_index];
+      } else {
+        [(id<MTL4ComputeCommandEncoder>)state->encoder
+            writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                 intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
+                                  atIndex:state->samples.end_of_encoder_sample_index];
+        state->owner->stamp_heap = state->samples.sample_buffer;
+        state->owner->stamp_index = state->samples.end_of_encoder_sample_index;
+      }
+      state->samples.sample_buffer = 0;
+    }
+    if (state->render)
+      [state->encoder endEncoding];
+    else if (!p->arg)
+      [state->owner closeCompute];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_commit(void *obj) {
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *state = (MullionMetal4Buffer *)*(obj_handle_t *)obj;
+    // a buffer that failed to begin is never ended (MTL4CommandBuffer: begin before end)
+    @synchronized(state) {
+      if (state->feedback.error) {
+        state->feedback.status = WMTCommandBufferStatusError;
+        state->finished = true;
+        return STATUS_SUCCESS;
+      }
+      state->feedback.status = WMTCommandBufferStatusCommitted;
+    }
+    [state closeCompute];
+    [state->residency commit];
+    [state->buffer endCommandBuffer];
+    dispatch_group_enter(state->feedback_ready);
+    MTL4CommitOptions *options = [[MTL4CommitOptions alloc] init];
+    if (!options) {
+      [state fail:nil];
+      state->feedback.status = WMTCommandBufferStatusError;
+      state->finished = true;
+      dispatch_group_leave(state->feedback_ready);
+      return STATUS_SUCCESS;
+    }
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+      @synchronized(state) {
+        state->feedback.error = (obj_handle_t)[feedback.error retain];
+        state->feedback.gpu_start = feedback.GPUStartTime * NSEC_PER_SEC;
+        state->feedback.gpu_end = feedback.GPUEndTime * NSEC_PER_SEC;
+        state->feedback.status = feedback.error ? WMTCommandBufferStatusError : WMTCommandBufferStatusCompleted;
+        state->finished = true;
+      }
+      dispatch_group_leave(state->feedback_ready);
+    }];
+    void (^commit)(void) = ^{
+      if (state->wait_event)
+        [state->queue waitForEvent:state->wait_event value:state->wait_value];
+      if (state->drawable)
+        [state->queue waitForDrawable:state->drawable];
+      [state->queue commit:&state->buffer count:1 options:options];
+      [state->queue signalEvent:state->event value:state->value];
+      if (state->drawable) {
+        [state->queue signalDrawable:state->drawable];
+        state->after > 0 ? [state->drawable presentAfterMinimumDuration:state->after] : [state->drawable present];
+      }
+    };
+    if (test_late_ns) {
+      dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, test_late_ns);
+      pthread_mutex_lock(&test_late_mutex);
+      dispatch_async(test_late_commits, ^{
+        dispatch_semaphore_wait(test_late_timer, deadline);
+        @autoreleasepool {
+          commit();
+        }
+      });
+      pthread_mutex_unlock(&test_late_mutex);
+    } else {
+      commit();
+    }
+    [options release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_feedback(void *obj) {
+  struct unixcall_metal4_feedback *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *state = (MullionMetal4Buffer *)p->buffer;
+    if (state)
+      @synchronized(state) {
+        p->ret = state->feedback;
+      }
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_waitUntilCompleted(void *obj) {
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *state = (MullionMetal4Buffer *)*(obj_handle_t *)obj;
+    for (;;) {
+      @synchronized(state) {
+        if (state->finished && state->feedback.error)
+          break;
+      }
+      // an error's feedback also ends the wait if the GPU cannot signal its event
+      if ([state->event waitUntilSignaledValue:state->value timeoutMS:NSEC_PER_SEC / NSEC_PER_MSEC]) {
+        dispatch_group_wait(state->feedback_ready, DISPATCH_TIME_FOREVER);
+        break;
+      }
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CounterHeap_new(void *obj) {
+  struct unixcall_generic_obj_uint64_obj_ret *p = obj;
+  if (@available(macOS 26.0, *)) {
+    _Static_assert(sizeof(MTL4TimestampHeapEntry) == sizeof(uint64_t), "timestamp query layout");
+    MTL4CounterHeapDescriptor *desc = [[MTL4CounterHeapDescriptor alloc] init];
+    desc.type = MTL4CounterHeapTypeTimestamp;
+    desc.count = p->arg;
+    // the driver writes the error of a heap past its size without checking that one was asked for
+    NSError *error = nil;
+    p->ret = (obj_handle_t)[(id<MTLDevice>)p->handle newCounterHeapWithDescriptor:desc error:&error];
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_queryTimestampFrequency(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *p = obj;
+  if (@available(macOS 26.0, *))
+    p->ret = [(id<MTLDevice>)p->handle queryTimestampFrequency];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_waitForEvent(void *obj) {
+  struct unixcall_mtl4_event *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *state = (MullionMetal4Buffer *)p->queue;
+    [state->wait_event release];
+    state->wait_event = [(id<MTLEvent>)p->event retain];
+    state->wait_value = p->value;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_present(void *obj) {
+  struct unixcall_generic_obj_obj_double_noret *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *state = (MullionMetal4Buffer *)p->handle;
+    state->drawable = [(id<MTLDrawable>)p->arg0 retain];
+    state->after = p->arg1;
+  }
+  return STATUS_SUCCESS;
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_draw_geometry_parts(
+    MullionMetal4Encoder *state, uint32_t warps, uint32_t instances, uint32_t threads, uint32_t max
+) {
+  id<MTL4RenderCommandEncoder> encoder = (id<MTL4RenderCommandEncoder>)state->encoder;
+  uint32_t origin[2] = {0, 0};
+  MTLSize object = MTLSizeMake(threads, 1, 1), mesh = MTLSizeMake(1, 1, 1);
+  if (!max || (uint64_t)warps * instances <= max) {
+    metal4_bytes(state, Metal4ObjectBinding, origin, sizeof(origin), SM50_BINDING_INDEX_DRAW_ORIGIN);
+    [encoder drawMeshThreadgroups:MTLSizeMake(warps, instances, 1)
+        threadsPerObjectThreadgroup:object
+          threadsPerMeshThreadgroup:mesh];
+    return;
+  }
+  /* whole instances at a time where one fits, otherwise parts of one instance */
+  uint32_t width = warps <= max ? warps : max, height = warps <= max ? max / warps : 1;
+  for (uint64_t instance = 0; instance < instances; instance += height)
+    for (uint64_t warp = 0; warp < warps; warp += width) {
+      origin[0] = warp;
+      origin[1] = instance;
+      metal4_bytes(state, Metal4ObjectBinding, origin, sizeof(origin), SM50_BINDING_INDEX_DRAW_ORIGIN);
+      [encoder drawMeshThreadgroups:MTLSizeMake(MIN(width, warps - origin[0]), MIN(height, instances - origin[1]), 1)
+          threadsPerObjectThreadgroup:object
+            threadsPerMeshThreadgroup:mesh];
+    }
+}
+
+/* an indirect geometry draw's `parts` Metal draws, whose grids and origins the GS dispatch marshal wrote in `args`:
+ * grids from `grids` on, 12 bytes apart, origins (SM50_BINDING_INDEX_DRAW_ORIGIN) from `origins` on, 8 bytes apart */
+static void
+API_AVAILABLE(macos(26.0)) metal4_draw_geometry_indirect_parts(
+    MullionMetal4Encoder *state, id<MTLBuffer> args, uint64_t grids, uint64_t origins, uint32_t parts, uint32_t threads
+) {
+  id<MTL4RenderCommandEncoder> encoder = (id<MTL4RenderCommandEncoder>)state->encoder;
+  for (uint32_t i = 0; i < parts; i++) {
+    metal4_buffer(state, Metal4ObjectBinding, (obj_handle_t)args, origins + 8 * i, SM50_BINDING_INDEX_DRAW_ORIGIN);
+    [encoder drawMeshThreadgroupsWithIndirectBuffer:metal4_address(state->owner, (obj_handle_t)args) + grids + 12 * i
+                        threadsPerObjectThreadgroup:MTLSizeMake(threads, 1, 1)
+                          threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+  }
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_render(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+  id<MTL4RenderCommandEncoder> encoder = (id<MTL4RenderCommandEncoder>)state->encoder;
+  // a pipeline that could not be built is set as none: the draws after it are left out until another is set
+  bool pipeline = true;
+  while (next && !state->owner->feedback.error) {
+    enum WMTRenderCommandType type = next->type;
+    if (!pipeline &&
+        ((type >= WMTRenderCommandDraw && type <= WMTRenderCommandDrawMeshThreadgroupsIndirect) ||
+         (type >= WMTRenderCommandMullionGeometryDraw && type <= WMTRenderCommandMullionGeometryDrawIndexedIndirect) ||
+         (type >= WMTRenderCommandMullionTessellationMeshDraw && type <= WMTRenderCommandExecuteCommandsInBuffer) ||
+         type == WMTRenderCommandExecuteCommandsInBufferIndirect)) {
+      next = next->next.ptr;
+      continue;
+    }
+    switch (type) {
+    default:
+      assert(!next->type && "unhandled render command type");
+      break;
+    case WMTRenderCommandNop:
+      break;
+    case WMTRenderCommandUseResource: {
+      const struct wmtcmd_render_useresource *body = (const struct wmtcmd_render_useresource *)next;
+      metal4_resident(state->owner, (id<MTLResource>)body->resource);
+      break;
+    }
+    case WMTRenderCommandSetVertexBuffer: {
+      struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
+      metal4_buffer(state, Metal4VertexBinding, body->buffer, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetVertexBufferOffset: {
+      struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
+      metal4_offset(state, Metal4VertexBinding, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetFragmentBuffer: {
+      struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
+      metal4_buffer(state, Metal4FragmentBinding, body->buffer, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetFragmentBufferOffset: {
+      struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
+      metal4_offset(state, Metal4FragmentBinding, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetMeshBuffer: {
+      struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
+      metal4_buffer(state, Metal4MeshBinding, body->buffer, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetMeshBufferOffset: {
+      struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
+      metal4_offset(state, Metal4MeshBinding, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetObjectBuffer: {
+      struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
+      metal4_buffer(state, Metal4ObjectBinding, body->buffer, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetObjectBufferOffset: {
+      struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
+      metal4_offset(state, Metal4ObjectBinding, body->offset, body->index);
+      break;
+    }
+    case WMTRenderCommandSetFragmentBytes: {
+      struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
+      metal4_bytes(state, Metal4FragmentBinding, body->bytes.ptr, body->length, body->index);
+      break;
+    }
+    case WMTRenderCommandSetFragmentTexture: {
+      struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
+      metal4_texture(state, Metal4FragmentBinding, body->texture, body->index);
+      break;
+    }
+    case WMTRenderCommandSetRasterizerState: {
+      struct wmtcmd_render_setrasterizerstate *body = (struct wmtcmd_render_setrasterizerstate *)next;
+      [encoder setTriangleFillMode:(MTLTriangleFillMode)body->fill_mode];
+      [encoder setCullMode:(MTLCullMode)body->cull_mode];
+      [encoder setDepthClipMode:(MTLDepthClipMode)body->depth_clip_mode];
+      [encoder setDepthBias:body->depth_bias slopeScale:body->scole_scale clamp:body->depth_bias_clamp];
+      [encoder setFrontFacingWinding:(MTLWinding)body->winding];
+      break;
+    }
+    case WMTRenderCommandSetViewports: {
+      struct wmtcmd_render_setviewports *body = (struct wmtcmd_render_setviewports *)next;
+      [encoder setViewports:(const MTLViewport *)body->viewports.ptr count:body->viewport_count];
+      break;
+    }
+    case WMTRenderCommandSetScissorRects: {
+      struct wmtcmd_render_setscissorrects *body = (struct wmtcmd_render_setscissorrects *)next;
+      [encoder setScissorRects:(const MTLScissorRect *)body->scissor_rects.ptr count:body->rect_count];
+      break;
+    }
+    case WMTRenderCommandSetPSO: {
+      struct wmtcmd_render_setpso *body = (struct wmtcmd_render_setpso *)next;
+      metal4_resident(state->owner, (id<MTLRenderPipelineState>)body->pso);
+      if ((pipeline = body->pso))
+        [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)body->pso];
+      break;
+    }
+    case WMTRenderCommandSetDSSO: {
+      struct wmtcmd_render_setdsso *body = (struct wmtcmd_render_setdsso *)next;
+      [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->dsso];
+      [encoder setStencilFrontReferenceValue:body->stencil_ref backReferenceValue:body->back_stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetDepthStencilState: {
+      struct wmtcmd_render_setdepthstencilstate *body = (struct wmtcmd_render_setdepthstencilstate *)next;
+      [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->depth_stencil_state];
+      break;
+    }
+    case WMTRenderCommandSetBlendFactorAndStencilRef: {
+      struct wmtcmd_render_setblendcolor *body = (struct wmtcmd_render_setblendcolor *)next;
+      [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
+      [encoder setStencilFrontReferenceValue:body->stencil_ref backReferenceValue:body->back_stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetBlendFactor: {
+      struct wmtcmd_render_setblendcolor *body = (struct wmtcmd_render_setblendcolor *)next;
+      [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
+      break;
+    }
+    case WMTRenderCommandSetStencilRef: {
+      struct wmtcmd_render_setstencilref *body = (struct wmtcmd_render_setstencilref *)next;
+      [encoder setStencilFrontReferenceValue:body->stencil_ref backReferenceValue:body->back_stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetDepthTestBounds: {
+      struct wmtcmd_render_setdepthtestbounds *body = (struct wmtcmd_render_setdepthtestbounds *)next;
+      if (@available(macOS 26.0, *))
+        [encoder setDepthTestMinBound:body->min maxBound:body->max];
+      break;
+    }
+    case WMTRenderCommandSetVisibilityMode: {
+      struct wmtcmd_render_setvisibilitymode *body = (struct wmtcmd_render_setvisibilitymode *)next;
+      [encoder setVisibilityResultMode:(MTLVisibilityResultMode)body->mode offset:body->offset];
+      break;
+    }
+    case WMTRenderCommandDraw: {
+      struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
+      [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
+                  vertexStart:body->vertex_start
+                  vertexCount:body->vertex_count
+                instanceCount:body->instance_count
+                 baseInstance:body->base_instance];
+      break;
+    }
+    case WMTRenderCommandDrawIndexed: {
+      struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->index_buffer);
+      [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
+                          indexCount:body->index_count
+                           indexType:(MTLIndexType)body->index_type
+                         indexBuffer:metal4_address(state->owner, body->index_buffer) + body->index_buffer_offset
+                   indexBufferLength:[(id<MTLBuffer>)body->index_buffer length] - body->index_buffer_offset
+                       instanceCount:body->instance_count
+                          baseVertex:body->base_vertex
+                        baseInstance:body->base_instance];
+      break;
+    }
+    case WMTRenderCommandDrawIndirect: {
+      struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
+      [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
+               indirectBuffer:metal4_address(state->owner, body->indirect_args_buffer) + body->indirect_args_offset];
+      break;
+    }
+    case WMTRenderCommandDrawIndexedIndirect: {
+      struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->index_buffer);
+      [encoder
+          drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
+                      indexType:(MTLIndexType)body->index_type
+                    indexBuffer:metal4_address(state->owner, body->index_buffer) + body->index_buffer_offset
+              indexBufferLength:[(id<MTLBuffer>)body->index_buffer length] - body->index_buffer_offset
+                 indirectBuffer:metal4_address(state->owner, body->indirect_args_buffer) + body->indirect_args_offset];
+      break;
+    }
+    case WMTRenderCommandDrawMeshThreadgroups: {
+      struct wmtcmd_render_draw_meshthreadgroups *body = (struct wmtcmd_render_draw_meshthreadgroups *)next;
+      [encoder drawMeshThreadgroups:MTLSizeMake(
+                                        body->threadgroup_per_grid.width, body->threadgroup_per_grid.height,
+                                        body->threadgroup_per_grid.depth
+                                    )
+          threadsPerObjectThreadgroup:MTLSizeMake(
+                                          body->object_threadgroup_size.width, body->object_threadgroup_size.height,
+                                          body->object_threadgroup_size.depth
+                                      )
+            threadsPerMeshThreadgroup:MTLSizeMake(
+                                          body->mesh_threadgroup_size.width, body->mesh_threadgroup_size.height,
+                                          body->mesh_threadgroup_size.depth
+                                      )];
+      break;
+    }
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
+      struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
+          (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:metal4_address(state->owner, body->indirect_args_buffer) +
+                                                      body->indirect_args_offset
+                          threadsPerObjectThreadgroup:MTLSizeMake(
+                                                          body->object_threadgroup_size.width,
+                                                          body->object_threadgroup_size.height,
+                                                          body->object_threadgroup_size.depth
+                                                      )
+                            threadsPerMeshThreadgroup:MTLSizeMake(
+                                                          body->mesh_threadgroup_size.width,
+                                                          body->mesh_threadgroup_size.height,
+                                                          body->mesh_threadgroup_size.depth
+                                                      )];
+      break;
+    }
+    case WMTRenderCommandMemoryBarrier: {
+      struct wmtcmd_render_memory_barrier *body = (struct wmtcmd_render_memory_barrier *)next;
+      [encoder barrierAfterEncoderStages:(MTLStages)body->stages_after
+                     beforeEncoderStages:(MTLStages)body->stages_before
+                       visibilityOptions:MTL4VisibilityOptionDevice];
+      break;
+    }
+    case WMTRenderCommandMullionGeometryDraw: {
+      struct wmtcmd_render_mullion_geometry_draw *body = (struct wmtcmd_render_mullion_geometry_draw *)next;
+      metal4_offset(state, Metal4ObjectBinding, body->draw_arguments_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      metal4_draw_geometry_parts(
+          state, body->warp_count, body->instance_count, body->vertex_per_warp, body->max_object_threadgroups
+      );
+      break;
+    }
+    case WMTRenderCommandMullionGeometryDrawIndexed: {
+      struct wmtcmd_render_mullion_geometry_draw_indexed *body =
+          (struct wmtcmd_render_mullion_geometry_draw_indexed *)next;
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->index_buffer, body->index_buffer_offset, SM50_BINDING_INDEX_INDEX_BUFFER
+      );
+      metal4_offset(state, Metal4ObjectBinding, body->draw_arguments_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      metal4_draw_geometry_parts(
+          state, body->warp_count, body->instance_count, body->vertex_per_warp, body->max_object_threadgroups
+      );
+      break;
+    }
+    case WMTRenderCommandMullionGeometryDrawIndirect: {
+      struct wmtcmd_render_mullion_geometry_draw_indirect *body =
+          (struct wmtcmd_render_mullion_geometry_draw_indirect *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dispatch_args_buffer);
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->indirect_args_buffer, body->indirect_args_offset,
+          SM50_BINDING_INDEX_INDIRECT_ARGUMENTS
+      );
+      metal4_draw_geometry_indirect_parts(
+          state, (id<MTLBuffer>)body->dispatch_args_buffer, body->dispatch_args_offset, body->origins_offset,
+          body->parts, body->vertex_per_warp
+      );
+      metal4_buffer(state, Metal4ObjectBinding, body->imm_draw_arguments, 0, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      break;
+    }
+    case WMTRenderCommandMullionGeometryDrawIndexedIndirect: {
+      struct wmtcmd_render_mullion_geometry_draw_indexed_indirect *body =
+          (struct wmtcmd_render_mullion_geometry_draw_indexed_indirect *)next;
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->index_buffer, body->index_buffer_offset, SM50_BINDING_INDEX_INDEX_BUFFER
+      );
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->indirect_args_buffer, body->indirect_args_offset,
+          SM50_BINDING_INDEX_INDIRECT_ARGUMENTS
+      );
+      metal4_draw_geometry_indirect_parts(
+          state, (id<MTLBuffer>)body->dispatch_args_buffer, body->dispatch_args_offset, body->origins_offset,
+          body->parts, body->vertex_per_warp
+      );
+      metal4_buffer(state, Metal4ObjectBinding, body->imm_draw_arguments, 0, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      break;
+    }
+    case WMTRenderCommandMullionTessellationMeshDraw: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw *body =
+          (struct wmtcmd_render_mullion_tessellation_mesh_draw *)next;
+      metal4_offset(state, Metal4ObjectBinding, body->draw_arguments_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, body->parts)
+          threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
+            threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
+      break;
+    }
+    case WMTRenderCommandMullionTessellationMeshDrawIndexed: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed *body =
+          (struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed *)next;
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->index_buffer, body->index_buffer_offset, SM50_BINDING_INDEX_INDEX_BUFFER
+      );
+      metal4_offset(state, Metal4ObjectBinding, body->draw_arguments_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, body->parts)
+          threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
+            threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
+      break;
+    }
+
+    case WMTRenderCommandMullionTessellationMeshDrawIndirect: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw_indirect *body =
+          (struct wmtcmd_render_mullion_tessellation_mesh_draw_indirect *)next;
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->indirect_args_buffer, body->indirect_args_offset,
+          SM50_BINDING_INDEX_INDIRECT_ARGUMENTS
+      );
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:metal4_address(state->owner, body->dispatch_args_buffer) +
+                                                      body->dispatch_args_offset
+                          threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
+                            threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
+      metal4_buffer(state, Metal4ObjectBinding, body->imm_draw_arguments, 0, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      break;
+    }
+    case WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect: {
+      struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect *body =
+          (struct wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect *)next;
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->index_buffer, body->index_buffer_offset, SM50_BINDING_INDEX_INDEX_BUFFER
+      );
+      metal4_buffer(
+          state, Metal4ObjectBinding, body->indirect_args_buffer, body->indirect_args_offset,
+          SM50_BINDING_INDEX_INDIRECT_ARGUMENTS
+      );
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:metal4_address(state->owner, body->dispatch_args_buffer) +
+                                                      body->dispatch_args_offset
+                          threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
+                            threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
+      metal4_buffer(state, Metal4ObjectBinding, body->imm_draw_arguments, 0, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      break;
+    }
+    case WMTRenderCommandUpdateFence: {
+      struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
+      [encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:(MTLStages)body->stages];
+      break;
+    }
+    case WMTRenderCommandWaitForFence: {
+      struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
+      [encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:(MTLStages)body->stages];
+      break;
+    }
+    case WMTRenderCommandSetViewport: {
+      struct wmtcmd_render_setviewport *body = (struct wmtcmd_render_setviewport *)next;
+      union {
+        struct WMTViewport src;
+        MTLViewport dst;
+      } u = {.src = body->viewport};
+      [encoder setViewport:u.dst];
+      break;
+    }
+    case WMTRenderCommandSetScissorRect: {
+      struct wmtcmd_render_setscissorrect *body = (struct wmtcmd_render_setscissorrect *)next;
+      union {
+        struct WMTScissorRect src;
+        MTLScissorRect dst;
+      } u = {.src = body->scissor_rect};
+      [encoder setScissorRect:u.dst];
+      break;
+    }
+    case WMTRenderCommandDispatchThreadsPerTile: {
+      struct wmtcmd_render_dispatch_threads_per_tile *body = (struct wmtcmd_render_dispatch_threads_per_tile *)next;
+      [encoder dispatchThreadsPerTile:MTLSizeMake(body->width, body->height, 1)];
+      break;
+    }
+    case WMTRenderCommandExecuteCommandsInBuffer: {
+      struct wmtcmd_render_executecommands *body = (struct wmtcmd_render_executecommands *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->indirect_command_buffer);
+      [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                             withRange:NSMakeRange(body->location, body->length)];
+      break;
+    }
+    case WMTRenderCommandExecuteCommandsInBufferIndirect: {
+      struct wmtcmd_render_executecommands_indirect *body = (struct wmtcmd_render_executecommands_indirect *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->indirect_command_buffer);
+      [encoder
+          executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                   indirectBuffer:metal4_address(state->owner, body->indirect_buffer) + body->indirect_buffer_offset];
+      break;
+    }
+    }
+    next = next->next.ptr;
+  }
+}
+static void
+API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+  id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)state->encoder;
+  MTLSize threadgroup_size = state->threadgroup;
+  while (next && !state->owner->feedback.error) {
+    switch ((enum WMTComputeCommandType)next->type) {
+    default:
+      assert(!next->type && "unhandled compute command type");
+      break;
+    case WMTComputeCommandDispatch: {
+      struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
+      // a grid with no groups runs nothing in Direct3D (D3D11.3 18.6.2), and Metal rejects it
+      if (!body->size.width || !body->size.height || !body->size.depth)
+        break;
+      [encoder dispatchThreadgroups:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+              threadsPerThreadgroup:threadgroup_size];
+      break;
+    }
+    case WMTComputeCommandDispatchPart: {
+      struct wmtcmd_compute_dispatch_part *body = (struct wmtcmd_compute_dispatch_part *)next;
+      if (!body->size.width || !body->size.height || !body->size.depth)
+        break;
+      MTLSize size = MTLSizeMake(body->size.width, body->size.height, body->size.depth);
+      MTLSize group =
+          MTLSizeMake(body->threadgroup_size.width, body->threadgroup_size.height, body->threadgroup_size.depth);
+      // MTL4ComputeCommandEncoder has no stage-in region; MTLIndirectComputeCommand retains this API. the parts of
+      // a command buffer take the commands of indirect command buffers it keeps, each twice the last
+      MullionMetal4Buffer *owner = state->owner;
+      if (!owner->parts || owner->parts_used == owner->parts.size) {
+        MTLIndirectCommandBufferDescriptor *desc = [[[MTLIndirectCommandBufferDescriptor alloc] init] autorelease];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = YES;
+        desc.inheritPipelineState = YES;
+        id<MTLIndirectCommandBuffer> commands =
+            [owner->device newIndirectCommandBufferWithDescriptor:desc
+                                                  maxCommandCount:MAX(2 * owner->parts.size, 1)
+                                                          options:MTLResourceStorageModeShared];
+        if (!commands) {
+          [owner fail:nil];
+          break;
+        }
+        metal4_resident(owner, commands);
+        [commands release];
+        owner->parts = commands;
+        owner->parts_used = 0;
+      }
+      id<MTLIndirectComputeCommand> command = [owner->parts indirectComputeCommandAtIndex:owner->parts_used];
+      [command setStageInRegion:MTLRegionMake3D(
+                                    body->origin.x, body->origin.y, body->origin.z, size.width, size.height, size.depth
+                                )];
+      [command concurrentDispatchThreadgroups:size threadsPerThreadgroup:group];
+      [encoder executeCommandsInBuffer:owner->parts withRange:NSMakeRange(owner->parts_used++, 1)];
+      break;
+    }
+    case WMTComputeCommandDispatchThreads: {
+      struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
+      [encoder dispatchThreads:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+          threadsPerThreadgroup:threadgroup_size];
+      break;
+    }
+    case WMTComputeCommandDispatchIndirect: {
+      struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
+      [encoder dispatchThreadgroupsWithIndirectBuffer:metal4_address(state->owner, body->indirect_args_buffer) +
+                                                      body->indirect_args_offset
+                                threadsPerThreadgroup:threadgroup_size];
+      break;
+    }
+    case WMTComputeCommandSetPSO: {
+      struct wmtcmd_compute_setpso *body = (struct wmtcmd_compute_setpso *)next;
+      [encoder setComputePipelineState:(id<MTLComputePipelineState>)body->pso];
+      threadgroup_size.width = body->threadgroup_size.width;
+      threadgroup_size.height = body->threadgroup_size.height;
+      threadgroup_size.depth = body->threadgroup_size.depth;
+      state->threadgroup = threadgroup_size;
+      metal4_resident(state->owner, (id<MTLComputePipelineState>)body->pso);
+      break;
+    }
+    case WMTComputeCommandSetBuffer: {
+      struct wmtcmd_compute_setbuffer *body = (struct wmtcmd_compute_setbuffer *)next;
+      metal4_buffer(state, Metal4ComputeBinding, body->buffer, body->offset, body->index);
+      break;
+    }
+    case WMTComputeCommandSetBufferOffset: {
+      struct wmtcmd_compute_setbufferoffset *body = (struct wmtcmd_compute_setbufferoffset *)next;
+      metal4_offset(state, Metal4ComputeBinding, body->offset, body->index);
+      break;
+    }
+    case WMTComputeCommandUseResource: {
+      const struct wmtcmd_compute_useresource *body = (const struct wmtcmd_compute_useresource *)next;
+      metal4_resident(state->owner, (id<MTLResource>)body->resource);
+      break;
+    }
+    case WMTComputeCommandSetBytes: {
+      struct wmtcmd_compute_setbytes *body = (struct wmtcmd_compute_setbytes *)next;
+      metal4_bytes(state, Metal4ComputeBinding, body->bytes.ptr, body->length, body->index);
+      break;
+    }
+    case WMTComputeCommandSetTexture: {
+      struct wmtcmd_compute_settexture *body = (struct wmtcmd_compute_settexture *)next;
+      metal4_texture(state, Metal4ComputeBinding, body->texture, body->index);
+      break;
+    }
+    case WMTComputeCommandUpdateFence: {
+      struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
+      [encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageDispatch];
+      break;
+    }
+    case WMTComputeCommandSetVisibleFunctionTable: {
+      struct wmtcmd_compute_setvisiblefunctiontable *body = (struct wmtcmd_compute_setvisiblefunctiontable *)next;
+      metal4_resident(state->owner, (id<MTLVisibleFunctionTable>)body->table);
+      [metal4_table(state, Metal4ComputeBinding) setResource:[(id<MTLVisibleFunctionTable>)body->table gpuResourceID]
+                                               atBufferIndex:body->index];
+      break;
+    }
+    case WMTComputeCommandWaitForFence: {
+      struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
+      [encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageDispatch];
+      break;
+    }
+    case WMTComputeCommandMemoryBarrier: {
+      [encoder barrierAfterEncoderStages:MTLStageDispatch
+                     beforeEncoderStages:MTLStageDispatch
+                       visibilityOptions:MTL4VisibilityOptionDevice];
+      break;
+    }
+    case WMTComputeCommandExecuteCommandsInBuffer: {
+      struct wmtcmd_compute_executecommands *body = (struct wmtcmd_compute_executecommands *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->indirect_command_buffer);
+      [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                             withRange:NSMakeRange(body->location, body->length)];
+      break;
+    }
+    case WMTComputeCommandExecuteCommandsInBufferIndirect: {
+      struct wmtcmd_compute_executecommands_indirect *body = (struct wmtcmd_compute_executecommands_indirect *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->indirect_command_buffer);
+      [encoder
+          executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                   indirectBuffer:metal4_address(state->owner, body->indirect_buffer) + body->indirect_buffer_offset];
+      break;
+    }
+    }
+
+    next = next->next.ptr;
+  }
+}
+static void
+API_AVAILABLE(macos(26.0)) metal4_blit(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+  id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)state->encoder;
+  while (next && !state->owner->feedback.error) {
+    switch ((enum WMTBlitCommandType)next->type) {
+    default:
+      assert(!next->type && "unhandled blit command type");
+      break;
+    case WMTBlitCommandCopyFromBufferToBuffer: {
+      struct wmtcmd_blit_copy_from_buffer_to_buffer *body = (struct wmtcmd_blit_copy_from_buffer_to_buffer *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
+                 sourceOffset:body->src_offset
+                     toBuffer:(id<MTLBuffer>)body->dst
+            destinationOffset:body->dst_offset
+                         size:body->copy_length];
+      break;
+    }
+    case WMTBlitCommandCopyFromBufferToTexture: {
+      struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
+                 sourceOffset:body->src_offset
+            sourceBytesPerRow:body->bytes_per_row
+          sourceBytesPerImage:body->bytes_per_image
+                   sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                    toTexture:(id<MTLTexture>)body->dst
+             destinationSlice:body->slice
+             destinationLevel:body->level
+            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)];
+      break;
+    }
+    case WMTBlitCommandCopyFromBufferToTextureWithBlitOption: {
+      struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *body =
+          (struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
+                 sourceOffset:body->src_offset
+            sourceBytesPerRow:body->bytes_per_row
+          sourceBytesPerImage:body->bytes_per_image
+                   sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                    toTexture:(id<MTLTexture>)body->dst
+             destinationSlice:body->slice
+             destinationLevel:body->level
+            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                      options:(MTLBlitOption)body->options];
+      break;
+    }
+    case WMTBlitCommandCopyFromTextureToBuffer: {
+      struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromTexture:(id<MTLTexture>)body->src
+                       sourceSlice:body->slice
+                       sourceLevel:body->level
+                      sourceOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                        sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                          toBuffer:(id<MTLBuffer>)body->dst
+                 destinationOffset:body->offset
+            destinationBytesPerRow:body->bytes_per_row
+          destinationBytesPerImage:body->bytes_per_image];
+      break;
+    }
+    case WMTBlitCommandCopyFromTextureToBufferWithBlitOption: {
+      struct wmtcmd_blit_copy_from_texture_to_buffer_withblitoption *body =
+          (struct wmtcmd_blit_copy_from_texture_to_buffer_withblitoption *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromTexture:(id<MTLTexture>)body->src
+                       sourceSlice:body->slice
+                       sourceLevel:body->level
+                      sourceOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                        sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                          toBuffer:(id<MTLBuffer>)body->dst
+                 destinationOffset:body->offset
+            destinationBytesPerRow:body->bytes_per_row
+          destinationBytesPerImage:body->bytes_per_image
+                           options:(MTLBlitOption)body->options];
+      break;
+    }
+    case WMTBlitCommandCopyFromTextureToTexture: {
+      struct wmtcmd_blit_copy_from_texture_to_texture *body = (struct wmtcmd_blit_copy_from_texture_to_texture *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromTexture:(id<MTLTexture>)body->src
+                   sourceSlice:body->src_slice
+                   sourceLevel:body->src_level
+                  sourceOrigin:MTLOriginMake(body->src_origin.x, body->src_origin.y, body->src_origin.z)
+                    sourceSize:MTLSizeMake(body->src_size.width, body->src_size.height, body->src_size.depth)
+                     toTexture:(id<MTLTexture>)body->dst
+              destinationSlice:body->dst_slice
+              destinationLevel:body->dst_level
+             destinationOrigin:MTLOriginMake(body->dst_origin.x, body->dst_origin.y, body->dst_origin.z)];
+      break;
+    }
+    case WMTBlitCommandGenerateMipmaps: {
+      struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->texture);
+      [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
+      break;
+    }
+    case WMTBlitCommandUpdateFence: {
+      struct wmtcmd_blit_fence_op *body = (struct wmtcmd_blit_fence_op *)next;
+      [encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageBlit];
+      break;
+    }
+    case WMTBlitCommandWaitForFence: {
+      struct wmtcmd_blit_fence_op *body = (struct wmtcmd_blit_fence_op *)next;
+      [encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageBlit];
+      break;
+    }
+    case WMTBlitCommandFillBuffer: {
+      struct wmtcmd_blit_fillbuffer *body = (struct wmtcmd_blit_fillbuffer *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->buffer);
+      [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
+      break;
+    }
+    case WMTBlitCommandResetCommandsInBuffer: {
+      struct wmtcmd_blit_resetcommands *body = (struct wmtcmd_blit_resetcommands *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->indirect_command_buffer);
+      [encoder resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
+                           withRange:NSMakeRange(body->location, body->length)];
+      break;
+    }
+    case WMTBlitCommandCopyTexture: {
+      struct wmtcmd_blit_copy_texture *body = (struct wmtcmd_blit_copy_texture *)next;
+      metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+      metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+      [encoder copyFromTexture:(id<MTLTexture>)body->src toTexture:(id<MTLTexture>)body->dst];
+      break;
+    }
+    }
+
+    [encoder barrierAfterEncoderStages:MTLStageBlit
+                   beforeEncoderStages:MTLStageBlit
+                     visibilityOptions:MTL4VisibilityOptionDevice];
+    next = next->next.ptr;
+  }
+}
+static MTL4AccelerationStructureDescriptor *
+API_AVAILABLE(macos(26.0)) metal4_structure_descriptor(
+    MullionMetal4Buffer *state, const struct WMTAccelerationStructureInfo *info
+) {
+  if (info->instances) {
+    MTL4IndirectInstanceAccelerationStructureDescriptor *desc =
+        [[[MTL4IndirectInstanceAccelerationStructureDescriptor alloc] init] autorelease];
+    desc.usage = (MTLAccelerationStructureUsage)info->usage;
+    desc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeIndirect;
+    desc.instanceDescriptorBuffer = metal4_range(state, info->instance_buffer, info->instance_offset);
+    desc.instanceDescriptorStride = sizeof(MTLIndirectAccelerationStructureInstanceDescriptor);
+    desc.maxInstanceCount = info->max_instance_count;
+    desc.instanceCountBuffer = metal4_range(state, info->instance_count_buffer, info->instance_count_offset);
+    desc.instanceTransformationMatrixLayout = MTLMatrixLayoutRowMajor;
+    return desc;
+  }
+  const struct WMTAccelerationStructureGeometry *geometries = info->geometries.ptr;
+  NSMutableArray *array = [NSMutableArray arrayWithCapacity:info->geometry_count];
+  for (uint32_t i = 0; i < info->geometry_count; i++) {
+    const struct WMTAccelerationStructureGeometry *g = &geometries[i];
+    MTL4AccelerationStructureGeometryDescriptor *geometry;
+    if (g->vertex_format == WMTAttributeFormatInvalid) {
+      MTL4AccelerationStructureBoundingBoxGeometryDescriptor *boxes =
+          [[[MTL4AccelerationStructureBoundingBoxGeometryDescriptor alloc] init] autorelease];
+      boxes.boundingBoxBuffer = metal4_range(state, g->buffer, g->offset);
+      boxes.boundingBoxStride = g->stride;
+      boxes.boundingBoxCount = g->count;
+      geometry = boxes;
+    } else {
+      MTL4AccelerationStructureTriangleGeometryDescriptor *triangles =
+          [[[MTL4AccelerationStructureTriangleGeometryDescriptor alloc] init] autorelease];
+      triangles.vertexBuffer = metal4_range(state, g->buffer, g->offset);
+      triangles.vertexStride = g->stride;
+      triangles.vertexFormat = (MTLAttributeFormat)g->vertex_format;
+      triangles.indexBuffer = metal4_range(state, g->index_buffer, g->index_offset);
+      triangles.indexType = (MTLIndexType)g->index_type;
+      triangles.triangleCount = g->count;
+      triangles.transformationMatrixBuffer = metal4_range(state, g->transform_buffer, g->transform_offset);
+      triangles.transformationMatrixLayout = MTLMatrixLayoutRowMajor;
+      geometry = triangles;
+    }
+    geometry.opaque = g->opaque;
+    geometry.allowDuplicateIntersectionFunctionInvocation = !g->no_duplicate_any_hit;
+    [array addObject:geometry];
+  }
+  MTL4PrimitiveAccelerationStructureDescriptor *desc =
+      [[[MTL4PrimitiveAccelerationStructureDescriptor alloc] init] autorelease];
+  desc.usage = (MTLAccelerationStructureUsage)info->usage;
+  desc.geometryDescriptors = array;
+  return desc;
+}
+
+static void
+API_AVAILABLE(macos(26.0)) metal4_acceleration(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+  id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)state->encoder;
+  while (next && !state->owner->feedback.error) {
+    @autoreleasepool {
+      switch ((enum WMTAccelerationStructureCommandType)next->type) {
+      default:
+        assert(!next->type && "unhandled acceleration structure command type");
+        break;
+      case WMTAccelerationStructureCommandBuild: {
+        struct wmtcmd_accelerationstructure_build *body = (struct wmtcmd_accelerationstructure_build *)next;
+        metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+        metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+        MTL4AccelerationStructureDescriptor *desc = metal4_structure_descriptor(state->owner, &body->info);
+        if (body->src)
+          [encoder refitAccelerationStructure:(id<MTLAccelerationStructure>)body->src
+                                   descriptor:desc
+                                  destination:(id<MTLAccelerationStructure>)body->dst
+                                scratchBuffer:metal4_range(state->owner, body->scratch, body->scratch_offset)];
+        else
+          [encoder buildAccelerationStructure:(id<MTLAccelerationStructure>)body->dst
+                                   descriptor:desc
+                                scratchBuffer:metal4_range(state->owner, body->scratch, body->scratch_offset)];
+        break;
+      }
+      case WMTAccelerationStructureCommandCopy: {
+        struct wmtcmd_accelerationstructure_copy *body = (struct wmtcmd_accelerationstructure_copy *)next;
+        metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+        metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+        [encoder copyAccelerationStructure:(id<MTLAccelerationStructure>)body->src
+                   toAccelerationStructure:(id<MTLAccelerationStructure>)body->dst];
+        break;
+      }
+      case WMTAccelerationStructureCommandCopyAndCompact: {
+        struct wmtcmd_accelerationstructure_copy *body = (struct wmtcmd_accelerationstructure_copy *)next;
+        metal4_resident(state->owner, (id<MTLAllocation>)body->dst);
+        metal4_resident(state->owner, (id<MTLAllocation>)body->src);
+        [encoder copyAndCompactAccelerationStructure:(id<MTLAccelerationStructure>)body->src
+                             toAccelerationStructure:(id<MTLAccelerationStructure>)body->dst];
+        break;
+      }
+      case WMTAccelerationStructureCommandWriteCompactedSize: {
+        struct wmtcmd_accelerationstructure_write_compacted_size *body =
+            (struct wmtcmd_accelerationstructure_write_compacted_size *)next;
+        metal4_resident(state->owner, (id<MTLAllocation>)body->structure);
+        [encoder writeCompactedAccelerationStructureSize:(id<MTLAccelerationStructure>)body->structure
+                                                toBuffer:metal4_range(state->owner, body->buffer, body->offset)];
+        break;
+      }
+      case WMTAccelerationStructureCommandWaitForFence: {
+        struct wmtcmd_accelerationstructure_fence_op *body = (struct wmtcmd_accelerationstructure_fence_op *)next;
+        [encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageAccelerationStructure];
+        break;
+      }
+      case WMTAccelerationStructureCommandUpdateFence: {
+        struct wmtcmd_accelerationstructure_fence_op *body = (struct wmtcmd_accelerationstructure_fence_op *)next;
+        [encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageAccelerationStructure];
+        break;
+      }
+      }
+    }
+    [encoder barrierAfterEncoderStages:MTLStageAccelerationStructure
+                   beforeEncoderStages:MTLStageAccelerationStructure
+                     visibilityOptions:MTL4VisibilityOptionDevice];
+    next = next->next.ptr;
+  }
+}
+
+static NTSTATUS
+_MTL4CommandEncoder_encodeCommands(void *obj) {
+  struct unixcall_metal4_commands *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Encoder *state = (MullionMetal4Encoder *)p->encoder;
+    if (!state || state->owner->feedback.error)
+      return STATUS_SUCCESS;
+    switch (p->kind) {
+    case WMTMetal4Render:
+      metal4_render(state, p->head.ptr);
+      break;
+    case WMTMetal4Compute:
+      metal4_compute(state, p->head.ptr);
+      break;
+    case WMTMetal4Blit:
+      metal4_blit(state, p->head.ptr);
+      break;
+    case WMTMetal4AccelerationStructure:
+      metal4_acceleration(state, p->head.ptr);
+      break;
+    default:
+      return STATUS_UNSUCCESSFUL;
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,
@@ -4407,6 +5839,17 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_pushDebugGroup,
     &_MTLCommandBuffer_popDebugGroup,
     &_WMTFlightWrite,
+    &_MTL4CommandBuffer_new,
+    &_MTL4CommandBuffer_encoder,
+    &_MTL4CommandEncoder_encodeCommands,
+    &_MTL4CommandEncoder_endEncoding,
+    &_MTL4CommandBuffer_commit,
+    &_MTL4CommandBuffer_feedback,
+    &_MTL4CommandBuffer_waitUntilCompleted,
+    &_MTL4CounterHeap_new,
+    &_MTLDevice_queryTimestampFrequency,
+    &_MTL4CommandBuffer_present,
+    &_MTL4CommandBuffer_waitForEvent,
 };
 
 #ifndef MULLION_NATIVE
@@ -4592,6 +6035,17 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_pushDebugGroup,
     &_MTLCommandBuffer_popDebugGroup,
     &_WMTFlightWrite,
+    &_MTL4CommandBuffer_new,
+    &_MTL4CommandBuffer_encoder,
+    &_MTL4CommandEncoder_encodeCommands,
+    &_MTL4CommandEncoder_endEncoding,
+    &_MTL4CommandBuffer_commit,
+    &_MTL4CommandBuffer_feedback,
+    &_MTL4CommandBuffer_waitUntilCompleted,
+    &_MTL4CounterHeap_new,
+    &_MTLDevice_queryTimestampFrequency,
+    &_MTL4CommandBuffer_present,
+    &_MTL4CommandBuffer_waitForEvent,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");
