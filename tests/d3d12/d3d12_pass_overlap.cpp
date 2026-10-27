@@ -23,7 +23,12 @@ uint ps(float4 position : SV_Position) : SV_Target {
     v = v * 1664525u + 1013904223u;
   return value + (v & mask);
 }
-[numthreads(GROUP, 1, 1)] void cs(uint3 tid : SV_DispatchThreadID) { written[tid.x] = value; }
+[numthreads(GROUP, 1, 1)] void cs(uint3 tid : SV_DispatchThreadID) {
+  uint v = tid.x;
+  [loop] for (uint i = 0; i < work; i++)
+    v = v * 1664525u + 1013904223u;
+  written[tid.x] = value + (v & mask);
+}
 )hlsl";
 
 enum Case { Dispatch, Target, Depth, Cases };
@@ -126,7 +131,8 @@ main(int argc, char **argv) {
         list->DrawInstanced(3, 1, 0, 0);
         if (mixed) {
           list->SetPipelineState(compute.Get());
-          list->SetComputeRoot32BitConstants(0, 1, &i, 0);
+          const UINT constants[] = {i, 0, 0};
+          list->SetComputeRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
           list->Dispatch(1, 1, 1);
           list->SetPipelineState(pipelines[Plain].Get());
         }
@@ -223,17 +229,19 @@ main(int argc, char **argv) {
         list->ClearRenderTargetView(rtv, zero, 0, nullptr);
       list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
       // the last repeat's dispatch is overwritten with zeros here, with no view for ClearUnorderedAccessViewUint
-      const UINT none = 0;
+      const UINT none[3] = {};
       list->SetPipelineState(compute.Get());
-      list->SetComputeRoot32BitConstants(0, 1, &none, 0);
+      list->SetComputeRoot32BitConstants(0, 3, none, 0);
       list->Dispatch(elements / group, 1, 1);
       D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_UAV};
       list->ResourceBarrier(1, &barrier);
       const bool depth_case = c == Depth;
       draw(pipelines[depth_case ? Writes : Plain].Get(), 0, depth_case, slow, work);
       if (c == Dispatch) {
+        // longer than the slow draw, so that the copies after it which did not wait for it would read first
+        const UINT constants[] = {dispatched, 2 * work, 0};
         list->SetPipelineState(compute.Get());
-        list->SetComputeRoot32BitConstants(0, 1, &dispatched, 0);
+        list->SetComputeRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
         list->Dispatch(elements / group, 1, 1);
       } else {
         draw(pipelines[Plain].Get(), 1, false, between, 0);
