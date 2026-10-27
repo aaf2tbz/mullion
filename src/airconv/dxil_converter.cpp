@@ -1960,9 +1960,12 @@ convert_dxil(
     return simd(name, ty, args, ty);
   };
   // the SIMD group's width, and this lane's index: vertex functions have no input for them, but their SIMD groups hold
-  // consecutive vertices from lane 0, so a lane is the lanes active before it when the function starts
+  // consecutive vertices from lane 0, so a lane is the lanes active before it when the function starts. functions not
+  // made from the shader's signature (a ray shader's, a domain shader's in a geometry shader's) have no input for
+  // them either, and are reckoned the same way
+  bool simd_inputs = ctx.shader_type != D3D10_SB_VERTEX_SHADER && ctx.shader_type != kShaderLibrary && ctx.own_signature;
   auto lane_index = [&]() -> Value * {
-    if (ctx.shader_type != D3D10_SB_VERTEX_SHADER)
+    if (simd_inputs)
       return ctx.function->getArg(shader->func_signature.DefineInput(air::InputThreadIndexInSIMDGroup{}));
     IRBuilder<>::InsertPointGuard guard(ir);
     ir.SetInsertPoint(&*ctx.function->getEntryBlock().getFirstInsertionPt());
@@ -2034,7 +2037,7 @@ convert_dxil(
     return gradient_lod(ir.CreateFSub(lane(1), lane(0)), ir.CreateFSub(lane(2), lane(0)));
   };
   auto lane_count = [&]() -> Value * {
-    if (ctx.shader_type != D3D10_SB_VERTEX_SHADER)
+    if (simd_inputs || !ctx.simd_width)
       return ctx.function->getArg(shader->func_signature.DefineInput(air::InputThreadsPerSIMDGroup{}));
     return ir.getInt32(ctx.simd_width);
   };
