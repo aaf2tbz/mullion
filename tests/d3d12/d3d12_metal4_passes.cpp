@@ -12,7 +12,9 @@
 #include <fstream>
 
 static constexpr UINT group = 64;
-static constexpr UINT sizes[] = {group - 1, group, group + 1, group *group + 1};
+// below, at and above the shader's threadgroup boundary, and of so many groups that work begun beside the dispatch
+// would read what it has not written yet
+static constexpr UINT sizes[] = {group - 1, group, group + 1, group *group + 1, group *group *group};
 static const char hlsl[] = R"hlsl(
 RWStructuredBuffer<uint> source : register(u0);
 RWStructuredBuffer<uint> destination : register(u1);
@@ -61,7 +63,6 @@ run(const std::string &cs, const std::string &vs, const std::string &ps, UINT qu
       device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), compute.Get(), IID_PPV_ARGS(&list))
   );
 
-  // below, at and above the shader's threadgroup boundary
   const UINT count = sizes[std::size(sizes) - 1];
   const UINT64 bytes = UINT64(count) * sizeof(UINT);
   ComPtr<ID3D12Resource> work[4];

@@ -1,5 +1,4 @@
-# Metal 4: a compute segment does not wait for the compute work before it in its encoder, the resolver of an
-# indirect draw among them
+# Metal 4: a compute segment does not wait for the compute work before it in its encoder
 # family native
 # family 9
 --- a/src/winemetal/unix/winemetal_unix.c

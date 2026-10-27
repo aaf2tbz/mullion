@@ -16,7 +16,9 @@
 // "If any of the Dispatch arguments are 0, while the command will be sent to the driver, the effect is that
 // nothing happens." (D3D11.3 18.6.2). every combination of zero dimensions leaves the output and counts unchanged.
 // resolves preserve the ended value in the heap, both when repeated and when recorded in another list.
-// "when a NULL pixel shader is bound to the pipeline, PSInvocations does not increment" (20.4.7).
+// "when a NULL pixel shader is bound to the pipeline, PSInvocations does not increment" (20.4.7). a geometry shader
+// that passes each triangle on, without a pixel shader, runs once per triangle and outputs one: "Number of times a
+// geometry shader was invoked", "Number of primitives output by a geometry shader" (20.4.7).
 // "The value of PSInvocations may include or exclude helper pixels for 2x2 stamps" (20.4.7). Each triangle
 // can invoke at most all four lanes of every stamp touching the target, so two such stamp grids bound a quad.
 // "OCCLUSION measures multi-samples (not pixels)"; "If the Pixel Shader outputs depth, then PSInvocations
@@ -43,6 +45,11 @@ float4 vs_strip(uint id : SV_VertexID) : SV_Position {
   float2 corners[] = {float2(-1, 1), float2(1, 1), float2(-1, -1), float2(1, -1)};
   return float4(corners[id % 4], 0.5, 1);
 }
+struct Vertex { float4 position : SV_Position; };
+[maxvertexcount(3)] void gs(triangle Vertex input[3], inout TriangleStream<Vertex> output) {
+  for (uint i = 0; i < 3; i++)
+    output.Append(input[i]);
+}
 StructuredBuffer<uint> values : register(t0);
 RWStructuredBuffer<uint> output : register(u0);
 [numthreads(TX, TY, TZ)]
@@ -65,7 +72,7 @@ main(int argc, char **argv) {
                                     groups[0] * groups[1] * groups[2],
                plane_words = UINT64(cs_width) * cs_height * threads[2] * groups[2], output_words = 2 * plane_words;
   const UINT instances = 1 + next() % 3, first = 1 + next() % 3, nested = 1 + next() % 3, discarded = 1 + next() % 3,
-             no_pixel = 1 + next() % 3;
+             no_pixel = 1 + next() % 3, geometry = 1 + next() % 3;
   Compiler compiler;
   if (!front_end(argc, argv, compiler)) {
     printf("skipped: dxcompiler.dll not found\n");
@@ -78,16 +85,16 @@ main(int argc, char **argv) {
   step("seed %u, %s: compile VS, PS and CS", seed, compiler.dxc ? "dxil" : "dxbc");
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), ps = compiler.compile(hlsl, "ps", "ps", defines),
        cs = compiler.compile(hlsl, "cs", "cs", defines), depth_ps = compiler.compile(hlsl, "ps_depth", "ps", defines),
-       strip_vs = compiler.compile(hlsl, "vs_strip", "vs", defines);
+       strip_vs = compiler.compile(hlsl, "vs_strip", "vs", defines), gs = compiler.compile(hlsl, "gs", "gs", defines);
   defines.back() = "TZ=" + std::to_string(flat_threads[2]);
   auto cs_flat = compiler.compile(hlsl, "cs", "cs", defines);
-  if (vs.empty() || ps.empty() || cs.empty() || cs_flat.empty() || depth_ps.empty() || strip_vs.empty()) {
+  if (vs.empty() || ps.empty() || cs.empty() || cs_flat.empty() || depth_ps.empty() || strip_vs.empty() || gs.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-  enum { Empty, All, First, Nested, Reused, Compute, NoPixel, Queries };
+  enum { Empty, All, First, Nested, Reused, Compute, NoPixel, Geometry, Queries };
   step("seed %u: create a pipeline statistics heap", seed);
   D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Queries};
   ComPtr<ID3D12QueryHeap> queries;
@@ -126,10 +133,12 @@ main(int argc, char **argv) {
   graphics.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
   graphics.SampleDesc = {1, 0};
   D3D12_COMPUTE_PIPELINE_STATE_DESC compute{compute_rs.Get(), bytecode(cs)};
-  ComPtr<ID3D12PipelineState> draw_pso, dispatch_pso, flat_dispatch_pso, no_pixel_pso;
+  ComPtr<ID3D12PipelineState> draw_pso, dispatch_pso, flat_dispatch_pso, no_pixel_pso, geometry_pso;
   CHECK(device->CreateGraphicsPipelineState(&graphics, IID_PPV_ARGS(&draw_pso)));
   graphics.PS = {};
   CHECK(device->CreateGraphicsPipelineState(&graphics, IID_PPV_ARGS(&no_pixel_pso)));
+  graphics.GS = bytecode(gs);
+  CHECK(device->CreateGraphicsPipelineState(&graphics, IID_PPV_ARGS(&geometry_pso)));
   CHECK(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&dispatch_pso)));
   compute.CS = bytecode(cs_flat);
   CHECK(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&flat_dispatch_pso)));
@@ -246,6 +255,10 @@ main(int argc, char **argv) {
   list->SetPipelineState(no_pixel_pso.Get());
   list->DrawInstanced(vertices_per_quad * no_pixel, instances, 0, 0);
   end(NoPixel);
+  begin(Geometry);
+  list->SetPipelineState(geometry_pso.Get());
+  list->DrawInstanced(vertices_per_quad * geometry, instances, 0, 0);
+  end(Geometry);
   list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, First, 1, repeated.Get(), result_stride);
   list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, First, 1, repeated.Get(),
                          2 * result_stride);
@@ -268,6 +281,7 @@ main(int argc, char **argv) {
   quads[First] = UINT64(first + nested) * instances;
   quads[Nested] = UINT64(nested) * instances;
   quads[NoPixel] = UINT64(no_pixel) * instances;
+  quads[Geometry] = UINT64(geometry) * instances;
   UINT *input;
   CHECK(source->Map(0, nullptr, (void **)&input));
   memset(input + 1, 0, output_words * sizeof(UINT));
@@ -304,7 +318,7 @@ main(int argc, char **argv) {
       expect(got.CInvocations == primitives && got.CPrimitives == primitives,
              "query %u: clip invocations %llu, primitives %llu, want %llu", q, got.CInvocations, got.CPrimitives,
              primitives);
-      const UINT64 shaded_quads = q == NoPixel ? 0 : quads[q];
+      const UINT64 shaded_quads = q == NoPixel || q == Geometry ? 0 : quads[q];
       const UINT stamp_width = 2, stamp_height = 2;
       const UINT64 minimum_pixels = UINT64(width) * height * shaded_quads,
                    maximum_pixels = UINT64((width + stamp_width - 1) / stamp_width) *
@@ -312,8 +326,12 @@ main(int argc, char **argv) {
                                     triangles_per_quad * shaded_quads;
       expect(got.PSInvocations >= minimum_pixels && got.PSInvocations <= maximum_pixels,
              "query %u: PS count %llu, want [%llu, %llu]", q, got.PSInvocations, minimum_pixels, maximum_pixels);
-      expect(!got.GSPrimitives && !got.HSInvocations && !got.DSInvocations && (quads[q] || !got.GSInvocations),
-             "query %u: unused stage count", q);
+      const UINT64 geometry_primitives = q == Geometry ? primitives : 0;
+      expect(got.GSPrimitives == geometry_primitives &&
+                 (q == Geometry ? got.GSInvocations == primitives : quads[q] || !got.GSInvocations),
+             "query %u: GS invocations %llu, primitives %llu, want %llu", q, got.GSInvocations, got.GSPrimitives,
+             geometry_primitives);
+      expect(!got.HSInvocations && !got.DSInvocations, "query %u: unused stage count", q);
       const UINT64 compute_invocations = q == All || q == Compute ? direct_invocations + indirect_invocations : 0;
       expect(got.CSInvocations == compute_invocations, "query %u: CS invocations %llu, want %llu", q, got.CSInvocations,
              compute_invocations);
