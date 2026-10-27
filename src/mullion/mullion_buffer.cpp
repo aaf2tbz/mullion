@@ -162,10 +162,17 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     auto texel_size = MTLGetTexelSize(format);
     assert(texel_size);
     assert(!(allocation->suballocation_size_ & (texel_size - 1)));
-    auto total_length = allocation->suballocation_size_ * allocation->suballocation_count_;
+    uint64_t total_length = (uint64_t)allocation->suballocation_size_ * allocation->suballocation_count_;
     WMTTextureInfo info{};
     info.type = WMTTextureTypeTextureBuffer;
     info.width = total_length / (uint64_t)texel_size;
+    // Metal caps texture buffers at 2^28 texels (maxTextureBufferWidth); larger D3D12 typed views
+    // (e.g. a 1.6 GB R32 buffer) would abort in MTLTextureDescriptor validation. Clamp the view.
+    constexpr uint64_t kMaxTextureBufferWidth = 268435456ull;
+    if (info.width > kMaxTextureBufferWidth) {
+      info.width = kMaxTextureBufferWidth;
+      total_length = kMaxTextureBufferWidth * (uint64_t)texel_size;
+    }
     info.height = 1;
     info.depth = 1;
     info.array_length = 1;
