@@ -5,7 +5,8 @@
 // the Pixel Shader invocation"), and statistics count its runs even where they fail (D3D11.3 20.4.7). the range may come from a bundle, a wide
 // range passes all, an inverted one none, NaN counts as 0, and a pipeline without the test or a pass without a depth
 // buffer passes all. a draw that writes depth writes it only where it passes ("cannot affect the render target, depth,
-// or stencil buffer"). each case draws into its own band of pixels whose stored depths are `stored`.
+// or stencil buffer"), with a pixel shader or without one. each case draws into its own band of pixels whose stored
+// depths are `stored`.
 // "The default values are 0 and 1 for the minimum and maximum, respectively."
 // https://microsoft.github.io/DirectX-Specs/d3d/DepthBoundsTest.html
 #include "d3d12_test.hpp"
@@ -56,7 +57,7 @@ main(int argc, char **argv) {
   const UINT band = std::size(stored);
   struct Case {
     float min, max;
-    bool test, depth_buffer, bundle, late = false, initial = false, draw_bundle = false, write = false;
+    bool test, depth_buffer, bundle, late = false, initial = false, draw_bundle = false, write = false, no_shader = false;
   } cases[] = {
       {0, 1, true, true, false, false, true},
       {0.3f, 0.6f, true, true, false},     {0.3f, 0.6f, true, true, true},  {-FLT_MAX, FLT_MAX, true, true, false},
@@ -71,6 +72,7 @@ main(int argc, char **argv) {
       {0.3f, 0.6f, true, true, false, true, false, true},
       {0.3f, 0.6f, true, true, false, false, false, false, true},
       {0.3f, 0.6f, true, true, false, true, false, false, true},
+      {0.3f, 0.6f, true, true, false, false, false, false, true, true},
   };
   const UINT width = band * std::size(cases);
 
@@ -95,8 +97,9 @@ main(int argc, char **argv) {
   stream.topology.data = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   stream.rasterizer.data = {D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE};
   stream.rasterizer.data.DepthClipEnable = TRUE;
-  auto pipeline = [&](bool write, bool test, bool depth_buffer, bool late_shader = false) -> ComPtr<ID3D12PipelineState> {
-    stream.ps.data = bytecode(late_shader ? late : ps);
+  auto pipeline = [&](bool write, bool test, bool depth_buffer, bool late_shader = false,
+                      bool no_shader = false) -> ComPtr<ID3D12PipelineState> {
+    stream.ps.data = no_shader ? D3D12_SHADER_BYTECODE{} : bytecode(late_shader ? late : ps);
     stream.depth.data = {depth_buffer, write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
     stream.depth.data.DepthBoundsTestEnable = test;
     stream.depth_format.data = depth_buffer ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;
@@ -182,7 +185,7 @@ main(int argc, char **argv) {
   for (UINT c = 0; c < std::size(cases); c++) {
     auto &k = cases[c];
     step("depth bounds case %u, late %u, bundle draw %u", c, k.late, k.draw_bundle);
-    auto &pso = psos.emplace_back(pipeline(k.write, k.test, k.depth_buffer, k.late));
+    auto &pso = psos.emplace_back(pipeline(k.write, k.test, k.depth_buffer, k.late, k.no_shader));
     if (!pso) {
       printf("failed: pipeline of case %u\n", c);
       return 1;
@@ -236,10 +239,10 @@ main(int argc, char **argv) {
     UINT passed = 0;
     for (UINT i = 0; i < band; i++) {
       bool pass = !k.test || !k.depth_buffer || (lo <= stored[i] && stored[i] <= hi);
-      UINT x = c * band + i, want = pass ? c + 1 : 0;
+      UINT x = c * band + i, want = pass && !k.no_shader ? c + 1 : 0;
       passed += pass;
       UINT written = got[row / 4 + x];
-      UINT want_uav = k.late || pass ? c + 1 : 0;
+      UINT want_uav = !k.no_shader && (k.late || pass) ? c + 1 : 0;
       float z = reinterpret_cast<float *>(reinterpret_cast<char *>(got) + depth_at)[x],
             want_z = k.write && pass ? 0.0f : stored[i];
       expect(got[x] == want && written == want_uav && z == want_z,
@@ -250,7 +253,8 @@ main(int argc, char **argv) {
     auto invocations =
         reinterpret_cast<D3D12_QUERY_DATA_PIPELINE_STATISTICS *>(reinterpret_cast<char *>(got) + statistics_at)[c]
             .PSInvocations;
-    expect(invocations == (k.late ? band : passed), "PSInvocations %llu, want %u", invocations, k.late ? band : passed);
+    UINT runs = k.no_shader ? 0 : k.late ? band : passed;
+    expect(invocations == runs, "PSInvocations %llu, want %u", invocations, runs);
   }
   readback->Unmap(0, nullptr);
   return verdict();
