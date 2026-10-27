@@ -412,6 +412,15 @@ def session(args):
         yield environment(args)
 
 
+def as_family(base, family):
+    """the environment that runs as the Apple GPU family named as --family names one"""
+    apple = family.removesuffix("-metal3")
+    env = dict(base) if apple == "native" else dict(base, MULLION_GPU_FAMILY=apple)
+    if family.endswith("-metal3"):
+        env["MULLION_D3D12_METAL4"] = "0"
+    return env
+
+
 def environment(args):
     """the builds, the Wine's binary and the environment of a test in it, with the builds' libraries installed"""
     builds = [build.resolve() for build in args.build]
@@ -540,10 +549,7 @@ def own(args, tests, builds, binary, base):
     printing = threading.Lock()
 
     def one(family, test, again=False):
-        apple = family.removesuffix("-metal3")
-        env = dict(base) if apple == "native" else dict(base, MULLION_GPU_FAMILY=apple)
-        if family.endswith("-metal3"):
-            env["MULLION_D3D12_METAL4"] = "0"
+        env = as_family(base, family)
         native = not test["cmd"][0].endswith(".exe")
         command = test["cmd"] if native else [binary] + test["cmd"]
         test_env = dict(env, **test["env"])

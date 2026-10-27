@@ -96,8 +96,10 @@ def main():
     run.arguments(parser)
     parser.add_argument("--out", required=True, type=Path, help="where the dumps and logs go")
     parser.add_argument("--seconds", type=int, default=300, help="the most a run may take (default: %(default)s)")
+    parser.add_argument("--family", default="native", help="the Apple GPU family to run as, as tests/run.py names it")
     args = parser.parse_args()
     with run.session(args) as (builds, binary, base):
+        base = run.as_family(base, args.family)
         exe = next(path for build in builds for path in build.glob("tests/*/d3d12_flight.exe"))
         failed = 0
         for mode in ("removed", "exception", "quiet", "many", "d3d11"):
