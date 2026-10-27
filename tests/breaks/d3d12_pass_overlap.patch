@@ -1,6 +1,7 @@
 # the pass after an ordering point does not wait for the passes of the group before it
 # family native-metal3
 # family 7-metal3
+# family native
 --- a/src/d3d12/d3d12_command_queue.cpp
 +++ b/src/d3d12/d3d12_command_queue.cpp
 @@ -168,8 +168,6 @@

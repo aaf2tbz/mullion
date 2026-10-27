@@ -112,8 +112,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   static bool
   PassesOverlap() {
-    // not Metal 4's, whose passes barriers order
-    static const bool overlap = !Metal4 && env::getEnvVar("MULLION_D3D12_PASS_OVERLAP") != "0";
+    static const bool overlap = env::getEnvVar("MULLION_D3D12_PASS_OVERLAP") != "0";
     return overlap;
   }
 
@@ -160,6 +159,14 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       order_next_ |= pass->overlap == PassOverlap::Ordered;
       return sync;
     }
+    // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder, which barriers order
+    // and whose end updates fence_ (closeCompute): it waits for every pass before it, as WaitAll's encoders do
+    if constexpr (Metal4)
+      if (pass->type != EncoderType::Render && pass->type != EncoderType::Clear && pass->type != EncoderType::Resolve) {
+        order_next_ = false;
+        WaitAll([&](WMT::Fence fence) { sync.waits[sync.wait_count++] = fence; });
+        return sync;
+      }
     sync.waits[sync.wait_count++] = fence_;
     auto overlap = std::exchange(order_next_, false) ? PassOverlap::Ordered : pass->overlap;
     if (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses) {
@@ -835,10 +842,9 @@ public:
     gate_->device = device_;
 
     fence_ = metal_device.newFence();
-    if constexpr (!Metal4)
-      for (auto &fence : group_fences_)
-        if (!(fence = metal_device.newFence()))
-          return E_FAIL;
+    for (auto &fence : group_fences_)
+      if (!(fence = metal_device.newFence()))
+        return E_FAIL;
     // the work before the first present is frame 0, as Present numbers the work after it
     capture_.frame(metal_device, 0);
     if (profile_) {
@@ -1214,13 +1220,11 @@ public:
         default:
           break;
         }
-        // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder, which barriers
-        // order (_MTL4CommandBuffer_encoder)
         auto wait = [&](auto &encoder) {
-          if constexpr (!Metal4)
-            for (unsigned i = 0; i < sync.wait_count; i++)
-              encoder.waitForFence(sync.waits[i]);
+          for (unsigned i = 0; i < sync.wait_count; i++)
+            encoder.waitForFence(sync.waits[i]);
         };
+        // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder (NextSync)
         auto end = [&](auto &encoder) {
           if constexpr (Metal4) {
             encoder.endSegment();
@@ -1384,8 +1388,7 @@ public:
             scope.inflight->physical[WMTMetal4AccelerationStructure]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.accelerationStructureCommandEncoder(attachment)
                                                   : cmdbuf.accelerationStructureCommandEncoder();
-          if constexpr (!Metal4)
-            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
           encoder.encodeCommands(&data->cmd_head);
           if constexpr (!Metal4)
             encoder.updateFence(fence_);
@@ -1489,8 +1492,7 @@ public:
           if (diag::trace_encoders)
             scope.inflight->physical[WMTMetal4Blit]++;
           auto encoder = cmdbuf.blitCommandEncoder();
-          if constexpr (!Metal4)
-            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
           encoder.copyFromBuffer(staging, 0, data->dst, data->dst_offset, data->count * sizeof(uint64_t));
           if constexpr (!Metal4)
             encoder.updateFence(fence_);
@@ -1523,8 +1525,7 @@ public:
             if (diag::trace_encoders)
               scope.inflight->physical[WMTMetal4Blit]++;
             auto encoder = cmdbuf.blitCommandEncoder();
-            if constexpr (!Metal4)
-              WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
             if (allocation)
               encoder.copyFromBuffer(allocation->buffer(), offset, staging, 0, length);
             if constexpr (!Metal4)
@@ -1863,8 +1864,7 @@ public:
     if (diag::trace_encoders)
       inflight.physical[WMTMetal4Blit]++;
     auto blit = inflight.cmdbuf.blitCommandEncoder();
-    if constexpr (!Metal4)
-      WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
+    WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
     blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
     if constexpr (!Metal4)
       blit.updateFence(fence_);
@@ -1911,8 +1911,7 @@ public:
     if (!copies.empty()) {
       auto p = reinterpret_cast<MTLD3D12Resource *>(previous);
       auto blit = cmdbuf.blitCommandEncoder();
-      if constexpr (!Metal4)
-        WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
+      WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
       for (auto [to, from] : copies)
         for (uint32_t eye = 0; eye < g->texture->arrayLength(); eye++) {
           wmtcmd_blit_copy_from_texture_to_texture copy{.type = WMTBlitCommandCopyFromTextureToTexture};

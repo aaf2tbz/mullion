@@ -907,6 +907,13 @@ public:
   endSegment() {
     MTL4CommandEncoder_endEncoding(handle, true);
   }
+  // before every stage of the work encoded after it
+  void
+  waitForFence(Fence fence) {
+    wmtcmd_compute_fence_op cmd{.type = WMTComputeCommandWaitForFence, .fence = fence.handle};
+    cmd.next.set(nullptr);
+    encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&cmd));
+  }
   void
   copyFromBuffer(
       Buffer source, uint64_t source_offset, Buffer destination, uint64_t destination_offset, uint64_t size

@@ -5394,7 +5394,9 @@ API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const str
     }
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageDispatch];
+      // the encoder runs blits and acceleration structure builds as well (Metal4CommandBuffer)
+      [encoder waitForFence:(id<MTLFence>)body->fence
+          beforeEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
       break;
     }
     case WMTComputeCommandMemoryBarrier: {
