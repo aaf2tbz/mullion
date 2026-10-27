@@ -1281,8 +1281,12 @@ public:
     D3D12_RESOURCE_ALLOCATION_INFO info;
     GetResourceAllocationInfo(&info, 0, 1, pDesc);
     if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
-        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes)
+        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes) {
+      WARN("CreatePlacedResource: ", info.SizeInBytes, " bytes at alignment ", info.Alignment, " placed at ", Offset,
+           " of a heap of ", heap_desc.SizeInBytes, " at alignment ", heap_desc.Alignment, " (dimension ",
+           pDesc->Dimension, ", format ", pDesc->Format, ", alignment ", pDesc->Alignment, ")");
       return FAIL(E_INVALIDARG);
+    }
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -1984,7 +1988,7 @@ public:
         if (FAILED(ValidateResourceDescs(desc, &heap)))
           goto invalid;
         if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
-          DEBUG("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.\n");
+          WARN("GetResourceAllocationInfo: alignment ", desc->Alignment, " of a buffer");
           goto invalid;
         }
         resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -1993,7 +1997,9 @@ public:
       } else {
         WMTTextureInfo texture_info{};
         if (FAILED(PopulateWMTTextureInfo(this, texture_info, *desc))) {
-          DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
+          WARN("GetResourceAllocationInfo: texture of dimension ", desc->Dimension, ", format ", desc->Format, ", ",
+               desc->Width, "x", desc->Height, "x", desc->DepthOrArraySize, ", ", desc->MipLevels, " levels, ",
+               desc->SampleDesc.Count, " samples, layout ", desc->Layout, ", flags ", desc->Flags, " is refused");
           goto invalid;
         }
         MTL_DXGI_FORMAT_DESC format;
