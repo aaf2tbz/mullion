@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 79
+#define AIRCONV_VERSION 80
 
 #ifdef __cplusplus
 #include <string>
@@ -51,6 +51,10 @@ enum SM50_BINDING_INDEX: uint32_t {
   SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES = SM50_BINDING_INDEX_DEPTH_BOUNDS + 1,
   /* a conservative rasterizer's mesh stage: the viewports, SM50_CONSERVATIVE_VIEWPORTS */
   SM50_BINDING_INDEX_VIEWPORTS = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 1,
+  /* variable rate shading, a pixel shader's (SM50_SHADER_PSO_PIXEL_SHADER_DATA's coarse_shading): the rates and
+     combiners (SM50_SHADING_RATE), then the shading rate image's bytes, a D3D12_SHADING_RATE for each tile */
+  SM50_BINDING_INDEX_SHADING_RATE = SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES + 1,
+  SM50_BINDING_INDEX_SHADING_RATE_IMAGE = SM50_BINDING_INDEX_SHADING_RATE + 1,
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
@@ -148,6 +152,9 @@ struct MTL_PIXEL_SHADER_REFLECTION {
      what a conservative rasterizer's dilated vertices extrapolate (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA) */
   uint32_t FlatInputs;
   uint32_t NoPerspectiveInputs;
+  /* the shader runs for each pixel or sample whatever the shading rate: it runs per sample, outputs depth or stencil
+     reference, or evaluates its inputs where it chooses */
+  uint32_t FineShading;
 };
 
 struct MTL_SHADER_REFLECTION {
@@ -188,6 +195,8 @@ struct MTL_SHADER_REFLECTION {
      large; and the most primitives it outputs */
   uint32_t MeshConservativeTriangles;
   uint32_t MeshMaxPrimitives;
+  /* a vertex or geometry shader's SV_ShadingRate: its varying, as 1 + register * 4 + component, or 0 */
+  uint32_t ShadingRateOutput;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -504,6 +513,12 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
      stage passes on in SM50_CONSERVATIVE_VARYINGS (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), takes every
      sample as covered, and divides its perspective inputs by SM50_CONSERVATIVE_RCP_W's */
   bool conservative;
+  /* variable rate shading (D3D12 Variable Rate Shading, tier 2): a pixel shader of coarse pixels, two wide or high at
+     most, whose rate is SM50_SHADING_RATE's at SM50_BINDING_INDEX_SHADING_RATE combined with the primitive's and the
+     image's. it does nothing where MTL_PIXEL_SHADER_REFLECTION's FineShading */
+  bool coarse_shading;
+  /* the primitive's rate, the varying of the stage before (MTL_SHADER_REFLECTION's ShadingRateOutput), or 0 */
+  uint32_t shading_rate_varying;
 };
 
 /* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the corners
@@ -520,6 +535,16 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
 struct SM50_CONSERVATIVE_VIEWPORTS {
   float viewports[16][4];
   float state[4];
+};
+
+/* what a coarse shading pixel shader binds at SM50_BINDING_INDEX_SHADING_RATE: RSSetShadingRate's rate and combiners,
+   and the shading rate image's size in tiles, 0 without one; its bytes are at SM50_BINDING_INDEX_SHADING_RATE_IMAGE,
+   a row of image_width after another */
+struct SM50_SHADING_RATE {
+  uint32_t base;
+  uint32_t combiners[2];
+  uint32_t image_width;
+  uint32_t image_height;
 };
 
 struct SM50_IA_INPUT_ELEMENT {

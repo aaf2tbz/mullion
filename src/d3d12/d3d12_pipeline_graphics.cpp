@@ -397,9 +397,9 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds,
-             late, conservative] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+             late, conservative, coarse, rate] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
       hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds, late,
-           conservative);
+           conservative, coarse, rate);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -563,9 +563,10 @@ protected:
   std::unordered_map<obj_handle_t, PipelineDescriptor> pipeline_descriptors_;
   mullion::mutex render_targets_mutex_;
   // the pixel shader made again when first needed: counting pipeline statistics, with its depth and stencil tests
-  // after it (an occlusion query and the depth bounds test of a GPU without one), or blending only the targets a pass
-  // binds, as Metal refuses a pipeline whose shader reads a target it has no format for
-  std::function<WMT::Reference<WMT::Function>(bool statistics, bool late, uint32_t blends)> pixel_shader_;
+  // after it (an occlusion query and the depth bounds test of a GPU without one), of coarse pixels (variable rate
+  // shading), or blending only the targets a pass binds, as Metal refuses a pipeline whose shader reads a target it has
+  // no format for
+  std::function<WMT::Reference<WMT::Function>(bool statistics, bool late, bool coarse, uint32_t blends)> pixel_shader_;
   std::unordered_map<uint32_t, WMT::Reference<WMT::Function>> pixel_shaders_;
   // the targets the pixel shader blends itself (ShaderBlend)
   uint32_t blend_mask_ = 0;
@@ -1337,6 +1338,12 @@ public:
       data_ps.depth_bounds = depth_bounds_emulated;
       data_ps.late_tests = false;
       data_ps.conservative = conservative;
+      data_ps.coarse_shading = false;
+      // the primitive's shading rate, from the stage before the rasterizer: a domain or mesh shader has none
+      data_ps.shading_rate_varying = sm50_shader_t(shader_gs)      ? ref_gs.ShadingRateOutput
+                                     : tessellation || mesh_shader ? 0
+                                                                   : ref_vs.ShadingRateOutput;
+      coarse_shading = !ref_ps.PixelShader.FineShading;
 
       std::array<WMTPixelFormat, std::size(data_ps.pixel_formats)> formats{};
       for (unsigned i = 0; i < pDesc->NumRenderTargets; i++)
@@ -1351,7 +1358,7 @@ public:
       pixel_shader_ =
           [this, code = std::string((const char *)pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength),
            signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common,
-           ps_name](bool statistics, bool late, uint32_t blends) mutable {
+           ps_name](bool statistics, bool late, bool coarse, uint32_t blends) mutable {
             D3D12_SHADER_BYTECODE bytecode{code.data(), code.size()};
             SM50Shader shader;
             MTL_SHADER_REFLECTION reflection;
@@ -1360,13 +1367,14 @@ public:
             auto data = data_ps;
             data.pipeline_statistics = statistics;
             data.late_tests = late;
+            data.coarse_shading = coarse;
             for (unsigned i = 0; i < std::size(data.blend); i++)
               if (!(blends >> i & 1))
                 data.blend[i] = {};
             data.next = &common;
             SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
             auto arguments = RootSignature(rootsig, signature.ptr(), &data);
-            auto name = ps_name + "_" + std::to_string(blends | statistics << 8 | late << 9);
+            auto name = ps_name + "_" + std::to_string(blends | statistics << 8 | late << 9 | coarse << 10);
             return CompileFunction(device_, this, std::span(&bytecode, 1), arguments, name.c_str(),
                                    [&shader](auto args, auto name, auto bitcode, auto error) {
                                      return SM50Compile(shader, args, name, bitcode, error);
@@ -1601,15 +1609,18 @@ public:
     return GetCachedPipelineBlob(blob);
   }
 
-  WMT::RenderPipelineState RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar,
-                                         bool Statistics, bool Occluded) override {
+  WMT::RenderPipelineState
+  RenderTargets(
+      WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar, bool Statistics, bool Occluded, bool Coarse
+  ) override {
     Mask &= rtv_mask;
     DSVPlanar &= dsv_mask;
     Statistics &= pixel_shader || statistics_geometry_;
+    Coarse &= pixel_shader && coarse_shading;
     // a pixel shader's discard of the depth bounds test takes its samples out of an occlusion query only before the
     // depth and stencil tests
     bool late = Occluded && depth_bounds_emulated && pixel_shader;
-    if (!Pipeline || (!Statistics && !late && Mask == rtv_mask && DSVPlanar == dsv_mask))
+    if (!Pipeline || (!Statistics && !late && !Coarse && Mask == rtv_mask && DSVPlanar == dsv_mask))
       return Pipeline;
     std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
     auto described = pipeline_descriptors_.find(Pipeline.handle);
@@ -1619,7 +1630,8 @@ public:
     auto &descriptor = described->second;
     auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) |
                (uint32_t(Statistics) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 2)) |
-               (uint32_t(late) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 3));
+               (uint32_t(late) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 3)) |
+               (uint32_t(Coarse) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 4));
     auto found = descriptor.variants.find(key);
     if (found != descriptor.variants.end())
       return found->second;
@@ -1630,9 +1642,9 @@ public:
         [&](auto info) {
           // a pipeline without a pixel shader may have the depth bounds test's fragment function, which has no variants
           if (auto blends = blend_mask_ & Mask;
-              pixel_shader && (Statistics || late || blends != blend_mask_)) {
-            auto &ps = pixel_shaders_[blends | Statistics << 8 | late << 9];
-            if (!ps && !(ps = pixel_shader_(Statistics, late, blends)))
+              pixel_shader && (Statistics || late || Coarse || blends != blend_mask_)) {
+            auto &ps = pixel_shaders_[blends | Statistics << 8 | late << 9 | Coarse << 10];
+            if (!ps && !(ps = pixel_shader_(Statistics, late, Coarse, blends)))
               return WMT::Reference<WMT::RenderPipelineState>{};
             info.fragment_function = ps;
           }
@@ -1652,7 +1664,8 @@ public:
             info.stencil_pixel_format = WMTPixelFormatInvalid;
           return device_->GetMTLDevice().newRenderPipelineState(info, error);
         },
-        descriptor.info);
+        descriptor.info
+    );
     if (!pipeline) {
       ERR("Failed to create attachment PSO of shaders ", name, ": ", error.description().getUTF8String());
       return {};

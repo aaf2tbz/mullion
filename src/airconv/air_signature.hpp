@@ -668,6 +668,8 @@ public:
   const std::vector<FunctionOutput> &Outputs() const { return outputs; }
   bool EarlyFragmentTests() const { return early_fragment_tests; }
   void UseLateFragmentTests() { early_fragment_tests = false; }
+  // a fragment function's inputs at the centroid at the center instead
+  void CenterCentroids();
   void UseMaxWorkgroupSize(uint32_t size) { max_work_group_size = size; }
   void UseMaxMeshWorkgroupSize(uint32_t size) { max_mesh_work_group_size = size; }
 

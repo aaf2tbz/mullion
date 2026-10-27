@@ -494,8 +494,13 @@ public:
   // conservative rasterization of triangles: the mesh stage reads the viewports (SM50_BINDING_INDEX_VIEWPORTS)
   bool conservative = false;
 
-  virtual WMT::RenderPipelineState RenderTargets(WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar,
-                                                 bool Statistics = false, bool Occluded = false) = 0;
+  // whether its pixel shader has a variant of coarse pixels (MTL_PIXEL_SHADER_REFLECTION's FineShading)
+  bool coarse_shading = false;
+
+  virtual WMT::RenderPipelineState RenderTargets(
+      WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar, bool Statistics = false,
+      bool Occluded = false, bool Coarse = false
+  ) = 0;
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
 };
 

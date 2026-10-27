@@ -908,6 +908,27 @@ public:
       reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData)->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
       return S_OK;
     }
+    // variable rate shading, which pixel shaders of coarse pixels emulate: per primitive from a vertex or geometry
+    // shader, and from a shading rate image of 16x16 tiles; coarse pixels of up to 2x2 (CoarseShading, airconv)
+    case D3D12_FEATURE_D3D12_OPTIONS6: {
+      if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS6>(pFeatureData, DataSize) != S_OK)
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(pFeatureData);
+      out->AdditionalShadingRatesSupported = FALSE;
+      out->PerPrimitiveShadingRateSupportedWithViewportIndexing = FALSE;
+      out->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_2;
+      out->ShadingRateImageTileSize = 16;
+      out->BackgroundProcessingSupported = FALSE;
+      return S_OK;
+    }
+    // the sum combiner; a mesh shader's SV_ShadingRate is not read
+    case D3D12_FEATURE_D3D12_OPTIONS10: {
+      if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS10>(pFeatureData, DataSize) != S_OK)
+        return E_INVALIDARG;
+      reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS10 *>(pFeatureData)->VariableRateShadingSumCombinerSupported =
+          TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS14: {
       if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS14>(pFeatureData, DataSize) != S_OK)
         return FAIL(E_INVALIDARG);
@@ -916,12 +937,8 @@ public:
       return S_OK;
     }
     /* capabilities with no complete path yet: D3D12 defines an all-zero answer as unsupported, or tier 0, in each */
-    case D3D12_FEATURE_D3D12_OPTIONS6:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS6>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS8:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS8>(pFeatureData, DataSize);
-    case D3D12_FEATURE_D3D12_OPTIONS10:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS10>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS13: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
         return FAIL(E_INVALIDARG);

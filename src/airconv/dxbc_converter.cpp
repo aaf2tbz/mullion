@@ -670,6 +670,10 @@ llvm::Error convert_dxbc_pixel_shader(
     };
   }
 
+  // variable rate shading, of a shader that is not run per pixel or sample whatever the rate
+  bool coarse_shading =
+      pso_data && pso_data->coarse_shading && !pShaderInternal->ps_fine_shading && !shader_info->pull_mode_reg_mask;
+
   std::optional<uint32_t> statistics;
   if (pso_data && pso_data->pipeline_statistics) {
     statistics = func_signature.DefineInput(air::ArgumentBindingBuffer{
@@ -804,6 +808,10 @@ llvm::Error convert_dxbc_pixel_shader(
       };
     }
   }
+
+  std::optional<CoarseShading> coarse;
+  if (coarse_shading)
+    coarse.emplace(func_signature, pso_data->shading_rate_varying);
 
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
@@ -997,6 +1005,9 @@ llvm::Error convert_dxbc_pixel_shader(
     llvm::Value *covered = kept ? kept : coverage != ~0u ? function->getArg(coverage) : nullptr;
     counts = first(covered ? builder.CreateAnd(covered, bounded) : bounded);
   }
+  // a coarse pixel's leader alone counts and writes (CoarseShading)
+  if (coarse)
+    coarse->Enter(function, builder, air, resource_map);
   if (statistics) {
     // D3D11.3 20.4.7 counts executions even when an output depth fails the test.
     auto counter = function->getArg(*statistics);
@@ -1058,6 +1069,8 @@ llvm::Error convert_dxbc_pixel_shader(
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
+  if (coarse)
+    coarse->Leave(builder, air, resource_map);
   for (uint32_t rt = 0; rt < 8; rt++)
     if (held[rt] != ~0u)
       blend_output(
@@ -1074,6 +1087,8 @@ llvm::Error convert_dxbc_pixel_shader(
   } else {
     builder.CreateRet(value);
   }
+  if (coarse)
+    coarse->Finish();
   // the shader reads the conservative rasterizer's inputs, and divides what it evaluates of one over w by 1/w's there
   for (auto [input, value] : conservative_inputs)
     input->replaceUsesWithIf(value, [&](llvm::Use &use) {
@@ -2008,6 +2023,8 @@ AIRCONV_API int SM50Initialize(
       pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0,
                             sm50_shader->ps_has_coverage_input, sm50_shader->ps_flat_input_mask,
                             sm50_shader->ps_noperspective_input_mask};
+      // EvaluateAttribute* evaluates where the shader chooses, which coarse shading does not move
+      pRefl->PixelShader.FineShading = sm50_shader->ps_fine_shading || sm50_shader->shader_info.pull_mode_reg_mask;
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;
@@ -2017,6 +2034,12 @@ AIRCONV_API int SM50Initialize(
             uint32_t(out.componentType() == RegisterComponentType::Uint) << out.reg();
       }
     }
+    pRefl->ShadingRateOutput = 0;
+    for (auto &out : sm50_shader->output_signature)
+      if (out.systemValue() == D3D12_SB_NAME_SHADING_RATE &&
+          (sm50_shader->shader_type == microsoft::D3D10_SB_VERTEX_SHADER ||
+           sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER))
+        pRefl->ShadingRateOutput = 1 + out.reg() * 4 + std::countr_zero(out.mask());
     pRefl->NumOutputElement = sm50_shader->max_output_register;
     pRefl->CullDistances = sm50_shader->cull_distance_scalars.size();
     pRefl->ClipDistances = sm50_shader->clip_distance_scalars.size();
