@@ -91,7 +91,7 @@ main() {
   };
   // the arguments of a draw of every patch, for DrawInstancedIndirect
   const D3D11_DRAW_INSTANCED_INDIRECT_ARGS every_patch{patches, 1, 0, 0};
-  D3D11_BUFFER_DESC arguments_desc{sizeof(every_patch), D3D11_USAGE_IMMUTABLE, 0, 0, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS};
+  D3D11_BUFFER_DESC arguments_desc{sizeof(every_patch), D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS};
   D3D11_SUBRESOURCE_DATA arguments_data{&every_patch};
   ComPtr<ID3D11Buffer> arguments;
   CHECK(device->CreateBuffer(&arguments_desc, &arguments_data, &arguments));

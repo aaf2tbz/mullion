@@ -103,7 +103,7 @@ public:
 };
 
 template <bool EnableMetalFX>
-class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
+class MTLD3D11SwapChain final : public MTLDXGISubObject<IMTLDXGISwapChain, MTLD3D11Device> {
 public:
   MTLD3D11SwapChain(
       IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, IMTLDXGIDevice *pDXGIDevice,
@@ -172,7 +172,8 @@ public:
       .Width = desc_.Width,
       .Height = desc_.Height,
       .MipLevels = 1,
-      .ArraySize = 1,
+      // a stereo buffer holds the left eye in slice 0, the right one in slice 1
+      .ArraySize = desc_.Stereo ? 2u : 1u,
       .Format = desc_.Format,
       .SampleDesc = desc_.SampleDesc,
       .Usage = D3D11_USAGE_DEFAULT,
@@ -196,6 +197,8 @@ public:
     device_context_->WaitUntilGPUIdle();
     WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
+    if (diag::profile)
+      diag::LatencyClosed(present_semaphore_);
     CloseHandle(present_semaphore_);
   };
 
@@ -212,7 +215,7 @@ public:
         riid == __uuidof(IDXGISwapChain) || riid == __uuidof(IDXGISwapChain1) ||
         riid == __uuidof(IDXGISwapChain2) ||
         riid == __uuidof(IDXGISwapChain3) ||
-        riid == __uuidof(IDXGISwapChain4)) {
+        riid == __uuidof(IDXGISwapChain4) || riid == __uuidof(IMTLDXGISwapChain)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -223,6 +226,14 @@ public:
 
     return E_NOINTERFACE;
   };
+
+  HRESULT STDMETHODCALLTYPE
+  SetWindowReservation(IUnknown *reservation) final {
+    if (!reservation || window_reservation_)
+      return DXGI_ERROR_INVALID_CALL;
+    window_reservation_ = reservation;
+    return S_OK;
+  }
 
   HRESULT
   STDMETHODCALLTYPE
@@ -469,7 +480,8 @@ public:
     if (FAILED(device_->CheckFormatSupport(format, &support)) || !(support & D3D11_FORMAT_SUPPORT_DISPLAY) ||
         BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
       return E_INVALIDARG;
-    if ((flags ^ desc_.Flags) & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
+    if ((flags ^ desc_.Flags) &
+        (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
       return DXGI_ERROR_INVALID_CALL;
     if (BufferCount == 1 && desc_.SwapEffect >= DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
       return DXGI_ERROR_INVALID_CALL;
@@ -495,6 +507,15 @@ public:
     if (BufferCount)
       desc.BufferCount = BufferCount;
     desc.Flags = flags;
+    UINT dimension_limit = device_->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0
+                               ? D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
+                               : D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    if (desc.Width > dimension_limit || desc.Height > dimension_limit)
+      return E_INVALIDARG;
+    if ((flags & DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE) &&
+        ((format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) ||
+         desc.SampleDesc.Count != 1))
+      return DXGI_ERROR_INVALID_CALL;
 
     if (desc.Width == 0 || desc.Height == 0) {
       backbuffer_desc.Width = 1;
@@ -504,14 +525,18 @@ public:
       backbuffer_desc.Height = desc.Height;
     }
     backbuffer_desc.Format = desc.Format;
+    backbuffer_desc.MiscFlags = flags & DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE ? D3D11_RESOURCE_MISC_GDI_COMPATIBLE : 0;
 
     bool sequential =
         desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL || desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     std::vector<Com<D3D11ResourceCommon, false>> backbuffers(sequential ? desc.BufferCount : 1);
     for (UINT i = 0; i < backbuffers.size(); i++) {
       Com<D3D11ResourceCommon> buffer;
+      // a back buffer's views may take any format of its type group (D3D11_FORMAT_SUPPORT_BACK_BUFFER_CAST)
       HRESULT hr = mullion::CreateDeviceTexture2D(
-          device_, &backbuffer_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer)
+          device_, &backbuffer_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer),
+          CastsAcrossLayouts(device_->GetMTLDevice(), desc.Format, false) ? WMTTextureUsagePixelFormatView
+                                                                          : WMTTextureUsageUnknown
       );
       if (FAILED(hr))
         return hr;
@@ -525,6 +550,7 @@ public:
       D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc;
       upscaled_desc_.Height *= scale_factor;
       upscaled_desc_.Width *= scale_factor;
+      upscaled_desc_.ArraySize = 1;
       HRESULT hr = mullion::CreateDeviceTexture2D(
           device_, &upscaled_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled)
       );
@@ -669,14 +695,15 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
-    DEBUG("DXGISwapChain::GetFrameStatistics: stub");
-    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
-    stats->PresentCount = presentation_count_;
-    stats->SyncRefreshCount = presentation_count_;
-    stats->PresentRefreshCount = presentation_count_;
-    stats->SyncGPUTime = {};
-    stats->SyncQPCTime = {};
-    return S_OK;
+    if (!stats)
+      return E_INVALIDARG;
+    // a windowed bitblt model swap chain has none (IDXGISwapChain::GetFrameStatistics)
+    if (desc_.SwapEffect < DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && fullscreen_desc_.Windowed)
+      return DXGI_ERROR_INVALID_CALL;
+    wsi::WsiMode mode;
+    if (!wsi::getCurrentDisplayMode(monitor_, &mode) || !mode.refreshRate.numerator || !mode.refreshRate.denominator)
+      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    return presenter->frameStatistics(stats, double(mode.refreshRate.numerator) / mode.refreshRate.denominator);
   };
 
   HRESULT
@@ -767,6 +794,12 @@ public:
     auto began = diag::profile ? diag::Now() : 0;
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
+    if (((PresentFlags & DXGI_PRESENT_ALLOW_TEARING) &&
+         (SyncInterval || !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) || !fullscreen_desc_.Windowed)) ||
+        ((PresentFlags & DXGI_PRESENT_STEREO_PREFER_RIGHT) && !desc_.Stereo) ||
+        (PresentFlags & (DXGI_PRESENT_STEREO_TEMPORARY_MONO | DXGI_PRESENT_RESTRICT_TO_OUTPUT)))
+      return DXGI_ERROR_INVALID_CALL;
+    FLIGHT("swap chain %p: Present, interval %llu, flags %#llx", this, uint64_t(SyncInterval), uint64_t(PresentFlags));
 
     HRESULT hr = S_OK;
     follower_.follow(hWnd, native_view_);
@@ -790,6 +823,15 @@ public:
 
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
 
+    // the frame presented last is the last buffer, which the frame shown keeps where it is not new
+    if (hr == S_OK && desc_.SwapEffect >= DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && backbuffers_.size() > 1)
+      for (auto [to, from] : PresentCopies(pPresentParameters, desc_.Width, desc_.Height)) {
+        D3D11_BOX box{UINT(to.left + from.x), UINT(to.top + from.y), 0, UINT(to.right + from.x), UINT(to.bottom + from.y), 1};
+        for (UINT eye = 0; eye < backbuffer_desc_.ArraySize; eye++)
+          device_context_->CopySubresourceRegion(
+              backbuffers_[0].ptr(), eye, to.left, to.top, 0, backbuffers_.back().ptr(), eye, &box
+          );
+      }
     device_context_->PrepareFlush();
     if (hr == DXGI_STATUS_OCCLUDED) {
       // flush commands without presenting
@@ -812,9 +854,14 @@ public:
       auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
       presenter->changeGammaRamp(output->GetGammaRamp());
     }
+    // the output is mono: a stereo buffer shows its left eye, or its right one when the present prefers it
+    auto &shown = backbuffers_[0]->texture();
+    auto eye = shown->createView(
+        {shown->pixelFormat(), WMTTextureType2D, 0, 1, PresentFlags & DXGI_PRESENT_STEREO_PREFER_RIGHT ? 1u : 0u, 1}
+    );
     if constexpr (EnableMetalFX) {
       chunk->emitcc([
-        this, vsync_duration, backbuffer = backbuffers_[0]->texture(),
+        this, vsync_duration, backbuffer = backbuffers_[0]->texture(), eye,
         sync_state = SyncFrame(++presentation_count_),
         upscaled = upscaled_backbuffer_->texture(),
         scaler = this->metalfx_scaler, state = presenter->synchronizeLayerProperties()
@@ -825,8 +872,10 @@ public:
         scaler_info.input_height = backbuffer->height();
         scaler_info.output_width = upscaled->width();
         scaler_info.output_height = upscaled->height();
-        ctx.upscale(backbuffer, upscaled, scaler);
-        ctx.present(upscaled, presenter, vsync_duration, std::move(state));
+        ctx.upscale(backbuffer, eye, upscaled, scaler);
+        ctx.present(upscaled, upscaled->fullView, presenter, vsync_duration, std::move(state));
+        if (diag::profile)
+          diag::LatencyReleased(present_semaphore_);
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
@@ -834,9 +883,11 @@ public:
       chunk->emitcc([
         this, vsync_duration, state = presenter->synchronizeLayerProperties(),
         sync_state = SyncFrame(++presentation_count_),
-        backbuffer = backbuffers_[0]->texture()
+        backbuffer = backbuffers_[0]->texture(), eye
       ](ArgumentEncodingContext &ctx) mutable {
-        ctx.present(backbuffer, presenter, vsync_duration, std::move(state));
+        ctx.present(backbuffer, eye, presenter, vsync_duration, std::move(state));
+        if (diag::profile)
+          diag::LatencyReleased(present_semaphore_);
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
@@ -862,8 +913,10 @@ public:
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
     cmd_queue.PresentBoundary();
-    if (diag::profile)
+    if (diag::profile) {
       diag::Write(diag::Line("span", "present", "", GetCurrentThreadId(), began, diag::Now() - began));
+      diag::LatencyPresented(present_semaphore_);
+    }
 
     return hr;
   };
@@ -976,6 +1029,8 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     }
     if (max_latency > frame_latency) {
+      if (diag::profile)
+        diag::LatencyReleased(present_semaphore_);
       ReleaseSemaphore(present_semaphore_, max_latency - frame_latency,
                        nullptr);
     }
@@ -1005,20 +1060,20 @@ public:
                          &result, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
       return nullptr;
     }
+    if (diag::profile)
+      diag::LatencyTaken(present_semaphore_);
 
     return result;
   };
 
   HRESULT STDMETHODCALLTYPE
   SetMatrixTransform(const DXGI_MATRIX_3X2_F *matrix) override {
-    ERR("DXGISwapChain2::SetMatrixTransform: not implemented");
-    return E_NOTIMPL;
+    return DXGI_ERROR_INVALID_CALL;
   };
 
   HRESULT STDMETHODCALLTYPE
   GetMatrixTransform(DXGI_MATRIX_3X2_F *matrix) override {
-    ERR("DXGISwapChain2::GetMatrixTransform: not implemented");
-    return E_NOTIMPL;
+    return DXGI_ERROR_INVALID_CALL;
   };
 
   HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(
@@ -1100,6 +1155,7 @@ private:
   mullion::mutex mutex_;
 
   bool handle_alt_tab_;
+  Com<IUnknown> window_reservation_;
 
   std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;

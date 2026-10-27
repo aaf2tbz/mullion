@@ -13,13 +13,17 @@ DEFINE_COM_INTERFACE("03629ed8-bcdd-4582-8997-3817209a34f4",
     : public ID3D11RasterizerState2 {
   virtual void SetupRasterizerState(wmtcmd_render_setrasterizerstate& cmd) = 0;
   virtual bool IsScissorEnabled() = 0;
-  virtual uint32_t UAVOnlySampleCount() = 0;
+  virtual uint32_t ForcedSampleCount() = 0;
+  // lines are quadrilaterals (D3D11.3 15.14.1)
+  virtual bool QuadrilateralLines() = 0;
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
 };
 
 DEFINE_COM_INTERFACE("b01aaffa-b4d3-478a-91be-6195f215aaba",
                      IMTLD3D11DepthStencilState)
     : public ID3D11DepthStencilState {
-  virtual WMT::DepthStencilState GetDepthStencilState(uint32_t planar_flags) = 0;
+  virtual WMT::DepthStencilState GetDepthStencilState(uint32_t planar_flags, uint32_t readonly_flags) = 0;
   virtual bool IsEnabled() = 0;
 };
 
@@ -27,7 +31,10 @@ DEFINE_COM_INTERFACE("279a1d66-2fc1-460c-a0a7-a7a5f2b7a48f",
                      IMTLD3D11BlendState)
     : public ID3D11BlendState1 {
   virtual bool IsDualSourceBlending() = 0;
-  virtual void SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo* blend_info, uint32_t num_rt, uint32_t valid_rt) = 0;
+  virtual bool IsAlphaToCoverage() = 0;
+  // the targets the pixel shader blends itself, whose blending this leaves off (ShaderBlend)
+  virtual std::array<SM50_SHADER_BLEND, 8>
+  SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *blend_info, uint32_t num_rt, uint32_t valid_rt) = 0;
 };
 
 namespace std {

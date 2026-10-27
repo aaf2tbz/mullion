@@ -1,0 +1,12 @@
+# a conservative pixel shader writes no depth
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -555,7 +555,7 @@
+     bool writes_depth = std::ranges::any_of(func_signature.Outputs(), [](auto &output) {
+       return std::holds_alternative<air::OutputDepth>(output);
+     });
+-    if (!writes_depth && !pso_disable_depth_output && !func_signature.EarlyFragmentTests()) {
++    if (false) {
+       auto at = func_signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
+       epilogue >> [=](pvalue value) {
+         return make_irvalue([=](struct context ctx) {

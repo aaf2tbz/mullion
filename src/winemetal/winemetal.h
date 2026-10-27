@@ -606,6 +606,9 @@ enum WMTAttributeFormat : uint32_t {
   WMTAttributeFormatHalf = 53,
   WMTAttributeFormatFloatRG11B10 = 54,
   WMTAttributeFormatFloatRGB9E5 = 55,
+  // past Metal's own: encodings Metal has no format for, which shaders decode (D3D11.3 8.20)
+  WMTAttributeFormatUInt1010102 = 0x100,
+  WMTAttributeFormatUChar4Normalized_BGRX,
 };
 
 WINEMETAL_API obj_handle_t MTLDevice_newLibrary(obj_handle_t device, obj_handle_t data, obj_handle_t *err_out);
@@ -699,6 +702,8 @@ struct WMTRenderPassInfo {
   uint8_t render_target_array_length;
   uint8_t tile_width;
   uint8_t tile_height;
+  // the samples placed at the pixel center, for targets of the center pattern; 0 keeps Metal's, the standard pattern
+  uint8_t center_samples;
   uint32_t render_target_height;
   uint32_t render_target_width;
   obj_handle_t visibility_buffer;
@@ -1272,6 +1277,8 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetDepthStencilState,
   WMTRenderCommandSetDepthTestBounds,
   WMTRenderCommandExecuteCommandsInBufferIndirect,
+  WMTRenderCommandSetVertexBytes,
+  WMTRenderCommandSetMeshBytes,
 };
 
 struct wmtcmd_render_nop {
@@ -1745,11 +1752,18 @@ enum WMTGPUFamily {
   WMTGPUFamilyMacCatalyst1 = 4001,
   WMTGPUFamilyMacCatalyst2 = 4002,
   WMTGPUFamilyMetal3 = 5001,
+  WMTGPUFamilyMetal4 = 5002,
 };
 
 WINEMETAL_API bool MTLDevice_supportsFamily(obj_handle_t device, enum WMTGPUFamily gpu_family);
 
 WINEMETAL_API bool MTLDevice_supportsBCTextureCompression(obj_handle_t device);
+
+WINEMETAL_API bool MTLDevice_supports32BitFloatFiltering(obj_handle_t device);
+
+WINEMETAL_API bool MTLDevice_supports32BitMSAA(obj_handle_t device);
+
+WINEMETAL_API uint64_t MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supportsTextureSampleCount(obj_handle_t device, uint8_t sample_count);
 
@@ -2449,11 +2463,87 @@ enum WMTSampledEncoder {
 };
 // appended calls keep the preceding bridge ABI indices
 enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, WMTUnixComputeMaxThreadsPerThreadgroup,
+       WMTUnixDeviceSupports32BitFloatFiltering, WMTUnixDeviceMaxArgumentBufferSamplerCount,
+       WMTUnixDeviceSupports32BitMSAA, WMTUnixPresentStatisticsNew, WMTUnixDrawableCountPresent,
+       WMTUnixPresentStatisticsGet, WMTUnixGPUStatistics, WMTUnixCommandBufferPushDebugGroup,
+       WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixMetal4NewBuffer, WMTUnixMetal4Encoder,
+       WMTUnixMetal4Commands, WMTUnixMetal4EndEncoder, WMTUnixMetal4Commit, WMTUnixMetal4Feedback, WMTUnixMetal4Wait,
+       WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
        WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
+// MULLION_DIAG=profile: each bridge call's count and time in QueryPerformanceCounter ticks, by code, since the last
+// totals were taken; the bridge times calls once WMTDiagTimeCalls was called
+struct WMTDiagCall {
+  uint64_t count, ticks;
+  const char *name;
+};
+WINEMETAL_API void WMTDiagTimeCalls(void);
+WINEMETAL_API void WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]);
+WINEMETAL_API int64_t WMTDiagSemaphoreCount(void *semaphore);
+// the statistics the device's driver keeps in its IORegistry entry (PerformanceStatistics), as tab-separated
+// name=value pairs: their length, written to buffer when it holds them
+WINEMETAL_API uint64_t WMTGPUStatistics(obj_handle_t device, char *buffer, uint64_t size);
+WINEMETAL_API void MTLCommandBuffer_pushDebugGroup(obj_handle_t cmdbuf, obj_handle_t name);
+WINEMETAL_API void MTLCommandBuffer_popDebugGroup(obj_handle_t cmdbuf);
 WINEMETAL_API uint64_t DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size);
+// the flight recorder: each thread keeps its last records in memory, and a dump writes them, in time order and with
+// its reason, to <executable>.flight in MULLION_DIAG_PATH or else ~/Library/Logs/Mullion, the first of a process
+// anew and the others after it.
+// a site is a printf format of up to four 64-bit integer arguments, copied once; a record is a site with its
+// arguments, its thread and its time in the CPU's counter's ticks
+struct WMTFlightEntry {
+  uint64_t time;
+  struct WMTConstMemoryPointer site;
+  uint64_t args[4];
+  uint32_t thread;
+};
+WINEMETAL_API const void *WMTFlightSite(const char *format);
+WINEMETAL_API void WMTFlightRecord(const void *site, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+WINEMETAL_API void WMTFlightDump(const char *reason);
+
+// what a presenter's frames did on screen, in host seconds (CACurrentMediaTime): the number of the last frame shown
+// (frames count from 1) and when it was, when counting began, and the time the statistics were read
+struct WMTPresentStatistics {
+  uint64_t shown;
+  double shown_time, since, now;
+};
+WINEMETAL_API obj_handle_t WMTPresentStatistics_new(void);
+// frame `number` counts once it is on screen: a drawable's once Metal shows it, a null drawable's now
+WINEMETAL_API void MetalDrawable_countPresent(obj_handle_t drawable, obj_handle_t statistics, uint64_t number);
+WINEMETAL_API void WMTPresentStatistics_get(obj_handle_t statistics, struct WMTPresentStatistics *out);
+
+enum WMTMetal4Stream : uint32_t { WMTMetal4Render, WMTMetal4Compute, WMTMetal4Blit, WMTMetal4AccelerationStructure };
+struct WMTMetal4BindingCounts {
+  uint32_t buffers, textures, samplers;
+};
+struct WMTMetal4Feedback {
+  uint32_t status, render_passes, compute_passes;
+  uint32_t padding;
+  obj_handle_t error;
+  uint64_t gpu_start, gpu_end;
+};
+WINEMETAL_API obj_handle_t MTL4CommandBuffer_new(
+    obj_handle_t queue, obj_handle_t fence, obj_handle_t event, uint64_t value, obj_handle_t residency,
+    struct WMTMetal4BindingCounts bindings
+);
+// a compute-class `samples` that starts where the previous pass's end was sampled gets that sample as its start
+WINEMETAL_API obj_handle_t MTL4CommandBuffer_encoder(
+    obj_handle_t buffer, enum WMTMetal4Stream kind, const struct WMTRenderPassInfo *render,
+    struct WMTSampleBufferAttachmentInfo *samples
+);
+WINEMETAL_API void
+MTL4CommandEncoder_encodeCommands(obj_handle_t encoder, enum WMTMetal4Stream kind, const struct wmtcmd_base *head);
+WINEMETAL_API void MTL4CommandEncoder_endEncoding(obj_handle_t encoder, bool segment);
+WINEMETAL_API void MTL4CommandBuffer_commit(obj_handle_t buffer);
+WINEMETAL_API struct WMTMetal4Feedback MTL4CommandBuffer_feedback(obj_handle_t buffer);
+WINEMETAL_API void MTL4CommandBuffer_waitUntilCompleted(obj_handle_t buffer);
+WINEMETAL_API obj_handle_t MTL4CounterHeap_new(obj_handle_t device, uint64_t count);
+WINEMETAL_API uint64_t MTLDevice_queryTimestampFrequency(obj_handle_t device);
+WINEMETAL_API void MTL4CommandBuffer_present(obj_handle_t buffer, obj_handle_t drawable, double after);
+
+WINEMETAL_API void MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value);
 
 #endif

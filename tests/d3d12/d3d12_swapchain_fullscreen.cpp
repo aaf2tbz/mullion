@@ -26,7 +26,7 @@ main() {
     return verdict();
   auto watchdog = CreateThread(
       nullptr, 0,
-      [](void *event) -> DWORD {
+      [](void *event) WINAPI -> DWORD {
         if (WaitForSingleObject(event, timeout_ms) != WAIT_OBJECT_0) {
           printf("failed: creation or teardown did not finish within %lu ms\n", timeout_ms);
           TerminateProcess(GetCurrentProcess(), 1);

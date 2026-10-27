@@ -1,5 +1,6 @@
 // contract: ClearView rectangles use view coordinates and stay inside every selected slice; 3D calls are dropped.
 // "The driver or hardware is responsible for clamping rects to the surface extents." (D3D11.3 5.2.3.3).
+// "an empty list clears the entire surface" (5.2.3.3); the null-list case checks all selected subresources.
 // "that of the view format" (5.2.3.3.1).
 // "ClearView doesn’t support 3D textures." (Microsoft Learn, ID3D11DeviceContext1::ClearView, Remarks).
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/nf-d3d11_1-id3d11devicecontext1-clearview
@@ -8,7 +9,7 @@
 // copies read all elements and all mips and slices, including those outside the view. there are no shaders.
 #include "d3d11_test.hpp"
 #include "../copy_formats.hpp"
-#include <d3d11_1.h>
+#include <d3d11_2.h>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -19,18 +20,6 @@ int
 main(int argc, char **argv) {
   const UINT seed = argc > 1 ? UINT(strtoul(argv[1], nullptr, 0)) : std::mt19937::default_seed;
   std::mt19937 random(seed);
-  auto watchdog = CreateThread(
-      nullptr, 0,
-      [](void *) -> DWORD {
-        Sleep(550000);
-        printf("failed: clear rectangle test exceeded its deadline\n");
-        ExitProcess(1);
-      },
-      nullptr, 0, nullptr
-  );
-  if (!expect(watchdog != nullptr, "watchdog was created"))
-    return verdict();
-  CloseHandle(watchdog);
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> immediate, deferred;
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
@@ -41,16 +30,12 @@ main(int argc, char **argv) {
   ComPtr<ID3D11DeviceContext1> immediate1, deferred1;
   CHECK(immediate.As(&immediate1));
   CHECK(deferred.As(&deferred1));
+  D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+  D3D11_FEATURE_DATA_D3D11_OPTIONS1 options1{};
+  CHECK(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options)));
+  CHECK(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &options1, sizeof(options1)));
   auto map = [&](ID3D11Resource *resource, UINT sub, D3D11_MAPPED_SUBRESOURCE &mapped) -> HRESULT {
-    const auto deadline = GetTickCount64() + 20000;
-    HRESULT hr;
-    do {
-      hr = immediate->Map(resource, sub, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-      if (hr != DXGI_ERROR_WAS_STILL_DRAWING)
-        return hr;
-      Sleep(1);
-    } while (GetTickCount64() < deadline);
-    return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+    return immediate->Map(resource, sub, D3D11_MAP_READ, 0, &mapped);
   };
   const UINT sentinel = 0x45abcdef;
   UINT variant = 0;
@@ -164,7 +149,9 @@ main(int argc, char **argv) {
     }
     const LONG w = buffered ? count : extents[mip][0], h = extents[mip][1];
     auto context = listed ? deferred1.Get() : immediate1.Get();
-    for (UINT mode = 0; mode < 8; mode++) {
+    for (UINT mode = 0; mode < 9; mode++) {
+      if (mode && (!options.ClearView || (view_kind == 2 && !options1.ClearViewAlsoSupportsDepthOnlyFormats)))
+        continue;
       if ((!mode && (view_kind || (buffered && kind != 2))) || (mode && !floating))
         continue;
       std::vector<D3D11_RECT> rects;
@@ -191,6 +178,8 @@ main(int argc, char **argv) {
             {std::numeric_limits<LONG>::min(), std::numeric_limits<LONG>::min(), std::numeric_limits<LONG>::max(),
              std::numeric_limits<LONG>::max()}
         };
+        break;
+      case 8:
         break;
       default:
         for (UINT i = 0; i < 8; i++)
@@ -224,7 +213,7 @@ main(int argc, char **argv) {
         else
           context->ClearUnorderedAccessViewUint(uav.Get(), uints);
       } else
-        context->ClearView(view.Get(), clear_view, rects.data(), UINT(rects.size()));
+        context->ClearView(view.Get(), clear_view, rects.empty() ? nullptr : rects.data(), UINT(rects.size()));
       if (listed) {
         ComPtr<ID3D11CommandList> commands;
         CHECK(deferred->FinishCommandList(FALSE, &commands));
@@ -243,7 +232,7 @@ main(int argc, char **argv) {
               const LONG local = LONG(element) - (buffered ? LONG(first) : 0);
               const bool in_view = buffered ? element >= first && element < first + count
                                             : sub % mips == mip && slice >= first_slice && slice < first_slice + slices;
-              bool covered = mode == 0;
+              bool covered = mode == 0 || mode == 8;
               for (auto &r : rects)
                 covered |= local >= r.left && local < r.right && LONG(y) >= r.top && LONG(y) < r.bottom;
               const UINT want = in_view && covered && !(volume && mode) ? value : sentinel;

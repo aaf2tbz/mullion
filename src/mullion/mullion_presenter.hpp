@@ -11,6 +11,13 @@
 
 namespace mullion {
 
+// a copy the runtime makes from the previous frame onto the one a flip model swap chain presents: its destination,
+// and its source's offset from it
+struct PresentCopy {
+  RECT to;
+  POINT from;
+};
+
 // how a back buffer is put on its target: the part of it that is presented, from its origin, as a fraction of each
 // side; the target's size over the picture's, 1 for a picture stretched over the target; the back buffer's place for
 // a place in the picture (rows of a matrix, and what each adds), which turns a picture that the back buffer holds
@@ -82,16 +89,25 @@ public:
     presentation_ = presentation;
   }
 
+  // on a Metal 3 or a Metal 4 command buffer
+  template <
+      typename CommandBuffer,
+      typename Encoder =
+          decltype(std::declval<CommandBuffer>().renderCommandEncoder(std::declval<WMTRenderPassInfo &>()))>
   WMT::MetalDrawable encodeCommands(
-      WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
-      std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-      std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
-      uint64_t seq_id = 0, unsigned *encoder_count = nullptr
+      CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
+      std::type_identity_t<std::function<void(Encoder)>> &&wait_fences,
+      std::type_identity_t<std::function<void(Encoder)>> &&update_fences, uint64_t seq_id = 0,
+      unsigned *encoder_count = nullptr
   );
 
   // draws the oldest frame encoded without a layer, at least `after` seconds after the previous one (as
   // presentDrawableAfterMinimumDuration does); call it once that frame's command buffer has completed
   void drawToWindow(double after);
+
+  // the frames shown (IDXGISwapChain::GetFrameStatistics), counting refreshes at `refresh_rate` since the presenter
+  // was made
+  HRESULT frameStatistics(DXGI_FRAME_STATISTICS *stats, double refresh_rate);
 
 private:
   void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
@@ -122,7 +138,11 @@ private:
     WMT::Reference<WMT::Buffer> buffer;
     void *pixels;
     uint32_t width, height;
+    uint64_t number;
   };
+  WMT::Reference<WMT::PresentStatistics> statistics_ = WMT::MakePresentStatistics();
+  // the frames encoded
+  uint64_t frames_ = 0;
   std::deque<WindowFrame> window_frames_;
   std::chrono::steady_clock::time_point window_last_draw_;
   mullion::mutex window_mutex_;

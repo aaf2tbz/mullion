@@ -91,6 +91,7 @@ class VisibilityResultQuery {
 public:
   bool pipeline_statistics = false;
   std::vector<std::pair<Rc<Buffer>, uint32_t>> statistics;
+  std::vector<std::pair<Rc<Buffer>, uint32_t>> dispatch_statistics;
   void
   incRef() {
     refcount_.fetch_add(1u, std::memory_order_acquire);
@@ -105,6 +106,7 @@ public:
   begin(uint64_t seqId, unsigned offset) {
     accumulated_value_ = 0;
     statistics.clear();
+    dispatch_statistics.clear();
     seq_id_begin = seqId;
     occlusion_counter_begin = offset;
     seq_id_end = ~0uLL;
@@ -115,7 +117,8 @@ public:
   end(uint64_t seqId, unsigned offset) {
     seq_id_end = seqId;
     occlusion_counter_end = offset;
-    if (seq_id_begin == seq_id_end && occlusion_counter_begin == occlusion_counter_end && statistics.empty()) {
+    if (seq_id_begin == seq_id_end && occlusion_counter_begin == occlusion_counter_end && statistics.empty() &&
+        dispatch_statistics.empty()) {
       seq_id_issued = seq_id_end;
     }
   }

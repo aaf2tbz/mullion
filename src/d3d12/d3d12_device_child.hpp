@@ -44,7 +44,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **object) override {
     if (!object)
-      return E_POINTER;
+      return FAIL(E_POINTER);
     *object = nullptr;
     if (riid != __uuidof(ID3DDestructionNotifier))
       return E_NOINTERFACE;
@@ -56,15 +56,15 @@ public:
   HRESULT STDMETHODCALLTYPE
   RegisterDestructionCallback(PFN_DESTRUCTION_CALLBACK function, void *data, UINT *id) override {
     if (!function)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     std::lock_guard<mullion::mutex> lock(callback_mutex_);
     if (id && next_callback_ == std::numeric_limits<UINT>::max())
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
     UINT assigned = id ? next_callback_ + 1 : 0;
     try {
       callbacks_.push_back({function, data, assigned});
     } catch (const std::bad_alloc &) {
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
     }
     if (id)
       *id = next_callback_ = assigned;

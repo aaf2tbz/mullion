@@ -502,15 +502,17 @@ jobs:
       - name: Build with tests
         run: |
           export PATH="$PATH:$GITHUB_WORKSPACE/toolchains/${{ env.LLVM_MINGW_DIR }}/bin"
-          meson setup --cross-file build-win64.txt -Denable_tests=true -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine build --buildtype release
+          meson setup --cross-file build-win64.txt -Denable_tests=true -Db_ndebug=false -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine build --buildtype release
           meson compile -C build
 
       - name: Host tests
-        run: meson test -C build host_tessellator --print-errorlogs
+        run: meson test -C build host_tessellator host_mutate --print-errorlogs
 
   test-gpu:
     if: vars.MULLION_WINE != ''
     runs-on: [self-hosted, macOS, ARM64]
+    env:
+      MULLION_TEST_LOCK: ${{ runner.temp }}/mullion-gpu.lock
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -519,12 +521,24 @@ jobs:
 
       - name: Build with tests
         run: |
-          meson setup --cross-file build-win64.txt -Denable_tests=true -Dnative_llvm_path="${{ vars.MULLION_LLVM }}" -Dwine_install_path="${{ vars.MULLION_WINE }}" build --buildtype release
+          meson setup --cross-file build-win64.txt -Denable_tests=true -Db_ndebug=false -Dnative_llvm_path="${{ vars.MULLION_LLVM }}" -Dwine_install_path="${{ vars.MULLION_WINE }}" build --buildtype release
           meson compile -C build
 
       # as the GPU itself and as an M3's, the families the preview supports, under Metal's validation
       - name: Tests
         run: python3 tests/run.py --build build --wine "${{ vars.MULLION_WINE }}" --prefix "${{ vars.MULLION_PREFIX }}" --family native,9 --validate
+
+      - name: Benchmarks
+        run: python3 tests/run.py --build build --wine "${{ vars.MULLION_WINE }}" --prefix "${{ vars.MULLION_PREFIX }}" --family native --benchmark
+
+      - name: Test evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: gpu-tests
+          path: |
+            build/meson-logs/tests
+            build/meson-logs/benchmarks
 
   build-clang-release-x86-windows-cross:
     runs-on: macos-15

@@ -4,8 +4,23 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <unordered_set>
+#include "log/log.hpp"
+#include "thread.hpp"
 
 namespace mullion {
+
+// Metal holds maxArgumentBufferSamplerCount distinct samplers ("unique argument buffer samplers per app") and the
+// ones past it sample wrong with no error (measured on an M1 Pro): the first of them says so. an id Metal gives again
+// is the slot it reuses, so the ids seen count the slots taken
+static void
+Hold(WMT::Device device, uint64_t id) {
+  static mullion::mutex mutex;
+  static std::unordered_set<uint64_t> ids;
+  std::lock_guard<mullion::mutex> lock(mutex);
+  if (ids.insert(id).second && ids.size() == device.maxArgumentBufferSamplerCount() + 1)
+    WARN("Sampler: past the ", ids.size() - 1, " distinct samplers Metal holds; the newer ones sample wrong");
+}
 
 void
 Sampler::incRef() {
@@ -35,6 +50,7 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     return nullptr;
   }
   ret->sampler_state_handle = ret->info_.gpu_resource_id;
+  Hold(device, ret->sampler_state_handle);
 
   WMTSamplerInfo cube_sampler_info = capped;
   // it's probably still wrong, but the best result we can get
@@ -53,6 +69,7 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     return nullptr;
   }
   ret->sampler_state_cube_handle = cube_sampler_info.gpu_resource_id;
+  Hold(device, ret->sampler_state_cube_handle);
   if (border_color) {
     WMTSamplerInfo white_info = capped;
     white_info.border_color = WMTSamplerBorderColorOpaqueWhite;
@@ -60,6 +77,7 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     if (!ret->sampler_state_white)
       return nullptr;
     ret->sampler_state_white_handle = white_info.gpu_resource_id;
+    Hold(device, ret->sampler_state_white_handle);
     std::copy_n(border_color, 4, ret->border_color);
   }
   constexpr uint64_t field_max = (1 << SM50_SAMPLER_METADATA_LOD_BITS) - 1;

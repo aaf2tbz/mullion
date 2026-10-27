@@ -4,6 +4,10 @@
 // what the command list bound.
 // the input layout uses slots with gaps. every buffer holds one value for all its vertices, a triangle covers the
 // target, and its pixels are the three slots' values.
+// after ExecuteIndirect, the named slots become null and the others retain their bindings (Microsoft Learn,
+// Indirect Drawing). a following draw observes zero for the named slots (D3D11.3 8.20), including after zero
+// maximum/count-buffer commands. both snapshots check every pixel.
+// https://learn.microsoft.com/en-us/windows/win32/direct3d12/indirect-drawing
 #include "d3d12_test.hpp"
 
 static const char hlsl[] = R"hlsl(
@@ -67,7 +71,9 @@ main(int argc, char **argv) {
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT64 bytes;
   device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+  const UINT64 alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+  const UINT64 second_offset = (bytes + alignment - 1) / alignment * alignment;
+  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, second_offset + bytes, D3D12_RESOURCE_STATE_COPY_DEST);
 
   // two sets of vertex buffers: what the list binds, and what a command brings. buffer n of a set holds set + n
   const UINT bound = 0x10, brought = 0x90, stride = sizeof(UINT), buffer_bytes = vertices * stride;
@@ -95,9 +101,10 @@ main(int argc, char **argv) {
     D3D12_VERTEX_BUFFER_VIEW views[count];
     D3D12_DRAW_ARGUMENTS draw;
   };
-  unsigned failures = 0, cases = 0;
   for (UINT named = 1; named < 1u << count; named++)
-    for (bool indirect : {false, true}) {
+    for (bool indirect : {false, true})
+      for (UINT mode : {0u, 1u, 2u}) {
+      step("slots %#x, %s, %s", named, indirect ? "indirect" : "direct", mode == 0 ? "zero maximum" : mode == 1 ? "zero counter" : "one command");
       std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arguments;
       Arguments values{};
       UINT want = 0;
@@ -120,10 +127,13 @@ main(int argc, char **argv) {
       D3D12_COMMAND_SIGNATURE_DESC signature_desc{(UINT)packed.size(), (UINT)arguments.size(), arguments.data()};
       ComPtr<ID3D12CommandSignature> signature;
       CHECK(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)));
-      auto commands = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, packed.size(), D3D12_RESOURCE_STATE_GENERIC_READ);
+      auto commands = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, packed.size() + sizeof(UINT), D3D12_RESOURCE_STATE_GENERIC_READ);
       void *mapped;
       CHECK(commands->Map(0, nullptr, &mapped));
       memcpy(mapped, packed.data(), packed.size());
+      const UINT zero = 0;
+      memcpy(static_cast<char *>(mapped) + packed.size(), &zero, sizeof(zero));
+      commands->Unmap(0, nullptr);
 
       CHECK(forget(readback.Get()));
       CHECK(allocator->Reset());
@@ -135,27 +145,43 @@ main(int argc, char **argv) {
       list->RSSetViewports(1, &viewport);
       list->RSSetScissorRects(1, &scissor);
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      const float clear[4] = {};
+      list->ClearRenderTargetView(rtv, clear, 0, nullptr);
       for (UINT n = 0; n < count; n++) {
         auto v = view(!indirect && (named >> n & 1), n);
         list->IASetVertexBuffers(slots[n], 1, &v);
       }
       if (indirect)
-        list->ExecuteIndirect(signature.Get(), 1, commands.Get(), 0, nullptr, 0);
-      else
+        list->ExecuteIndirect(signature.Get(), mode == 0 ? 0 : 1, commands.Get(), 0,
+                              mode == 1 ? commands.Get() : nullptr, packed.size());
+      else if (mode == 2)
         list->DrawInstanced(vertices, 1, 0, 0);
       transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
       D3D12_TEXTURE_COPY_LOCATION src{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX},
           dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {.PlacedFootprint = footprint}};
       list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
       transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      list->DrawInstanced(vertices, 1, 0, 0);
+      transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      dst.PlacedFootprint.Offset += second_offset;
+      list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
       CHECK(submit(device.Get(), queue.Get(), list.Get()));
       const UINT *pixels;
       CHECK(readback->Map(0, nullptr, (void **)&pixels));
-      cases++;
-      if (pixels[0] != want && failures++ < 12)
-        printf("slots %#x %s: the values drawn are %#x, want %#x\n", named, indirect ? "through a signature" : "bound directly", pixels[0], want);
+      UINT after = 0;
+      for (UINT n = 0; n < count; n++)
+        if (!(indirect && (named >> n & 1)))
+          after |= ((named >> n & 1 ? brought : bound) + n) << 8 * n;
+      for (UINT pass = 0; pass < 2; pass++)
+        for (UINT y = 0; y < size; y++)
+          for (UINT x = 0; x < size; x++) {
+            const UINT value = *reinterpret_cast<const UINT *>(reinterpret_cast<const char *>(pixels) +
+                (pass ? second_offset : 0) + y * footprint.Footprint.RowPitch + x * sizeof(UINT));
+            const UINT expected = pass ? after : mode == 2 ? want : 0;
+            expect(value == expected, "pass %u pixel %u,%u is %#x, want %#x", pass, x, y, value, expected);
+          }
       readback->Unmap(0, nullptr);
     }
-  printf("%s: %u wrong of %u draws\n", failures ? "failed" : "passed", failures, cases);
-  return failures != 0;
+  return verdict();
 }

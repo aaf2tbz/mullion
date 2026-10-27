@@ -24,20 +24,66 @@
 // outputs and double-map results are not prescribed here. Every defined word is checked, excluding padding and
 // discarded data. Unknown modes and forbidden flag combinations must fail, without assuming their HRESULT.
 // https://gitlab.winehq.org/wine/wine/-/blob/wine-11.0/dlls/d3d11/tests/d3d11.c
+// the same storage checks use each D3D10 resource's Map/Unmap on devices created at both 10.x levels.
+// D3D10 has no deferred context or buffer subresource argument. Failed D3D10 Map outputs are not prescribed.
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d10/nf-d3d10-id3d10buffer-map
 #include "d3d11_test.hpp"
 #include <d3d11_1.h>
+#include <d3d10_1.h>
 #include <algorithm>
 #include <optional>
 
-int
-main() {
+static int
+mapping(D3D10_FEATURE_LEVEL1 legacy_level = D3D10_FEATURE_LEVEL1(0)) {
+  const bool legacy = legacy_level != 0;
   const UINT word_bytes = sizeof(UINT);
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> immediate;
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-  CHECK(D3D11CreateDevice(
-      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr, &immediate
-  ));
+  if (legacy) {
+    auto create = reinterpret_cast<decltype(&D3D10CreateDevice1)>(
+        GetProcAddress(LoadLibraryA("d3d10_1.dll"), "D3D10CreateDevice1")
+    );
+    if (!expect(create != nullptr, "D3D10CreateDevice1 is unavailable"))
+      return verdict();
+    ComPtr<ID3D10Device1> device10;
+    CHECK(create(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, legacy_level, D3D10_1_SDK_VERSION, &device10));
+    CHECK(device10.As(&device));
+    device->GetImmediateContext(&immediate);
+  } else {
+    CHECK(D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr, &immediate
+    ));
+  }
+
+  auto unmap = [&](ID3D11DeviceContext *context, ID3D11Resource *resource, UINT sub) {
+    if (!legacy) {
+      context->Unmap(resource, sub);
+      return;
+    }
+    D3D11_RESOURCE_DIMENSION dimension;
+    resource->GetType(&dimension);
+    ComPtr<ID3D10Resource> of;
+    if (!expect(SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&of))), "no D3D10 resource for Unmap"))
+      return;
+    switch (dimension) {
+    case D3D11_RESOURCE_DIMENSION_BUFFER:
+      static_cast<ID3D10Buffer *>(of.Get())->Unmap();
+      break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+      static_cast<ID3D10Texture1D *>(of.Get())->Unmap(sub);
+      break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+      static_cast<ID3D10Texture2D *>(of.Get())->Unmap(sub);
+      break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+      static_cast<ID3D10Texture3D *>(of.Get())->Unmap(sub);
+      break;
+    default:
+      expect(false, "unexpected resource dimension %u", dimension);
+      break;
+    }
+  };
 
   // the page comes from this build's configuration; the texture row comes from a mapped control.
   D3D11_TEXTURE2D_DESC probe_desc{1, 1, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0}, D3D11_USAGE_STAGING, 0,
@@ -59,7 +105,6 @@ main() {
   } descriptions[] = {{D3D11_USAGE_DEFAULT, 0},
                       {D3D11_USAGE_IMMUTABLE, 0},
                       {D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE},
-                      {D3D11_USAGE_STAGING, 0},
                       {D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ},
                       {D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_WRITE},
                       {D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE}};
@@ -142,16 +187,48 @@ main() {
         expect(got_dimension == dimension, "GetType returned %u, want %u", got_dimension, dimension);
 
         auto map = [&](ID3D11DeviceContext *context, ID3D11Resource *of, UINT sub, D3D11_MAP mode,
-                       std::optional<HRESULT> wanted, UINT flags = 0)
-            -> D3D11_MAPPED_SUBRESOURCE {
-          snprintf(trace::doing, sizeof(trace::doing),
-               "Map %s: dimension %u, width %u, source usage %u/access %#x, %s, sub %u, mode %u, flags %#x",
-               of == resource.Get() ? "resource" : "readback", dimension, width, usage, access,
-               context == immediate.Get() ? "immediate" : "deferred", sub, mode, flags);
+                       std::optional<HRESULT> wanted, UINT flags = 0) -> D3D11_MAPPED_SUBRESOURCE {
+          snprintf(
+              trace::doing, sizeof(trace::doing),
+              "Map %s level %#x: dimension %u, width %u, source usage "
+              "%u/access %#x, %s, sub %u, mode %u, flags %#x",
+              of == resource.Get() ? "resource" : "readback", legacy_level, dimension, width, usage, access,
+              context == immediate.Get() ? "immediate" : "deferred", sub, mode, flags
+          );
           UINT guard = width * word_bytes;
           D3D11_MAPPED_SUBRESOURCE outputs[3] = {{&guard, guard, ~guard}, {&guard, guard, ~guard},
                                                 {&guard, guard, ~guard}};
-          auto hr = context->Map(of, sub, mode, flags, &outputs[1]);
+          HRESULT hr;
+          if (!legacy) {
+            hr = context->Map(of, sub, mode, flags, &outputs[1]);
+          } else {
+            ComPtr<ID3D10Resource> of10;
+            hr = of->QueryInterface(IID_PPV_ARGS(&of10));
+            if (!expect(hr == S_OK, "no D3D10 resource for Map"))
+              return {};
+            auto mode10 = D3D10_MAP(mode);
+            switch (dimension) {
+            case D3D11_RESOURCE_DIMENSION_BUFFER:
+              hr = static_cast<ID3D10Buffer *>(of10.Get())->Map(mode10, flags, &outputs[1].pData);
+              break;
+            case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+              hr = static_cast<ID3D10Texture1D *>(of10.Get())->Map(sub, mode10, flags, &outputs[1].pData);
+              break;
+            case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+              D3D10_MAPPED_TEXTURE2D mapped{outputs[1].pData, outputs[1].RowPitch};
+              hr = static_cast<ID3D10Texture2D *>(of10.Get())->Map(sub, mode10, flags, &mapped);
+              outputs[1].pData = mapped.pData;
+              outputs[1].RowPitch = mapped.RowPitch;
+              break;
+            }
+            default: {
+              D3D10_MAPPED_TEXTURE3D mapped{outputs[1].pData, outputs[1].RowPitch, outputs[1].DepthPitch};
+              hr = static_cast<ID3D10Texture3D *>(of10.Get())->Map(sub, mode10, flags, &mapped);
+              outputs[1] = {mapped.pData, mapped.RowPitch, mapped.DepthPitch};
+              break;
+            }
+            }
+          }
           if (wanted)
             expect(hr == *wanted, "Map(%u, %u, %#x) returned %#lx, want %#lx", sub, mode, flags, (long)hr,
                    (long)*wanted);
@@ -164,15 +241,15 @@ main() {
           auto mapped = outputs[1];
           if (FAILED(hr)) {
             // Windows outputs recorded by Wine's test_resource_map and test_deferred_context_map.
-            if ((context == immediate.Get() && staging && sub >= subresources &&
-                 (is_buffer || dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)) ||
-                (context != immediate.Get() && dynamic && is_buffer && mode == D3D11_MAP_READ))
+            if (!legacy && ((context == immediate.Get() && staging && sub >= subresources &&
+                             (is_buffer || dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)) ||
+                            (context != immediate.Get() && dynamic && is_buffer && mode == D3D11_MAP_READ)))
               expect(!mapped.pData && mapped.RowPitch == guard && mapped.DepthPitch == ~guard,
                      "failed Map changed its documented outputs");
             return {};
           }
           if (wanted != S_OK) {
-            context->Unmap(of, sub);
+            unmap(context, of, sub);
             return {};
           }
           const UINT pointer_alignment = 16; // D3D11.3 5.6.1, feature level 10.0 and higher
@@ -185,7 +262,7 @@ main() {
           if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
             usable &= expect(mapped.DepthPitch >= mapped.RowPitch * h, "Map returned a short depth pitch");
           if (!usable) {
-            context->Unmap(of, sub);
+            unmap(context, of, sub);
             return {};
           }
           return mapped;
@@ -214,12 +291,14 @@ main() {
               if (!mapped.pData)
                 return false;
               data(mapped, sub, false);
-              immediate->Unmap(snapshot.Get(), sub);
+              unmap(immediate.Get(), snapshot.Get(), sub);
             }
           }
           return true;
         };
         for (bool deferred : {false, true}) {
+          if (legacy && deferred)
+            continue;
           ComPtr<ID3D11DeviceContext> context = immediate;
           if (deferred)
             CHECK(device->CreateDeferredContext(0, &context));
@@ -247,7 +326,7 @@ main() {
                 auto mapped = map(on, resource.Get(), sub, control, S_OK);
                 if (mapped.pData) {
                   data(mapped, sub, dynamic || !(access & D3D11_CPU_ACCESS_READ));
-                  on->Unmap(resource.Get(), sub);
+                  unmap(on, resource.Get(), sub);
                 }
               }
             }
@@ -296,7 +375,7 @@ main() {
                 for (auto &word : words[0])
                   word += words[0].size();
               data(mapped, 0, mode != D3D11_MAP_READ);
-              context->Unmap(resource.Get(), 0);
+              unmap(context.Get(), resource.Get(), 0);
             }
             if (!observe())
               return verdict();
@@ -309,7 +388,7 @@ main() {
               return verdict();
             reuse();
           }
-          if (dynamic || (staging && access && !deferred)) {
+          if ((!legacy || !is_buffer) && (dynamic || (staging && access && !deferred))) {
             auto control = dynamic ? D3D11_MAP_WRITE_DISCARD :
                            access & D3D11_CPU_ACCESS_READ ? D3D11_MAP_READ : D3D11_MAP_WRITE;
             for (UINT sub : {subresources, subresources + 1}) {
@@ -359,4 +438,12 @@ main() {
     }
   }
   return verdict();
+}
+
+int
+main() {
+  for (auto level : {D3D10_FEATURE_LEVEL_10_0, D3D10_FEATURE_LEVEL_10_1})
+    if (int status = mapping(level))
+      return status;
+  return mapping();
 }

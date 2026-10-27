@@ -317,7 +317,9 @@ read_control_flow(
       auto after_call = fresh_bb("after_call");
       auto func_id = Inst.m_Operands[0].m_Index[0].m_RegIndex;
       bb_current->target = BasicBlockCall{func_id, after_call};
-      call_targets.push_back({bb_current, &std::get<BasicBlockCall>(bb_current->target)});
+      // a function's own calls are inlined into each copy of it; the main program comes before every label
+      if (func_entries.empty())
+        call_targets.push_back({bb_current, &std::get<BasicBlockCall>(bb_current->target)});
       bb_current = after_call;
       break;
     }
@@ -325,9 +327,10 @@ read_control_flow(
       auto if_true = fresh_bb("if_true");
       auto after_callc = fresh_bb("after_callc");
       bb_current->target = BasicBlockConditionalBranch{readCondition(Inst, 0, phase), if_true, after_callc};
-      call_targets.push_back({bb_current, &std::get<BasicBlockCall>(bb_current->target)});
       auto func_id = Inst.m_Operands[1].m_Index[0].m_RegIndex;
       if_true->target = BasicBlockCall{func_id, after_callc};
+      if (func_entries.empty())
+        call_targets.push_back({if_true, &std::get<BasicBlockCall>(if_true->target)});
       bb_current = after_callc;
       break;
     }
@@ -681,7 +684,9 @@ read_control_flow(
 
     std::vector<std::pair<BasicBlock *, BasicBlockCall *>> new_call_targets;
 
-    for (auto [bb, call] : call_targets) {
+    for (auto [bb, target] : call_targets) {
+      // the call is replaced in its block below, and its return point is still needed
+      auto call = *target;
       std::unordered_map<BasicBlock *, BasicBlock *> visited;
       std::stack<BasicBlock *> block_to_redirect;
 
@@ -695,7 +700,7 @@ read_control_flow(
         return cloned;
       };
 
-      bb->target = BasicBlockUnconditionalBranch{clone(func_entries.at(call->func_id))};
+      bb->target = BasicBlockUnconditionalBranch{clone(func_entries.at(call.func_id))};
 
       while (!block_to_redirect.empty()) {
         auto current = block_to_redirect.top();
@@ -705,7 +710,7 @@ read_control_flow(
             patterns{
                 [](BasicBlockUndefined) -> BasicBlockTarget { return BasicBlockUndefined{}; },
                 [&](BasicBlockReturn ret) -> BasicBlockTarget {
-                  return BasicBlockUnconditionalBranch{call->return_point};
+                  return BasicBlockUnconditionalBranch{call.return_point};
                 },
                 [&](BasicBlockUnconditionalBranch uncond) -> BasicBlockTarget {
                   return BasicBlockUnconditionalBranch{clone(uncond.target)};

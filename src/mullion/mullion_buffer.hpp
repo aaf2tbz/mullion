@@ -70,6 +70,8 @@ struct BufferViewKey {
 
 struct BufferViewDescriptor {
   WMTPixelFormat format;
+  // a written view: Metal reads some formats' texture buffers only
+  bool write = false;
 };
 
 class Buffer;

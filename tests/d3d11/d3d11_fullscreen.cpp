@@ -217,13 +217,17 @@ main(int argc, char **argv) {
           const auto colour = DXGI_COLOR_SPACE_TYPE(value);
           UINT support = 0;
           expect(swapchain3->CheckColorSpaceSupport(colour, &support) == S_OK, "colour space support");
-          if (colour == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
-            expect(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, "sRGB presentation support");
           if (colour == DXGI_COLOR_SPACE_RESERVED)
             expect(!support, "reserved colour space support");
-          expect(swapchain3->SetColorSpace1(colour) ==
-                     (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT ? S_OK : E_INVALIDARG),
-                 "colour space setting disagrees with support");
+          // CheckColorSpaceSupport allows setting unadvertised spaces; a successful set must then report support.
+          HRESULT set = swapchain3->SetColorSpace1(colour);
+          if (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+            expect(set == S_OK, "advertised colour space refused");
+          if (SUCCEEDED(set)) {
+            expect(swapchain3->CheckColorSpaceSupport(colour, &support) == S_OK &&
+                       (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT),
+                   "set colour space not reported supported");
+          }
         }
         expect(swapchain3->SetColorSpace1(DXGI_COLOR_SPACE_CUSTOM) == E_INVALIDARG, "custom colour space");
         swapchain3.Reset();

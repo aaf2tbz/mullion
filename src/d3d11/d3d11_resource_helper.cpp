@@ -313,6 +313,16 @@ CreateMTLTextureDescriptorInternal(
   if (Width == 0 || Height == 0 || Depth == 0 || ArraySize == 0 || SampleCount == 0)
     return E_INVALIDARG;
 
+  const bool d3d11 = pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0;
+  const UINT dimension_limit =
+      Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D
+          ? (d3d11 ? D3D11_REQ_TEXTURE1D_U_DIMENSION : D3D10_REQ_TEXTURE1D_U_DIMENSION)
+      : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+          ? (d3d11 ? D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION : D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+          : (d3d11 ? D3D11_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D10_REQ_TEXTURE3D_U_V_OR_W_DIMENSION);
+  if (Width > dimension_limit || Height > dimension_limit || Depth > dimension_limit)
+    return E_INVALIDARG;
+
   UINT array_limit = pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0 ?
                        (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? D3D11_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION :
                                                                          D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION) :
@@ -340,10 +350,11 @@ CreateMTLTextureDescriptorInternal(
   }
 
   // a format makes the textures its row names (Microsoft Learn, "Format support for Direct3D Feature Level 11.0
-  // hardware": Texture1D, Texture2D, Texture3D)
+  // hardware": Texture1D, Texture2D, Texture3D, TextureCube)
   UINT support = 0;
   pDevice->CheckFormatSupport(Format, &support);
-  if (!(support & (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D   ? D3D11_FORMAT_SUPPORT_TEXTURE1D
+  if (!(support & ((MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)    ? D3D11_FORMAT_SUPPORT_TEXTURECUBE
+                   : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? D3D11_FORMAT_SUPPORT_TEXTURE1D
                    : Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D ? D3D11_FORMAT_SUPPORT_TEXTURE2D
                                                                      : D3D11_FORMAT_SUPPORT_TEXTURE3D)))
     return E_INVALIDARG;
@@ -392,7 +403,8 @@ CreateMTLTextureDescriptorInternal(
   if ((BindFlags & D3D11_BIND_RENDER_TARGET) && !any_bit_set(capability & FormatCapability::Color))
     return E_INVALIDARG;
   if ((BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&
-      ((BindFlags & D3D11_BIND_DEPTH_STENCIL) || !any_bit_set(capability & FormatCapability::Write)))
+      ((BindFlags & D3D11_BIND_DEPTH_STENCIL) ||
+       !TypedUnorderedAccess(capability, pDevice->GetMTLPixelFormatCapability(metal_format.BufferPixelFormat))))
     return E_INVALIDARG;
   // a plane's format is the one a shader reads the depth stencil texture in
   if ((BindFlags & D3D11_BIND_SHADER_RESOURCE) && any_bit_set(capability & FormatCapability::DepthStencil) &&
@@ -412,7 +424,8 @@ CreateMTLTextureDescriptorInternal(
     if (BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
       metal_usage |= WMTTextureUsageRenderTarget;
     if (BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
-      metal_usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+      // a uint clear writes through a uint view; a written texture is not compressed anyway
+      metal_usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
       // NOTE: R32/RG32_TYPELESS format should be mapped to uint pixel format
       if (metal_format.PixelFormat == WMTPixelFormatR32Uint ||
           metal_format.PixelFormat == WMTPixelFormatR32Sint ||
@@ -430,6 +443,14 @@ CreateMTLTextureDescriptorInternal(
     // well this is necessary for passing validation layer
     metal_usage |= WMTTextureUsagePixelFormatView;
   }
+
+  // a resolve Metal cannot do renders its destination, any single-sampled default texture (ResolveSubresource)
+  if (Usage == D3D11_USAGE_DEFAULT && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D && SampleCount == 1 &&
+      any_bit_set(capability & FormatCapability::Color))
+    metal_usage |= WMTTextureUsageRenderTarget;
+
+  if ((MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && MipmapFormat(pDescOut->pixel_format) != pDescOut->pixel_format)
+    metal_usage |= WMTTextureUsagePixelFormatView;
 
   if (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) {
     metal_usage |= WMTTextureUsageRenderTarget;

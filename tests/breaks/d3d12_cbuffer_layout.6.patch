@@ -1,0 +1,12 @@
+# an out-of-bounds scalar reads the view's first bytes
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -2559,8 +2559,6 @@
+           ty, ir.CreatePointerCast(pointer, ty->getPointerTo(space)),
+           std::min(Align(constant(a(3))), getKnownAlignment(buffer.Pointer, ctx.module.getDataLayout()))
+       );
+-      if (inside)
+-        ret = ir.CreateSelect(inside, ret, Constant::getNullValue(ty));
+       break;
+     }
+     case CBufferLoadLegacy: {

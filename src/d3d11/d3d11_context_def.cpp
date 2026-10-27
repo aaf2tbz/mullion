@@ -307,7 +307,7 @@ public:
       VisibilityQueryBoundary(true);
       auto query_id = ctx_state.current_cmdlist->issued_visibility_query.size();
       ctx_state.current_cmdlist->issued_visibility_query.emplace_back(
-          static_cast<MTLD3D11OcclusionQuery *>(pAsync), false
+          static_cast<MTLD3D11OcclusionQuery *>(pAsync), desc.Query == D3D11_QUERY_PIPELINE_STATISTICS
       );
       ctx_state.pending_visibility_queries.insert(query_id);
       EmitST([list = ctx_state.current_cmdlist.ptr(), query_id](ArgumentEncodingContext &enc) {
@@ -401,8 +401,8 @@ public:
       if (desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) {
         auto &regions = ctx_state.current_cmdlist->regions;
         regions.back().pipeline_query = static_cast<MTLD3D11OcclusionQuery *>(pAsync);
-        regions.emplace_back();
         InvalidateCurrentPass(true);
+        regions.emplace_back();
       }
       break;
     }

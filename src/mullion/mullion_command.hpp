@@ -2,11 +2,17 @@
 
 #include "Metal.hpp"
 #include "../airconv/airconv_public.h"
+#include "d3d12.h"
 #include "mullion_buffer.hpp"
 #include "mullion_command_constants.hpp"
+#include "mullion_format.hpp"
 #include "mullion_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
+#include <bit>
+#include <cfloat>
+#include <cmath>
+#include <span>
 #include <unordered_map>
 
 namespace mullion {
@@ -19,7 +25,7 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   resource.type = WMTRenderCommandUseResource;
   resource.resource = result;
   resource.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
-  resource.stages = WMTRenderStageVertex | WMTRenderStageFragment;
+  resource.stages = WMTRenderStageVertex | WMTRenderStageMesh | WMTRenderStageFragment;
   auto &pipeline = emit.template operator()<wmtcmd_render_setpso>();
   pipeline.type = WMTRenderCommandSetPSO;
   pipeline.pso = count;
@@ -37,7 +43,7 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   zeroed.type = WMTRenderCommandMemoryBarrier;
   zeroed.scope = WMTBarrierScopeBuffers;
   zeroed.stages_after = WMTRenderStageVertex;
-  zeroed.stages_before = WMTRenderStageVertex | WMTRenderStageFragment;
+  zeroed.stages_before = WMTRenderStageVertex | WMTRenderStageMesh | WMTRenderStageFragment;
   if (scan) {
     auto &strip_pipeline = emit.template operator()<wmtcmd_render_setpso>();
     strip_pipeline.type = WMTRenderCommandSetPSO;
@@ -54,9 +60,95 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   pixel.buffer = result;
   pixel.offset = result_offset;
   pixel.index = SM50_BINDING_INDEX_PIPELINE_STATISTICS;
+  auto &geometry = emit.template operator()<wmtcmd_render_setbuffer>();
+  geometry.type = WMTRenderCommandSetMeshBuffer;
+  geometry.buffer = result;
+  geometry.offset = result_offset;
+  geometry.index = SM50_BINDING_INDEX_PIPELINE_STATISTICS;
   auto &previous = emit.template operator()<wmtcmd_render_setpso>();
   previous.type = WMTRenderCommandSetPSO;
   previous.pso = restore;
+}
+
+// Metal clips a triangle that reaches 1.5 of a viewport past its center into pieces, and on their seams runs a pixel
+// shader once for each piece. D3D allows that (D3D11.3 15.4), but applications draw
+// past the viewport as if it never happened, a full-screen triangle reaches 3. so Metal's viewports are made larger
+// about their centers, and the stage before the rasterizer multiplies x and y by the inverse
+// (SM50_BINDING_INDEX_RASTER_SCALE): positions land on the same pixels, and the cut moves out by the factor. it is the
+// largest power of two, which keeps the scale exact, that leaves the viewports in the bounds an application may give
+// them itself. returns the inverse
+inline float
+EnlargeViewports(std::span<WMTViewport> viewports, double bound_min, double bound_max) {
+  double reach = INFINITY;
+  for (auto &v : viewports)
+    for (auto [origin, size] : {std::pair{v.originX, v.width}, std::pair{v.originY, v.height}})
+      if (size > 0)
+        reach = std::min({reach, (origin - bound_min) / (size / 2) + 1, (bound_max - origin) / (size / 2) - 1});
+  double factor = std::isfinite(reach) && reach >= 1 ? std::exp2(std::floor(std::log2(reach))) : 1;
+  for (auto &v : viewports) {
+    v.originX -= (factor - 1) * v.width / 2, v.originY -= (factor - 1) * v.height / 2;
+    v.width *= factor, v.height *= factor;
+  }
+  return float(1 / factor);
+}
+
+// what a line drawn as triangles keeps of the rasterizer state, which those of SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's
+// quad_lines are: a line is not culled, filled or biased, and faces front (D3D11.3 15.10, 15.13, 15.14)
+template <typename State>
+inline void
+RasterizeAsLines(State &state) {
+  state.fill_mode = WMTTriangleFillModeFill;
+  state.cull_mode = WMTCullModeNone;
+  state.depth_bias = state.scole_scale = state.depth_bias_clamp = 0;
+  state.winding = WMTWindingCounterClockwise;
+}
+
+// the target the pixel shader blends itself (SM50_SHADER_BLEND), with Metal's blending off for it, where Metal's
+// blender keeps other results than D3D's: a blended float target, whose NaNs and signed zeros D3D keeps through every
+// weight (D3D11.3 17.5) and Metal's rewritten equation loses (it drops a Zero weight's product, folds a weight both
+// sides share, and reverse subtracts complementary weights into -0), and a UINT target's logic op (17.7), which Metal
+// offers only privately and saturates where D3D keeps the channel's bits. `desc` is a D3D11 or D3D12 render target blend description, whose
+// members and values agree
+template <typename Desc>
+inline SM50_SHADER_BLEND
+ShaderBlend(WMTColorAttachmentBlendInfo &color, const Desc &desc, bool logic) {
+  // a format without alpha reads its destination alpha as 1 into the blender (D3D11.3 19.3.4), where Metal reads the
+  // channel it stores the format with; SourceAlphaSaturated is min(As, 1 - Ad) for color and 1 for alpha
+  if (GET_SWIZZLE_ALPHA(color.pixel_format) == WMTTextureSwizzleOne)
+    for (auto [factor, saturated] : {std::pair{&color.src_rgb_blend_factor, WMTBlendFactorZero},
+                                     {&color.dst_rgb_blend_factor, WMTBlendFactorZero},
+                                     {&color.src_alpha_blend_factor, WMTBlendFactorOne},
+                                     {&color.dst_alpha_blend_factor, WMTBlendFactorOne}})
+      *factor = *factor == WMTBlendFactorDestinationAlpha             ? WMTBlendFactorOne
+                : *factor == WMTBlendFactorOneMinusDestinationAlpha ? WMTBlendFactorZero
+                : *factor == WMTBlendFactorSourceAlphaSaturated     ? saturated
+                                                                    : *factor;
+  SM50_SHADER_BLEND blend{};
+  auto format = WMTPixelFormat(ORIGINAL_FORMAT(color.pixel_format));
+  bool integer = IsIntegerFormat(format);
+  if (logic && integer) {
+    WMTClearColor high{FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
+    SanitizeRTVClearColor(format, high);
+    blend.logic = true;
+    blend.logic_op = desc.LogicOp;
+    for (auto [bits, value] : {std::pair{&blend.bits[0], high.r}, {&blend.bits[1], high.g}, {&blend.bits[2], high.b},
+                               {&blend.bits[3], high.a}})
+      *bits = std::bit_width(uint64_t(value));
+  } else {
+    MTL_DXGI_FORMAT_DESC description{};
+    description.PixelFormat = format;
+    if (!color.blending_enabled || integer || BorderColorRange(description)[1] <= 1)
+      return blend;
+    blend.blend = true;
+    blend.src = desc.SrcBlend;
+    blend.dst = desc.DestBlend;
+    blend.op = desc.BlendOp;
+    blend.src_alpha = desc.SrcBlendAlpha;
+    blend.dst_alpha = desc.DestBlendAlpha;
+    blend.op_alpha = desc.BlendOpAlpha;
+  }
+  color.blending_enabled = false;
+  return blend;
 }
 
 struct TileBarrierPSOKey {
@@ -97,12 +189,37 @@ public:
     return library_;
   }
   WMT::RenderPipelineState PipelineStatistics(bool scan = false);
+  // zeroes a stream output draw's scratch inside its render pass (zero_words)
+  WMT::RenderPipelineState ZeroWords();
+  // the kernel `name` as a compute pipeline, made once for the device
+  WMT::Reference<WMT::ComputePipelineState> ComputePipeline(const std::string &name);
+
+  // a texture of `type` that a shader reads and writes as `sample`, bound in place of an unbound one: Metal leaves a
+  // null texture's functions undefined. its metadata carries SM50_TEXTURE_METADATA_UNBOUND, and the shader drops what
+  // it answers. `fresh` is set when it was made by this call, and `backing` is a texture buffer's buffer
+  struct StandIn {
+    WMT::Texture texture;
+    uint64_t id;
+    WMT::Buffer backing;
+    bool fresh;
+  };
+  StandIn UnboundTexture(WMTTextureType type, SM50_SAMPLE_TYPE sample, bool write);
 
 private:
+  // a vertex function that runs without rasterizing, made when first used
+  WMT::RenderPipelineState VertexPipeline(WMT::Reference<WMT::RenderPipelineState> &pipeline, const char *name);
+
   WMT::Reference<WMT::Library> library_;
   WMT::Device device_;
-  mullion::mutex statistics_mutex_;
-  WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2];
+  mullion::mutex pipelines_mutex_;
+  WMT::Reference<WMT::RenderPipelineState> pipeline_statistics_draw_[2], zero_words_;
+  std::unordered_map<std::string, WMT::Reference<WMT::ComputePipelineState>> compute_pipelines_;
+  struct Unbound {
+    WMT::Reference<WMT::Texture> texture;
+    uint64_t id;
+    WMT::Reference<WMT::Buffer> backing;
+  };
+  std::unordered_map<uint32_t, Unbound> unbound_textures_;
 };
 
 class EmulatedCommandContext {

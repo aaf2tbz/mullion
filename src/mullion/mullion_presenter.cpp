@@ -150,12 +150,12 @@ Presenter::synchronizeLayerProperties() {
   return {metadata, layer_props_, final_colorspace, gamma_lut_texture_, present_blit_, present_scale_};
 }
 
+template <typename CommandBuffer, typename Encoder>
 WMT::MetalDrawable
 Presenter::encodeCommands(
-    WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
-    std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-    std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
-    uint64_t seq_id, unsigned *encoder_count
+    CommandBuffer cmdbuf, WMT::Texture backbuffer, const PresentState &state,
+    std::type_identity_t<std::function<void(Encoder)>> &&wait_fences,
+    std::type_identity_t<std::function<void(Encoder)>> &&update_fences, uint64_t seq_id, unsigned *encoder_count
 ) {
   const auto &metadata = state.metadata;
   double width = state.layer_props.drawable_width;
@@ -164,6 +164,9 @@ Presenter::encodeCommands(
   layer_.setColorSpace(state.colorspace);
 
   auto drawable = layer_ ? layer_.nextDrawable() : WMT::MetalDrawable{};
+  auto number = ++frames_;
+  if (drawable)
+    drawable.countPresent(statistics_, number);
   if (!drawable && (!window_target_ || window_target_.width() != width || window_target_.height() != height)) {
     WMTTextureInfo texture_info{};
     texture_info.type = WMTTextureType2D;
@@ -217,7 +220,7 @@ Presenter::encodeCommands(
 
   // a layer whose drawable timed out drops this frame; only a window without a layer takes frames through GDI
   if (!layer_) {
-    WindowFrame frame{{}, nullptr, (uint32_t)width, (uint32_t)height};
+    WindowFrame frame{{}, nullptr, (uint32_t)width, (uint32_t)height, number};
     WMTBufferInfo buffer_info{.length = frame.width * frame.height * 4ull, .options = WMTResourceStorageModeShared};
     buffer_info.memory.set(nullptr);
     frame.buffer = device_.newBuffer(buffer_info);
@@ -239,6 +242,16 @@ Presenter::encodeCommands(
   }
   return drawable;
 }
+
+template WMT::MetalDrawable Presenter::encodeCommands(
+    WMT::CommandBuffer, WMT::Texture, const PresentState &, std::function<void(WMT::RenderCommandEncoder)> &&,
+    std::function<void(WMT::RenderCommandEncoder)> &&, uint64_t, unsigned *
+);
+template WMT::MetalDrawable Presenter::encodeCommands(
+    WMT::Metal4CommandBuffer, WMT::Texture, const PresentState &,
+    std::function<void(WMT::Metal4RenderCommandEncoder)> &&, std::function<void(WMT::Metal4RenderCommandEncoder)> &&,
+    uint64_t, unsigned *
+);
 
 void
 Presenter::drawToWindow(double after) {
@@ -267,6 +280,24 @@ Presenter::drawToWindow(double after) {
   );
   ReleaseDC(window_, dc);
   window_last_draw_ = std::chrono::steady_clock::now();
+  WMT::MetalDrawable{}.countPresent(statistics_, frame.number);
+}
+
+HRESULT
+Presenter::frameStatistics(DXGI_FRAME_STATISTICS *stats, double refresh_rate) {
+  LARGE_INTEGER before, after, frequency;
+  QueryPerformanceCounter(&before);
+  auto shown = statistics_.get();
+  QueryPerformanceCounter(&after);
+  QueryPerformanceFrequency(&frequency);
+  if (!shown.shown)
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  // the host's clock was read between the two QPC reads
+  auto qpc = (before.QuadPart + after.QuadPart) / 2 - LONGLONG((shown.now - shown.shown_time) * frequency.QuadPart);
+  // the scheduler's last sample is the refresh the frame was shown at
+  UINT refresh = UINT(std::llround((shown.shown_time - shown.since) * refresh_rate));
+  *stats = {UINT(shown.shown), refresh, refresh, {.QuadPart = qpc}, {}};
+  return S_OK;
 }
 
 void
@@ -280,8 +311,12 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
       {{&true_data}, WMTDataTypeBool, kPresentFCIndex_BackbufferSizeMatched},
       {{is_pq ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_HDRPQ},
       {{with_hdr_metadata ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_WithHDRMetadata},
-      {{Is_sRGBVariant(ConvertSwapChainFormat(source_format_)) ? &true_data : &false_data}, WMTDataTypeBool,
-       kPresentFCIndex_BackbufferIsSRGB},
+      // linear values the target takes as sRGB bytes: an sRGB back buffer's, or a linear color space's in a GDI
+      // bitmap, where an sRGB target's own encoding misses D3D11.3 3.2.3.8 by up to 0.8 of a code
+      {{Is_sRGBVariant(ConvertSwapChainFormat(source_format_)) || (!layer_ && colorspace_ & WMTColorSpaceSRGBLinear)
+            ? &true_data
+            : &false_data},
+       WMTDataTypeBool, kPresentFCIndex_BackbufferIsSRGB},
       {{is_ms ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_BackbufferIsMS},
       {{gamma_enable ? &true_data : &false_data}, WMTDataTypeBool, kPresentFCIndex_GammaEnabled},
       {{source_format_ == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM ? &true_data : &false_data}, WMTDataTypeBool,

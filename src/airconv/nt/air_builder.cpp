@@ -90,6 +90,26 @@ AIRBuilder::getTypeOverloadSuffix(Type *Ty, Signedness Sign) {
   return Ret;
 }
 
+// an unbound slot reads 0 and its queries answer 0 (D3D11.3 22.4.22: "If there is no resource bound to the specified
+// slot, 0 is returned"). Metal leaves a null texture's functions undefined, so the runtime binds a texture of the
+// slot's type in its place and a select drops what it answers: a branch round each call costs a sampling shader more
+Value *
+AIRBuilder::CreateTextureCall(const Texture &Texture, FunctionCallee Fn, ArrayRef<Value *> Ops) {
+  Value *Call = builder.CreateCall(Fn, Ops);
+  if (!Texture.Unbound || Call->getType()->isVoidTy())
+    return Call;
+  auto Drop = [&](Value *Answer) {
+    return builder.CreateSelect(Texture.Unbound, Constant::getNullValue(Answer->getType()), Answer);
+  };
+  auto Struct = dyn_cast<StructType>(Call->getType());
+  if (!Struct)
+    return Drop(Call);
+  Value *Answer = PoisonValue::get(Struct);
+  for (unsigned i = 0; i < Struct->getNumElements(); i++)
+    Answer = builder.CreateInsertValue(Answer, Drop(builder.CreateExtractValue(Call, i)), i);
+  return Answer;
+}
+
 Value *
 AIRBuilder::CreateAtomicRMW(
     const Texture &Texture, Value *Handle, AtomicRMWInst::BinOp Op, Value *Pos, Value *ValVec4, Value *ArrayIndex
@@ -195,7 +215,7 @@ AIRBuilder::CreateAtomicRMW(
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getTexelType(Texture), Tys, false), Attrs);
 
-  return builder.CreateCall(Fn, Ops);
+  return CreateTextureCall(Texture, Fn, Ops);
 }
 
 std::pair<Value *, Value *>
@@ -268,9 +288,10 @@ AIRBuilder::CreateAtomicCmpXchg(
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getBoolTy(), Tys, false), Attrs);
 
-  auto Ret = builder.CreateCall(Fn, Ops);
+  auto Ret = CreateTextureCall(Texture, Fn, Ops);
 
-  return {builder.CreateLoad(TyTexel, Ptr), Ret};
+  auto Old = builder.CreateLoad(TyTexel, Ptr);
+  return {Texture.Unbound ? builder.CreateSelect(Texture.Unbound, Constant::getNullValue(TyTexel), Old) : Old, Ret};
 }
 
 Type *
@@ -423,7 +444,7 @@ AIRBuilder::CreateSampleCommon(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -515,7 +536,7 @@ AIRBuilder::CreateSampleCmpCommon(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -523,7 +544,7 @@ AIRBuilder::CreateSampleCmpCommon(
 std::pair<Value *, Value *>
 AIRBuilder::CreateSampleGrad(
     const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
-    Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+    Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference
 ) {
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
@@ -567,6 +588,11 @@ AIRBuilder::CreateSampleGrad(
   if (TexInfo.is_array) {
     Tys.push_back(getIntTy());
     Ops.push_back(ArrayIndex ? ArrayIndex : getInt(0));
+  }
+
+  if (Reference) {
+    Tys.push_back(getFloatTy());
+    Ops.push_back(Reference);
   }
 
   Tys.push_back(getTextureSampleCoordType(Texture));
@@ -613,7 +639,7 @@ AIRBuilder::CreateSampleGrad(
   Tys.push_back(getIntTy());
   Ops.push_back(getInt(0));
 
-  std::string FnName = "air.sample_";
+  std::string FnName = Reference ? "air.sample_compare_" : "air.sample_";
   FnName += TexInfo.air_symbol_suffix;
   FnName += "_grad";
   FnName += getTypeOverloadSuffix(getTexelType(Texture), getTexelSign(Texture));
@@ -622,7 +648,7 @@ AIRBuilder::CreateSampleGrad(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 }
@@ -729,7 +755,7 @@ AIRBuilder::CreateRead(
       FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 }
@@ -880,7 +906,7 @@ AIRBuilder::CreateGather(
       FnName, FunctionType::get(getTextureGatherResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -964,7 +990,7 @@ AIRBuilder::CreateGatherCompare(
       FnName, FunctionType::get(getTextureGatherResultType(Texture), Tys, false), Attrs
   );
 
-  auto Result = builder.CreateCall(Fn, Ops);
+  auto Result = CreateTextureCall(Texture, Fn, Ops);
 
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 };
@@ -1048,7 +1074,7 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getIntTy(), Tys, false), Attrs);
 
-  return builder.CreateSelect(builder.CreateIsNull(Handle), builder.getInt32(0), builder.CreateCall(Fn, Ops));
+  return CreateTextureCall(Texture, Fn, Ops);
 }
 
 std::pair<Value *, Value *>
@@ -1103,7 +1129,7 @@ AIRBuilder::CreateCalculateLOD(const Texture &Texture, Value *Handle, Value *Sam
   auto FnUnclamped =
       getModule()->getOrInsertFunction(FnUnclampedName, FunctionType::get(getFloatTy(), Tys, false), Attrs);
 
-  return {builder.CreateCall(Fn, Ops), builder.CreateCall(FnUnclamped, Ops)};
+  return {CreateTextureCall(Texture, Fn, Ops), CreateTextureCall(Texture, FnUnclamped, Ops)};
 }
 
 CallInst *
@@ -1176,6 +1202,12 @@ AIRBuilder::CreateSamplePos(Value *SampleCount, Value *Index) {
   return builder.CreateCall(Fn, {SampleCount, Index});
 }
 
+// a render target sample's offset: the pattern of no samples places every one at the center
+Value *
+AIRBuilder::CreateRasterizerSamplePos(Value *Index) {
+  return CreateSamplePos(CenteredSamples ? getInt(0) : CreateGetNumSamples(), Index);
+}
+
 Value *
 AIRBuilder::CreateDerivative(Value *Val, bool YAxis) {
   if (!Val->getType()->getScalarType()->isFloatingPointTy()) {
@@ -1205,6 +1237,8 @@ AIRBuilder::CreateDerivative(Value *Val, bool YAxis) {
 
 CallInst *
 AIRBuilder::CreateDiscard() {
+  if (Live)
+    builder.CreateStore(builder.getFalse(), Live);
   auto &Context = getContext();
   auto Attrs = AttributeList::get(
       Context, {{~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
@@ -1563,8 +1597,19 @@ AIRBuilder::CreateInterpolateAtCentroid(Value *Interpoant, bool Perspective) {
       Perspective ? "air.interpolate_centroid_perspective.f32" : "air.interpolate_centroid_no_perspective.f32",
       FunctionType::get(getFloatTy(), {Interpoant->getType()}, false), Attrs
   );
-
-  return builder.CreateCall(Fn, {Interpoant});
+  if (!CentroidCoverage)
+    return builder.CreateCall(Fn, {Interpoant});
+  // the center when every sample is covered, else the first covered; a helper run covers none, and takes the
+  // mask's first sample, or the center with all of them
+  auto all = builder.CreateSub(builder.CreateShl(getInt(1), CreateGetNumSamples()), getInt(1));
+  auto mask = builder.CreateAnd(CentroidMask, all), covered = builder.CreateAnd(CentroidCoverage, mask);
+  auto pick = builder.CreateSelect(builder.CreateICmpNE(covered, getInt(0)), covered, mask);
+  auto ctz = getModule()->getOrInsertFunction("air.ctz.i32", FunctionType::get(getIntTy(), {getIntTy(), builder.getInt1Ty()}, false));
+  auto first = builder.CreateCall(ctz, {pick, builder.getFalse()});
+  return builder.CreateSelect(
+      builder.CreateICmpEQ(pick, all), CreateInterpolateAtCenter(Interpoant, Perspective),
+      CreateInterpolateAtSample(Interpoant, first, Perspective)
+  );
 }
 
 Value *
@@ -1930,6 +1975,7 @@ AIRBuilder::CreateIntBinOp(IntBinOp Op, Value *LHS, Value *RHS, bool Signed) {
   static char const *FnNames[] = {
       "max",
       "min",
+      "mul_hi",
   };
 
   if (uint32_t(Op) >= std::size(FnNames)) {
@@ -2090,7 +2136,13 @@ AIRBuilder::SanitizePosition(llvm::Value *Pos) {
       builder.CreateAnd(builder.CreateExtractElement(Mask, 2ull), builder.CreateExtractElement(Mask, 3ull))
   );
   auto PosClipped = llvm::ConstantVector::get({getFloat(0.0f), getFloat(0.0f), getFloat(1.0f), getFloat(0.0f)});
-  return builder.CreateSelect(ValidPos, Pos, PosClipped);
+  Pos = builder.CreateSelect(ValidPos, Pos, PosClipped);
+  if (!RasterScale)
+    return Pos;
+  auto Scale = builder.CreateLoad(getFloatTy(), RasterScale);
+  for (unsigned i = 0; i < 2; i++)
+    Pos = builder.CreateInsertElement(Pos, builder.CreateFMul(builder.CreateExtractElement(Pos, i), Scale), i);
+  return Pos;
 }
 
 } // namespace llvm::air

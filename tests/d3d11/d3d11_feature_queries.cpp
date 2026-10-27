@@ -8,6 +8,9 @@
 // the device" (Microsoft Learn, ID3D11Device::CheckMultisampleQualityLevels). NV12 uses even dimensions
 // (DXGI_FORMAT, NV12). D3D11.3 19.1.4 requires shader loads for integer formats and depth/stencil for D16_UNORM;
 // Microsoft Learn, format support for feature level 9.3, disallows display scan-out for the two wider formats.
+// integer format rows disallow shader gather4 and mipmap auto-generation (Microsoft Learn, format support for
+// Direct3D feature level 11.0 hardware, R8_UINT/R32_UINT and the other UINT/SINT rows).
+// absent dimension caps must reject that storage: "2D texture resources supported." (Learn, D3D11_FORMAT_SUPPORT).
 #include "d3d11_test.hpp"
 #include <d3d11_2.h>
 #include <d3d10_1.h>
@@ -28,6 +31,28 @@ main() {
       UINT bits = ~0u;
       HRESULT hr = device->CheckFormatSupport(format, &bits);
       expect((hr == S_OK && bits) || (hr == E_FAIL && !bits), "hr %08lx, support %#x", hr, bits);
+      constexpr UINT extent = 4; // a complete BC block and even video dimensions
+      if (!(bits & D3D11_FORMAT_SUPPORT_TEXTURE1D)) {
+        D3D11_TEXTURE1D_DESC desc{extent, 1, 1, format, D3D11_USAGE_DEFAULT};
+        ComPtr<ID3D11Texture1D> texture;
+        expect(FAILED(device->CreateTexture1D(&desc, nullptr, &texture)) && !texture,
+               "unsupported 1D format created storage");
+      }
+      for (bool cube : {false, true})
+        if (!(bits & (cube ? D3D11_FORMAT_SUPPORT_TEXTURECUBE : D3D11_FORMAT_SUPPORT_TEXTURE2D))) {
+          constexpr UINT cube_faces = 6; // D3D11.3 5.3.5
+          D3D11_TEXTURE2D_DESC desc{extent, extent, 1, cube ? cube_faces : 1, format, {1, 0}, D3D11_USAGE_DEFAULT};
+          desc.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+          ComPtr<ID3D11Texture2D> texture;
+          expect(FAILED(device->CreateTexture2D(&desc, nullptr, &texture)) && !texture,
+                 "unsupported %s format created storage", cube ? "cube" : "2D");
+        }
+      if (!(bits & D3D11_FORMAT_SUPPORT_TEXTURE3D)) {
+        D3D11_TEXTURE3D_DESC desc{extent, extent, extent, 1, format, D3D11_USAGE_DEFAULT};
+        ComPtr<ID3D11Texture3D> texture;
+        expect(FAILED(device->CreateTexture3D(&desc, nullptr, &texture)) && !texture,
+               "unsupported 3D format created storage");
+      }
       D3D11_FEATURE_DATA_FORMAT_SUPPORT query{format, ~0u};
       HRESULT feature_hr = device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT, &query, sizeof(query));
       expect(feature_hr == hr && query.OutFormatSupport == bits, "direct and feature queries differ");
@@ -43,6 +68,8 @@ main() {
                "gather below feature level 10.1: %#x", bits);
       std::string type = name;
       if ((type.ends_with("_UINT") || type.ends_with("_SINT")) && !type.starts_with("DXGI_FORMAT_D")) {
+        expect(!(bits & (D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN)),
+               "integer format reports gather or automatic mips: %#x", bits);
         expect(!(bits & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE), "integer format reports shader sampling");
         if (level >= D3D_FEATURE_LEVEL_10_0)
           expect(hr == S_OK && (bits & D3D11_FORMAT_SUPPORT_SHADER_LOAD), "integer format has no shader loads");
@@ -119,9 +146,34 @@ main() {
       UINT bits = ~0u;
       HRESULT hr = device->CheckFormatSupport(format, &bits);
       expect(hr == S_OK || (hr == E_FAIL && !bits), "hr %08lx, support %#x", hr, bits);
+      constexpr UINT extent = 4;
+      if (!(bits & D3D10_FORMAT_SUPPORT_TEXTURE1D)) {
+        D3D10_TEXTURE1D_DESC desc{extent, 1, 1, format, D3D10_USAGE_DEFAULT};
+        ComPtr<ID3D10Texture1D> texture;
+        expect(FAILED(device->CreateTexture1D(&desc, nullptr, &texture)) && !texture,
+               "unsupported 1D format created storage");
+      }
+      for (bool cube : {false, true})
+        if (!(bits & (cube ? D3D10_FORMAT_SUPPORT_TEXTURECUBE : D3D10_FORMAT_SUPPORT_TEXTURE2D))) {
+          constexpr UINT cube_faces = 6;
+          D3D10_TEXTURE2D_DESC desc{extent, extent, 1, cube ? cube_faces : 1, format, {1, 0}, D3D10_USAGE_DEFAULT};
+          desc.MiscFlags = cube ? D3D10_RESOURCE_MISC_TEXTURECUBE : 0;
+          ComPtr<ID3D10Texture2D> texture;
+          expect(FAILED(device->CreateTexture2D(&desc, nullptr, &texture)) && !texture,
+                 "unsupported %s format created storage", cube ? "cube" : "2D");
+        }
+      if (!(bits & D3D10_FORMAT_SUPPORT_TEXTURE3D)) {
+        D3D10_TEXTURE3D_DESC desc{extent, extent, extent, 1, format, D3D10_USAGE_DEFAULT};
+        ComPtr<ID3D10Texture3D> texture;
+        expect(FAILED(device->CreateTexture3D(&desc, nullptr, &texture)) && !texture,
+               "unsupported 3D format created storage");
+      }
       std::string type = name;
-      if ((type.ends_with("_UINT") || type.ends_with("_SINT")) && !type.starts_with("DXGI_FORMAT_D"))
+      if ((type.ends_with("_UINT") || type.ends_with("_SINT")) && !type.starts_with("DXGI_FORMAT_D")) {
+        expect(!(bits & (D3D10_FORMAT_SUPPORT_SHADER_GATHER | D3D10_FORMAT_SUPPORT_MIP_AUTOGEN)),
+               "integer format reports gather or automatic mips: %#x", bits);
         expect(hr == S_OK && (bits & D3D10_FORMAT_SUPPORT_SHADER_LOAD), "integer format has no shader loads");
+      }
       if (format == DXGI_FORMAT_D16_UNORM)
         expect(hr == S_OK && (bits & D3D10_FORMAT_SUPPORT_DEPTH_STENCIL),
                "required depth format has no depth/stencil support");

@@ -53,7 +53,7 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
   Com<IMTLDXGIAdapter> dxgi_adapter_mtl = nullptr;
 
   if (MinimumFeatureLevel < D3D_FEATURE_LEVEL_11_0)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   HRESULT hr;
 
@@ -74,7 +74,7 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
     if (!dxgi_adapter) {
       auto dxcore_adapter = com_cast<IDXCoreAdapter>(pAdapter);
       if (!dxcore_adapter)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       LUID luid;
       if (FAILED(hr = dxcore_adapter->GetProperty(DXCoreAdapterProperty::InstanceLuid, sizeof(luid), &luid)) ||
           FAILED(hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory))) ||
@@ -190,7 +190,7 @@ extern "C" HRESULT WINAPI
 D3D12EnableExperimentalFeatures(UINT NumFeatures, const IID *pIIDs, void *pConfigurationStructs, UINT *pConfigurationStructSizes) {
   static const GUID shader_models = {0x76f5573e, 0xf13a, 0x40f5, {0xb2, 0x97, 0x81, 0xce, 0x9e, 0x18, 0x93, 0x3f}};
   if (NumFeatures && !pIIDs)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   if (!std::all_of(pIIDs, pIIDs + NumFeatures, [](REFIID iid) { return iid == shader_models; }))
     return E_NOINTERFACE;
   if (NumFeatures)

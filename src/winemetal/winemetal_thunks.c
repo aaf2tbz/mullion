@@ -21,6 +21,239 @@
 
 #define PtrToUInt64(v) ((uint64_t)(uintptr_t)(v))
 
+#ifndef MULLION_NATIVE
+#include "winbase.h"
+#include "winnls.h"
+#include <intrin.h>
+
+int wmt_diag_calls;
+static struct WMTDiagCall diag_calls[WMTUnixCallCount];
+
+NTSTATUS
+wmt_diag_call(unsigned int code, void *args, const char *name) {
+  LARGE_INTEGER began, ended;
+  QueryPerformanceCounter(&began);
+  NTSTATUS status = WINE_UNIX_CALL_UNTIMED(code, args);
+  QueryPerformanceCounter(&ended);
+  // the name before the counts: whoever takes a count sees its name
+  diag_calls[code].name = name;
+  InterlockedIncrement64((LONG64 *)&diag_calls[code].count);
+  InterlockedAdd64((LONG64 *)&diag_calls[code].ticks, ended.QuadPart - began.QuadPart);
+  return status;
+}
+
+WINEMETAL_API void
+WMTDiagTimeCalls(void) {
+  wmt_diag_calls = 1;
+}
+
+/* ntdll's (Wine's winternl.h): 0 is SemaphoreBasicInformation, a SEMAPHORE_BASIC_INFORMATION */
+NTSYSAPI NTSTATUS WINAPI NtQuerySemaphore(HANDLE, int, void *, ULONG, ULONG *);
+
+WINEMETAL_API int64_t
+WMTDiagSemaphoreCount(void *semaphore) {
+  struct {
+    LONG current, maximum;
+  } info;
+  return NtQuerySemaphore(semaphore, 0, &info, sizeof(info), NULL) ? -1 : info.current;
+}
+
+WINEMETAL_API void
+WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]) {
+  for (unsigned int code = 0; code < WMTUnixCallCount; code++) {
+    calls[code].count = InterlockedExchange64((LONG64 *)&diag_calls[code].count, 0);
+    calls[code].ticks = InterlockedExchange64((LONG64 *)&diag_calls[code].ticks, 0);
+    calls[code].name = diag_calls[code].name;
+  }
+}
+
+// a thread's ring holds about its last few frames of records. a ring outlives its thread, whose records it keeps
+// until the next thread that takes it writes over them
+enum { kFlightRecords = 4096 };
+struct flight_ring {
+  struct flight_ring *next;
+  DWORD owner;
+  int64_t written;
+  struct WMTFlightEntry entries[kFlightRecords];
+};
+static struct flight_ring *flight_rings;
+static DWORD flight_slot = TLS_OUT_OF_INDEXES;
+static int64_t flight_lost;
+static SRWLOCK flight_dump_lock = SRWLOCK_INIT;
+static LONG flight_dumps;
+// QueryPerformanceCounter is a system call in Wine on macOS (hundreds of ns a record), so records read the CPU's
+// counter, which the dump scales by the QueryPerformanceCounter time since the recorder started
+static uint64_t flight_started, flight_started_qpc;
+
+static inline uint64_t
+flight_ticks(void) {
+// ARM64EC code defines __x86_64__ too
+#if defined(__aarch64__) || defined(__arm64ec__)
+  uint64_t ticks;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+  return ticks;
+#elif defined(__x86_64__) || defined(__i386__)
+  return __rdtsc();
+#else
+#error "the flight recorder has no counter for this CPU"
+#endif
+}
+static const void *flight_exception_site;
+
+WINEMETAL_API const void *
+WMTFlightSite(const char *format) {
+  size_t size = strlen(format) + 1;
+  char *site = HeapAlloc(GetProcessHeap(), 0, size);
+  if (site)
+    memcpy(site, format, size);
+  return site;
+}
+
+static struct flight_ring *
+flight_take(void) {
+  DWORD self = GetCurrentThreadId();
+  struct flight_ring *ring;
+  for (ring = __atomic_load_n(&flight_rings, __ATOMIC_ACQUIRE); ring; ring = ring->next)
+    if (!__atomic_load_n(&ring->owner, __ATOMIC_RELAXED) && !InterlockedCompareExchange((LONG *)&ring->owner, self, 0))
+      break;
+  if (!ring) {
+    if (!(ring = VirtualAlloc(NULL, sizeof(*ring), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)))
+      return NULL;
+    ring->owner = self;
+    do
+      ring->next = __atomic_load_n(&flight_rings, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&flight_rings, &ring->next, ring, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+  }
+  TlsSetValue(flight_slot, ring);
+  return ring;
+}
+
+WINEMETAL_API void
+WMTFlightRecord(const void *site, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  struct flight_ring *ring = flight_slot == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(flight_slot);
+  if (!site || flight_slot == TLS_OUT_OF_INDEXES || (!ring && !(ring = flight_take()))) {
+    InterlockedIncrement64(&flight_lost);
+    return;
+  }
+  struct WMTFlightEntry *entry = &ring->entries[ring->written % kFlightRecords];
+  entry->time = flight_ticks();
+  WMT_MEMPTR_SET(entry->site, site);
+  entry->args[0] = a, entry->args[1] = b, entry->args[2] = c, entry->args[3] = d;
+  entry->thread = GetCurrentThreadId();
+  // a dump reads what is written before the count, and may read the one record being written torn
+  __atomic_store_n(&ring->written, ring->written + 1, __ATOMIC_RELEASE);
+}
+
+static int64_t
+flight_kept(int64_t written) {
+  return written < kFlightRecords ? written : kFlightRecords;
+}
+
+WINEMETAL_API void
+WMTFlightDump(const char *reason) {
+  AcquireSRWLockExclusive(&flight_dump_lock);
+  uint64_t count = 0, overwritten = 0;
+  struct flight_ring *rings = __atomic_load_n(&flight_rings, __ATOMIC_ACQUIRE), *ring;
+  for (ring = rings; ring; ring = ring->next)
+    count += flight_kept(__atomic_load_n(&ring->written, __ATOMIC_ACQUIRE));
+  struct WMTFlightEntry *entries =
+      count ? VirtualAlloc(NULL, count * sizeof(*entries), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : NULL;
+  if (count && !entries)
+    count = 0;
+  uint64_t at = 0;
+  for (ring = rings; ring && at < count; ring = ring->next) {
+    int64_t written = __atomic_load_n(&ring->written, __ATOMIC_ACQUIRE), kept = flight_kept(written);
+    for (int64_t i = written - kept; i < written && at < count; i++)
+      entries[at++] = ring->entries[i % kFlightRecords];
+    overwritten += written - kept;
+  }
+  WCHAR path[MAX_PATH];
+  char executable[3 * MAX_PATH] = "";
+  DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+  WCHAR *name = path + length;
+  while (name > path && name[-1] != '\\' && name[-1] != '/')
+    name--;
+  WideCharToMultiByte(CP_UTF8, 0, name, -1, executable, sizeof(executable), NULL, NULL);
+  LARGE_INTEGER frequency, now;
+  QueryPerformanceFrequency(&frequency);
+  QueryPerformanceCounter(&now);
+  uint64_t ticks = flight_ticks(), elapsed = now.QuadPart - flight_started_qpc;
+  // where MULLION_DIAG=profile writes its records, when it is set
+  char directory[MAX_PATH] = "";
+  if (GetEnvironmentVariableA("MULLION_DIAG_PATH", directory, sizeof(directory)) >= sizeof(directory))
+    directory[0] = 0;
+  struct unixcall_wmtflight_write params;
+  WMT_MEMPTR_SET(params.reason, reason);
+  WMT_MEMPTR_SET(params.directory, directory);
+  WMT_MEMPTR_SET(params.executable, executable);
+  WMT_MEMPTR_SET(params.records, entries);
+  params.count = at;
+  params.frequency = elapsed ? (double)(ticks - flight_started) * frequency.QuadPart / elapsed : 0;
+  params.now = ticks;
+  params.lost = __atomic_load_n(&flight_lost, __ATOMIC_RELAXED);
+  params.overwritten = overwritten;
+  UNIX_CALL(WMTUnixFlightWrite, &params);
+  flight_dumps++;
+  if (entries)
+    VirtualFree(entries, 0, MEM_RELEASE);
+  ReleaseSRWLockExclusive(&flight_dump_lock);
+}
+
+// the exceptions that end a process unless it catches them: the first dumps the records before its handlers run
+static LONG CALLBACK
+flight_exception(EXCEPTION_POINTERS *pointers) {
+  static LONG dumped;
+  EXCEPTION_RECORD *record = pointers->ExceptionRecord;
+  // informational and warning codes, such as OutputDebugString's, are not failures
+  if ((record->ExceptionCode >> 30) != 3)
+    return EXCEPTION_CONTINUE_SEARCH;
+  WMTFlightRecord(flight_exception_site, record->ExceptionCode, (uint64_t)(uintptr_t)record->ExceptionAddress,
+                  record->NumberParameters > 0 ? record->ExceptionInformation[0] : 0,
+                  record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0);
+  switch (record->ExceptionCode) {
+  case EXCEPTION_ACCESS_VIOLATION:
+  case EXCEPTION_ILLEGAL_INSTRUCTION:
+  case EXCEPTION_PRIV_INSTRUCTION:
+  case EXCEPTION_IN_PAGE_ERROR:
+  case EXCEPTION_STACK_OVERFLOW:
+  case EXCEPTION_INT_DIVIDE_BY_ZERO:
+  case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    if (!InterlockedExchange(&dumped, 1))
+      WMTFlightDump("exception");
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// a process that ends after a dump dumps what followed it, and MULLION_FLIGHT=exit dumps every process at its end
+void
+wmt_flight_main(DWORD reason, BOOL exiting) {
+  switch (reason) {
+  case DLL_PROCESS_ATTACH:
+    flight_slot = TlsAlloc();
+    LARGE_INTEGER started;
+    QueryPerformanceCounter(&started);
+    flight_started = flight_ticks();
+    flight_started_qpc = started.QuadPart;
+    flight_exception_site = WMTFlightSite("exception %#llx at %#llx, information %#llx %#llx");
+    AddVectoredExceptionHandler(1, flight_exception);
+    break;
+  case DLL_THREAD_DETACH: {
+    struct flight_ring *ring = TlsGetValue(flight_slot);
+    if (ring)
+      __atomic_store_n(&ring->owner, 0, __ATOMIC_RELEASE);
+    break;
+  }
+  case DLL_PROCESS_DETACH: {
+    char mode[8];
+    DWORD length = GetEnvironmentVariableA("MULLION_FLIGHT", mode, sizeof(mode));
+    if (exiting && (flight_dumps || (length < sizeof(mode) && !strcmp(mode, "exit"))))
+      WMTFlightDump("exit");
+    break;
+  }
+  }
+}
+#endif
+
 WINEMETAL_API void
 NSObject_retain(obj_handle_t obj) {
   UNIX_CALL(0, &obj);
@@ -1139,6 +1372,33 @@ MTLComputePipelineState_maxTotalThreadsPerThreadgroup(obj_handle_t pipeline) {
   return params.ret;
 }
 
+WINEMETAL_API bool
+MTLDevice_supports32BitFloatFiltering(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupports32BitFloatFiltering, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_supports32BitMSAA(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupports32BitMSAA, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceMaxArgumentBufferSamplerCount, &params);
+  return params.ret;
+}
+
 WINEMETAL_API uint64_t
 MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(obj_handle_t pipeline) {
   struct unixcall_generic_obj_uint64_ret params;
@@ -1564,6 +1824,32 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
 }
 
 WINEMETAL_API uint64_t
+WMTGPUStatistics(obj_handle_t device, char *buffer, uint64_t size) {
+  struct unixcall_wmtgpu_statistics params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.buffer, buffer);
+  params.size = size;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixGPUStatistics, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_pushDebugGroup(obj_handle_t cmdbuf, obj_handle_t name) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = cmdbuf;
+  params.arg = name;
+  UNIX_CALL(WMTUnixCommandBufferPushDebugGroup, &params);
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_popDebugGroup(obj_handle_t cmdbuf) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = cmdbuf;
+  UNIX_CALL(WMTUnixCommandBufferPopDebugGroup, &params);
+}
+
+WINEMETAL_API uint64_t
 DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size) {
   struct unixcall_dispatchdata_bytes params;
   params.data = data;
@@ -1572,4 +1858,100 @@ DispatchData_getBytes(obj_handle_t data, void *buffer, uint64_t size) {
   params.ret = 0;
   UNIX_CALL(WMTUnixDispatchDataBytes, &params);
   return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+WMTPresentStatistics_new(void) {
+  struct unixcall_generic_obj_ret params;
+  params.ret = NULL_OBJECT_HANDLE;
+  UNIX_CALL(WMTUnixPresentStatisticsNew, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MetalDrawable_countPresent(obj_handle_t drawable, obj_handle_t statistics, uint64_t number) {
+  struct unixcall_generic_obj_obj_uint64_noret params;
+  params.handle = drawable;
+  params.arg0 = statistics;
+  params.arg1 = number;
+  UNIX_CALL(WMTUnixDrawableCountPresent, &params);
+}
+
+WINEMETAL_API void
+WMTPresentStatistics_get(obj_handle_t statistics, struct WMTPresentStatistics *out) {
+  struct unixcall_generic_obj_ptr_noret params;
+  params.handle = statistics;
+  WMT_MEMPTR_SET(params.arg, out);
+  UNIX_CALL(WMTUnixPresentStatisticsGet, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTL4CommandBuffer_new(
+    obj_handle_t queue, obj_handle_t fence, obj_handle_t event, uint64_t value, obj_handle_t residency,
+    struct WMTMetal4BindingCounts bindings
+) {
+  struct unixcall_metal4_new p = {
+      .queue = queue, .fence = fence, .event = event, .residency = residency, .value = value, .bindings = bindings
+  };
+  UNIX_CALL(WMTUnixMetal4NewBuffer, &p);
+  return p.ret;
+}
+WINEMETAL_API obj_handle_t
+MTL4CommandBuffer_encoder(
+    obj_handle_t buffer, enum WMTMetal4Stream kind, const struct WMTRenderPassInfo *render,
+    struct WMTSampleBufferAttachmentInfo *samples
+) {
+  struct unixcall_metal4_encoder p = {.buffer = buffer, .kind = kind};
+  WMT_MEMPTR_SET(p.render, render);
+  WMT_MEMPTR_SET(p.samples, samples);
+  UNIX_CALL(WMTUnixMetal4Encoder, &p);
+  return p.ret;
+}
+WINEMETAL_API void
+MTL4CommandEncoder_encodeCommands(obj_handle_t encoder, enum WMTMetal4Stream kind, const struct wmtcmd_base *head) {
+  struct unixcall_metal4_commands p = {.encoder = encoder, .kind = kind};
+  WMT_MEMPTR_SET(p.head, head);
+  UNIX_CALL(WMTUnixMetal4Commands, &p);
+}
+WINEMETAL_API void
+MTL4CommandEncoder_endEncoding(obj_handle_t encoder, bool segment) {
+  struct unixcall_generic_obj_uint64_noret p = {encoder, segment};
+  UNIX_CALL(WMTUnixMetal4EndEncoder, &p);
+}
+WINEMETAL_API void
+MTL4CommandBuffer_commit(obj_handle_t buffer) {
+  UNIX_CALL(WMTUnixMetal4Commit, &buffer);
+}
+WINEMETAL_API struct WMTMetal4Feedback
+MTL4CommandBuffer_feedback(obj_handle_t buffer) {
+  struct unixcall_metal4_feedback p = {.buffer = buffer};
+  UNIX_CALL(WMTUnixMetal4Feedback, &p);
+  return p.ret;
+}
+WINEMETAL_API void
+MTL4CommandBuffer_waitUntilCompleted(obj_handle_t buffer) {
+  UNIX_CALL(WMTUnixMetal4Wait, &buffer);
+}
+WINEMETAL_API obj_handle_t
+MTL4CounterHeap_new(obj_handle_t device, uint64_t count) {
+  struct unixcall_generic_obj_uint64_obj_ret p = {.handle = device, .arg = count};
+  UNIX_CALL(WMTUnixMetal4CounterHeap, &p);
+  return p.ret;
+}
+WINEMETAL_API uint64_t
+MTLDevice_queryTimestampFrequency(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret p = {.handle = device};
+  UNIX_CALL(WMTUnixMetal4Frequency, &p);
+  return p.ret;
+}
+WINEMETAL_API void
+MTL4CommandBuffer_present(obj_handle_t buffer, obj_handle_t drawable, double after) {
+  struct unixcall_generic_obj_obj_double_noret p = {buffer, drawable, after};
+  UNIX_CALL(WMTUnixMetal4Present, &p);
+}
+
+WINEMETAL_API void
+MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value) {
+  struct unixcall_mtl4_event p = {.queue = buffer, .event = event, .value = value};
+  UNIX_CALL(WMTUnixMetal4WaitEvent, &p);
 }

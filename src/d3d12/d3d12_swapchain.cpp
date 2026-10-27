@@ -32,7 +32,9 @@
 #include "util_cpu_fence.hpp"
 #include "util_hotpatch.h"
 #include "config/config.hpp"
+#include <bit>
 #include <cfloat>
+#include <limits>
 
 /**
 Ref: https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency
@@ -109,7 +111,7 @@ public:
   };
 };
 
-class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D12Device> {
+class MTLD3D12SwapChain final : public MTLDXGISubObject<IMTLDXGISwapChain, MTLD3D12Device> {
 
   Com<IDXGIFactory1> factory_;
   Com<MTLD3D12CommandQueue> queue_;
@@ -142,6 +144,15 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
 
   D3D12SwapChainBufferRefs buffer_refs_{this};
   std::vector<Com<MTLD3D12Resource, false>> backbuffers_;
+  struct PresentQueue {
+    Com<ID3D12CommandQueue> queue;
+    Com<ID3D12Fence> ready;
+  };
+  std::vector<PresentQueue> present_queues_;
+  Com<MTLD3D12CommandQueue> presentation_queue_;
+  Com<ID3D12Fence> present_finished_;
+  UINT64 presentation_sequence_ = 0;
+  Com<IUnknown> window_reservation_;
 
   bool
   LayerSupportEDR() {
@@ -212,7 +223,8 @@ public:
         .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
         .Width = desc_.Width,
         .Height = desc_.Height,
-        .DepthOrArraySize = 1,
+        // a stereo buffer holds the left eye in slice 0, the right one in slice 1
+        .DepthOrArraySize = UINT16(desc_.Stereo ? 2 : 1),
         .MipLevels = 1,
         .Format = desc_.Format,
         .SampleDesc =
@@ -232,6 +244,8 @@ public:
       static_cast<MTLDXGIOutput *>(target_.ptr())->SetFullscreen(false);
     WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
+    if (diag::profile)
+      diag::LatencyClosed(present_semaphore_);
     CloseHandle(present_semaphore_);
   };
 
@@ -239,13 +253,14 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) final {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIDeviceSubObject) ||
         riid == __uuidof(IDXGISwapChain) || riid == __uuidof(IDXGISwapChain1) || riid == __uuidof(IDXGISwapChain2) ||
-        riid == __uuidof(IDXGISwapChain3) || riid == __uuidof(IDXGISwapChain4)) {
+        riid == __uuidof(IDXGISwapChain3) || riid == __uuidof(IDXGISwapChain4) ||
+        riid == __uuidof(IMTLDXGISwapChain)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -256,6 +271,14 @@ public:
 
     return E_NOINTERFACE;
   };
+
+  HRESULT STDMETHODCALLTYPE
+  SetWindowReservation(IUnknown *reservation) final {
+    if (!reservation || window_reservation_)
+      return DXGI_ERROR_INVALID_CALL;
+    window_reservation_ = reservation;
+    return S_OK;
+  }
 
   HRESULT
   STDMETHODCALLTYPE
@@ -283,7 +306,7 @@ public:
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
     if (!Fullscreen && pTarget)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
     if (modeset_inprogress)
       return !!Fullscreen == !fullscreen_desc_.Windowed ? S_OK : DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
@@ -319,7 +342,7 @@ public:
     Com<IDXGIOutput1> output = pTarget;
 
     if (!wsi::isWindow(hWnd))
-      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      return FAIL(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
 
     if (output == nullptr) {
       if (FAILED(GetOutputFromMonitor(wsi::getWindowMonitor(hWnd), &output))) {
@@ -329,7 +352,7 @@ public:
     }
 
     if (!GetWindowRect(hWnd, &window_state_.rect))
-      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      return FAIL(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
 
     DXGI_OUTPUT_DESC desc;
     if (HRESULT hr = output->GetDesc(&desc); FAILED(hr))
@@ -388,7 +411,7 @@ public:
   HRESULT
   ChangeDisplayMode(IDXGIOutput1 *pOutput, DXGI_MODE_DESC1 *pDisplayMode) {
     if (!pOutput)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     // Find a mode that the output supports
 
@@ -427,7 +450,7 @@ public:
             selected_mode.ScanlineOrdering == DXGI_MODE_SCANLINE_ORDER_LOWER_FIELD_FIRST
     };
     if (!wsi::setWindowMode(output_desc.Monitor, hWnd, wsi_mode))
-      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      return FAIL(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
 
     *pDisplayMode = selected_mode;
     init_refresh_rate_ = double(selected_mode.RefreshRate.Numerator) / double(selected_mode.RefreshRate.Denominator);
@@ -437,10 +460,10 @@ public:
   HRESULT
   RestoreDisplayMode(HMONITOR hMonitor) {
     if (!hMonitor)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     if (!wsi::restoreDisplayMode(hMonitor))
-      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      return FAIL(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
 
     init_refresh_rate_ = DBL_MAX;
     return S_OK;
@@ -464,7 +487,7 @@ public:
   STDMETHODCALLTYPE
   GetDesc(DXGI_SWAP_CHAIN_DESC *pDesc) final {
     if (!pDesc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     pDesc->BufferDesc.Width = desc_.Width;
     pDesc->BufferDesc.Height = desc_.Height;
@@ -486,11 +509,19 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags) final {
+    return Resize(BufferCount, Width, Height, Format, flags, nullptr, nullptr);
+  }
+
+  HRESULT
+  Resize(
+      UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags, const UINT *pCreationNodeMask,
+      IUnknown *const *ppPresentQueue
+  ) {
     // held buffers cannot be retired (IDXGISwapChain::ResizeBuffers, Remarks).
     {
       std::lock_guard<mullion::mutex> lock(buffer_refs_.mutex);
       if (buffer_refs_.referenced_buffers)
-        return DXGI_ERROR_INVALID_CALL;
+        return FAIL(DXGI_ERROR_INVALID_CALL);
     }
     // the new buffers first: the swap chain stays as it is when they cannot be made. 0 and DXGI_FORMAT_UNKNOWN keep
     // what there is (the window's size for a size of 0), and the flags are the swap chain's from now on, except that
@@ -505,20 +536,46 @@ public:
       desc.Format = Format;
     if (BufferCount)
       desc.BufferCount = BufferCount;
-    if (!IsFlipSwapChainFormat(desc.Format))
-      return DXGI_ERROR_INVALID_CALL;
-    if (desc.BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+    if (desc.Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc.Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
       return E_INVALIDARG;
-    if ((flags ^ desc_.Flags) & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
-      return DXGI_ERROR_INVALID_CALL;
+    if (!IsFlipSwapChainFormat(desc.Format))
+      return FAIL(DXGI_ERROR_INVALID_CALL);
+    if (desc.BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+      return FAIL(E_INVALIDARG);
+    if (desc.BufferCount < 2)
+      return FAIL(DXGI_ERROR_INVALID_CALL);
+    if ((flags ^ desc_.Flags) &
+        (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     desc.Flags = flags;
     auto backbuffer_desc = backbuffer_desc_;
     backbuffer_desc.Width = std::max(desc.Width, 1u);
     backbuffer_desc.Height = std::max(desc.Height, 1u);
     backbuffer_desc.Format = desc.Format;
     decltype(backbuffers_) backbuffers;
+    std::vector<PresentQueue> present_queues(ppPresentQueue || presentation_queue_ ? desc.BufferCount : 0);
     D3D12_HEAP_PROPERTIES heap_props = device_->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_DEFAULT);
+    for (UINT i = 0; i < present_queues.size(); i++) {
+      auto &present = present_queues[i];
+      Com<ID3D12Device> device;
+      UINT mask = pCreationNodeMask && pCreationNodeMask[i] ? pCreationNodeMask[i] : 1;
+      auto object = ppPresentQueue ? ppPresentQueue[i] : static_cast<IUnknown *>(queue_.ptr());
+      if (!std::has_single_bit(mask) || UINT(std::bit_width(mask)) > device_->GetNodeCount() || !object ||
+          FAILED(object->QueryInterface(IID_PPV_ARGS(&present.queue))) ||
+          FAILED(present.queue->GetDevice(IID_PPV_ARGS(&device))) || device.ptr() != device_)
+        return DXGI_ERROR_INVALID_CALL;
+      auto queue_desc = present.queue->GetDesc();
+      if (queue_desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT || (queue_desc.NodeMask ? queue_desc.NodeMask : 1) != mask)
+        return DXGI_ERROR_INVALID_CALL;
+      if (HRESULT hr = CreateFence(device_, 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&present.ready)); FAILED(hr))
+        return hr;
+    }
     for (unsigned i = 0; i < desc.BufferCount; i++) {
+      if (pCreationNodeMask) {
+        heap_props.CreationNodeMask = pCreationNodeMask[i] ? pCreationNodeMask[i] : 1;
+        heap_props.VisibleNodeMask =
+            std::numeric_limits<UINT>::max() >> (std::numeric_limits<UINT>::digits - device_->GetNodeCount());
+      }
       Com<ID3D12Resource> backbuffer;
       if (HRESULT hr = mullion::CreateCommittedTexture(
               device_, &heap_props, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, &backbuffer_desc,
@@ -528,9 +585,21 @@ public:
         return hr;
       backbuffers.push_back(reinterpret_cast<MTLD3D12Resource *>(backbuffer.ptr()));
     }
+    if (ppPresentQueue && !presentation_queue_) {
+      Com<ID3D12CommandQueue> queue;
+      Com<ID3D12Fence> finished;
+      D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+      if (HRESULT hr = CreateCommandQueue(device_, &queue_desc, IID_PPV_ARGS(&queue)); FAILED(hr))
+        return hr;
+      if (HRESULT hr = CreateFence(device_, 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&finished)); FAILED(hr))
+        return hr;
+      presentation_queue_ = static_cast<MTLD3D12CommandQueue *>(queue.ptr());
+      present_finished_ = std::move(finished);
+    }
     desc_ = desc;
     backbuffer_desc_ = backbuffer_desc;
     backbuffers_ = std::move(backbuffers);
+    present_queues_ = std::move(present_queues);
     // the first of the new buffers is the next to be presented
     current_buffer_ = 0;
     settings_.Resized();
@@ -543,10 +612,10 @@ public:
   STDMETHODCALLTYPE
   ResizeTarget(const DXGI_MODE_DESC *pDesc) final {
     if (!pDesc)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     if (!wsi::isWindow(hWnd))
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
     if (modeset_inprogress)
@@ -563,11 +632,11 @@ public:
 
     if (fullscreen_desc_.Windowed) {
       if (!wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width, newDisplayMode.Height))
-        return DXGI_ERROR_INVALID_CALL;
+        return FAIL(DXGI_ERROR_INVALID_CALL);
     } else {
       RECT bounds{}, rect{};
       if (!wsi::getDesktopCoordinates(monitor_, &bounds) || !GetWindowRect(hWnd, &rect))
-        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        return FAIL(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
       auto state = window_state_;
       if (rect.right - rect.left != bounds.right - bounds.left ||
           rect.bottom - rect.top != bounds.bottom - bounds.top) {
@@ -579,7 +648,7 @@ public:
         if (HRESULT hr = ChangeDisplayMode(target_.ptr(), &newDisplayMode); FAILED(hr))
           return hr;
       if (!wsi::updateFullscreenWindow(monitor_, hWnd, &state, false))
-        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        return FAIL(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
       window_state_ = state;
     }
     std::lock_guard<mullion::mutex> lock(mutex_);
@@ -609,13 +678,13 @@ public:
           HMONITOR                  Monitor,
           IDXGIOutput1**            ppOutput) {
     if (!ppOutput)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     Com<IDXGIAdapter> adapter;
     Com<IDXGIOutput> output;
 
     if (FAILED(device_->GetAdapter(IID_PPV_ARGS(&adapter))))
-      return E_FAIL;
+      return FAIL(E_FAIL);
 
     for (uint32_t i = 0; SUCCEEDED(adapter->EnumOutputs(i, &output)); i++) {
       DXGI_OUTPUT_DESC outputDesc;
@@ -636,7 +705,7 @@ public:
     InitReturnPtr(ppOutput);
     
     if (!wsi::isWindow(hWnd))
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     
     Com<IDXGIOutput1> output;
 
@@ -656,20 +725,19 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
-    DEBUG("DXGISwapChain::GetFrameStatistics: stub");
-    stats->PresentCount = presentation_count_;
-    stats->SyncRefreshCount = presentation_count_;
-    stats->PresentRefreshCount = presentation_count_;
-    stats->SyncGPUTime = {};
-    stats->SyncQPCTime = {};
-    return S_OK;
+    if (!stats)
+      return E_INVALIDARG;
+    wsi::WsiMode mode;
+    if (!wsi::getCurrentDisplayMode(monitor_, &mode) || !mode.refreshRate.numerator || !mode.refreshRate.denominator)
+      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    return presenter->frameStatistics(stats, double(mode.refreshRate.numerator) / mode.refreshRate.denominator);
   };
 
   HRESULT
   STDMETHODCALLTYPE
   GetLastPresentCount(UINT *last_present_count) final {
     if (last_present_count == NULL) {
-      return E_POINTER;
+      return FAIL(E_POINTER);
     }
     *last_present_count = presentation_count_;
     return S_OK;
@@ -679,7 +747,7 @@ public:
   STDMETHODCALLTYPE
   GetDesc1(DXGI_SWAP_CHAIN_DESC1 *pDesc) final {
     if (pDesc == NULL) {
-      return E_POINTER;
+      return FAIL(E_POINTER);
     }
     *pDesc = desc_;
     return S_OK;
@@ -689,7 +757,7 @@ public:
   STDMETHODCALLTYPE
   GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pDesc) final {
     if (pDesc == NULL) {
-      return E_POINTER;
+      return FAIL(E_POINTER);
     }
     *pDesc = fullscreen_desc_;
     return S_OK;
@@ -699,7 +767,7 @@ public:
   STDMETHODCALLTYPE
   GetHwnd(HWND *pHwnd) final {
     if (pHwnd == NULL) {
-      return E_POINTER;
+      return FAIL(E_POINTER);
     }
     *pHwnd = hWnd;
     return S_OK;
@@ -716,14 +784,23 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    // TEST validates the interval too (IDXGISwapChain::Present, SyncInterval: 0 through 4).
+    if (SyncInterval > 4)
+      return DXGI_ERROR_INVALID_CALL;
+    if (((PresentFlags & DXGI_PRESENT_ALLOW_TEARING) &&
+         (SyncInterval || !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) || !fullscreen_desc_.Windowed)) ||
+        ((PresentFlags & DXGI_PRESENT_STEREO_PREFER_RIGHT) && !desc_.Stereo) ||
+        (PresentFlags & (DXGI_PRESENT_STEREO_TEMPORARY_MONO | DXGI_PRESENT_RESTRICT_TO_OUTPUT)))
+      return DXGI_ERROR_INVALID_CALL;
     if (FAILED(device_->GetDeviceRemovedReason()))
-      return DXGI_ERROR_DEVICE_REMOVED;
+      return FAIL(DXGI_ERROR_DEVICE_REMOVED);
     HRESULT hr = S_OK;
     follower_.follow(hWnd, native_view_);
     if (desc_.Width == 0 || desc_.Height == 0)
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
+    auto began = diag::profile ? diag::Now() : 0;
     // a window the picture keeps its size in may have another size by now
     if (settings_.Update(desc_, fullscreen_desc_.Windowed, hWnd, *presenter))
       ApplyLayerProps();
@@ -734,15 +811,48 @@ public:
     );
 
     auto &backbuffer = backbuffers_[current_buffer_];
+    // the frame presented last is the buffer before this one, which the frame shown keeps where it is not new
+    auto &previous = backbuffers_[(current_buffer_ + backbuffers_.size() - 1) % backbuffers_.size()];
+    auto copies = backbuffers_.size() > 1 ? PresentCopies(pPresentParameters, desc_.Width, desc_.Height)
+                                          : std::vector<PresentCopy>{};
+    // the output is mono: a stereo buffer shows its left eye, or its right one when the present prefers it
+    auto &shown = backbuffer->texture;
+    auto eye = shown->createView(
+        {shown->pixelFormat(), WMTTextureType2D, 0, 1, PresentFlags & DXGI_PRESENT_STEREO_PREFER_RIGHT ? 1u : 0u, 1}
+    );
     // full screen, the output's gamma ramp
     if (target_)
       presenter->changeGammaRamp(static_cast<MTLDXGIOutput *>(target_.ptr())->GetGammaRamp());
-    hr = queue_->Present(
-        this, this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration, dump_id_, presentation_count_
-    );
+    if (present_queues_.empty()) {
+      hr = queue_->Present(
+          this, this->presenter.ptr(), backbuffer.ptr(), eye, present_semaphore_, vsync_duration, dump_id_,
+          presentation_count_, previous.ptr(), std::move(copies)
+      );
+    } else {
+      // one presentation order, bracketed by the assigned queue's work (IDXGISwapChain3::ResizeBuffers1).
+      auto &present = present_queues_[current_buffer_];
+      auto sequence = ++presentation_sequence_;
+      if (FAILED(hr = present.queue->Signal(present.ready.ptr(), sequence)) ||
+          FAILED(hr = presentation_queue_->Wait(present.ready.ptr(), sequence)) ||
+          FAILED(
+              hr = presentation_queue_->Present(
+                  this, presenter.ptr(), backbuffer.ptr(), eye, present_semaphore_, vsync_duration, dump_id_,
+                  presentation_count_, previous.ptr(), std::move(copies)
+              )
+          ) ||
+          FAILED(hr = presentation_queue_->Signal(present_finished_.ptr(), sequence)) ||
+          FAILED(hr = present.queue->Wait(present_finished_.ptr(), sequence)))
+        return hr;
+    }
+    if (FAILED(hr))
+      return hr;
 
     presentation_count_ += 1;
     current_buffer_ = (current_buffer_ + 1) % backbuffers_.size();
+    if (began) {
+      diag::Write(diag::Line("span", "present", "", GetCurrentThreadId(), began, diag::Now() - began));
+      diag::LatencyPresented(present_semaphore_);
+    }
 
     return hr;
   };
@@ -756,7 +866,7 @@ public:
   STDMETHODCALLTYPE
   GetRestrictToOutput(IDXGIOutput **ppRestrictToOutput) final {
     if (!ppRestrictToOutput)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     // a swap chain here is restricted to no output
     *ppRestrictToOutput = nullptr;
     return S_OK;
@@ -772,7 +882,7 @@ public:
   STDMETHODCALLTYPE
   GetBackgroundColor(DXGI_RGBA *pColor) final {
     if (!pColor)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     *pColor = settings_.background;
     return S_OK;
   };
@@ -787,7 +897,7 @@ public:
   STDMETHODCALLTYPE
   GetRotation(DXGI_MODE_ROTATION *pRotation) final {
     if (!pRotation)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     *pRotation = settings_.rotation;
     return S_OK;
   };
@@ -805,11 +915,13 @@ public:
   HRESULT STDMETHODCALLTYPE
   SetMaximumFrameLatency(UINT max_latency) override {
     if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     if (max_latency == 0 || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS) {
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     }
     if (max_latency > frame_latency) {
+      if (diag::profile)
+        diag::LatencyReleased(present_semaphore_);
       ReleaseSemaphore(present_semaphore_, max_latency - frame_latency, nullptr);
     }
     frame_latency = max_latency;
@@ -820,7 +932,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   GetMaximumFrameLatency(UINT *max_latency) override {
     if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     if (max_latency) {
       *max_latency = frame_latency;
     }
@@ -839,24 +951,26 @@ public:
     if (!DuplicateHandle(processHandle, present_semaphore_, processHandle, &result, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
       return nullptr;
     }
+    if (diag::profile)
+      diag::LatencyTaken(present_semaphore_);
 
     return result;
   };
 
   HRESULT STDMETHODCALLTYPE
   SetMatrixTransform(const DXGI_MATRIX_3X2_F *matrix) override {
-    return DXGI_ERROR_INVALID_CALL;
+    return FAIL(DXGI_ERROR_INVALID_CALL);
   };
 
   HRESULT STDMETHODCALLTYPE
   GetMatrixTransform(DXGI_MATRIX_3X2_F *matrix) override {
-    return DXGI_ERROR_INVALID_CALL;
+    return FAIL(DXGI_ERROR_INVALID_CALL);
   };
 
   HRESULT STDMETHODCALLTYPE
   CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT *pColorSpaceSupport) override {
     if (!pColorSpaceSupport)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     *pColorSpaceSupport = CGColorSpace_checkColorSpaceSupported(ConvertColorSpace(ColorSpace, false))
                               ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT
                               : 0;
@@ -874,8 +988,9 @@ public:
       UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT *pCreationNodeMask,
       IUnknown *const *ppPresentQueue
   ) override {
-    WARN("DXGISwapChain3::ResizeBuffers1: ignoring d3d12 related parameters");
-    return ResizeBuffers(BufferCount, Width, Height, Format, SwapChainFlags);
+    if (!pCreationNodeMask || !ppPresentQueue)
+      return DXGI_ERROR_INVALID_CALL;
+    return Resize(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -883,7 +998,7 @@ public:
     UINT support = 0;
     CheckColorSpaceSupport(ColorSpace, &support);
     if (!(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto target_color_space = ConvertColorSpace(ColorSpace, LayerSupportEDR());
     if (presenter->changeLayerColorSpace(target_color_space)) {
       // TODO(d3d12): flush command queue
@@ -908,7 +1023,7 @@ CreateSwapChain(
 ) {
   // Direct3D 12 Swap Chains, Swap effects: only flip sequential and flip discard are supported
   if (pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
-    return DXGI_ERROR_INVALID_CALL;
+    return FAIL(DXGI_ERROR_INVALID_CALL);
   auto swapchain = Com<MTLD3D12SwapChain>::transfer(new MTLD3D12SwapChain(pFactory, pDevice, pQueue, hWnd, pDesc, pFullscreenDesc));
   HRESULT hr = swapchain->ResizeBuffers(0, pDesc->Width, pDesc->Height, DXGI_FORMAT_UNKNOWN, pDesc->Flags);
   if (FAILED(hr))

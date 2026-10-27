@@ -60,7 +60,7 @@ main() {
   auto run = [&](std::function<void()> operation) {
     HANDLE thread = CreateThread(
         nullptr, 0,
-        [](void *p) -> DWORD {
+        [](void *p) WINAPI -> DWORD {
           (*static_cast<const std::function<void()> *>(p))();
           return 0;
         },

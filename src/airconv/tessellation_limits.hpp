@@ -1,6 +1,7 @@
 // what a tessellation pipeline's stages are sized for: how air_tessellation.metal cuts a patch of the largest factor
 #pragma once
 #include "DXBCParser/d3d12tokenizedprogramformat.hpp"
+#include "airconv_public.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -115,9 +116,10 @@ struct tess_pieces {
   uint32_t count, primitives;
 };
 
-// conservative rasterization (`conservative`) always shares a workload of triangles: each primitive is a fan of nine
-// vertices and seven triangles, each vertex with six more floats (SM50_CONSERVATIVE_VARYINGS), and its corners'
-// registers wait in threadgroup memory, 16 KB of it, for the fans; `primitives` 0 where not even one fits
+// conservative rasterization (`conservative`) always shares a workload of triangles: each primitive is one triangle
+// of three vertices of its own, each with the conservative rasterizer's floats (SM50_CONSERVATIVE_VARYINGS,
+// SM50_CONSERVATIVE_RCP_W), and its corners' registers wait in threadgroup memory, 16 KB of it, for the triangles;
+// `primitives` 0 where not even one fits
 constexpr uint32_t conservative_stash_limit = 16384;
 
 inline tess_pieces
@@ -127,11 +129,11 @@ tessellation_pieces(
 ) {
   uint32_t corners = get_primitive_vertices(primitive), vertices = get_max_workload_vertices(factor, domain);
   if (conservative && corners == 3) {
-    uint32_t grown = vertex_size + 6 * sizeof(float);
-    uint32_t fans = std::min({256u / 9, 512u / 7, conservative_stash_limit / (3 * std::max(vertex_size, 1u))});
-    while (fans && mesh_size(9 * fans, grown, 7 * fans) > mesh_size_limit)
-      fans--;
-    return {fans ? (vertices + fans - 1) / fans : 0, fans};
+    uint32_t grown = vertex_size + (SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * sizeof(float);
+    uint32_t triangles = std::min({256u / 3, 512u, conservative_stash_limit / (3 * std::max(vertex_size, 1u))});
+    while (triangles && mesh_size(3 * triangles, grown, triangles) > mesh_size_limit)
+      triangles--;
+    return {triangles ? (vertices + triangles - 1) / triangles : 0, triangles};
   }
   // a point has its size too
   vertex_size += corners == 1 ? sizeof(float) : 0;

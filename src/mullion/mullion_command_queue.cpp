@@ -118,7 +118,8 @@ CommandQueue::ProfilePass(EncoderData *pass, diag::ProfileBuffer *&profiled) {
     attachment = {samples.buffer, first, first + count - 1};
   }
   buffer.passes.push_back(
-      {seq, diag::Now(), kind, std::move(runs), std::move(targets), uint32_t(buffer.samples.size() - 1), first, count});
+      {seq, diag::Now(), kind, std::move(runs), std::move(targets), uint32_t(buffer.samples.size() - 1), first, count,
+       pass->event_path ? pass->event_path : ""});
   profiled = &buffer;
   return attachment;
 }
@@ -151,15 +152,6 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.reset();
   };
   event = device.newSharedEvent();
-
-  std::string env = env::getEnvVar("MULLION_CAPTURE_FRAME");
-
-  if (!env.empty()) {
-    try {
-      capture_state.scheduleNextFrameCapture(std::stoull(env));
-    } catch (const std::invalid_argument &) {
-    }
-  }
 }
 
 CommandQueue::~CommandQueue() {
@@ -173,12 +165,19 @@ CommandQueue::Drain() {
   ready_for_encode.fetch_add(1, std::memory_order_release);
   ready_for_encode.notify_one();
   encodeThread.join();
-  // only committed work has completion callbacks; the blocked chunk and its tail are abandoned
-  WaitCPUFence(ready_for_commit.load(std::memory_order_acquire) - 1);
+  // only committed work has completion callbacks; the blocked chunk and its tail are abandoned, and so not ongoing
+  auto committed = ready_for_commit.load(std::memory_order_acquire) - 1;
+  WaitCPUFence(committed);
+  chunk_ongoing.fetch_sub(drain_last_seq_ - committed, std::memory_order_release);
 }
 
 void
 CommandQueue::Shutdown() {
+  if (stopped.load())
+    return;
+  // what was committed runs to its end, with its completions
+  for (uint64_t ongoing; (ongoing = chunk_ongoing.load(std::memory_order_acquire));)
+    chunk_ongoing.wait(ongoing, std::memory_order_acquire);
   if (stopped.exchange(true))
     return;
   TRACE("Destructing command queue");
@@ -212,7 +211,7 @@ CommandQueue::CommitCurrentChunk() {
   if (profile_) {
     profile_->buffers[chunk_id % kCommandChunkCount].submitted = began;
     if (chunk.signal_frame_latency_fence_ != ~0ull)
-      diag::Frame(profile_->id, chunk_id);
+      diag::Frame(device, profile_->id, chunk_id);
   }
 #if ASYNC_ENCODING
   ready_for_encode.fetch_add(1, std::memory_order_release);
@@ -238,35 +237,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
 
   auto pool = WMT::MakeAutoreleasePool();
 
-  switch (capture_state.getNextAction(chunk.frame_)) {
-  case CaptureState::NextAction::StartCapture: {
-    WMTCaptureInfo info;
-    auto capture_mgr = WMT::CaptureManager::sharedCaptureManager();
-    info.capture_object = device;
-    info.destination = WMTCaptureDestinationGPUTraceDocument;
-    char filename[1024];
-    std::time_t now;
-    std::time(&now);
-    std::strftime(filename, 1024, "_%H'%M'%S_%m-%d-%y.gputrace", std::localtime(&now));
-    auto fileUrl = env::getUnixPath(env::getExeBaseName() + "_F." + std::to_string(chunk.frame_) + filename);
-    WARN("A new capture will be saved to ", fileUrl);
-    info.output_url.set(fileUrl.c_str());
-
-    capture_mgr.startCapture(info);
-    break;
-  }
-  case CaptureState::NextAction::StopCapture: {
-    auto capture_mgr = WMT::CaptureManager::sharedCaptureManager();
-    capture_mgr.stopCapture();
-    break;
-  }
-  case CaptureState::NextAction::Nothing: {
-    if (capture_state.shouldCaptureNextFrame()) {
-      capture_state.scheduleNextFrameCapture(chunk.frame_ + 1);
-    }
-    break;
-  }
-  }
+  capture_state.frame(device, chunk.frame_);
 
   auto cmdbuf = commandQueue.commandBuffer();
   chunk.attached_cmdbuf = cmdbuf;
@@ -284,6 +255,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
     device.sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
     buffer.committed = diag::Now();
   }
+  FLIGHT("context queue %p: chunk %llu of frame %llu commits as %#llx", this, seq, chunk.frame_, cmdbuf.handle);
   cmdbuf.commit();
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
@@ -326,8 +298,14 @@ CommandQueue::WaitForFinishThread() {
       chunk.attached_cmdbuf.waitUntilCompleted();
     }
     auto completed = profile_ ? diag::Now() : 0;
+    FLIGHT("context queue %p: chunk %llu completes, status %llu", this, internal_seq,
+           uint64_t(chunk.attached_cmdbuf.status()));
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
+      // the first: Metal fails the command buffers after a fault too
+      static bool dumped;
+      if (!std::exchange(dumped, true))
+        WMTFlightDump("a command buffer error");
     }
     if (auto logs = chunk.attached_cmdbuf.logs()) {
       for (auto &log : logs.elements()) {
@@ -355,6 +333,8 @@ CommandQueue::WaitForFinishThread() {
         for (uint32_t i = 0; i < pass.count; i++)
           line += str::format('\t', pass.first == ~0u ? ~uint64_t(0) : clocks[pass.buffer][pass.first + i]);
         lines += line + '\n' + pass.targets;
+        if (!pass.event.empty())
+          lines += diag::Line("event", profile_->id, internal_seq, pass.id, pass.event);
       }
       diag::Write(lines);
       chunk.readback.timestamp.reset();

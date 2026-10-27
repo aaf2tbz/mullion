@@ -531,6 +531,11 @@ struct InputPrimitiveID {};
 struct InputFrontFacing {};
 struct InputInputCoverage {};
 struct InputSampleIndex {};
+// what a color attachment holds, read before the shader's output replaces it ([[color(index)]])
+struct InputRenderTarget {
+  uint32_t index;
+  MSLScalerOrVectorType type;
+};
 
 struct InputPayload {
   uint32_t size;
@@ -624,7 +629,7 @@ using FunctionInput = template_concat_t<
     /* fragment */
     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
     InputFrontFacing, InputPosition, InputSampleIndex, //
-    InputFragmentStageIn, InputInputCoverage,
+    InputFragmentStageIn, InputInputCoverage, InputRenderTarget,
     /* object & mesh */
     InputPayload, InputMeshGridProperties, InputMesh,
     /* kernel */
@@ -653,13 +658,16 @@ public:
    * for ArgumentBinding*: no guarantee
    */
   uint32_t DefineInput(const FunctionInput &input);
+  size_t InputCount() const { return inputs.size(); }
   uint32_t DefineOutput(const FunctionOutput &output);
   uint32_t DefineMeshVertexOutput(const MeshVertexOutput &output);
   uint32_t DefineMeshPrimitiveOutput(const MeshPrimitiveOutput &output);
   void UseEarlyFragmentTests() { early_fragment_tests = true; }
-  void UseLateFragmentTests() { early_fragment_tests = false; }
-  // the inputs defined so far, by argument index
+  // the inputs defined so far, by argument index, and the outputs
   const std::vector<FunctionInput> &Inputs() const { return inputs; }
+  const std::vector<FunctionOutput> &Outputs() const { return outputs; }
+  bool EarlyFragmentTests() const { return early_fragment_tests; }
+  void UseLateFragmentTests() { early_fragment_tests = false; }
   // a fragment function's inputs at the centroid at the center instead
   void CenterCentroids();
   void UseMaxWorkgroupSize(uint32_t size) { max_work_group_size = size; }

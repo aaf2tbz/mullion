@@ -230,6 +230,8 @@ to_input_primitive(D3D11_PRIMITIVE_TOPOLOGY topo) {
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
     return D3D_PRIMITIVE_TRIANGLE_ADJ;
   default:
+    if (topo >= D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST && topo <= D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST)
+      return D3D_PRIMITIVE(D3D_PRIMITIVE_1_CONTROL_POINT_PATCH + (topo - D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST));
     // a topology class is its primitive (MTLCompiledGeometryPipelineImpl)
     return (D3D_PRIMITIVE)to_metal_primitive_topology(topo);
   }
@@ -886,6 +888,7 @@ public:
         }
         return ClearRenderTargetView(rtv, Color);
       }
+      color = RenderTargetColor(rtv->pixelFormat(), Color);
       InvalidateCurrentPass(true);
       UseWrappedView(rtv, true);
       EmitST([texture = rtv->texture(), view = rtv->viewId(),
@@ -988,6 +991,11 @@ public:
           });
         }
       }
+      if (!NumRects) {
+        EmitOP([=](ArgumentEncodingContext &enc) {
+          enc.clear_uav_cmd.clear(first_element, 0, width * element_stride, height);
+        });
+      }
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
         auto rect_offset_x = std::max<int64_t>(rect.left, 0);
@@ -1021,15 +1029,18 @@ public:
       if (desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
         return;
       }
+      BlitObject resource(device, srv->resource_.ptr());
+      UINT misc = resource.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? resource.Texture1DDesc.MiscFlags
+                  : resource.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D ? resource.Texture2DDesc.MiscFlags
+                                                                           : resource.Texture3DDesc.MiscFlags;
+      constexpr UINT required = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+      if (!(misc & D3D11_RESOURCE_MISC_GENERATE_MIPS) || (srv->bindFlags() & required) != required)
+        return;
       PrepareTextureUse({srv->texture()});
       SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
       UseWrappedView(srv, true);
       EmitOP([tex = srv->texture(), viewId = srv->viewId()](ArgumentEncodingContext &enc) {
-        // workaround: mipmap generation of a8unorm is borked, so use a r8unorm view
-        auto fixedViewId = viewId;
-        if (tex->pixelFormat(viewId) == WMTPixelFormatA8Unorm) {
-          fixedViewId = tex->checkViewUseFormat(viewId, WMTPixelFormatR8Unorm);
-        }
+        auto fixedViewId = tex->checkViewUseFormat(viewId, MipmapFormat(tex->pixelFormat(viewId)));
         WMT::Texture texture = enc.access(tex, fixedViewId, ResourceAccess::ReadWrite).texture;
         if (texture.mipmapLevelCount() > 1) {
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_generate_mipmaps>();
@@ -1087,7 +1098,10 @@ public:
             dst = static_cast<D3D11ResourceCommon *>(pDstResource)->texture(),
             dst_level = DstSubresource % Dst.Texture2DDesc.MipLevels,
             dst_slice = DstSubresource / Dst.Texture2DDesc.MipLevels, SrcSubresource,
-            format = format_desc.PixelFormat](ArgumentEncodingContext &enc) mutable {
+            // channels are averaged where they are stored
+            format = WMTPixelFormat(ORIGINAL_FORMAT(format_desc.PixelFormat)),
+            native = any_bit_set(device->GetMTLPixelFormatCapability(format_desc.PixelFormat) & FormatCapability::Resolve
+            )](ArgumentEncodingContext &enc) mutable {
       TextureViewDescriptor src_desc;
       src_desc.format = format;
       src_desc.type = src->textureType();
@@ -1107,7 +1121,14 @@ public:
       auto src_view = src->createView(src_desc);
       auto dst_view = dst->createView(dst_desc);
 
-      enc.resolveTexture(forward_rc(src), src_view, forward_rc(dst), dst_view);
+      if (native)
+        return enc.resolveTexture(forward_rc(src), src_view, forward_rc(dst), dst_view);
+      // a format Metal cannot resolve is averaged by a draw
+      enc.clear_rt_cmd.begin(dst, dst_view, 0, 0, true);
+      enc.clear_rt_cmd.resolve(
+          0, 0, src->width(src_view), src->height(src_view), src, src_view, 0, 0, D3D12_RESOLVE_MODE_AVERAGE
+      );
+      enc.clear_rt_cmd.end();
     });
   }
 
@@ -1291,6 +1312,13 @@ public:
         copy_offset = pDstBox->left;
         copy_len = pDstBox->right - copy_offset;
       }
+      // D3D11.3 5.3.4.3.1 drops partial constant updates without flags or full-constant alignment.
+      constexpr UINT constant_bytes = sizeof(float) * D3D11_COMMONSHADER_CONSTANT_BUFFER_COMPONENTS;
+      if ((Dst.BufferDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) &&
+          ((copy_offset % constant_bytes) || (copy_len % constant_bytes) ||
+           ((copy_offset || copy_len != Dst.BufferDesc.ByteWidth) &&
+            !(CopyFlags & (D3D11_COPY_DISCARD | D3D11_COPY_NO_OVERWRITE)))))
+        return;
       UINT buffer_len = 0;
       UINT unused_bind_flag = 0;
       if (auto dynamic = GetDynamicBuffer(pDstResource, &buffer_len, &unused_bind_flag)) {
@@ -1818,11 +1846,14 @@ public:
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
-        if (enc.pipelineStatisticsActive())
+        if (enc.pipelineStatisticsActive()) {
+          // the count's vertex function reads the arguments by address
+          enc.makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(ArgBuffer.ptr());
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive),
                                       IndexType == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t),
                                       IndexBufferOffset + index_sub_offset, 0,
                                      buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
+        }
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
@@ -1866,9 +1897,11 @@ public:
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(MULLION_DRAW_ARGUMENTS), ResourceAccess::Read
         );
-        if (enc.pipelineStatisticsActive())
+        if (enc.pipelineStatisticsActive()) {
+          enc.makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(ArgBuffer.ptr());
           enc.countPipelineStatistics(0, 0, get_primitive_vertex_count(Primitive), 0, 0, 0,
                                      buffer->gpuAddress() + buffer_offset + AlignedByteOffsetForArgs);
+        }
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
@@ -2229,6 +2262,7 @@ public:
       return;
     EmitOP([ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ](ArgumentEncodingContext &enc) {
       enc.resolveComputePassBarrier();
+      enc.countComputePipelineStatistics({ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ});
       auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
       cmd.type = WMTComputeCommandDispatch;
       cmd.size = {ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
@@ -2250,6 +2284,7 @@ public:
       EmitOP([AlignedByteOffsetForArgs, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 12, ResourceAccess::Read);
         enc.resolveComputePassBarrier();
+        enc.countComputePipelineStatistics({}, buffer->buffer(), AlignedByteOffsetForArgs + buffer_offset);
         auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
         cmd.type = WMTComputeCommandDispatchIndirect;
         cmd.indirect_args_buffer = buffer->buffer();;
@@ -3282,6 +3317,14 @@ public:
     }
 
     if (NumUAVs != D3D11_KEEP_UNORDERED_ACCESS_VIEWS) {
+      if (NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+        for (UINT slot = UAVStartSlot; slot < state_.OutputMerger.NumRTVs; slot++) {
+          if (state_.OutputMerger.RTVs[slot])
+            should_invalidate_pass = true;
+          state_.OutputMerger.RTVs[slot] = nullptr;
+        }
+        state_.OutputMerger.NumRTVs = std::min(state_.OutputMerger.NumRTVs, UAVStartSlot);
+      }
       auto MinUAV = NumUAVs ? UAVStartSlot : D3D11_1_UAV_SLOT_COUNT;
       auto MaxUAV = NumUAVs ? UAVStartSlot + NumUAVs : 0u;
       auto OldMinUAV = std::exchange(state_.OutputMerger.MinUAVBinding, MinUAV);
@@ -3295,6 +3338,8 @@ public:
           InitialCount = pUAVInitialCounts ? pUAVInitialCounts[Slot - UAVStartSlot] : ~0u;
         }
         if (pUAV) {
+          if (NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+            should_invalidate_pass |= OMResolveRTVHazard(pUAV);
           bool replaced = false;
           auto &entry = UAVs.bind(Slot, {pUAV}, replaced);
           if (InitialCount != ~0u) {
@@ -3326,9 +3371,6 @@ public:
         }
 
         // No check on SO as SO^UAV = 1
-
-        if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
-          should_invalidate_pass |= OMResolveRTVHazard(pUAV);
       }
     }
 
@@ -3487,10 +3529,15 @@ public:
         if (state_.Rasterizer.RasterizerState == expected.ptr())
           return;
         auto current_rs =
-            state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
+            state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
         if (current_rs->IsScissorEnabled() != expected->IsScissorEnabled()) {
           dirty_state.set(DirtyState::Scissors);
         }
+        // the forced sample count is rasterized with the pass's sample count and positions
+        if (current_rs->ForcedSampleCount() != expected->ForcedSampleCount())
+          InvalidateCurrentPass(true);
+        if (current_rs->QuadrilateralLines() != expected->QuadrilateralLines())
+          InvalidateRenderPipeline();
         state_.Rasterizer.RasterizerState = expected.ptr();
         dirty_state.set(DirtyState::RasterizerState);
       } else {
@@ -3501,6 +3548,10 @@ public:
         if (state_.Rasterizer.RasterizerState->IsScissorEnabled() != default_rasterizer_state->IsScissorEnabled()) {
           dirty_state.set(DirtyState::Scissors);
         }
+        if (state_.Rasterizer.RasterizerState->ForcedSampleCount() != default_rasterizer_state->ForcedSampleCount())
+          InvalidateCurrentPass(true);
+        if (state_.Rasterizer.RasterizerState->QuadrilateralLines() != default_rasterizer_state->QuadrilateralLines())
+          InvalidateRenderPipeline();
       }
       state_.Rasterizer.RasterizerState = nullptr;
       dirty_state.set(DirtyState::RasterizerState);
@@ -3526,10 +3577,25 @@ public:
   RSSetViewports(UINT NumViewports, const D3D11_VIEWPORT *pViewports) override {
     std::lock_guard<mutex_t> lock(mutex);
 
-    if (NumViewports > 16)
+    if (NumViewports > std::size(state_.Rasterizer.viewports))
       return;
+    const auto level = device->GetFeatureLevel();
+    // feature levels 9_x use unsigned viewport origins (D3D11_VIEWPORT, Microsoft Learn).
+    const auto minimum = level >= D3D_FEATURE_LEVEL_11_0   ? D3D11_VIEWPORT_BOUNDS_MIN
+                         : level >= D3D_FEATURE_LEVEL_10_0 ? D3D10_VIEWPORT_BOUNDS_MIN
+                                                         : 0;
+    const auto maximum = level < D3D_FEATURE_LEVEL_11_0 ? D3D10_VIEWPORT_BOUNDS_MAX : D3D11_VIEWPORT_BOUNDS_MAX;
+    // invalid arrays leave all viewports unchanged (D3D11.3 15.6.1).
+    for (UINT i = 0; i < NumViewports; i++) {
+      const auto &v = pViewports[i];
+      if (!(v.Width >= 0 && v.Height >= 0 && v.TopLeftX >= minimum && v.TopLeftY >= minimum &&
+            v.TopLeftX + v.Width <= maximum && v.TopLeftY + v.Height <= maximum && v.MinDepth >= 0.0f &&
+            v.MaxDepth <= 1.0f && v.MinDepth <= v.MaxDepth))
+        return;
+    }
     if (state_.Rasterizer.NumViewports == NumViewports &&
-        memcmp(state_.Rasterizer.viewports, pViewports, NumViewports * sizeof(D3D11_VIEWPORT)) == 0) {
+        (!NumViewports ||
+         memcmp(state_.Rasterizer.viewports, pViewports, NumViewports * sizeof(D3D11_VIEWPORT)) == 0)) {
       return;
     }
     state_.Rasterizer.NumViewports = NumViewports;
@@ -3555,10 +3621,8 @@ public:
         else
           pViewports[i] = {0, 0, 0, 0, 0, 0};
       };
-      *pNumViewports = std::min(num_viewports_available, num_viewports_requested);
-    } else {
-      *pNumViewports = num_viewports_available;
     }
+    *pNumViewports = num_viewports_available;
   }
 
   void
@@ -3577,7 +3641,7 @@ public:
       state_.Rasterizer.scissor_rects[i] = pRects[i];
     }
     IMTLD3D11RasterizerState *current_rs =
-        state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
+        state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
     if (current_rs->IsScissorEnabled()) {
       dirty_state.set(DirtyState::Scissors);
       // otherwise no need to update scissor because it's either already dirty
@@ -3600,10 +3664,8 @@ public:
         else
           pRects[i] = {0, 0, 0, 0};
       };
-      *pNumRects = std::min(num_rects_available, num_rects_requested);
-    } else {
-      *pNumRects = num_rects_available;
     }
+    *pNumRects = num_rects_available;
   }
 #pragma endregion
 
@@ -3650,16 +3712,19 @@ public:
     return annotation_.GetStatus();
   };
 
-  void STDMETHODCALLTYPE SetMarkerInt(const WCHAR *label, int data) override {
-    // no-op
-  };
+  // a marker is an instant, which no pass is named by
+  void STDMETHODCALLTYPE SetMarkerInt(const WCHAR *label, int data) override {};
 
   void STDMETHODCALLTYPE BeginEventInt(const WCHAR *label, int data) override {
-    // no-op
+    if (!diag::events)
+      return;
+    auto name = diag::EventName(0, label, label ? std::char_traits<WCHAR>::length(label) * sizeof(WCHAR) : 0);
+    EmitST([name = std::move(name)](ArgumentEncodingContext &enc) { diag::PushEvent(enc.events, name); });
   };
 
   void STDMETHODCALLTYPE EndEvent() override {
-    // no-op
+    if (diag::events)
+      EmitST([](ArgumentEncodingContext &enc) { diag::PopEvent(enc.events); });
   };
 
 #pragma endregion
@@ -4341,6 +4406,16 @@ public:
     }
     if (SrcBox.right <= SrcBox.left || SrcBox.bottom <= SrcBox.top || SrcBox.back <= SrcBox.front)
       return;
+    // D3D11.3 5.6.5 requires matching strides and complete structures on both sides.
+    if ((src_desc.StructureByteStride && dst_desc.StructureByteStride &&
+         src_desc.StructureByteStride != dst_desc.StructureByteStride) ||
+        (src_desc.StructureByteStride &&
+         (SrcBox.left % src_desc.StructureByteStride ||
+          (SrcBox.right - SrcBox.left) % src_desc.StructureByteStride)) ||
+        (dst_desc.StructureByteStride &&
+         (DstX % dst_desc.StructureByteStride ||
+          (SrcBox.right - SrcBox.left) % dst_desc.StructureByteStride)))
+      return;
     if (auto staging_dst = GetStagingResource(pDstResource, DstSubresource)) {
       if (auto staging_src = GetStagingResource(pSrcResource, SrcSubresource)) {
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
@@ -4422,6 +4497,9 @@ public:
   CopyTexture(TextureCopyCommand &&cmd) {
     if (cmd.Invalid)
       return;
+    if (cmd.pSrc == cmd.pDst && cmd.SrcSubresource == cmd.DstSubresource && cmd.SrcOrigin.x == cmd.DstOrigin.x &&
+        cmd.SrcOrigin.y == cmd.DstOrigin.y && cmd.SrcOrigin.z == cmd.DstOrigin.z)
+      return;
     PrepareTextureUse({GetTexture(cmd.pSrc, cmd.Plane), GetTexture(cmd.pDst, cmd.Plane)});
     auto src_type = DXGIFormatType(cmd.Src.Format), dst_type = DXGIFormatType(cmd.Dst.Format);
     bool src_bc = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC, dst_bc = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC;
@@ -4473,6 +4551,13 @@ public:
 
   void
   CopyTextureBitcast(TextureCopyCommand &&cmd) {
+    const bool overlap = cmd.pSrc == cmd.pDst && cmd.SrcSubresource == cmd.DstSubresource &&
+                         cmd.SrcOrigin.x < cmd.DstOrigin.x + cmd.SrcSize.width &&
+                         cmd.DstOrigin.x < cmd.SrcOrigin.x + cmd.SrcSize.width &&
+                         cmd.SrcOrigin.y < cmd.DstOrigin.y + cmd.SrcSize.height &&
+                         cmd.DstOrigin.y < cmd.SrcOrigin.y + cmd.SrcSize.height &&
+                         cmd.SrcOrigin.z < cmd.DstOrigin.z + cmd.SrcSize.depth &&
+                         cmd.DstOrigin.z < cmd.SrcOrigin.z + cmd.SrcSize.depth;
     // a format's unit is what a texel of the other one is copied as: a block of 4 by 4 texels, or a texel
     // (BytesPerTexel is the size of either)
     const uint32_t src_unit = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1,
@@ -4494,6 +4579,22 @@ public:
                 cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto [src, src_sub_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
           auto [dst, dst_sub_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          auto source = src->buffer();
+          if (overlap) {
+            // all source rows precede any write to overlapping rows (D3D11.3 5.6.2.1)
+            // Metal MTLBlitCommandEncoder::copy requires four-byte buffer offsets on macOS
+            constexpr size_t blit_alignment = 4;
+            auto [buffer, offset] = enc.allocateTempBuffer(src_->length, blit_alignment);
+            auto &snapshot = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+            snapshot.type = WMTBlitCommandCopyFromBufferToBuffer;
+            snapshot.src = source;
+            snapshot.src_offset = src_sub_offset;
+            snapshot.dst = buffer;
+            snapshot.dst_offset = offset;
+            snapshot.copy_length = src_->length;
+            source = buffer;
+            src_sub_offset = offset;
+          }
           for (unsigned offset_z = 0; offset_z < cmd.SrcSize.depth; offset_z++) {
             for (unsigned row = 0; row < units_high; row++) {
               auto src_offset = unit_offset(src_, cmd.SrcFormat, src_unit, cmd.SrcOrigin, cmd.Plane, cmd.Src.Height) +
@@ -4503,7 +4604,7 @@ public:
               auto &cmdcp = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
               cmdcp.type = WMTBlitCommandCopyFromBufferToBuffer;
               cmdcp.copy_length = units_wide * cmd.DstFormat.BytesPerTexel;
-              cmdcp.src = src->buffer();
+              cmdcp.src = source;
               cmdcp.src_offset = src_sub_offset + src_offset;
               cmdcp.dst = dst->buffer();
               cmdcp.dst_offset = dst_sub_offset + dst_offset;
@@ -4620,14 +4721,14 @@ public:
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
         UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
         UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
-        EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+        EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd),
+                overlap](ArgumentEncodingContext &enc) {
           auto src_format = src_->pixelFormat();
           auto dst_format = dst_->pixelFormat();
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
-          if (Forget_sRGB(dst_format) != Forget_sRGB(src_format)) {
-
-            // bitcast, using a temporary buffer
+          if (Forget_sRGB(dst_format) != Forget_sRGB(src_format) || overlap) {
+            // overlapping copies read a pre-copy image (D3D11.3 5.6.2.1); Metal blits may overwrite it
             size_t bytes_per_row, bytes_per_image, bytes_total;
             if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
               bytes_per_row = (align(cmd.SrcSize.width, 4u) >> 2) * cmd.SrcFormat.BytesPerTexel;
@@ -5094,7 +5195,8 @@ public:
     PrepareTextureUse({pRenderTargetView->texture()});
     InvalidateCurrentPass();
     UseWrappedView(pRenderTargetView, true);
-    auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
+    auto stored = RenderTargetColor(pRenderTargetView->pixelFormat(), ColorRGBA);
+    auto clear_color = WMTClearColor{stored[0], stored[1], stored[2], stored[3]};
     auto &props = pRenderTargetView->description();
 
     EmitOP([texture = pRenderTargetView->texture(), view = pRenderTargetView->viewId(),
@@ -5204,6 +5306,8 @@ public:
       uint32_t render_target_height = state_.OutputMerger.RenderTargetHeight;
       bool uav_only = false;
       uint32_t sample_count = state_.OutputMerger.SampleCount;
+      IMTLD3D11RasterizerState *rs =
+          state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
       if (state_.OutputMerger.DSV) {
         dsv_info.Texture = state_.OutputMerger.DSV->texture();
         dsv_info.viewId = state_.OutputMerger.DSV->viewId();
@@ -5217,12 +5321,10 @@ public:
           return false;
         }
         D3D11_ASSERT(so_only || state_.Rasterizer.NumViewports);
-        IMTLD3D11RasterizerState *state =
-            state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
         auto &viewport = state_.Rasterizer.viewports[0];
         render_target_width = so_only ? 1 : viewport.Width;
         render_target_height = so_only ? 1 : viewport.Height;
-        sample_count = state->UAVOnlySampleCount();
+        sample_count = std::max(1u, rs->ForcedSampleCount());
         if (!(render_target_width && render_target_height)) {
           ERR("uav only rendering is enabled but viewport is empty");
           return false;
@@ -5236,7 +5338,8 @@ public:
       auto allocated_encoder_argbuf_size = std::make_unique<uint64_t>(0);
       allocated_encoder_argbuf_size_ = allocated_encoder_argbuf_size.get();
 
-      EmitST([rtvs = std::move(rtvs), dsv = std::move(dsv_info), effective_render_target, uav_only,
+      bool single_raster = !uav_only && rs->ForcedSampleCount() == 1;
+      EmitST([rtvs = std::move(rtvs), dsv = std::move(dsv_info), effective_render_target, uav_only, single_raster,
             render_target_height, render_target_width, sample_count,
             render_target_array, encoder_argbuf_size = std::move(allocated_encoder_argbuf_size)](ArgumentEncodingContext &ctx) {
         auto pool = WMT::MakeAutoreleasePool();
@@ -5250,6 +5353,8 @@ public:
           if (rtv.PixelFormat == WMTPixelFormatInvalid) {
             continue;
           }
+          if (rtv.Texture->centered || single_raster)
+            info.center_samples = rtv.Texture->sampleCount();
           auto &color = info.colors[rtv.RenderTargetIndex];
           color.attachment = ctx.access<PipelineStage::Pixel>(rtv.Texture, rtv.viewId, ResourceAccess::ReadWrite);
           color.depth_plane = rtv.DepthPlane;
@@ -5259,6 +5364,8 @@ public:
         };
 
         if (dsv.Texture.ptr()) {
+          if (dsv.Texture->centered || single_raster)
+            info.center_samples = dsv.Texture->sampleCount();
           auto access_flag = ResourceAccess::Read;
           // TODO: ...should know more about store behavior (e.g. DiscardView)
           if (dsv_planar_flags & 1) {
@@ -5372,8 +5479,21 @@ public:
     if (GetManagedShader<PipelineStage::Geometry>() || state_.ShaderStages[PipelineStage::Hull].Shader)
       return false;
     auto VS = GetManagedShader<PipelineStage::Vertex>();
-    return is_adjacency_topology(state_.InputAssembler.Topology) || (VS && VS->reflection().CullDistances);
+    return is_adjacency_topology(state_.InputAssembler.Topology) || (VS && VS->reflection().CullDistances) ||
+           QuadLines();
   }
+
+  // the topology's lines are quadrilaterals, which the mesh stage makes (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
+  bool
+  QuadLines() {
+    auto rs = state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+    auto primitive = to_input_primitive(state_.InputAssembler.Topology);
+    return rs->QuadrilateralLines() && (primitive == D3D_PRIMITIVE_LINE || primitive == D3D_PRIMITIVE_LINE_ADJ);
+  }
+  // whether the current pipeline draws lines as triangles, which the rasterizer state then takes as lines
+  bool quad_lines_ = false;
+  // the pipeline's pixel shader blends a target itself, reading the blend factor after the depth ranges (ShaderBlend)
+  bool shader_blend_ = false;
 
   // after a geometry draw: whether the draw goes on as an ordinary one, which is so for stream output without a
   // geometry shader whose stream also rasterizes, unless the mesh stage already has. the ordinary pipeline is then
@@ -5442,18 +5562,50 @@ public:
         (PS || ds_enabled) && (!Desc.SOLayout || Desc.SOLayout->RasterizedStream() != D3D11_SO_NO_RASTERIZED_STREAM);
     if (!Desc.RasterizationEnabled)
       Desc.PixelShader = nullptr; // Even rasterization is disabled, Metal still checks if VS-PS signatures match.
-    Desc.SampleMask = state_.OutputMerger.SampleMask;
+    // the sample mask selects output samples, which rendering with UAVs alone has none of (D3D11.3 3.5.6.4)
+    bool attached = Desc.DepthStencilFormat != WMTPixelFormatInvalid ||
+                    std::any_of(Desc.ColorAttachmentFormats, Desc.ColorAttachmentFormats + Desc.NumColorAttachments,
+                                [](auto format) { return format != WMTPixelFormatInvalid; });
+    Desc.SampleMask = attached ? state_.OutputMerger.SampleMask : ~0u;
+    IMTLD3D11RasterizerState *rs =
+        state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+    // its sample lies at the pixel center, and the targets' samples with it (D3D11.3 3.5.6.2)
+    Desc.SingleRasterSample = attached && rs->ForcedSampleCount() == 1;
+    auto centered = [](auto &view) { return view && view->texture_->centered; };
+    Desc.CenteredSamples = Desc.SingleRasterSample || centered(state_.OutputMerger.DSV) ||
+                           std::any_of(state_.OutputMerger.RTVs, state_.OutputMerger.RTVs + Desc.NumColorAttachments, centered);
     Desc.GSPassthrough = GS && !Desc.SOLayout ? GS->reflection().GeometryShader.GSPassThrough : ~0u;
+    // a pixel shader whose runs are seen tests the last pre-raster stage's clip distances itself (D3D11.3 15.4.1),
+    // where Metal would cut the primitive and run a pixel on the cut once for each piece. a geometry shader after
+    // tessellation still clips in Metal
+    auto last = GS && Desc.GSPassthrough == ~0u ? GS : Desc.DomainShader ? Desc.DomainShader : Desc.VertexShader;
+    Desc.ClipDistances = Desc.PixelShader && !(Desc.DomainShader && GS) &&
+                                 (Desc.PixelShader->reflection().UAVSlotMask ||
+                                  Desc.PixelShader->reflection().PixelShader.HasCoverageInput)
+                             ? last->reflection().ClipDistances
+                             : 0;
     Desc.PassThrough =
         !so_raster_pass_ && (PassesPrimitivesThrough() || (IndexedDraw && !state_.InputAssembler.IndexBuffer));
     Desc.InputPrimitive = !GS && (Desc.SOLayout || Desc.PassThrough) ? to_input_primitive(state_.InputAssembler.Topology) : 0;
+    Desc.QuadLines = !GS && Desc.PassThrough && QuadLines();
+    if (std::exchange(quad_lines_, Desc.QuadLines) != Desc.QuadLines)
+      dirty_state.set(DirtyState::RasterizerState);
+    // which targets the pipeline's pixel shader blends itself (ShaderBlend)
+    WMTRenderPipelineBlendInfo blend{};
+    for (unsigned i = 0; i < Desc.NumColorAttachments; i++)
+      blend.colors[i].pixel_format = Desc.ColorAttachmentFormats[i];
+    auto blends = Desc.BlendState->SetupMetalPipelineDescriptor(&blend, Desc.NumColorAttachments,
+                                                                PS ? PS->reflection().PSValidRenderTargets : 0);
+    if ((shader_blend_ = std::any_of(blends.begin(), blends.end(), [](auto &b) { return b.blend; })))
+      dirty_state.set(DirtyState::BlendFactorAndStencilRef);
     if (unlikely(Desc.GSPassthrough == ~0u && (Desc.GeometryShader != nullptr || Desc.SOLayout || Desc.PassThrough))) {
       Desc.GSStripTopology = is_strip_topology(state_.InputAssembler.Topology);
     } else {
       Desc.GSStripTopology = false;
     }
     Desc.IndexBufferFormat = IndexFormat<IndexedDraw>();
-    Desc.SampleCount = state_.OutputMerger.SampleCount;
+    // a pass with no targets rasterizes the forced count, and its pipeline with it
+    Desc.SampleCount = attached ? state_.OutputMerger.SampleCount : std::max(1u, rs->ForcedSampleCount());
   }
 
   // how a draw's vertices are numbered: by the bound index buffer's format, or not at all. the object stage of a
@@ -5678,22 +5830,24 @@ public:
         auto encoder = enc.currentRenderEncoder();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
-        cmd.dsso = state->GetDepthStencilState(encoder->dsv_planar_flags);
+        cmd.dsso = state->GetDepthStencilState(encoder->dsv_planar_flags, encoder->dsv_readonly_flags);
         cmd.stencil_ref = cmd.back_stencil_ref = stencil_ref;
       });
     }
     if (dirty_state.any(DirtyState::RasterizerState)) {
       IMTLD3D11RasterizerState *state =
-          state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
-      EmitST([state](ArgumentEncodingContext& enc) {
+          state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+      EmitST([state, lines = quad_lines_](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
         cmd.type = WMTRenderCommandSetRasterizerState;
         state->SetupRasterizerState(cmd);
+        if (lines)
+          RasterizeAsLines(cmd);
       });
     }
     if (dirty_state.any(DirtyState::BlendFactorAndStencilRef)) {
-      EmitST([r = state_.OutputMerger.BlendFactor[0], g = state_.OutputMerger.BlendFactor[1],
-            b = state_.OutputMerger.BlendFactor[2], a = state_.OutputMerger.BlendFactor[3],
+      auto factor = state_.OutputMerger.BlendFactor;
+      EmitST([r = factor[0], g = factor[1], b = factor[2], a = factor[3],
             stencil_ref = state_.OutputMerger.StencilRef](ArgumentEncodingContext &enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
         cmd.type = WMTRenderCommandSetBlendFactorAndStencilRef;
@@ -5705,13 +5859,14 @@ public:
       });
     }
     IMTLD3D11RasterizerState *current_rs =
-        state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
+        state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
     bool allow_scissor = current_rs->IsScissorEnabled();
     // a primitive names one of the viewports and scissors there may be (D3D11.3 15.8.1). a viewport that is not set
     // is of no size (15.6): nothing is drawn through it, which an empty scissor says to Metal, whatever viewport it
     // has there. with no viewport set at all, Metal has its one, and takes one scissor
     const UINT viewport_count =
         state_.Rasterizer.NumViewports ? D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE : 1;
+    float scale = 1;
     if (dirty_state.any(DirtyState::Viewport) && state_.Rasterizer.NumViewports) {
       auto viewports = AllocateCommandData<WMTViewport>(viewport_count);
       for (unsigned i = 0; i < viewport_count; i++) {
@@ -5719,6 +5874,7 @@ public:
         viewports[i] = {d3dViewport.TopLeftX, d3dViewport.TopLeftY, d3dViewport.Width,
                         d3dViewport.Height,   d3dViewport.MinDepth, d3dViewport.MaxDepth};
       }
+      scale = EnlargeViewports(viewports.span(), D3D11_VIEWPORT_BOUNDS_MIN, D3D11_VIEWPORT_BOUNDS_MAX);
       pass_viewports_ += viewport_count;
       EmitST([viewports = std::move(viewports)](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
@@ -5728,26 +5884,71 @@ public:
         enc.currentRenderEncoder()->viewports += viewports.size();
       });
     }
+    static_assert(SM50_VIEWPORTS == D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+    // with no viewport set, Metal's own has the range 0 to 1. a pixel shader that blends itself reads the blend factor
+    // after all the viewports' ranges (SM50_SHADER_BLEND)
+    if (dirty_state.any(DirtyState::Viewport) || (shader_blend_ && dirty_state.any(DirtyState::BlendFactorAndStencilRef))) {
+      auto &factor = state_.OutputMerger.BlendFactor;
+      auto ranges = AllocateCommandData<float>(shader_blend_ ? 2 * SM50_VIEWPORTS + std::size(factor) : 2 * viewport_count);
+      for (unsigned i = 0; i < viewport_count; i++) {
+        auto &d3dViewport = state_.Rasterizer.viewports[i < state_.Rasterizer.NumViewports ? i : 0];
+        ranges[2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.MinDepth : 0;
+        ranges[2 * i + 1] = state_.Rasterizer.NumViewports ? d3dViewport.MaxDepth : 1;
+      }
+      if (shader_blend_)
+        std::copy_n(factor, std::size(factor), ranges.data() + 2 * SM50_VIEWPORTS);
+      EmitST([ranges = std::move(ranges)](ArgumentEncodingContext &enc) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setbytes>();
+        cmd.type = WMTRenderCommandSetFragmentBytes;
+        cmd.bytes.set(ranges.data());
+        cmd.length = ranges.size() * sizeof(float);
+        cmd.index = SM50_BINDING_INDEX_DEPTH_RANGES;
+      });
+    }
+    if (dirty_state.any(DirtyState::Viewport)) {
+      auto raster_scale = AllocateCommandData<float>(1 + 2 * SM50_VIEWPORTS);
+      raster_scale[0] = scale;
+      for (unsigned i = 0; i < SM50_VIEWPORTS; i++) {
+        auto &d3dViewport = state_.Rasterizer.viewports[i < state_.Rasterizer.NumViewports ? i : 0];
+        // with no viewport set, Metal's covers the pass
+        raster_scale[1 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Width : render_pass_width_;
+        raster_scale[2 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Height : render_pass_height_;
+      }
+      EmitST([raster_scale = std::move(raster_scale)](ArgumentEncodingContext &enc) {
+        for (auto stage : {WMTRenderCommandSetVertexBytes, WMTRenderCommandSetMeshBytes}) {
+          auto &bytes = enc.encodeRenderCommand<wmtcmd_render_setbytes>();
+          bytes.type = stage;
+          bytes.bytes.set(raster_scale.data());
+          bytes.length = raster_scale.span().size_bytes();
+          bytes.index = SM50_BINDING_INDEX_RASTER_SCALE;
+        }
+      });
+    }
     if (dirty_state.any(DirtyState::Scissors)) {
       // Metal wants scissors within the pass
       auto render_target_width = render_pass_width_, render_target_height = render_pass_height_;
       auto scissors = AllocateCommandData<WMTScissorRect>(viewport_count);
       for (unsigned i = 0; i < viewport_count; i++) {
-        if (i >= state_.Rasterizer.NumViewports) {
+        if (i >= state_.Rasterizer.NumViewports || (allow_scissor && i >= state_.Rasterizer.NumScissorRects)) {
           scissors[i] = {0, 0, 0, 0};
-        } else if (allow_scissor) {
-          if (i < state_.Rasterizer.NumScissorRects) {
-            auto &d3d_rect = state_.Rasterizer.scissor_rects[i];
-            LONG left = std::clamp(d3d_rect.left, (LONG)0, (LONG)render_target_width);
-            LONG top = std::clamp(d3d_rect.top, (LONG)0, (LONG)render_target_height);
-            LONG right = std::clamp(d3d_rect.right, left, (LONG)render_target_width);
-            LONG bottom = std::clamp(d3d_rect.bottom, top, (LONG)render_target_height);
-            scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
-          } else {
-            scissors[i] = {0, 0, 0, 0};
-          }
         } else {
-          scissors[i] = {0, 0, render_target_width, render_target_height};
+          // a viewport scissors to the pixels its floored extents hold (D3D11.3 15.6.1)
+          auto &viewport = state_.Rasterizer.viewports[i];
+          D3D11_RECT d3d_rect = allow_scissor ? state_.Rasterizer.scissor_rects[i]
+                                              : D3D11_RECT{0, 0, LONG(render_target_width), LONG(render_target_height)};
+          LONG left =
+              std::clamp(std::max(d3d_rect.left, LONG(std::floor(viewport.TopLeftX))), (LONG)0, (LONG)render_target_width);
+          LONG top =
+              std::clamp(std::max(d3d_rect.top, LONG(std::floor(viewport.TopLeftY))), (LONG)0, (LONG)render_target_height);
+          LONG right = std::clamp(
+              std::min(d3d_rect.right, LONG(std::floor(viewport.TopLeftX + viewport.Width))), left,
+              (LONG)render_target_width
+          );
+          LONG bottom = std::clamp(
+              std::min(d3d_rect.bottom, LONG(std::floor(viewport.TopLeftY + viewport.Height))), top,
+              (LONG)render_target_height
+          );
+          scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
         }
       }
       pass_scissors_ += viewport_count;
@@ -5811,6 +6012,9 @@ public:
       cmd.type = WMTComputeCommandSetPSO;
       cmd.pso = ComputePipeline.PipelineState;
       cmd.threadgroup_size = tg_size;
+      auto encoder = static_cast<ComputeEncoderData *>(enc.currentEncoder());
+      encoder->last_pso = ComputePipeline.PipelineState;
+      encoder->threadgroup_size = tg_size;
     });
 
     cmdbuf_state = CommandBufferState::ComputePipelineReady;
@@ -5972,13 +6176,12 @@ public:
       state_(),
       annotation_(this),
       ext_(this) {
-    pDevice->CreateRasterizerState2(&kDefaultRasterizerDesc, (ID3D11RasterizerState2 **)&default_rasterizer_state);
+    default_rasterizer_state = pDevice->GetDefaultRasterizerState();
     pDevice->CreateBlendState1(&kDefaultBlendDesc, (ID3D11BlendState1 **)&default_blend_state);
     pDevice->CreateDepthStencilState(
         &kDefaultDepthStencilDesc, (ID3D11DepthStencilState **)&default_depth_stencil_state
     );
     /* we don't need the extra reference as they are always valid */
-    default_rasterizer_state->Release();
     default_blend_state->Release();
     default_depth_stencil_state->Release();
 

@@ -1,6 +1,7 @@
 #include "mullion_capture.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
+#include <ctime>
 
 #ifdef __WIN32
 #include "windows.h"
@@ -15,6 +16,44 @@ CaptureState::CaptureState() {
     return;
   WARN("Mullion capture enabled");
   state = State::Idle;
+  try {
+    if (auto frame = env::getEnvVar("MULLION_CAPTURE_FRAME"); !frame.empty())
+      scheduleNextFrameCapture(std::stoull(frame));
+  } catch (const std::exception &) {
+  }
+}
+
+void
+CaptureState::frame(WMT::Device device, uint64_t frame) {
+  switch (getNextAction(frame)) {
+  case NextAction::StartCapture: {
+    WMTCaptureInfo info;
+    info.capture_object = device;
+    info.destination = WMTCaptureDestinationGPUTraceDocument;
+    char filename[1024];
+    std::time_t now;
+    std::time(&now);
+    std::strftime(filename, 1024, "_%H'%M'%S_%m-%d-%y.gputrace", std::localtime(&now));
+    // a trace is large: it goes where the logs go, not next to the executable, when MULLION_LOG_PATH names a directory
+    auto directory = env::getEnvVar("MULLION_LOG_PATH");
+    if (directory == "none")
+      directory.clear();
+    if (!directory.empty() && directory.back() != '/' && directory.back() != '\\')
+      directory += '\\';
+    auto fileUrl = env::getUnixPath(directory + env::getExeBaseName() + "_F." + std::to_string(frame) + filename);
+    WARN("A new capture will be saved to ", fileUrl);
+    info.output_url.set(fileUrl.c_str());
+    WMT::CaptureManager::sharedCaptureManager().startCapture(info);
+    break;
+  }
+  case NextAction::StopCapture:
+    WMT::CaptureManager::sharedCaptureManager().stopCapture();
+    break;
+  case NextAction::Nothing:
+    if (shouldCaptureNextFrame())
+      scheduleNextFrameCapture(frame + 1);
+    break;
+  }
 }
 
 CaptureState::NextAction

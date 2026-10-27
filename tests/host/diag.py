@@ -207,8 +207,11 @@ def profile(directory):
         with patch.object(sys, "argv", args), redirect_stdout(output):
             with patch.object(tool, "table", wraps=tool.table) as tables:
                 tool.main()
-        kinds, pipelines, passes, work, made, bridge = [call.args[1] for call in tables.call_args_list]
+        kinds, pipelines, events, passes, work, made, bridge = [call.args[1] for call in tables.call_args_list]
         assert kinds == expected_kinds[index]
+        # no event names these passes
+        assert events == ([(sum(gpu[n] for n in expected_passes[index]),
+                            f"(in no event): {len(expected_passes[index])} passes")] if expected_passes[index] else [])
         assert [(time, text.split(";")[0]) for time, text in pipelines] == expected_pipelines[index]
         runs = {part for _, text in pipelines if "; pipeline totals across selected passes: " in text
                 for part in text.split("; pipeline totals across selected passes: ")[1].split("; ")}
@@ -281,6 +284,31 @@ def d3d11(directory):
     assert tile.draws == 2 and tile.tile_dispatches == 1 and tile.pipelines == ("Tile:45", "Render:123456789")
 
 
+def events(directory):
+    # contract: an event record names the application's events a pass began in, outermost first, each name ended by
+    # the unit separator; an event's GPU time includes the events in it (mullion-diag, event records). a name may be
+    # empty or hold a '/'
+    end = tool.EVENT_END
+    path = directory / "events.diag"
+    path.write_text("cmdbuf\tq\t1\t0\t0\t0\t100\n" + "".join(f"pass\tq\t1\t{n}\tRender\t0\t\t{10 * n}\t{10 * n + gpu}\n"
+                            for n, gpu in ((1, 1), (2, 2), (3, 4), (4, 8))) +
+                    f"event\tq\t1\t1\tframe{end}shadow{end}\n"
+                    f"event\tq\t1\t2\tframe{end}shadow{end}a/b{end}\n"
+                    f"event\tq\t1\t3\tframe{end}{end}\n")
+    record = tool.Record(path)
+    assert record.events == {("q", 1, 1): ("frame", "shadow"), ("q", 1, 2): ("frame", "shadow", "a/b"),
+                             ("q", 1, 3): ("frame", "")}
+    output = StringIO()
+    with patch.object(sys, "argv", ["mullion-diag", "report", str(path)]), redirect_stdout(output):
+        with patch.object(tool, "table", wraps=tool.table) as tables:
+            tool.main()
+    rows = next(call.args[1] for call in tables.call_args_list if "application event" in call.args[0])
+    assert sorted(rows) == sorted([(7, "frame: 3 passes"), (3, "frame / shadow: 2 passes"),
+                                   (2, "frame / shadow / a/b: 1 passes"), (4, "frame / : 1 passes"),
+                                   (8, "(in no event): 1 passes")]), rows
+    assert "event frame / shadow / a/b;" in output.getvalue()
+
+
 def calibrated(directory):
     # Apple's Converting GPU timestamps into CPU time interpolates between two paired clock samples. GPU units
     # here are half a host nanosecond for one queue and one for the other, each with a different epoch.
@@ -319,9 +347,50 @@ def calibrated(directory):
         raise AssertionError("a missing pair must not use uncalibrated timestamps")
 
 
+def held(directory):
+    # contract: a frame is the time of the thread that presents. while it waits, the GPU running, the GPU waiting for
+    # a command buffer Mullion was translating, one no thread of Mullion was making (the application), or one
+    # committed and not started holds it; its own calls into Mullion are Mullion's; the rest is the application's,
+    # whatever other threads do meanwhile. a hitch is a frame over twice the median (mullion-diag, bounds). the
+    # frames read Metal's host clock 500 ns behind theirs, and every expected time below is taken from these
+    # intervals by hand
+    lines = [
+        "frame\tq\t1\t1000\t500", "frame\tq\t2\t2000\t1500", "frame\tq\t3\t3000\t2500",
+        "frame\tq\t4\t6000\t5500",
+        # committed, completed, then the GPU's start and end on the host clock
+        "cmdbuf\ta\t1\t1100\t0\t700\t1100",   # runs 1200 to 1600
+        "cmdbuf\tb\t1\t1250\t0\t800\t900",    # inside the first, on another queue
+        "cmdbuf\tb\t2\t1450\t0\t1000\t1200",  # past the first's end, to 1700
+        "cmdbuf\ta\t2\t1900\t0\t1500\t2300",  # 2000 to 2800
+        "cmdbuf\ta\t3\t2950\t0\t2450\t2450",  # never ran
+        # work of Mullion's thread 1: translating 1050 to 1100, then 3100 to 5000 while the application works
+        "span\texecute\t1\t1\t1050\t50", "span\tencode\t2\t1\t3100\t1900",
+        # thread p presents, and waits 1000 to 1700 and 2000 to 2800; thread w's wait holds no frame
+        "span\tpresent\t\tp\t1980\t20", "span\tpresent\t\tp\t2990\t10", "span\tpresent\t\tp\t5990\t10",
+        "span\twait\tfence\tp\t1000\t700", "span\twait\tfence\tp\t2000\t800",
+        "span\twait\tfence\tw\t3000\t1000",
+    ]
+    path = directory / "mullion-3.diag"
+    path.write_text("\n".join(lines) + "\n")
+    rows = tool.bounds(tool.Record(path))
+    assert [(r["frame"], r["length"], r["causes"], r["bound"], r["hitch"]) for r in rows] == [
+        # the wait: 1000 to 1050 nothing, 1050 to 1100 translating, 1100 to 1200 queued, 1200 to 1700 the GPU
+        (1, 1000, {"gpu": 500, "mullion": 70, "application": 330, "queued": 100}, "gpu", False),
+        (2, 1000, {"gpu": 800, "mullion": 10, "application": 190, "queued": 0}, "gpu", False),
+        (3, 3000, {"gpu": 0, "mullion": 10, "application": 2990, "queued": 0}, "application", True),
+    ], rows
+    # a record without Metal's host clock beside its frames, or with no thread that presents, has no verdict
+    path.write_text("\n".join(line.rsplit("\t", 1)[0] if line.startswith("frame") else line for line in lines) + "\n")
+    assert tool.bounds(tool.Record(path)) == []
+    path.write_text("\n".join(line for line in lines if "present" not in line) + "\n")
+    assert tool.bounds(tool.Record(path)) == []
+
+
 with tempfile.TemporaryDirectory() as directory:
+    held(Path(directory))
     profile(Path(directory))
     empty_and_short(Path(directory))
     d3d11(Path(directory))
     calibrated(Path(directory))
+    events(Path(directory))
 print("passed: host_diag_profile")

@@ -33,10 +33,19 @@ private:
               static_cast<const char *>(result->current()->mappedMemory(0)) + offset);
           statistics->PSInvocations += values->pixels;
           statistics->IAPrimitives += values->primitives;
-          statistics->CInvocations += values->primitives;
-          statistics->CPrimitives += values->primitives;
+          // a geometry shader's primitives reach the rasterizer in place of its inputs
+          auto clipped = values->primitives + values->rasterized - values->gs_inputs;
+          statistics->CInvocations += clipped;
+          statistics->CPrimitives += clipped;
+          statistics->GSInvocations += values->gs_invocations;
+          statistics->GSPrimitives += values->gs_primitives;
           statistics->IAVertices += values->vertices;
           statistics->VSInvocations += values->vertices;
+        }
+        for (auto &[result, offset] : query_->dispatch_statistics) {
+          auto values = reinterpret_cast<const PipelineStatisticsDispatch *>(
+              static_cast<const char *>(result->current()->mappedMemory(0)) + offset);
+          statistics->CSInvocations += values->invocations;
         }
         counts = *statistics;
       } else {

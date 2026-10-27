@@ -1,16 +1,15 @@
 # a GPU blit overwrites an encoded indirect draw after rendering, leaving its commands and addresses intact
-diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
 --- a/src/d3d12/d3d12_command_queue.cpp
 +++ b/src/d3d12/d3d12_command_queue.cpp
-@@ -170,6 +170,7 @@
-
+@@ -275,6 +275,7 @@
+ 
    std::shared_ptr<GPURecordTotals> record_totals_;
    std::shared_ptr<GPURecordChecks> own_checks_;
 +  bool record_fault_written_ = false;
-
+ 
    struct InflightCommandBuffer {
-     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
-@@ -757,6 +758,24 @@
+     WMT::Reference<MetalCommandBuffer> cmdbuf{};
+@@ -1137,6 +1138,29 @@
            encoder.encodeCommands(&data->cmd_head);
            encoder.updateFence(fence_, WMTRenderStageFragment);
            encoder.endEncoding();
@@ -24,21 +23,25 @@ diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.c
 +                          offsetof(IndirectRenderCommandData, zero_count);
 +            fill.length = sizeof(IndirectRenderCommandData::zero_count);
 +            auto overwrite = cmdbuf.blitCommandEncoder();
-+            overwrite.waitForFence(fence_);
++            if constexpr (!Metal4)
++              overwrite.waitForFence(fence_);
 +            wmtcmd_blit_nop head{};
 +            head.type = WMTBlitCommandNop;
 +            head.next.set(&fill);
 +            overwrite.encodeCommands(&head);
-+            overwrite.updateFence(fence_);
-+            overwrite.endEncoding();
++            if constexpr (!Metal4)
++              overwrite.updateFence(fence_);
++            if constexpr (Metal4)
++              overwrite.endSegment();
++            else
++              overwrite.endEncoding();
 +          }
            break;
          }
          case EncoderType::Blit: {
-diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_allocator.cpp
 --- a/src/d3d12/d3d12_command_allocator.cpp
 +++ b/src/d3d12/d3d12_command_allocator.cpp
-@@ -68,6 +68,18 @@
+@@ -89,6 +89,18 @@
    std::lock_guard<mullion::mutex> lock(Totals->mutex);
    if (std::exchange(Checks->checked, true))
      return;

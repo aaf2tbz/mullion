@@ -238,10 +238,8 @@ Texture::import(mach_port_t mach_port) {
       flags.set(TextureAllocationFlag::GpuPrivate);
     if (info.options & WMTResourceHazardTrackingModeUntracked)
       flags.set(TextureAllocationFlag::NoTracking);
-    if ((info.usage & (WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget)) == 0)
-      flags.set(TextureAllocationFlag::ShaderReadonly);
     flags.set(TextureAllocationFlag::Shared);
-    return new TextureAllocation(this, std::move(texture), info, flags);
+    return wrap(std::move(texture), info, flags);
   }
   assert(texture && "failed to import shared texture");
   return nullptr;

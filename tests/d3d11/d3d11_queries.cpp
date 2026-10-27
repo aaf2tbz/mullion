@@ -1,3 +1,9 @@
+// contract: each SO stream counts independently, including when another stream cannot fit a complete primitive.
+// "each stream has its own independent NumPrimitivesWritten and PrimitivesStorageNeeded counters" (D3D11.3 14.5).
+// SO_STATISTICS "is a synonym for D3D11_QUERY_SO_STATISTICS_STREAM0" (20.4.9); the unnumbered overflow
+// predicate includes "any of the streams" (20.4.10). every written record and partial-stride tail is read back.
+// GSInvocations counts input primitives "multiplied by the instance count per primitive" (13.2.1.1);
+// GSPrimitives counts "Number of primitives GS generated" (20.4.7). a separate single-stream GS emits once.
 // "the driver will be asked to calculate the difference between two requests (one request for Issue( BEGIN ),
 // and one request for Issue( END ))." (D3D11.3 20.4.7). "However, the Issue command is not able to be predicated."
 // (20.2). recording contexts can bracket the same query independently; statistics count only the draws executed
@@ -33,13 +39,44 @@
 // (D3D11.3 20.3.5). repeated reads of one ended range must return that same data.
 // a cut means "the strip defined up to the previous index is to be completed, and the next index is a new strip"
 // (8.12). the expected primitive count is the sum over the complete strips authored below.
+// D3D10_QUERY has eight kinds, ending at SO_OVERFLOW_PREDICATE; D3D11 stream-specific queries are not D3D10 kinds.
+// "Specifies the type of query." (D3D10_QUERY_DESC::Query); only those enum values may create a D3D10 query.
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d10/ns-d3d10-d3d10_query_desc
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d10/ne-d3d10-d3d10_query
 #include "d3d11_test.hpp"
-#include <d3d10.h>
+#include <d3d10_1.h>
 #include <d3d11_1.h>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <limits>
 #include <random>
+
+static const char stream_shader[] = R"hlsl(
+struct Input { uint id : ID; uint instance : INSTANCE; };
+Input vs_stats(uint id : SV_VertexID, uint instance : SV_InstanceID) {
+  Input v; v.id = id; v.instance = instance; return v;
+}
+struct Output { float4 position : SV_Position; uint4 value : VALUE; };
+Output record(Input v, uint gi, uint stream_id) {
+  Output o; o.position = float4(0, 0, 0, 1); o.value = uint4(v.id, v.instance, gi, stream_id); return o;
+}
+#if STREAMS == 1
+[maxvertexcount(1)] [instance(GS_INSTANCES)]
+void gs_stats(point Input v[1], uint gi : SV_GSInstanceID, inout PointStream<Output> s0) {
+  s0.Append(record(v[0], gi, 0));
+}
+#else
+[maxvertexcount(4)]
+void gs_stats(point Input v[1], inout PointStream<Output> s0, inout PointStream<Output> s1,
+              inout PointStream<Output> s2, inout PointStream<Output> s3) {
+  s0.Append(record(v[0], 0, 0));
+  s1.Append(record(v[0], 0, 1));
+  s2.Append(record(v[0], 0, 2));
+  s3.Append(record(v[0], 0, 3));
+}
+#endif
+)hlsl";
 
 int
 main(int argc, char **argv) {
@@ -62,6 +99,75 @@ float4 vs_strip(uint id : SV_VertexID) : SV_Position {
        depth_code = compile(shader, "ps_depth", "ps"), strip_code = compile(shader, "vs_strip", "vs");
   if (!vs_code || !ps_code || !depth_code || !strip_code)
     return 1;
+  constexpr UINT max_gs_instances = 32; // D3D11.3 22.3.7, D3D11_GS_MAX_INSTANCE_COUNT
+  const UINT geometry_instances[] = {1, max_gs_instances, 1};
+  const UINT stream_counts[] = {1, 1, D3D11_SO_STREAM_COUNT};
+  auto stats_vs_code = compile(stream_shader, "vs_stats", "vs");
+  ComPtr<ID3DBlob> stats_gs_code[std::size(stream_counts)];
+  for (UINT mode = 0; mode < std::size(stream_counts); mode++) {
+    stats_gs_code[mode] = compile(stream_shader, "gs_stats", "gs",
+        {"STREAMS=" + std::to_string(stream_counts[mode]),
+         "GS_INSTANCES=" + std::to_string(geometry_instances[mode])});
+    if (!stats_gs_code[mode])
+      return 1;
+  }
+  if (!stats_vs_code)
+    return 1;
+  auto create10 = reinterpret_cast<decltype(&D3D10CreateDevice1)>(
+      GetProcAddress(LoadLibraryA("d3d10_1.dll"), "D3D10CreateDevice1")
+  );
+  if (!expect(create10 != nullptr, "D3D10CreateDevice1 is unavailable"))
+    return verdict();
+  for (auto feature : {D3D10_FEATURE_LEVEL_10_0, D3D10_FEATURE_LEVEL_10_1}) {
+    ComPtr<ID3D10Device1> legacy;
+    CHECK(create10(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, feature, D3D10_1_SDK_VERSION, &legacy));
+    const D3D10_QUERY_DESC event_desc{D3D10_QUERY_EVENT}, predicate_desc{D3D10_QUERY_OCCLUSION_PREDICATE};
+    ComPtr<ID3D10Query> control;
+    ComPtr<ID3D10Predicate> control_predicate;
+    CHECK(legacy->CreateQuery(&event_desc, &control));
+    CHECK(legacy->CreatePredicate(&predicate_desc, &control_predicate));
+    std::vector<UINT> kinds;
+    for (UINT kind = D3D10_QUERY_EVENT; kind <= D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3 + 1; kind++)
+      kinds.push_back(kind);
+    kinds.push_back(std::numeric_limits<UINT>::max());
+    for (UINT kind : kinds) {
+      step("D3D10 level=%#x query kind=%u", feature, kind);
+      const bool valid = kind <= D3D10_QUERY_SO_OVERFLOW_PREDICATE;
+      D3D10_QUERY_DESC desc{D3D10_QUERY(kind)};
+      ComPtr<ID3D10Query> query;
+      ID3D10Query *created = control.Get();
+      auto hr = legacy->CreateQuery(&desc, &created);
+      if (SUCCEEDED(hr) && created)
+        query.Attach(created);
+      expect(valid ? hr == S_OK && query : FAILED(hr) && !created, "D3D10 query kind=%u returned %#lx", kind, hr);
+      if (valid && query) {
+        D3D10_QUERY_DESC got{};
+        query->GetDesc(&got);
+        expect(got.Query == desc.Query && got.MiscFlags == 0, "D3D10 query description changed");
+        const UINT bytes = kind == D3D10_QUERY_EVENT || kind == D3D10_QUERY_OCCLUSION_PREDICATE ||
+                                   kind == D3D10_QUERY_SO_OVERFLOW_PREDICATE
+                               ? sizeof(BOOL)
+                           : kind == D3D10_QUERY_TIMESTAMP_DISJOINT  ? sizeof(D3D10_QUERY_DATA_TIMESTAMP_DISJOINT)
+                           : kind == D3D10_QUERY_PIPELINE_STATISTICS ? sizeof(D3D10_QUERY_DATA_PIPELINE_STATISTICS)
+                           : kind == D3D10_QUERY_SO_STATISTICS       ? sizeof(D3D10_QUERY_DATA_SO_STATISTICS)
+                                                                     : sizeof(UINT64);
+        expect(
+            query->GetDataSize() == bytes, "D3D10 query kind=%u data size=%u expected=%u", kind, query->GetDataSize(),
+            bytes
+        );
+      }
+      ComPtr<ID3D10Predicate> predicate;
+      ID3D10Predicate *created_predicate = control_predicate.Get();
+      hr = legacy->CreatePredicate(&desc, &created_predicate);
+      if (SUCCEEDED(hr) && created_predicate)
+        predicate.Attach(created_predicate);
+      const bool predicatable = kind == D3D10_QUERY_OCCLUSION_PREDICATE || kind == D3D10_QUERY_SO_OVERFLOW_PREDICATE;
+      expect(
+          predicatable ? hr == S_OK && predicate : hr == E_INVALIDARG && !created_predicate,
+          "D3D10 predicate kind=%u returned %#lx", kind, hr
+      );
+    }
+  }
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> immediate, deferred;
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
@@ -81,11 +187,9 @@ float4 vs_strip(uint id : SV_VertexID) : SV_Position {
   auto intact = [&] { return std::all_of(bytes.begin(), bytes.end(), [&](auto byte) { return byte == sentinel; }); };
   auto ready = [&](ID3D11Query *query) {
     HRESULT hr = S_FALSE;
-    for (UINT tries = 0; tries < 5000 && hr == S_FALSE; tries++) {
+    do {
       hr = immediate->GetData(query, nullptr, 0, 0);
-      if (hr == S_FALSE)
-        Sleep(1);
-    }
+    } while (hr == S_FALSE);
     return expect(hr == S_OK, "query never ready: %#lx", hr);
   };
 
@@ -262,6 +366,28 @@ float4 vs_strip(uint id : SV_VertexID) : SV_Position {
   UINT64 empty_count = ~UINT64(0);
   CHECK(immediate->GetData(empty.Get(), &empty_count, sizeof(empty_count), 0));
   expect(empty_count == 0, "empty deferred End returned %llu", empty_count);
+  for (auto kind : {D3D11_QUERY_OCCLUSION, D3D11_QUERY_OCCLUSION_PREDICATE, D3D11_QUERY_PIPELINE_STATISTICS}) {
+    const D3D11_QUERY_DESC desc{kind};
+    ComPtr<ID3D11Query> query;
+    CHECK(device->CreateQuery(&desc, &query));
+    for (UINT flushes : {0u, 1u, 3u}) {
+      step("empty query %u across %u flushes, reused", kind, flushes);
+      immediate->Begin(query.Get());
+      for (UINT i = 0; i < flushes; i++) {
+        immediate->CopyResource(destination.Get(), source.Get());
+        immediate->Flush();
+      }
+      immediate->End(query.Get());
+      if (!ready(query.Get()))
+        return verdict();
+      bytes.fill(sentinel);
+      CHECK(immediate->GetData(query.Get(), bytes.data(), query->GetDataSize(), 0));
+      expect(std::all_of(bytes.begin(), bytes.begin() + query->GetDataSize(), [](auto value) { return value == 0; }),
+             "empty query %u returned nonzero data", kind);
+      expect(std::all_of(bytes.begin() + query->GetDataSize(), bytes.end(),
+                         [&](auto value) { return value == sentinel; }), "empty query wrote past its data");
+    }
+  }
   step("seed %u, occlusion restart discards the first draw on both contexts", seed);
   const UINT width = 17, height = 13;
   D3D11_TEXTURE2D_DESC target_desc{width, height, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0}, D3D11_USAGE_DEFAULT,
@@ -717,6 +843,118 @@ float4 vs_strip(uint id : SV_VertexID) : SV_Position {
                   expect(got.PSInvocations >= UINT64(width / 2) * (height / 2) * strips * instances,
                          "strip draw lost pixel invocations: %llu", got.PSInvocations);
               }
+          }
+  }
+  ComPtr<ID3D11VertexShader> stats_vertex;
+  CHECK(device->CreateVertexShader(stats_vs_code->GetBufferPointer(), stats_vs_code->GetBufferSize(), nullptr,
+                                    &stats_vertex));
+  constexpr UINT stream_stride = 4 * sizeof(UINT), sentinel_word = 0xa5a5a5a5, prefix_words = 1;
+  for (UINT mode = 0; mode < std::size(stream_counts); mode++) {
+    const UINT streams = stream_counts[mode], gs_instances = geometry_instances[mode];
+    std::vector<D3D11_SO_DECLARATION_ENTRY> entries;
+    std::vector<UINT> strides(streams, stream_stride);
+    for (UINT stream = 0; stream < streams; stream++)
+      entries.push_back({stream, "VALUE", 0, 0, 4, BYTE(stream)});
+    ComPtr<ID3D11GeometryShader> geometry;
+    CHECK(device->CreateGeometryShaderWithStreamOutput(
+        stats_gs_code[mode]->GetBufferPointer(), stats_gs_code[mode]->GetBufferSize(), entries.data(), entries.size(),
+        strides.data(), strides.size(), D3D11_SO_NO_RASTERIZED_STREAM, nullptr, &geometry));
+    for (auto context : {immediate.Get(), deferred.Get()})
+      for (UINT points : {0u, 1u, max_gs_instances - 1, max_gs_instances, max_gs_instances + 1})
+        for (UINT instances : {1u, 3u})
+          for (UINT short_stream = 0; short_stream <= streams; short_stream++) {
+            const UINT generated = points * instances * gs_instances;
+            step("%s GS instances %u, streams %u, points %u, draw instances %u, short stream %u",
+                 context == immediate.Get() ? "immediate" : "deferred", gs_instances, streams, points,
+                 instances, short_stream);
+            ComPtr<ID3D11Buffer> output[D3D11_SO_STREAM_COUNT];
+            ID3D11Buffer *targets[D3D11_SO_STREAM_COUNT]{};
+            UINT offsets[D3D11_SO_STREAM_COUNT]{};
+            UINT capacity[D3D11_SO_STREAM_COUNT]{};
+            for (UINT stream = 0; stream < streams; stream++) {
+              capacity[stream] = stream == short_stream ? generated / 2 : generated;
+              const UINT words = prefix_words + capacity[stream] * stream_stride / sizeof(UINT) + 1;
+              output[stream] = buffer(device.Get(), words * sizeof(UINT), D3D11_BIND_STREAM_OUTPUT, sentinel_word);
+              if (!expect(!!output[stream], "SO buffer %u was not created", stream))
+                return verdict();
+              targets[stream] = output[stream].Get();
+              offsets[stream] = prefix_words * sizeof(UINT);
+            }
+            std::array<ComPtr<ID3D11Query>, 2 * D3D11_SO_STREAM_COUNT + 2> so_queries;
+            for (UINT q = 0; q < so_queries.size(); q++) {
+              const D3D11_QUERY type = q < 2 * D3D11_SO_STREAM_COUNT
+                  ? D3D11_QUERY(D3D11_QUERY_SO_STATISTICS_STREAM0 + q)
+                  : D3D11_QUERY(D3D11_QUERY_SO_STATISTICS + q - 2 * D3D11_SO_STREAM_COUNT);
+              const D3D11_QUERY_DESC desc{type};
+              CHECK(device->CreateQuery(&desc, &so_queries[q]));
+            }
+            context->ClearState();
+            context->VSSetShader(stats_vertex.Get(), nullptr, 0);
+            context->GSSetShader(geometry.Get(), nullptr, 0);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+            context->SOSetTargets(streams, targets, offsets);
+            context->Begin(shared.Get());
+            for (auto &query : so_queries)
+              context->Begin(query.Get());
+            context->DrawInstanced(points, instances, 0, 0);
+            for (auto &query : so_queries)
+              context->End(query.Get());
+            context->End(shared.Get());
+            context->SOSetTargets(0, nullptr, nullptr);
+            if (context == deferred.Get()) {
+              ComPtr<ID3D11CommandList> commands;
+              CHECK(deferred->FinishCommandList(FALSE, &commands));
+              immediate->ExecuteCommandList(commands.Get(), FALSE);
+            }
+            if (!ready(shared.Get()))
+              return verdict();
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
+            CHECK(read_statistics(shared.Get(), stats));
+            expect(stats.IAVertices == UINT64(points) * instances && stats.IAPrimitives == UINT64(points) * instances,
+                   "point IA counts %llu/%llu", stats.IAVertices, stats.IAPrimitives);
+            expect(stats.GSInvocations == generated, "GSInvocations %llu, want %u", stats.GSInvocations, generated);
+            if (streams == 1)
+              expect(stats.GSPrimitives == generated, "GSPrimitives %llu, want %u", stats.GSPrimitives, generated);
+            expect(!stats.CInvocations && !stats.CPrimitives && !stats.PSInvocations && !stats.HSInvocations &&
+                       !stats.DSInvocations && !stats.CSInvocations, "rasterization or an unused stage counted");
+            for (UINT q = 0; q < so_queries.size(); q++) {
+              if (!ready(so_queries[q].Get()))
+                return verdict();
+              const UINT stream = q < 2 * D3D11_SO_STREAM_COUNT ? q / 2 : 0;
+              const UINT needed = stream < streams ? generated : 0;
+              const UINT written = stream < streams ? capacity[stream] : 0;
+              if (!(q % 2)) {
+                D3D11_QUERY_DATA_SO_STATISTICS got{};
+                CHECK(immediate->GetData(so_queries[q].Get(), &got, sizeof(got), 0));
+                expect(got.NumPrimitivesWritten == written && got.PrimitivesStorageNeeded == needed,
+                       "SO query %u written/needed %llu/%llu, want %u/%u", q, got.NumPrimitivesWritten,
+                       got.PrimitivesStorageNeeded, written, needed);
+              } else {
+                BOOL got = FALSE;
+                CHECK(immediate->GetData(so_queries[q].Get(), &got, sizeof(got), 0));
+                const bool aggregate = q == so_queries.size() - 1;
+                const bool want = generated && short_stream < streams && (aggregate || stream == short_stream);
+                expect(got == BOOL(want), "SO predicate %u: %u, want %u", q, got, want);
+              }
+            }
+            for (UINT stream = 0; stream < streams; stream++) {
+              auto got = read(device.Get(), immediate.Get(), output[stream].Get());
+              const UINT words = prefix_words + capacity[stream] * stream_stride / sizeof(UINT) + 1;
+              if (!expect(got.size() == words, "SO readback size for stream %u", stream))
+                return verdict();
+              for (UINT word = 0; word < got.size(); word++) {
+                UINT want = sentinel_word;
+                if (word >= prefix_words && word < words - 1) {
+                  const UINT ordinal = (word - prefix_words) / 4, component = (word - prefix_words) % 4;
+                  const UINT record[] = {ordinal / gs_instances % points,
+                                         ordinal / (gs_instances * points),
+                                         ordinal % gs_instances, stream};
+                  want = record[component];
+                }
+                if (!expect(got[word] == want, "stream %u word %u: %#x, want %#x", stream, word, got[word], want))
+                  break;
+              }
+            }
           }
   }
   return verdict();

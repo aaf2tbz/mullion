@@ -4,7 +4,7 @@
 @@ -43,7 +43,7 @@
      if (!refCount) {
        // pending signals keep the object alive after the last public release has unblocked its waiters
-       Reach(UINT64_MAX);
+       completion->Reach(UINT64_MAX);
 -      ReleasePrivate();
 +      delete this;
      }

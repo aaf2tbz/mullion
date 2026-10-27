@@ -22,6 +22,9 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+// the system counter mach_absolute_time reads on Apple silicon runs at 24 MHz (CNTFRQ_EL0, which a Windows program
+// cannot read)
+constexpr UINT64 host_hz = 24000000;
 
 static constexpr UINT width = 8, height = 4, frames = 40;
 static constexpr UINT indices[] = {0, 1, 2}, direct_instances[] = {1, 2};
@@ -273,10 +276,7 @@ int main(int argc, char **argv) {
   const char *settings[] = {nullptr, "profiles", "profile"};
   for (const char *setting : settings) {
     step("MULLION_DIAG=%s", setting ? setting : "unset");
-    if (!expect(GetTempFileNameA(temporary, "prf", 0, directory), "temporary name unavailable"))
-      return verdict();
-    DeleteFileA(directory);
-    if (!expect(CreateDirectoryA(directory, nullptr), "temporary directory unavailable"))
+    if (!expect(temporary_directory(temporary, "prf", directory), "temporary directory unavailable"))
       return verdict();
     WCHAR wide[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, directory, -1, wide, std::size(wide));
@@ -318,7 +318,10 @@ int main(int argc, char **argv) {
     std::map<Key, std::vector<std::string>> buffers;
     std::map<Key, std::array<UINT64, 4>> calibrations;
     std::vector<std::vector<std::string>> passes, targets, presented;
-    UINT files = 0, presents = 0, submits = 0, present_spans = 0, encodes = 0, resource_buffers = 0;
+    UINT files = 0, presents = 0, submits = 0, present_spans = 0, encodes = 0, resource_buffers = 0, statistics = 0,
+         totals = 0;
+    // the bridge's calls a 'unix' record counts, each named once before (mullion_diag.hpp's Calls)
+    std::set<UINT64> named;
     UINT64 last_frame = 0;
     for (auto &entry : std::filesystem::directory_iterator(directory)) {
       if (entry.path().extension() != ".diag")
@@ -349,11 +352,30 @@ int main(int argc, char **argv) {
           passes.push_back(row);
         else if (row[0] == "target")
           targets.push_back(row);
-        else if (row[0] == "frame" && expect(row.size() == 4, "bad frame row")) {
+        else if (row[0] == "frame" && expect(row.size() == 5, "bad frame row")) {
+          number(row[4]);
           presents++;
           presented.push_back(row);
           expect(number(row[3]) > last_frame, "frame times reversed");
           last_frame = number(row[3]);
+        } else if (row[0] == "gpu") {
+          // the driver's statistics at the frame's end, name=value each
+          statistics++;
+          for (size_t i = 1; i < row.size(); i++)
+            if (auto at = row[i].find('='); expect(at && at != row[i].npos, "malformed statistic %s", row[i].c_str()))
+              number(row[i].substr(at + 1));
+        } else if (row[0] == "call" && expect(row.size() == 3 && !row[2].empty(), "bad call row")) {
+          expect(named.insert(number(row[1])).second, "call %s named twice", row[1].c_str());
+        } else if (row[0] == "unix") {
+          totals++;
+          for (size_t i = 1; i < row.size(); i++)
+            if (auto call = fields(row[i], ':'); expect(call.size() == 3, "bad call total %s", row[i].c_str())) {
+              expect(named.count(number(call[0])) && number(call[1]), "call total %s unnamed or empty", row[i].c_str());
+              number(call[2]);
+            }
+        } else if (row[0] == "span" && row.size() == 6 && row[1] == "wait") {
+          // a wait may take no time on the profile's clock
+          expect(number(row[3]) && number(row[4]), "empty wait span");
         } else if (row[0] == "span" && expect(row.size() == 6, "bad span row")) {
           submits += row[1] == "execute";
           present_spans += row[1] == "present";
@@ -386,6 +408,7 @@ int main(int argc, char **argv) {
       expect(resource_buffers > 0, "resource buffer creations missing");
       expect(presents == frames && present_spans == frames && submits == buffers.size() && encodes == buffers.size(),
              "missing or extra frames/submissions");
+      expect(statistics == presents && totals == presents, "frames without GPU statistics or call totals");
       for (auto &present : presented) {
         Key key{present[1], number(present[2])};
         if (expect(buffers.count(key), "present has no command buffer"))
@@ -425,8 +448,8 @@ int main(int argc, char **argv) {
         for (size_t i = 7; i < row.size(); i += 2) {
           auto start = number(row[i]), end = number(row[i + 1]);
           // the calibrations' host times come from a clock of 24 MHz on Apple silicon (mach_absolute_time), so a
-          // stage converted with them may land up to a tick, 41.7 ns, outside the command buffer's GPU times
-          const UINT64 host_tick = 42;
+          // stage converted with them may land up to a tick, outside the command buffer's GPU times
+          const UINT64 host_tick = (1000000000 + host_hz - 1) / host_hz;
           expect(start != ~UINT64(0) && end >= start && host_time(key, start) + rounding + host_tick >= number(buffer[5]) &&
                      host_time(key, end) <= finish + rounding + host_tick,
                  "GPU stage missing or outside command buffer");

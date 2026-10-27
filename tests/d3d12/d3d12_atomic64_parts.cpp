@@ -33,11 +33,12 @@ void cs(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 local : S
 )hlsl";
 
 static decltype(&MTLComputeCommandEncoder_encodeCommands) original_encode;
+static decltype(&MTL4CommandEncoder_encodeCommands) original_encode4;
 static uint64_t part_groups, largest_part, parts, pipeline_updates, part_pipeline_updates;
 static obj_handle_t part_encoder;
 
 static void
-observe_encode(obj_handle_t encoder, const wmtcmd_base *cmd) {
+observe(obj_handle_t encoder, const wmtcmd_base *cmd) {
   for (auto next = cmd; next; next = static_cast<const wmtcmd_base *>(next->next.ptr)) {
     if (next->type == WMTComputeCommandSetPSO)
       pipeline_updates++;
@@ -55,7 +56,20 @@ observe_encode(obj_handle_t encoder, const wmtcmd_base *cmd) {
       parts++;
     }
   }
+}
+
+static void
+observe_encode(obj_handle_t encoder, const wmtcmd_base *cmd) {
+  observe(encoder, cmd);
   original_encode(encoder, cmd);
+}
+
+// a Metal 4 queue encodes compute work through the encoder of every stream
+static void
+observe_encode4(obj_handle_t encoder, enum WMTMetal4Stream kind, const wmtcmd_base *cmd) {
+  if (kind == WMTMetal4Compute)
+    observe(encoder, cmd);
+  original_encode4(encoder, kind, cmd);
 }
 
 int
@@ -92,7 +106,7 @@ main(int argc, char **argv) {
   auto nt = reinterpret_cast<IMAGE_NT_HEADERS *>(module + dos->e_lfanew);
   auto imports = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(
       module + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-  ULONG_PTR *import = nullptr;
+  ULONG_PTR *import = nullptr, *import4 = nullptr;
   for (; imports->Name; imports++) {
     auto names = reinterpret_cast<IMAGE_THUNK_DATA *>(module + imports->OriginalFirstThunk);
     auto functions = reinterpret_cast<IMAGE_THUNK_DATA *>(module + imports->FirstThunk);
@@ -102,13 +116,19 @@ main(int argc, char **argv) {
       auto name = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(module + names->u1.AddressOfData);
       if (!strcmp(reinterpret_cast<const char *>(name->Name), "MTLComputeCommandEncoder_encodeCommands"))
         import = &functions->u1.Function;
+      if (!strcmp(reinterpret_cast<const char *>(name->Name), "MTL4CommandEncoder_encodeCommands"))
+        import4 = &functions->u1.Function;
     }
   }
   DWORD protection;
-  if (!expect(import && VirtualProtect(import, sizeof(*import), PAGE_READWRITE, &protection), "probe compute import"))
+  if (!expect(import && import4 && VirtualProtect(import, sizeof(*import), PAGE_READWRITE, &protection) &&
+                  VirtualProtect(import4, sizeof(*import4), PAGE_READWRITE, &protection),
+              "probe compute imports"))
     return verdict();
   original_encode = reinterpret_cast<decltype(original_encode)>(*import);
   *import = reinterpret_cast<ULONG_PTR>(observe_encode);
+  original_encode4 = reinterpret_cast<decltype(original_encode4)>(*import4);
+  *import4 = reinterpret_cast<ULONG_PTR>(observe_encode4);
 
   auto metal = GetModuleHandleA("winemetal.dll");
   auto all = reinterpret_cast<decltype(&WMTCopyAllDevices)>(GetProcAddress(metal, "WMTCopyAllDevices"));

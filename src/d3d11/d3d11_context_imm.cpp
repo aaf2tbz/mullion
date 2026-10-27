@@ -575,6 +575,16 @@ public:
       cmd_queue.CurrentFrameStatistics().event_stall++;
       Flush();
     }
+    // polling within a frame until the query finishes is a wait; a query looked at again a frame later is not
+    if (diag::profile) {
+      auto query = static_cast<MTLD3D11Query *>(pAsync);
+      if (query->polled && query->polled_frame != cmd_queue.CurrentFrameSeq())
+        query->polled = 0;
+      if (hr == S_FALSE && !query->polled)
+        query->polled = diag::Now(), query->polled_frame = cmd_queue.CurrentFrameSeq();
+      else if (hr == S_OK && query->polled)
+        diag::Waited("query", std::exchange(query->polled, 0));
+    }
     return hr;
   }
 

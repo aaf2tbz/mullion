@@ -165,7 +165,8 @@ main(int argc, char **argv) {
       CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators[i])));
       CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i].Get(), nullptr, IID_PPV_ARGS(&lists[i])));
     }
-    UINT64 added = committed() - before;
+    // memory the earlier lists held may be released meanwhile, which adds nothing
+    UINT64 after = committed(), added = after > before ? after - before : 0;
     if (added >= memory.ullTotalPhys) {
       printf("%u idle allocators commit %llu MB, on a machine of %llu MB\n", idle, added >> 20, memory.ullTotalPhys >> 20);
       wrong++;

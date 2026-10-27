@@ -16,7 +16,7 @@ PixelShaderOutputFormats(
   // hints name the 32-bit output register types (D3D11.3 7.6, 16.6), so equal types share a variant
   static_assert(WMTPixelFormatR32Float <= UINT8_MAX && WMTPixelFormatR32Sint <= UINT8_MAX &&
                 WMTPixelFormatR32Uint <= UINT8_MAX);
-  std::array<uint8_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> outputs{};
+  std::array<uint32_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> outputs{};
   for (uint32_t reg = 0; reg < outputs.size(); reg++) {
     auto slot = dual ? 0 : reg;
     if (!(shader.ValidRenderTargets & (1u << reg)) || (dual && reg > 1) || slot >= formats.size() ||
@@ -29,6 +29,12 @@ PixelShaderOutputFormats(
         bool(shader.SintRenderTargets & (1u << reg)) != (integer && !unsigned_output))
       outputs[reg] =
           integer ? (unsigned_output ? WMTPixelFormatR32Uint : WMTPixelFormatR32Sint) : WMTPixelFormatR32Float;
+    auto channels = RenderTargetChannels(formats[slot]);
+    if (channels != RenderTargetChannels(format)) {
+      outputs[reg] |= SM50_PIXEL_FORMAT_CHANNELS;
+      for (uint32_t i = 0; i < channels.size(); i++)
+        outputs[reg] |= i << (8 + 2 * channels[i]);
+    }
   }
   return outputs;
 }

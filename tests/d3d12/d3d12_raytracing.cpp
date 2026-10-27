@@ -294,8 +294,9 @@ main(int argc, char **argv) {
   // a library of shader model 6.6, which annotates the handles of its resources
   auto helper = compiler.compile(helper_hlsl, "", "lib_6_6");
   if (library.empty() || added.empty() || own.empty() || own_swapped.empty() || helper.empty()) {
-    printf("skipped: shader libraries are shader model 6.3\n");
-    return 77;
+    // DXC compiles it, so its empty code is a failure; FXC stops at shader model 5.1
+    printf(compiler.dxc ? "failed: HLSL did not compile\n" : "skipped: shader libraries are shader model 6.3\n");
+    return compiler.dxc ? 1 : 77;
   }
   ComPtr<ID3D12Device7> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));

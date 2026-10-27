@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "../temporary.hpp"
 #include "../trace.hpp"
 
 using Microsoft::WRL::ComPtr;

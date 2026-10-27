@@ -56,6 +56,7 @@ enum Op : uint32_t {
   IsNaN = 8,
   IsInf = 9,
   IsFinite = 10,
+  IsNormal = 11,
   Cos = 12,
   Sin = 13,
   Tan = 14,
@@ -1117,7 +1118,8 @@ read_dxil(
   };
   bool compute = shader->shader_type == D3D11_SB_COMPUTE_SHADER;
   if (shader->shader_type != D3D10_SB_VERTEX_SHADER &&
-      (used({WaveGetLaneIndex, WaveGetLaneCount, WavePrefixOp, WaveMultiPrefixOp, WaveMultiPrefixBitCount}) ||
+      (used({WaveIsFirstLane, WaveGetLaneIndex, WaveGetLaneCount, WavePrefixOp, WaveMultiPrefixOp,
+             WaveMultiPrefixBitCount}) ||
        (compute && used({DerivFineX, DerivFineY})))) {
     shader->func_signature.DefineInput(air::InputThreadIndexInSIMDGroup{});
     shader->func_signature.DefineInput(air::InputThreadsPerSIMDGroup{});
@@ -1614,12 +1616,12 @@ convert_dxil(
   auto i8 = ir.getInt8Ty();
   uint32_t corners = shader->mesh_lines ? 2 : 3;
   GlobalVariable *staged_position = nullptr, *staged_distance = nullptr, *staged_index = nullptr, *staged_culled = nullptr;
-  // conservative rasterization keeps every output for the group's fans (io_binding_map::ConservativeMesh): a vertex's
+  // conservative rasterization keeps every output for the group's triangles (io_binding_map::ConservativeMesh): a vertex's
   // varyings, position and clip distances, a primitive's varyings, ID, layer and viewport, as 32-bit words
   auto cm = ctx.resource.conservative_mesh.get();
   GlobalVariable *conservative_vertices = nullptr, *conservative_primitives = nullptr;
   uint32_t clip_count = 0, vertex_columns = 0, primitive_columns = 0;
-  bool primitive_outputs[4] = {}; // ID, layer, viewport, culled
+  bool primitive_outputs[3] = {}; // ID, layer, viewport
   if (cm) {
     for (auto &e : shader->mesh_outputs[0])
       if (e.semantic == SemanticClipDistance)
@@ -1629,7 +1631,6 @@ convert_dxil(
       primitive_outputs[1] |= e.semantic == SemanticRenderTargetArrayIndex;
       primitive_outputs[2] |= e.semantic == SemanticViewportArrayIndex;
     }
-    primitive_outputs[3] = culls || cull_distances;
     vertex_columns = cm->registers[0].size() + 4 + clip_count;
     primitive_columns = cm->registers[1].size() + 3;
   }
@@ -1801,11 +1802,20 @@ convert_dxil(
     return dxbc.ClampMinLOD(tex.texture->Metadata, defined(lod) ? lod : nullptr);
   };
   // typed reads and writes of textures and texel buffers; `coord` holds the LOD last
-  auto texel_read = [&](Handle &h, Value *coord, const int32_t offset[3], Value *sample) {
+  // the components a load's users extract
+  auto used = [&](CallInst *call) {
+    uint32_t mask = 0;
+    for (auto user : call->users()) {
+      auto extract = dyn_cast<ExtractValueInst>(user);
+      mask |= extract ? 1u << extract->getIndices()[0] : ~0u;
+    }
+    return mask;
+  };
+  auto texel_read = [&](Handle &h, Value *coord, const int32_t offset[3], Value *sample, CallInst *call) {
     auto &t = *h.texture;
     auto lod = sample ? ir.getInt32(0) : ir.CreateExtractElement(coord, 3);
     auto [address, array] = dxbc.TexelAddress(t, coord, offset, sample ? nullptr : lod);
-    return dxbc.ReadTexel(t, address, array, sample, lod);
+    return dxbc.ReadTexel(t, address, array, sample, lod, used(call) & kMaskAll);
   };
   auto texel_write = [&](Handle &h, Value *coord, CallInst *call, unsigned first) {
     auto &t = *h.texture;
@@ -2162,6 +2172,8 @@ convert_dxil(
     ir.SetInsertPoint(held);
     air.CreateAtomicFence(word.memory, scope);
     auto value = word.read();
+    // an exchange's write does not wait on the read for its value, so nothing else keeps them in order
+    air.CreateAtomicFence(word.memory, scope);
     word.write(update(value));
     air.CreateAtomicFence(word.memory, scope);
     air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
@@ -2186,6 +2198,9 @@ convert_dxil(
   // these for 32 bits and less, without groups; the rest walk the lanes
   auto reduce = [&](const std::string &name, Value *v, Signedness sign, bool prefix, Combine combine, Value *identity,
                     Value *group = nullptr) -> Value * {
+    // Metal's half sums count the helper lanes a branch leaves out; given the identity, they add nothing
+    if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves && v->getType()->isHalfTy())
+      v = ir.CreateSelect(simd("simd_is_helper_thread", ir.getInt1Ty(), {}), identity, v);
     if (v->getType()->getPrimitiveSizeInBits() != 64 && !group)
       return simd(prefix ? "simd_prefix_exclusive_" + name : "simd_" + name, v->getType(), {v}, v->getType(), sign);
     auto lane = prefix ? lane_index() : nullptr;
@@ -2347,9 +2362,17 @@ convert_dxil(
     case PrimitiveID:
       ret = ctx.resource.patch_id;
       break;
-    case WaveIsFirstLane:
-      ret = simd("simd_is_first", ir.getInt1Ty(), {});
+    case WaveIsFirstLane: {
+      // the lowest lane of the ballot: simd_is_first can take a helper lane, which the branch around it left out
+      auto ctz = ctx.module.getOrInsertFunction(
+          "air.ctz.i64", FunctionType::get(ir.getInt64Ty(), {ir.getInt64Ty(), ir.getInt1Ty()}, false)
+      );
+      auto mask = simd("simd_ballot", ir.getInt64Ty(), {ir.getTrue()}, ir.getInt64Ty());
+      ret = ir.CreateICmpEQ(
+          ir.CreateZExtOrTrunc(lane_index(), ir.getInt64Ty()), ir.CreateCall(ctz, {mask, ir.getFalse()})
+      );
       break;
+    }
     case WaveGetLaneIndex:
       ret = lane_index();
       break;
@@ -2506,7 +2529,7 @@ convert_dxil(
       break;
     }
     case SetMeshOutputCounts:
-      // Metal counts the vertices itself; a conservative mesh's are its fans', set at the end
+      // Metal counts the vertices itself; a conservative mesh's are its triangles', set at the end
       if (cm) {
         for (unsigned i = 0; i < 2; i++)
           ir.CreateStore(a(1 + i), mesh_counts[i]);
@@ -2579,7 +2602,7 @@ convert_dxil(
       v = ir.CreateBitCast(v, e.type == RegisterComponentType::Float ? ir.getFloatTy() : ir.getInt32Ty());
       mesh_row(call, e.rows, [&](uint32_t row) {
         auto component = row * e.cols + column;
-        // a conservative mesh's wait for its fans; cull distances as before
+        // a conservative mesh's wait for its triangles; cull distances as before
         if (cm) {
           auto bits = ir.CreateBitCast(v, ir.getInt32Ty());
           auto keep = [&](uint32_t at) {
@@ -2671,14 +2694,15 @@ convert_dxil(
       break;
     }
     case CBufferLoad: {
-      // DXIL.rst CBufferLoad aligns the offset; DXR shader records can put root constants after one DWORD
+      // DXIL.rst CBufferLoad aligns the offset; DXR shader records can put root constants after one DWORD. past the
+      // bound size it reads 0 (D3D11.3 7.5): from the start instead, its value dropped, as LoadConstantBuffer does
       auto &buffer = *handles[a(1)].cbuffer;
       auto offset = ir.CreateZExt(a(2), ir.getInt64Ty());
-      auto from = ir.GetInsertBlock();
-      llvm::Instruction *then = nullptr;
+      Value *inside = nullptr;
       if (buffer.Metadata) {
         auto end = ir.CreateAdd(offset, ir.getInt64(ctx.module.getDataLayout().getTypeStoreSize(ty).getFixedSize()));
-        ir.SetInsertPoint(then = SplitBlockAndInsertIfThen(ir.CreateICmpULE(end, buffer.Metadata), call, false));
+        inside = ir.CreateICmpULE(end, buffer.Metadata);
+        offset = ir.CreateSelect(inside, offset, ir.getInt64(0));
       }
       auto space = buffer.Pointer->getType()->getPointerAddressSpace();
       auto pointer = ir.CreateGEP(
@@ -2688,13 +2712,8 @@ convert_dxil(
           ty, ir.CreatePointerCast(pointer, ty->getPointerTo(space)),
           std::min(Align(constant(a(3))), getKnownAlignment(buffer.Pointer, ctx.module.getDataLayout()))
       );
-      if (then) {
-        ir.SetInsertPoint(call);
-        auto value = ir.CreatePHI(ty, 2);
-        value->addIncoming(Constant::getNullValue(ty), from);
-        value->addIncoming(ret, then->getParent());
-        ret = value;
-      }
+      if (inside)
+        ret = ir.CreateSelect(inside, ret, Constant::getNullValue(ty));
       break;
     }
     case CBufferLoadLegacy: {
@@ -2721,7 +2740,7 @@ convert_dxil(
       int32_t offset[3];
       offsets(call, 7, 3, offset);
       auto handle = tex.texture->Handle;
-      auto reference = op == SampleCmp || op == SampleCmpLevelZero ? a(10) : nullptr;
+      auto reference = op == SampleCmp || op == SampleCmpLevelZero ? dxbc.CompareReference(smp.sampler->Metadata, a(10)) : nullptr;
       // compute shaders have no derivatives: they sample with their quads' gradients, or compare at their LOD
       bool compute = ctx.shader_type == D3D11_SB_COMPUTE_SHADER;
       Value *residency_level = nullptr, *residency_bias = bias, *residency_clamp = nullptr;
@@ -2753,7 +2772,10 @@ convert_dxil(
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(10))}};
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *) {
-            return air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
+            return dxbc.SampleImplicit(
+                *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
+                options.second.lod, false
+            );
           };
           break;
         }
@@ -2763,7 +2785,10 @@ convert_dxil(
           };
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *) {
-            return air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
+            return dxbc.SampleImplicit(
+                *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
+                options.second.lod, true
+            );
           };
           break;
         }
@@ -2789,8 +2814,10 @@ convert_dxil(
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(11))}};
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *ref) {
-            return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, options.first, options.second)
-                       : air.CreateSample(texture, handle, s, coord, array, offset, options.first, options.second);
+            return dxbc.SampleImplicit(
+                *tex.texture, s, smp.sampler->Metadata, coord, array, offset, ref, options.first.bias,
+                options.second.lod, false
+            );
           };
           break;
         }
@@ -2830,7 +2857,7 @@ convert_dxil(
       offsets(call, 6, 3, offset);
       bool ms = llvm::air::AIRBuilder::getTextureInfo(h.texture->Logical).is_ms;
       auto [value, residency] = texel_read(
-          h, texel_coord(call, 3, !ms && defined(a(2)) ? a(2) : ir.getInt32(0)), offset, ms ? a(2) : nullptr
+          h, texel_coord(call, 3, !ms && defined(a(2)) ? a(2) : ir.getInt32(0)), offset, ms ? a(2) : nullptr, call
       );
       ret = to_struct(ty, value, residency);
       break;
@@ -2853,7 +2880,8 @@ convert_dxil(
         if (store) {
           texel_write(h, coord, call, 4);
         } else {
-          auto [value, residency] = texel_read(h, ir.CreateInsertElement(coord, ir.getInt32(0), 3), no_offset, nullptr);
+          auto [value, residency] =
+              texel_read(h, ir.CreateInsertElement(coord, ir.getInt32(0), 3), no_offset, nullptr, call);
           ret = to_struct(ty, value, residency);
         }
         break;
@@ -2868,19 +2896,14 @@ convert_dxil(
       auto parts = bits / unit->getBitWidth();
       auto base = ir.CreateUDiv(byte_address(h, a(2), a(3)), ir.getInt64(unit->getBitWidth() / 8));
       // a load reads only the components its users extract, so nothing is read past what the shader asks for
-      uint32_t mask = store ? constant(a(8)) : 0;
-      if (!store)
-        for (auto user : call->users()) {
-          auto extract = dyn_cast<ExtractValueInst>(user);
-          mask |= extract ? 1u << extract->getIndices()[0]
-                          : llvm::maskTrailingOnes<uint32_t>(cast<StructType>(ty)->getNumElements());
-        }
+      uint32_t mask =
+          store ? constant(a(8)) : used(call) & llvm::maskTrailingOnes<uint32_t>(cast<StructType>(ty)->getNumElements());
       auto element = ir.getIntNTy(bits);
       bool feedback = !store && (mask & (1u << 4));
       if (feedback)
         mask |= op == RawBufferLoad ? constant(a(4)) : (mask & kMaskAll ? 0 : kMaskAll);
       Value *residency = ir.getInt32(0);
-      auto units = [&](bool inside) {
+      auto units = [&](Value *base, bool inside) {
         Value *v = UndefValue::get(FixedVectorType::get(element, 4));
         for (unsigned i = 0; i < 4; i++) {
           if (!(mask & (1u << i)))
@@ -2911,7 +2934,7 @@ convert_dxil(
       // one bound for a load of several units where its last unit is inside
       auto read = mask & kMaskAll, last = llvm::Log2_32(read) * parts + parts - 1;
       bool whole = !store && !feedback && read && (parts > 1 || (read & (read - 1)));
-      auto v = dxbc.LoadBufferUnits(b, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units);
+      auto v = dxbc.LoadBufferUnits(b, base, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units);
       if (!store)
         ret = to_struct(ty, v, residency);
       break;
@@ -3443,6 +3466,15 @@ convert_dxil(
     case IsFinite:
       ret = ir.CreateFCmpOLT(fp_unary(llvm::air::AIRBuilder::fabs, a(1)), ConstantFP::getInfinity(a(1)->getType()));
       break;
+    case IsNormal: {
+      auto magnitude = fp_unary(llvm::air::AIRBuilder::fabs, a(1));
+      auto &semantics = a(1)->getType()->getFltSemantics();
+      ret = ir.CreateAnd(
+          ir.CreateFCmpOGE(magnitude, ConstantFP::get(a(1)->getType(), APFloat::getSmallestNormalized(semantics))),
+          ir.CreateFCmpOLT(magnitude, ConstantFP::getInfinity(a(1)->getType()))
+      );
+      break;
+    }
     case Bfrev:
       ret = air.CreateIntUnOp(llvm::air::AIRBuilder::reverse_bits, a(1));
       break;
@@ -3562,7 +3594,7 @@ convert_dxil(
         ret = samples;
         break;
       }
-      auto pos = air.CreateSamplePos(samples, a(texture ? 2 : 1));
+      auto pos = texture ? dxbc.TextureSamplePos(*handles[a(1)].texture, samples, a(2)) : air.CreateRasterizerSamplePos(a(1));
       ret = UndefValue::get(ty);
       for (unsigned i = 0; i < 2; i++)
         ret = ir.CreateInsertValue(ret, ir.CreateExtractElement(pos, i), {i});
@@ -3799,17 +3831,17 @@ convert_dxil(
   }
   if (cm) {
     // every path of the function ends here first: each thread grows the group's triangles of this slice a group's size
-    // apart from its own index, of those the shader set and never more than it declares (conservative_fan)
+    // apart from its own index, of those the shader set and never more than it declares (conservative_triangle)
     auto exported = llvm::BasicBlock::Create(ctx.llvm, "export_conservative_mesh", ctx.function, epilogue);
     epilogue->replaceAllUsesWith(exported);
     ir.SetInsertPoint(exported);
     air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
     auto &n = shader->threadgroup_size;
-    auto fans = ir.getInt32(cm->fans);
+    auto triangles = ir.getInt32(cm->triangles);
     auto count = air.CreateIntBinOp(
         llvm::air::AIRBuilder::min, ir.CreateLoad(ir.getInt32Ty(), mesh_counts[1]), ir.getInt32(shader->mesh_max_primitives)
     );
-    auto first = ir.CreateMul(cm->slice, fans);
+    auto first = ir.CreateMul(cm->slice, triangles);
     auto from = ir.GetInsertBlock();
     auto head = llvm::BasicBlock::Create(ctx.llvm, "", ctx.function, epilogue);
     auto body = llvm::BasicBlock::Create(ctx.llvm, "", ctx.function, epilogue);
@@ -3820,7 +3852,7 @@ convert_dxil(
     ir.SetInsertPoint(head);
     auto f = ir.CreatePHI(ir.getInt32Ty(), 2);
     f->addIncoming(ctx.resource.thread_id_in_group_flat_arg, from);
-    ir.CreateCondBr(ir.CreateICmpULT(f, fans), body, done);
+    ir.CreateCondBr(ir.CreateICmpULT(f, triangles), body, done);
     ir.SetInsertPoint(body);
     auto p = ir.CreateAdd(first, f);
     ir.CreateCondBr(ir.CreateICmpULT(p, count), grow, next);
@@ -3842,42 +3874,37 @@ convert_dxil(
       }
       Value *viewport = primitive_outputs[2] ? (Value *)word(conservative_primitives, p, cm->registers[1].size() + 2) : ir.getInt32(0);
       viewport = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport, ir.getInt32(15), false);
-      auto fan = conservative_fan(ir, air, ctx.types, clip, cm->viewports, viewport);
-      auto blend = [&](const ConservativeFan::Weights &parts, uint32_t u, uint32_t column) {
+      auto triangle = conservative_triangle(ir, air, ctx.types, clip, cm->viewports, viewport);
+      auto blend = [&](const ConservativeTriangle::Weights &parts, uint32_t u, uint32_t column) {
         Value *sum = nullptr;
         for (uint32_t k = 0; k < 3; k++) {
           auto part = ir.CreateFMul(parts[u][k], real(word(conservative_vertices, corner[k], column)));
           sum = sum ? ir.CreateFAdd(sum, part) : part;
         }
-        return sum;
+        return ir.CreateFDiv(sum, triangle.sum[u]);
       };
-      auto vertex_base = ir.CreateMul(f, ir.getInt32(9)), primitive_base = ir.CreateMul(f, ir.getInt32(7));
-      for (uint32_t u = 0; u < 9; u++) {
+      Value *vertex_base = ir.CreateMul(f, ir.getInt32(3)), *primitive = f;
+      for (uint32_t u = 0; u < 3; u++) {
         auto vertex = ir.CreateAdd(vertex_base, ir.getInt32(u));
-        air.CreateSetMeshPosition(vertex, fan.position[u]);
-        // a flat varying is the first corner's, every triangle of the fan starting there
+        air.CreateSetMeshPosition(vertex, triangle.position[u]);
+        // a flat varying is the first corner's
         for (uint32_t i = 0; i < cm->registers[0].size(); i++) {
           auto reg = cm->registers[0][i];
           bool integer = cm->integers[0][i], flat = integer || (cm->flat_inputs >> reg & 1);
           Value *value = flat ? word(conservative_vertices, corner[0], i)
-                              : blend(cm->noperspective_inputs >> reg & 1 ? fan.linear : fan.over_w, u, i);
+                              : blend(cm->noperspective_inputs >> reg & 1 ? triangle.linear : triangle.over_w, u, i);
           if (flat && !integer)
             value = real(value);
           air.CreateSetMeshVertexData(vertex, ir.getInt32(i), value);
         }
         for (uint32_t i = 0; i < clip_count; i++)
-          air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(fan.over_w, u, position_at + 4 + i));
-        for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++) {
-          Value *window = fan.window[i / 2][i % 2];
-          if (i == 0)
-            window = ir.CreateSelect(fan.in_front, window, air.getFloat(NAN));
-          air.CreateSetMeshVertexData(vertex, ir.getInt32(cm->at + i), window);
-        }
-        for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
-          air.CreateSetMeshVertexData(vertex, ir.getInt32(cm->at + SM50_CONSERVATIVE_VARYINGS + i), fan.rcp_w[u]);
+          air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(triangle.over_w, u, position_at + 4 + i));
+        conservative_varyings(air, triangle, u, vertex, cm->at);
+        air.CreateSetMeshIndex(ir.CreateAdd(vertex_base, ir.getInt32(u)), ir.CreateTrunc(vertex, i8));
       }
-      // a primitive is culled when one distance puts all its vertices out, or when the shader culls it itself
-      Value *culled = ir.getFalse();
+      // a primitive is culled when one distance puts all its vertices out, when the shader culls it itself, or when
+      // clipping leaves nothing of it
+      Value *culled = triangle.culled;
       if (culls)
         culled = ir.CreateOr(culled, ir.CreateICmpNE(ir.CreateLoad(i8, element_of(staged_culled, {p})), ir.getInt8(0)));
       for (uint32_t distance = 0; distance < cull_distances; distance++) {
@@ -3886,13 +3913,7 @@ convert_dxil(
           out = ir.CreateAnd(out, ir.CreateLoad(i8, element_of(staged_distance, {corner[k], ir.getInt32(distance)})));
         culled = ir.CreateOr(culled, ir.CreateICmpNE(out, ir.getInt8(0)));
       }
-      for (uint32_t t = 0; t < 7; t++) {
-        auto primitive = ir.CreateAdd(primitive_base, ir.getInt32(t));
-        for (uint32_t i = 0; i < 3; i++)
-          air.CreateSetMeshIndex(
-              ir.CreateAdd(ir.CreateMul(primitive, ir.getInt32(3)), ir.getInt32(i)),
-              ir.CreateTrunc(ir.CreateAdd(vertex_base, ir.getInt32(i ? t + i : 0)), i8)
-          );
+      {
         for (uint32_t i = 0; i < cm->registers[1].size(); i++) {
           Value *value = word(conservative_primitives, p, i);
           air.CreateSetMeshPrimitiveData(primitive, ir.getInt32(i), cm->integers[1][i] ? value : real(value));
@@ -3904,8 +3925,7 @@ convert_dxil(
           air.CreateSetMeshRenderTargetArrayIndex(primitive, system(1));
         if (primitive_outputs[2])
           air.CreateSetMeshViewportArrayIndex(primitive, system(2));
-        if (primitive_outputs[3])
-          air.CreateSetMeshPrimitiveCulled(primitive, culled);
+        air.CreateSetMeshPrimitiveCulled(primitive, culled);
       }
     }
     ir.CreateBr(next);
@@ -3913,12 +3933,12 @@ convert_dxil(
     f->addIncoming(ir.CreateAdd(f, ir.getInt32(n[0] * n[1] * n[2])), next);
     ir.CreateBr(head);
     ir.SetInsertPoint(done);
-    // this slice's fans
+    // this slice's triangles
     auto mine = air.CreateIntBinOp(
         llvm::air::AIRBuilder::min,
-        ir.CreateSelect(ir.CreateICmpUGT(count, first), ir.CreateSub(count, first), ir.getInt32(0)), fans, false
+        ir.CreateSelect(ir.CreateICmpUGT(count, first), ir.CreateSub(count, first), ir.getInt32(0)), triangles, false
     );
-    air.CreateSetMeshPrimitiveCount(ir.CreateMul(mine, ir.getInt32(7)));
+    air.CreateSetMeshPrimitiveCount(mine);
     ir.CreateBr(epilogue);
   } else if (staged_position || staged_distance) {
     // every path of the function ends here first
@@ -4048,11 +4068,11 @@ convert_dxil_mesh_stage(
   air::AirType types(context);
 
   // conservative rasterization: a slice of the group's triangles grown in each Metal mesh threadgroup
-  bool conservative = mesh && link && link->conservative && link->fans && !pShaderInternal->mesh_lines;
+  bool conservative = mesh && link && link->conservative && link->triangles && !pShaderInternal->mesh_lines;
   uint32_t slices = link && link->conservative ? std::max(link->slices, 1u) : 1;
   if (conservative) {
     resource_map.conservative_mesh = std::make_shared<io_binding_map::ConservativeMesh>();
-    resource_map.conservative_mesh->fans = link->fans;
+    resource_map.conservative_mesh->triangles = link->triangles;
     resource_map.conservative_mesh->flat_inputs = link->flat_inputs;
     resource_map.conservative_mesh->noperspective_inputs = link->noperspective_inputs;
   }
@@ -4067,14 +4087,15 @@ convert_dxil_mesh_stage(
   });
   auto &threads = pShaderInternal->threadgroup_size;
   if (mesh) {
-    auto fans = conservative ? link->fans : 0;
+    auto triangles = conservative ? link->triangles : 0;
     func_signature.DefineInput(air::InputMesh{
-        conservative ? 9 * fans : pShaderInternal->mesh_max_vertices,
-        conservative ? 7 * fans : pShaderInternal->mesh_max_primitives,
+        conservative ? 3 * triangles : pShaderInternal->mesh_max_vertices,
+        conservative ? triangles : pShaderInternal->mesh_max_primitives,
         pShaderInternal->mesh_lines ? air::MeshOutputTopology::Line : air::MeshOutputTopology::Triangle
     });
     func_signature.UseMaxMeshWorkgroupSize(threads[0] * threads[1] * threads[2]);
     uint32_t clip_distances = 0, cull_distances = 0;
+    bool culled = false;
     for (bool primitive : {false, true}) {
       uint32_t attributes = 0;
       for (auto &e : pShaderInternal->mesh_outputs[primitive]) {
@@ -4102,6 +4123,7 @@ convert_dxil_mesh_stage(
           break;
         case SemanticCullPrimitive:
           func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
+          culled = true;
           break;
         default:
           break;
@@ -4135,8 +4157,9 @@ convert_dxil_mesh_stage(
     }
     if (clip_distances)
       func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = clip_distances});
-    // Metal culls by primitive: the group derives it from the vertices' cull distances
-    if (cull_distances)
+    // Metal culls by primitive: the group derives it from the vertices' cull distances, and a conservative rasterizer
+    // from its clipping
+    if ((cull_distances || conservative) && !culled)
       func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
     // and the window coordinates the pixel shader tests against, after the vertices' varyings
     if (conservative) {
@@ -4174,6 +4197,7 @@ convert_dxil_mesh_stage(
     return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
   setup_tgsm(shader_info, resource_map, types, module);
 
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -4188,6 +4212,7 @@ convert_dxil_mesh_stage(
       },
       builder, nulldbg
   );
+  air.RasterScale = function->getArg(raster_scale);
 
   setup_metal_version(module, metal_version);
   setup_temp_register(shader_info, resource_map, types, module, builder);

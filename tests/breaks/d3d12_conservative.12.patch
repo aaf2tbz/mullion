@@ -1,12 +1,12 @@
-# a triangle of no area is not grown
+# a triangle of no area is not taken as one
 --- a/src/airconv/dxbc_converter_gs.cpp
 +++ b/src/airconv/dxbc_converter_gs.cpp
-@@ -278,7 +278,7 @@
-     boxed = builder.CreateInsertElement(boxed, builder.CreateFMul(y, w0), uint64_t(1));
-     boxed = builder.CreateInsertElement(boxed, at(clip[0], 2), uint64_t(2));
-     boxed = builder.CreateInsertElement(boxed, w0, uint64_t(3));
--    fan.position[u] = builder.CreateSelect(fan.degenerate, boxed, fan.position[u]);
-+    fan.position[u] = builder.CreateSelect(builder.getFalse(), boxed, fan.position[u]);
-     for (uint32_t j = 0; j < 3; j++) {
-       auto first = air.getFloat(j == 0 ? 1.0 : 0.0);
-       fan.over_w[u][j] = builder.CreateSelect(fan.degenerate, first, fan.over_w[u][j]);
+@@ -240,7 +240,7 @@
+       row[j][c] = sub(mul(a[(c + 1) % 3], b[(c + 2) % 3]), mul(a[(c + 2) % 3], b[(c + 1) % 3]));
+   }
+   auto det = add(add(mul(column[0][0], row[0][0]), mul(column[0][1], row[0][1])), mul(column[0][2], row[0][2]));
+-  auto degenerate = builder.CreateOr(builder.CreateFCmpOEQ(polygon_area, f(0)), builder.CreateFCmpOEQ(det, f(0)));
++  auto degenerate = builder.getFalse();
+   // the triangle's edges moved out by the square, where its corners are before the eye
+   const double grow = 1 + 1.0 / 64;
+   std::array<pvalue, 2> corner[3];

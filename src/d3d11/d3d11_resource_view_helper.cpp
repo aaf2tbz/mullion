@@ -4,16 +4,17 @@
 namespace mullion {
 
 void FixDepthStencilFormat(Texture *pTexture, MTL_DXGI_FORMAT_DESC &Desc) {
+  // a Metal depth view otherwise repeats R into the missing channels (D3D11.3 19.1.3.3)
   switch (pTexture->pixelFormat()) {
   case WMTPixelFormatDepth16Unorm:
     // DXGI_FORMAT_R16_TYPELESS
     // DXGI_FORMAT_R16_UNORM
-    Desc.PixelFormat = WMTPixelFormatDepth16Unorm;
+    Desc.PixelFormat = WMTPixelFormat(WMTPixelFormatDepth16Unorm | WMTPixelFormatR001Swizzle);
     break;
   case WMTPixelFormatDepth32Float:
     // DXGI_FORMAT_R32_TYPELESS
     // DXGI_FORMAT_R32_FLOAT
-    Desc.PixelFormat = WMTPixelFormatDepth32Float;
+    Desc.PixelFormat = WMTPixelFormat(WMTPixelFormatDepth32Float | WMTPixelFormatR001Swizzle);
     break;
   default:
     break;

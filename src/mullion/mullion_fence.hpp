@@ -20,6 +20,7 @@
 
 #include "Metal.hpp"
 #include "thread.hpp"
+#include "util_d3dkmt.h"
 #include <atomic>
 #include <cstdint>
 
@@ -87,10 +88,26 @@ public:
   ~EventListener();
 
   void setEventOnValue(Fence const *fence, HANDLE event, uint64_t value);
+  void setEventOnValue(WMT::SharedEvent shared, HANDLE event, uint64_t value);
 
 private:
   obj_handle_t shared_event_listener_;
   mullion::thread event_listener_thread_;
 };
+
+#ifdef _WIN32
+// sharing of fences (ID3D11Fence and ID3D12Fence, CreateSharedHandle): a D3DKMT allocation of `device` whose private
+// runtime data is the registered name of the event's mach port, 0 if one cannot be made
+D3DKMT_HANDLE shareEvent(D3DKMT_HANDLE device, WMT::SharedEvent event);
+// an NT handle of `allocation`, named `name` among the session's objects when it has a name
+HRESULT shareHandle(D3DKMT_HANDLE allocation, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name,
+                    HANDLE *handle);
+// the event of a handle shareEvent's allocation was shared by, and that allocation's handle in `device`; none if the
+// handle shares something else
+WMT::Reference<WMT::SharedEvent> openSharedEvent(WMT::Device mtl, D3DKMT_HANDLE device, HANDLE handle,
+                                                 D3DKMT_HANDLE &allocation);
+// a new NT handle to what is shared under `name` among the session's objects
+HRESULT openHandleByName(const WCHAR *name, DWORD access, HANDLE *handle);
+#endif
 
 }; // namespace mullion

@@ -25,6 +25,7 @@
 #include "mullion_geometry.hpp"
 #include "mullion_command.hpp"
 #include <span>
+#include <cmath>
 #include "util_env.hpp"
 
 namespace mullion {
@@ -137,6 +138,26 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   WMTIndexType index_type;
   uint64_t index_offset;
   D3D12_INDEX_BUFFER_VIEW index_view_{}; // what tessellation's object stage reads indices through
+  // the buffer the last address was found in and the addresses that find it too (LookupBufferByVA's pEnd): index
+  // buffers and immediate writes mostly look up one buffer after another. a buffer the list uses lives until it has
+  // run, so the entry stays right until Reset, or an aliasing barrier, after which another may take the addresses
+  BufferAllocation *va_found_ = nullptr;
+  uint64_t va_found_end_ = 0;
+
+  BufferAllocation *
+  LookupBuffer(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) {
+    if (va_found_ && VA >= va_found_->gpuAddress() && VA < va_found_end_) {
+      *pOffset = VA - va_found_->gpuAddress();
+      return va_found_;
+    }
+    uint64_t end;
+    auto allocation = device_->LookupBufferByVA(VA, pOffset, &end);
+    if (allocation && VA < end) {
+      va_found_ = allocation;
+      va_found_end_ = end;
+    }
+    return allocation;
+  }
   D3D12_STREAM_OUTPUT_BUFFER_VIEW so_views_[4]{};
   // per stream, the active statistics query's result, or 0
   uint64_t so_statistics_[4]{};
@@ -150,6 +171,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   UINT num_viewports;
   D3D12_VIEWPORT
   viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {{}};
+  // where the pass's viewports' depth ranges and raster scale are in the GPU heap, for indirect commands to bind
+  uint64_t depth_ranges_ = 0, raster_scale_ = 0;
 
   UINT num_scissors;
   D3D12_RECT
@@ -171,6 +194,12 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // a bundle keeps its calls, and ExecuteBundle replays them on the calling list: they read the state the caller set and
   // leave theirs set, as bundles inherit and pass state
   std::vector<std::function<void(MTLD3D12GraphicsCommandList *)>> bundle_;
+
+  // callers test Bundled() before Record(...), so a direct list builds no capture (vector copies, references) per call
+  bool
+  Bundled() const {
+    return type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+  }
 
   template <typename Call>
   bool
@@ -200,15 +229,52 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // OMSetDepthBounds' range, NaN as 0; the pass has a range set when depth_bounds_set_
   FLOAT depth_bounds_[2];
   bool depth_bounds_set_ = false;
+  // the last render pass a draw of a pipeline that uses UAVs or stream output was in: a UAV barrier orders nothing
+  // inside another
+  EncoderData *uav_draw_pass_ = nullptr;
+  // the textures the render pass targets_pass_ draws to: a transition of another resource orders nothing its draws
+  // wrote, unless they wrote through UAVs or stream output (PassWrote)
+  const EncoderData *targets_pass_ = nullptr;
+  std::array<const Texture *, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 1> targets_{};
+  // what orders the passes (EncoderData::overlap): events that order work without a pass of their own (barriers,
+  // queries, predication, stream output) so far; the last pass a draw or dispatch began, and how many such events
+  // there had been then; and what render passes drew to since the last ordering point
+  uint64_t order_serial_ = 0, plain_serial_ = 0;
+  const EncoderData *plain_pass_ = nullptr;
+  std::vector<const Texture *> overlap_targets_;
+
+  // work after this point waits for work before it: the open pass too, which barriers that do not end it (Order),
+  // queries and stream output leave open, and whose later draws or dispatches may read what passes before it wrote
+  void
+  OrderingPoint() {
+    order_serial_++;
+    if (allocator_->encoder_current)
+      allocator_->encoder_current->overlap = PassOverlap::Ordered;
+  }
+
+  // the overlap of a pass a draw or dispatch just began, after the passes before it are in the list
+  void
+  Overlap(EncoderData *pass, std::span<const Texture *const> targets) {
+    bool follows = plain_pass_ && allocator_->encoder_last == plain_pass_ && order_serial_ == plain_serial_;
+    if (!follows)
+      overlap_targets_.clear();
+    bool shared = std::ranges::any_of(targets, [&](auto texture) {
+      return texture && std::ranges::find(overlap_targets_, texture) != overlap_targets_.end();
+    });
+    pass->overlap = !follows ? PassOverlap::Ordered : shared ? PassOverlap::Shared : PassOverlap::Independent;
+    for (auto texture : targets)
+      if (texture)
+        overlap_targets_.push_back(texture);
+    plain_pass_ = pass;
+    plain_serial_ = order_serial_;
+  }
+  // no aliasing barrier since the last clear pass began (JoinableClear)
+  bool clear_joinable_ = false;
   // the depth bounds test of a GPU without one: the samples in the range a kernel found before the pass it is for, until
   // the range changes or a draw writes depth (DepthBoundsSamples)
   WMT::Buffer depth_bounds_samples_{};
   EncoderData *depth_bounds_pass_ = nullptr;
   bool depth_bounds_stale_ = true;
-  // the last render pass a draw of a pipeline that uses UAVs was in: a UAV barrier orders nothing inside another
-  EncoderData *uav_draw_pass_ = nullptr;
-  // no aliasing barrier since the last clear pass began (JoinableClear)
-  bool clear_joinable_ = false;
   // variable rate shading: RSSetShadingRate's rate and combiners, and RSSetShadingRateImage's image, whose bytes a copy
   // before the pass gives the pixel shader (SM50_BINDING_INDEX_SHADING_RATE_IMAGE)
   D3D12_SHADING_RATE shading_rate_ = D3D12_SHADING_RATE_1X1;
@@ -219,6 +285,53 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   WMT::Buffer shading_rate_bytes_{};
   uint64_t shading_rate_offset_ = 0;
   EncoderData *shading_rate_pass_ = nullptr;
+
+  // the full clears a later render pass may still take as its load actions (FoldClears): a cleared view is in the
+  // render target or depth write state, where copies, dispatches and other passes cannot touch it until a barrier names
+  // its resource. so a clear stays foldable across them until then, until a pass draws to it, or until something that
+  // needs no barrier (a clear of rectangles, a resolve) uses it. the textures are the clear pass's colors', then its
+  // depth stencil view's
+  struct PendingClear {
+    RenderEncoderData *pass;
+    std::array<const Texture *, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 1> textures{};
+  };
+  std::vector<PendingClear> clears_;
+
+  // MULLION_D3D12_HOIST_COPIES (on unless 0): what the last barrier that named a resource left it in, and when, for
+  // copies that need not end the render pass (PreCopy). a split barrier's beginning leaves no state
+  struct Named {
+    UINT subresource;
+    D3D12_RESOURCE_STATES state;
+    uint64_t serial;
+  };
+  std::unordered_map<ID3D12Resource *, Named> named_;
+  // ResourceBarrier calls so far, and how many there had been when the open render pass began
+  uint64_t barrier_serial_ = 0, render_serial_ = 0;
+  // the blit pass before the render pass hoisted_for_ that copies hoisted out of it run in
+  BlitEncoderData *hoisted_ = nullptr;
+  const EncoderData *hoisted_for_ = nullptr;
+
+  static bool
+  HoistsCopies() {
+    static const bool hoists = env::getEnvVar("MULLION_D3D12_HOIST_COPIES") != "0";
+    return hoists;
+  }
+
+  void
+  BarrierLeaves(ID3D12Resource *resource, UINT subresource, D3D12_RESOURCE_STATES state) {
+    if (!HoistsCopies())
+      return;
+    if (!resource)
+      named_.clear();
+    else
+      named_[resource] = {subresource, state, barrier_serial_};
+  }
+
+  // a texture used where no barrier says so: no clear of it before may fold into a later pass
+  void
+  UsedTexture(const Texture *texture) {
+    std::erase_if(clears_, [&](auto &clear) { return std::ranges::find(clear.textures, texture) != clear.textures.end(); });
+  }
 
   // occlusion queries: the running ones, each from the first visibility slot it counts in; the slots' GPU addresses,
   // in order; and the sums the ended ones need (sum_occlusion's), made before their results are read
@@ -231,9 +344,6 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     uint32_t query, first, count, binary;
   };
   std::vector<ActiveQuery> active_queries_;
-  // the open BeginEvent names, outermost first, and the innermost three joined: they name pipeline runs (RunName)
-  std::vector<std::string> events_;
-  std::string event_path_;
   std::vector<uint64_t> visibility_slots_;
   std::vector<std::pair<MTLD3D12QueryHeap *, OcclusionSum>> occlusion_sums_;
 
@@ -326,6 +436,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
                                  offset, allocator_->gpu_heap_buffer_, result_offset,
                                  draw.threads ? device_->GetLib().PipelineStatistics(true) : WMT::RenderPipelineState{},
                                  draw.threads);
+    // it binds a fragment buffer of its own
+    ForgetBuffers();
     uint64_t primitives = Primitives(vertices) * instances;
     vertices *= instances;
     if (predication_region_) {
@@ -624,6 +736,8 @@ public:
     index_type = {};
     index_offset = 0;
     index_view_ = {};
+    va_found_ = nullptr;
+    ForgetBuffers();
 
     dirty_state_.clrAll();
   }
@@ -637,6 +751,12 @@ public:
 
     ResetState(pInitialPipelineState);
     bundle_.clear();
+    clears_.clear();
+    plain_pass_ = nullptr;
+    overlap_targets_.clear();
+    named_.clear();
+    hoisted_ = nullptr;
+    hoisted_for_ = nullptr;
     // a bundle's initial state is its first call
     if (pInitialPipelineState && type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE)
       SetPipelineState(pInitialPipelineState);
@@ -651,6 +771,7 @@ public:
     predicated_.clear();
     predication_region_ = nullptr;
     left_for_later_ = false;
+    events_.clear();
 
     encoder_count = std::numeric_limits<size_t>::max();
     return allocator_->StartRecord(&entry);
@@ -660,7 +781,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -689,7 +810,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   Close() {
     if (encoder_count < std::numeric_limits<size_t>::max())
-      return E_FAIL;
+      return FAIL(E_FAIL);
     SumOcclusion();
     SumStatistics();
     EndPredication();
@@ -707,9 +828,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   Reset(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState) {
     if (encoder_count == std::numeric_limits<size_t>::max())
-      return E_FAIL;
-    events_.clear();
-    event_path_.clear();
+      return FAIL(E_FAIL);
     return FAILED(recording_error_) ? recording_error_ : Initialize(pAllocator, pInitialState);
   };
 
@@ -761,6 +880,8 @@ public:
     auto type = dsv.Texture->textureType(dsv.View);
     uint32_t kind = (type == WMTTextureType2DArray || type == WMTTextureType2DMultisampleArray) +
                     2 * (type == WMTTextureType2DMultisample || type == WMTTextureType2DMultisampleArray);
+    // the kernel reads the depth before the pass, so a clear of it stays before the kernel
+    UsedTexture(dsv.Texture);
     StartComputePass();
     depth_bounds_samples_ = allocator_->DepthBoundsSamples(uint64_t(dsv.Width) * dsv.Height);
     auto &pso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
@@ -821,6 +942,86 @@ public:
     copy.bytes_per_image = width * height;
   }
 
+  // the full clears of a new render pass's attachments become its load actions, the latest first, and their passes
+  // go: D3D11.3 5.2.3.1, "The full extent of the resource view is always cleared." passes between a clear and this one
+  // are copies, dispatches, other clears and draws to other targets, which cannot touch what it cleared (PendingClear);
+  // predication, settling and the like keep it where it is. a clear that stays keeps the older ones of its textures too
+  void
+  FoldClears(RenderEncoderData *render) {
+    std::array<const Texture *, 2 * (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 1)> kept{};
+    size_t kept_count = 0;
+    for (auto pending = clears_.size(); pending--;) {
+      auto clear = clears_[pending].pass;
+      auto &textures = clears_[pending].textures;
+      auto folds = [&] {
+        if (clear->render_target_width != render->render_target_width ||
+            clear->render_target_height != render->render_target_height ||
+            clear->render_target_array_length != render->render_target_array_length ||
+            // a timestamp query on the clear has the clock when the clear is done
+            clear->stamps ||
+            (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
+            (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment) ||
+            // a plane bound read-only may be sampled in the pass, and a load action clears only the tile's copy
+            ((clear->depth.attachment || clear->stencil.attachment) && render->dsv_readonly_flags))
+          return false;
+        for (auto texture : textures)
+          if (texture && std::ranges::find(kept.begin(), kept.begin() + kept_count, texture) != kept.begin() + kept_count)
+            return false;
+        for (auto &cleared : clear->colors)
+          if (cleared.attachment && std::ranges::none_of(render->colors, [&](auto &rt) {
+                return rt.attachment == cleared.attachment && rt.depth_plane == cleared.depth_plane;
+              }))
+            return false;
+        for (auto between = clear->next; between; between = between->next)
+          if (between->type != EncoderType::Clear && between->type != EncoderType::Render &&
+              between->type != EncoderType::Blit && between->type != EncoderType::Compute &&
+              between->type != EncoderType::ComputeParts)
+            return false;
+        return true;
+      };
+      if (!folds()) {
+        for (auto texture : textures)
+          if (texture && kept_count < kept.size())
+            kept[kept_count++] = texture;
+        if (kept_count == kept.size())
+          break;
+        continue;
+      }
+      for (auto &cleared : clear->colors) {
+        if (!cleared.attachment)
+          continue;
+        auto color = std::ranges::find_if(render->colors, [&](auto &rt) {
+          return rt.attachment == cleared.attachment && rt.depth_plane == cleared.depth_plane;
+        });
+        if (color->load_action == WMTLoadActionLoad) {
+          color->load_action = WMTLoadActionClear;
+          color->clear_color = cleared.clear_color;
+        }
+      }
+      if (clear->depth.attachment && render->depth.load_action == WMTLoadActionLoad) {
+        render->depth.load_action = WMTLoadActionClear;
+        render->depth.clear_depth = clear->depth.clear_depth;
+      }
+      if (clear->stencil.attachment && render->stencil.load_action == WMTLoadActionLoad) {
+        render->stencil.load_action = WMTLoadActionClear;
+        render->stencil.clear_stencil = clear->stencil.clear_stencil;
+      }
+      // out of the list, which only clear passes leave: the next one, if a clear, follows the one before now
+      clear->previous->next = clear->next;
+      if (clear->next && clear->next->type == EncoderType::Clear)
+        static_cast<RenderEncoderData *>(clear->next)->previous = clear->previous;
+      if (allocator_->encoder_last == clear)
+        allocator_->encoder_last = clear->previous;
+      allocator_->encoder_count_--;
+      clear->~RenderEncoderData();
+      clears_.erase(clears_.begin() + pending);
+    }
+    // what the pass draws to is used: a clear before it that stayed is not a later pass's
+    for (auto texture : targets_)
+      if (texture)
+        UsedTexture(texture);
+  }
+
   DrawCallStatus
   PreDraw(bool SkipResourceBinding = false) {
     if (!pso_graphics_)
@@ -861,6 +1062,9 @@ public:
       unsigned render_target_width = 16384, render_target_height = 16384, render_target_array_length = 0;
 
       unsigned effective_rtvs = 0;
+      render_serial_ = barrier_serial_;
+      targets_pass_ = render;
+      targets_.fill(nullptr);
       for (unsigned i = 0; i < num_rtvs; i++) {
         if (!(pso_graphics_->rtv_mask & (1u << i)))
           continue;
@@ -868,6 +1072,9 @@ public:
         if (!AttachmentDesc.Texture)
           continue;
         effective_rtvs++;
+        if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
+          render->center_samples = AttachmentDesc.Texture->sampleCount();
+        targets_[i] = AttachmentDesc.Texture;
         auto &rt = render->colors[i];
         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
         rt.depth_plane = AttachmentDesc.DepthPlane;
@@ -880,6 +1087,9 @@ public:
       if (dsv.Texture && pso_graphics_->dsv_mask) {
         auto &AttachmentDesc = dsv;
         effective_rtvs++;
+        if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
+          render->center_samples = AttachmentDesc.Texture->sampleCount();
+        targets_.back() = AttachmentDesc.Texture;
         auto dsv_planar_flags =
             DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View)) & pso_graphics_->dsv_mask;
         if (dsv_planar_flags & 1) {
@@ -911,40 +1121,8 @@ public:
         render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
       }
 
-      while (allocator_->encoder_last->type == EncoderType::Clear) {
-        auto clear = static_cast<RenderEncoderData *>(allocator_->encoder_last);
-        // D3D11.3 5.2.3.1: "The full extent of the resource view is always cleared."
-        if (clear->render_target_width != render_target_width || clear->render_target_height != render_target_height ||
-            clear->render_target_array_length != render_target_array_length)
-          break;
-        auto color = std::find_if(render->colors.begin(), render->colors.end(), [&](auto &rt) {
-          return clear->colors[0].attachment && rt.attachment == clear->colors[0].attachment &&
-                 rt.depth_plane == clear->colors[0].depth_plane;
-        });
-        // a timestamp query on the clear has the clock when the clear is done
-        if (clear->stamps || (clear->colors[0].attachment && color == render->colors.end()) ||
-            (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
-            (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment) ||
-            // a plane bound read-only may be sampled in the pass, and a load action clears only the tile's copy
-            ((clear->depth.attachment || clear->stencil.attachment) && render->dsv_readonly_flags))
-          break;
-        if (color != render->colors.end() && color->load_action == WMTLoadActionLoad) {
-          color->load_action = WMTLoadActionClear;
-          color->clear_color = clear->colors[0].clear_color;
-        }
-        if (clear->depth.attachment && render->depth.load_action == WMTLoadActionLoad) {
-          render->depth.load_action = WMTLoadActionClear;
-          render->depth.clear_depth = clear->depth.clear_depth;
-        }
-        if (clear->stencil.attachment && render->stencil.load_action == WMTLoadActionLoad) {
-          render->stencil.load_action = WMTLoadActionClear;
-          render->stencil.clear_stencil = clear->stencil.clear_stencil;
-        }
-        allocator_->encoder_last = clear->previous;
-        allocator_->encoder_last->next = nullptr;
-        allocator_->encoder_count_--;
-        clear->~RenderEncoderData();
-      }
+      FoldClears(render);
+      Overlap(render, targets_);
 
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
@@ -964,8 +1142,7 @@ public:
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       // a pipeline for a topology with adjacency is made here, and may fail
       auto pipeline = Pipeline();
-      if (!pipeline || (pso_graphics_->stream_output &&
-                        (!Pipeline(true) || (StreamOutputRasterizes() && !RenderTargets(pso_graphics_->so_raster)))))
+      if (!pipeline || (pso_graphics_->stream_output && !Pipeline(true)))
         return DrawCallStatus::Invalid;
       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd_setpso.type = WMTRenderCommandSetPSO;
@@ -973,7 +1150,7 @@ public:
       if (Logger::logLevel() == LogLevel::Trace)
         TRACE("pass ", allocator_->encoder_current->id, ": graphics pipeline ", pso_graphics_->name);
       if (device_->NamesPasses())
-        device_->NamePass(allocator_->encoder_current, RunName(pso_graphics_->name, pipeline), pipeline);
+        device_->NamePass(allocator_->encoder_current, pso_graphics_->name, pipeline);
 
       auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
       cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
@@ -985,7 +1162,8 @@ public:
       auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       cmd_setrs.type = WMTRenderCommandSetRasterizerState;
       cmd_setrs.cull_mode = pso_graphics_->cull_mode;
-      cmd_setrs.depth_clip_mode = pso_graphics_->depth_clip_mode;
+      // a conservative rasterizer clips depth itself, and its grown triangles' depth goes past the polygon's
+      cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
       cmd_setrs.depth_bias = pso_graphics_->depth_bias;
       cmd_setrs.depth_bias_clamp = pso_graphics_->depth_bias_clamp;
@@ -996,10 +1174,9 @@ public:
     }
     // under tessellation the vertex and hull shaders run in the object stage, the domain shader in the mesh stage; with
     // a geometry shader the vertex shader runs in the object stage, the geometry shader in the mesh stage
-    // stream output without a geometry shader also rasterizes through the vertex stage
     // a mesh shader pipeline has an object stage (its amplification shader, if any) and a mesh stage
     bool mesh = pso_graphics_->threads_per_patch || Geometry() || pso_graphics_->mesh_shader;
-    bool vertex = !mesh || StreamOutputRasterizes();
+    bool vertex = !mesh;
     auto geometry_buffer = [&](uint64_t Offset, uint8_t Index) {
       if (mesh) {
         EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, Index);
@@ -1032,7 +1209,8 @@ public:
       dirty_state_.clr(DirtyState::GraphicsRootSignature);
     }
 
-    // a conservative rasterizer's mesh stage dilates triangles by pixels of the viewport each chooses
+    // a conservative rasterizer's mesh stage grows triangles by pixels of the viewport each chooses, clipping depth
+    // as the pipeline does and facing as it does
     if (pso_graphics_->conservative) {
       auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(SM50_CONSERVATIVE_VIEWPORTS), 16);
       auto data = static_cast<SM50_CONSERVATIVE_VIEWPORTS *>(mapped);
@@ -1040,6 +1218,8 @@ public:
       for (UINT i = 0; i < std::min<UINT>(num_viewports, std::size(data->viewports)); i++)
         data->viewports[i][0] = viewports[i].TopLeftX, data->viewports[i][1] = viewports[i].TopLeftY,
         data->viewports[i][2] = viewports[i].Width, data->viewports[i][3] = viewports[i].Height;
+      data->state[0] = pso_graphics_->depth_clip_mode == WMTDepthClipModeClip;
+      data->state[1] = pso_graphics_->winding == WMTWindingCounterClockwise;
       if (allocator_->records_)
         allocator_->RecordGPUHeap(mapped, sizeof(*data), "conservative viewports");
       EncodeBuffer(WMTRenderCommandSetMeshBuffer, offset, SM50_BINDING_INDEX_VIEWPORTS);
@@ -1048,18 +1228,49 @@ public:
     // a primitive names one of the viewports and scissors there may be (D3D11.3 15.8.1). a viewport that is not set
     // is of no size and a scissor that is not set is empty (15.6, 15.7): nothing is drawn through either, which an
     // empty scissor says to Metal, whatever viewport it has there
-    if (dirty_state_.test(DirtyState::Viewport) && num_viewports) {
-      auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(count);
+    static_assert(SM50_VIEWPORTS == D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+    // the depth ranges, then the blend factor of a pixel shader that blends itself (SM50_SHADER_BLEND)
+    if (dirty_state_.test(DirtyState::Viewport) ||
+        (dirty_state_.test(DirtyState::BlendFactor) && pso_graphics_->shader_blend)) {
+      auto [ranges, ranges_offset] =
+          allocator_->AllocateGPUHeap((2 * count + std::size(blend_factor_)) * sizeof(float), alignof(float));
+      // with no viewport set, Metal's own has the range 0 to 1
       for (auto i = 0u; i < count; i++) {
-        auto &viewport = viewports[i < num_viewports ? i : 0];
-        metal_viewport[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
-                             viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
+        ((float *)ranges)[2 * i] = num_viewports ? viewports[i < num_viewports ? i : 0].MinDepth : 0;
+        ((float *)ranges)[2 * i + 1] = num_viewports ? viewports[i < num_viewports ? i : 0].MaxDepth : 1;
       }
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
-      cmd.type = WMTRenderCommandSetViewports;
-      cmd.viewports.set(metal_viewport);
-      cmd.viewport_count = count;
-      static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
+      std::copy_n(blend_factor_, std::size(blend_factor_), (float *)ranges + 2 * count);
+      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, ranges_offset, SM50_BINDING_INDEX_DEPTH_RANGES);
+      depth_ranges_ = allocator_->gpu_heap_buffer_address_ + ranges_offset;
+    }
+    if (dirty_state_.test(DirtyState::Viewport)) {
+      auto [scale, scale_offset] = allocator_->AllocateGPUHeap((1 + 2 * SM50_VIEWPORTS) * sizeof(float), alignof(float));
+      *(float *)scale = 1;
+      // with no viewport set, Metal's covers the pass
+      auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      for (auto i = 0u; i < SM50_VIEWPORTS; i++) {
+        auto &viewport = viewports[i < num_viewports ? i : 0];
+        ((float *)scale)[1 + 2 * i] = num_viewports ? viewport.Width : pass->render_target_width;
+        ((float *)scale)[2 + 2 * i] = num_viewports ? viewport.Height : pass->render_target_height;
+      }
+      if (num_viewports) {
+        auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(count);
+        for (auto i = 0u; i < count; i++) {
+          auto &viewport = viewports[i < num_viewports ? i : 0];
+          metal_viewport[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+                               viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
+        }
+        *(float *)scale =
+            EnlargeViewports({metal_viewport, count}, D3D12_VIEWPORT_BOUNDS_MIN, D3D12_VIEWPORT_BOUNDS_MAX);
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
+        cmd.type = WMTRenderCommandSetViewports;
+        cmd.viewports.set(metal_viewport);
+        cmd.viewport_count = count;
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
+      }
+      EncodeBuffer(WMTRenderCommandSetVertexBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
+      EncodeBuffer(WMTRenderCommandSetMeshBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
+      raster_scale_ = allocator_->gpu_heap_buffer_address_ + scale_offset;
       dirty_state_.clr(DirtyState::Viewport);
     }
 
@@ -1070,11 +1281,15 @@ public:
       auto metal_scissors = allocator_->AllocateCommandData<WMTScissorRect>(count);
       for (auto i = 0u; i < count; i++) {
         if (i < num_scissors && i < num_viewports) {
+          // a viewport scissors to the pixels its floored extents hold (D3D11.3 15.6.1)
           auto &d3d_rect = scissors[i];
-          LONG left = std::clamp(d3d_rect.left, (LONG)0, width);
-          LONG top = std::clamp(d3d_rect.top, (LONG)0, height);
-          LONG right = std::clamp(d3d_rect.right, left, width);
-          LONG bottom = std::clamp(d3d_rect.bottom, top, height);
+          auto &viewport = viewports[i];
+          LONG left = std::clamp(std::max(d3d_rect.left, LONG(std::floor(viewport.TopLeftX))), (LONG)0, width);
+          LONG top = std::clamp(std::max(d3d_rect.top, LONG(std::floor(viewport.TopLeftY))), (LONG)0, height);
+          LONG right =
+              std::clamp(std::min(d3d_rect.right, LONG(std::floor(viewport.TopLeftX + viewport.Width))), left, width);
+          LONG bottom =
+              std::clamp(std::min(d3d_rect.bottom, LONG(std::floor(viewport.TopLeftY + viewport.Height))), top, height);
           metal_scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
         } else {
           metal_scissors[i] = {};
@@ -1171,16 +1386,59 @@ public:
     }
     dirty_state_.clr(DirtyState::DepthBounds);
 
-    if (pso_graphics_->uses_uav)
+    if (pso_graphics_->uses_uav || pso_graphics_->stream_output)
       uav_draw_pass_ = allocator_->encoder_current;
+    // stream output appends in the order of the draws, across passes too
+    if (pso_graphics_->stream_output)
+      OrderingPoint();
     return DrawCallStatus::Ordinary;
+  }
+
+  // what EncodeBuffer bound in the render pass `pass`, by stage (vertex, fragment, mesh, object) and index: the same
+  // buffer again needs only its offset (Metal's set*BufferOffset), and the same offset nothing. an indirect command
+  // buffer may leave other bindings behind, so ExecuteIndirect forgets them (ForgetBuffers)
+  struct {
+    const EncoderData *pass = nullptr;
+    obj_handle_t buffer[4][16];
+    uint64_t offset[4][16];
+  } bound_;
+
+  void
+  ForgetBuffers() {
+    bound_.pass = nullptr;
   }
 
   void
   EncodeBuffer(WMTRenderCommandType Type, uint64_t Offset, uint8_t Index) {
+    obj_handle_t buffer = allocator_->gpu_heap_buffer_;
+    // each Set*Buffer is followed by its Set*BufferOffset (WMTRenderCommandType)
+    unsigned stage = Type == WMTRenderCommandSetVertexBuffer     ? 0
+                     : Type == WMTRenderCommandSetFragmentBuffer ? 1
+                     : Type == WMTRenderCommandSetMeshBuffer     ? 2
+                     : Type == WMTRenderCommandSetObjectBuffer   ? 3
+                                                                 : 4;
+    if (stage < 4 && Index < std::size(bound_.buffer[0])) {
+      if (bound_.pass != allocator_->encoder_current) {
+        bound_.pass = allocator_->encoder_current;
+        memset(bound_.buffer, 0, sizeof(bound_.buffer));
+      }
+      auto &buffer_bound = bound_.buffer[stage][Index], &offset_bound = bound_.offset[stage][Index];
+      if (buffer_bound == buffer && offset_bound == Offset)
+        return;
+      if (buffer_bound == buffer) {
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setbufferoffset>();
+        cmd.type = WMTRenderCommandType(Type + 1);
+        cmd.offset = Offset;
+        cmd.index = Index;
+        offset_bound = Offset;
+        return;
+      }
+      buffer_bound = buffer;
+      offset_bound = Offset;
+    }
     auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
     cmd.type = Type;
-    cmd.buffer = allocator_->gpu_heap_buffer_;
+    cmd.buffer = buffer;
     cmd.offset = Offset;
     cmd.index = Index;
   }
@@ -1255,12 +1513,6 @@ public:
     return pso_graphics_->geometry_shader || PassesAdjacency();
   }
 
-  // stream output without a geometry shader then draws as usual, unless the mesh stage already has
-  bool
-  StreamOutputRasterizes() {
-    return pso_graphics_->so_raster && !PassesAdjacency();
-  }
-
   WMT::RenderPipelineState
   RenderTargets(WMT::RenderPipelineState Pipeline) {
     auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
@@ -1278,8 +1530,8 @@ public:
   WMT::RenderPipelineState
   Pipeline(bool counting = false) {
     bool strip = Strip(topology_);
-    if (PassesAdjacency())
-      return RenderTargets(pso_graphics_->AdjacencyPipeline(strip, counting));
+    if (PassesAdjacency() || pso_graphics_->patches)
+      return RenderTargets(pso_graphics_->TopologyPipeline(topology_, counting));
     if (counting)
       return RenderTargets(strip ? pso_graphics_->so_count_strip : pso_graphics_->so_count);
     return RenderTargets(pso_graphics_->geometry_shader && strip ? pso_graphics_->pso_strip : pso_graphics_->pso);
@@ -1327,23 +1579,13 @@ public:
     };
     if (!pso_graphics_->stream_output)
       return draw();
-    // stream output (SM50_STREAM_OUTPUT_TARGETS) runs the draw twice: once counting each geometry invocation's
-    // primitives, and after a barrier again, writing them and drawing. its scratch area holds the filled sizes, a total
-    // per stream and object threadgroup, and a count per stream and invocation (at most a primitive per vertex)
-    SM50_STREAM_OUTPUT_TARGETS targets{};
-    for (unsigned b = 0; b < std::size(so_views_); b++) {
-      targets.address[b] = so_views_[b].BufferLocation;
-      targets.size[b] = so_views_[b].SizeInBytes;
-      targets.filled[b] = so_views_[b].BufferFilledSizeLocation;
-      targets.statistics[b] = so_statistics_[b];
-    }
+    auto targets = StreamOutputTargets();
     uint64_t groups = uint64_t(warps) * Args.InstanceCount;
-    uint64_t scratch_bytes = SM50StreamOutputScratch(groups, vertex_per_warp * pso_graphics_->gs_instances);
-    auto [Scratch, ScratchOffset] = allocator_->AllocateGPUHeap(scratch_bytes, 16);
+    auto [Scratch, ScratchOffset] =
+        allocator_->AllocateGPUHeap(SM50StreamOutputScratch(groups, vertex_per_warp * pso_graphics_->gs_instances), 16);
     // a draw whose scratch no heap has room for: the list fails when it is closed
     if (!Scratch)
       return;
-    memset(Scratch, 0, scratch_bytes);
     targets.scratch = allocator_->gpu_heap_buffer_address_ + ScratchOffset;
     targets.warps = warps;
     targets.instances = Args.InstanceCount;
@@ -1351,35 +1593,67 @@ public:
     if (allocator_->records_)
       allocator_->RecordGPUHeap(Targets, sizeof(targets), "stream output targets");
     memcpy(Targets, &targets, sizeof(targets));
+    StreamOut(TargetsOffset, ScratchOffset, draw, [&] {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
+      cmd = {WMTRenderCommandDraw};
+      cmd.primitive_type = WMTPrimitiveTypePoint;
+      cmd.vertex_count = SM50StreamOutputZeroed(groups) / sizeof(uint32_t);
+      cmd.instance_count = 1;
+    });
+  }
+
+  // the stream output targets bound, with no scratch area yet
+  SM50_STREAM_OUTPUT_TARGETS
+  StreamOutputTargets() {
+    SM50_STREAM_OUTPUT_TARGETS targets{};
+    for (unsigned b = 0; b < std::size(so_views_); b++) {
+      targets.address[b] = so_views_[b].BufferLocation;
+      targets.size[b] = so_views_[b].SizeInBytes;
+      targets.filled[b] = so_views_[b].BufferFilledSizeLocation;
+      targets.statistics[b] = so_statistics_[b];
+    }
+    return targets;
+  }
+
+  // stream output (SM50_STREAM_OUTPUT_TARGETS at `TargetsOffset`) runs a draw twice: once counting each geometry
+  // invocation's primitives, and after a barrier again, writing them and drawing. its scratch area holds the filled
+  // sizes, a total per stream and object threadgroup, and a count per stream and invocation (at most a primitive per
+  // vertex). the passes add to all but the counts, which `zero` zeroes first (zero_words), on every execution of the
+  // list, replays included
+  template <typename Draw, typename Zero>
+  void
+  StreamOut(uint64_t TargetsOffset, uint64_t ScratchOffset, Draw draw, Zero zero) {
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, TargetsOffset, SM50_BINDING_INDEX_STREAM_OUTPUT0);
     EncodeBuffer(WMTRenderCommandSetMeshBuffer, TargetsOffset, SM50_BINDING_INDEX_STREAM_OUTPUT0);
+    EncodeBuffer(WMTRenderCommandSetVertexBuffer, ScratchOffset, kCustomBufferArgumentIndex0);
     auto set_pso = [&](WMT::RenderPipelineState pso) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = pso;
     };
-    auto barrier = [&](WMTRenderStages before) {
+    auto barrier = [&](WMTRenderStages after, WMTRenderStages before) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_memory_barrier>();
       cmd.type = WMTRenderCommandMemoryBarrier;
       cmd.scope = WMTBarrierScopeBuffers;
-      cmd.stages_after = WMTRenderStageMesh;
+      cmd.stages_after = after;
       cmd.stages_before = before;
     };
+    set_pso(device_->GetLib().ZeroWords());
+    zero();
+    barrier(WMTRenderStageVertex, WMTRenderStagePreRaster);
     set_pso(Pipeline(true));
     draw();
-    barrier(WMTRenderStagePreRaster);
+    // without a geometry shader the object stage streams out
+    barrier(WMTRenderStagePreRaster, WMTRenderStagePreRaster);
     set_pso(Pipeline());
     draw();
     // the next draw may read what this one wrote, as vertices or filled sizes
-    barrier(WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
-    // without a geometry shader the caller then draws as usual
-    if (StreamOutputRasterizes())
-      set_pso(RenderTargets(pso_graphics_->so_raster));
+    barrier(WMTRenderStagePreRaster, WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
   }
 
   void STDMETHODCALLTYPE
   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) {
-    if (Record([=](auto *l) { l->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); }))
+    if (Bundled() && Record([=](auto *l) { l->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); }))
       return;
     // a draw of nothing: Metal takes no empty draw
     if (!VertexCountPerInstance || !InstanceCount)
@@ -1404,8 +1678,7 @@ public:
           D3D12_DRAW_ARGUMENTS{VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation},
           VertexCountPerInstance, {}
       );
-      if (!StreamOutputRasterizes())
-        return;
+      return;
     }
     // Metal's indirect draw arguments are D3D12's, instances second
     if (auto offset = Predicated(
@@ -1433,7 +1706,7 @@ public:
       UINT IndexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, INT BaseVertexLocation,
       UINT StartInstanceLocation
   ) {
-    if (Record([=](auto *l) { l->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartVertexLocation, BaseVertexLocation, StartInstanceLocation); }))
+    if (Bundled() && Record([=](auto *l) { l->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartVertexLocation, BaseVertexLocation, StartInstanceLocation); }))
       return;
     if (!IndexCountPerInstance || !InstanceCount)
       return;
@@ -1461,8 +1734,7 @@ public:
           },
           IndexCountPerInstance, IndexedView(index_view_)
       );
-      if (!StreamOutputRasterizes())
-        return;
+      return;
     }
     // Metal reads behind the view; Direct3D reads zero there, including with no index buffer (D3D11.3 8.19.2)
     const uint64_t index_size = index_type == WMTIndexTypeUInt32 ? sizeof(uint32_t) : sizeof(uint16_t);
@@ -1557,7 +1829,7 @@ public:
   bool
   PreDispatch(bool SkipResourceBinding = false) {
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
-      StartComputePass();
+      Overlap(StartComputePass(), {});
 
     if (!pso_compute_)
         return false;
@@ -1571,7 +1843,7 @@ public:
       if (Logger::logLevel() == LogLevel::Trace)
         TRACE("pass ", allocator_->encoder_current->id, ": compute pipeline ", pso_compute_->name);
       if (device_->NamesPasses())
-        device_->NamePass(allocator_->encoder_current, RunName(pso_compute_->name, pso_compute_->pso), pso_compute_->pso);
+        device_->NamePass(allocator_->encoder_current, pso_compute_->name, pso_compute_->pso);
     }
     BindComputeRootArguments(SkipResourceBinding);
     return true;
@@ -1607,7 +1879,7 @@ public:
 
   void STDMETHODCALLTYPE
   Dispatch(UINT X, UINT Y, UINT Z) {
-    if (Record([=](auto *l) { l->Dispatch(X, Y, Z); }))
+    if (Bundled() && Record([=](auto *l) { l->Dispatch(X, Y, Z); }))
       return;
     if (pso_compute_ && pso_compute_->groups_work_together) {
       PredicatedPasses predicated(this);
@@ -1671,6 +1943,56 @@ public:
     return true;
   }
 
+  // whether a barrier before the open render pass began, and none since, left `resource` (or its `subresource`) in
+  // `state`: no draw of the pass can have touched it but to read it
+  bool
+  LeftBefore(ID3D12Resource *resource, UINT subresource, D3D12_RESOURCE_STATES state) {
+    auto named = named_.find(resource);
+    return named != named_.end() && (named->second.state & state) && named->second.serial <= render_serial_ &&
+           (named->second.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || named->second.subresource == subresource);
+  }
+
+  // the pass a copy goes in: a blit pass before the open render pass, when no draw in it can have read what the copy
+  // writes or written what it reads (a barrier before the pass left the destination a copy's, and the source an
+  // upload heap's or a copy's), else a blit pass after what came before. what a resource never named in a barrier is
+  // in is not known, so a copy of one ends the pass. the hoisted pass is the current one until `Hoisted` ends
+  struct Hoisted {
+    MTLD3D12GraphicsCommandListImpl *list;
+    EncoderData *render = nullptr;
+    ~Hoisted() {
+      if (render)
+        list->allocator_->encoder_current = render;
+    }
+  };
+
+  bool
+  PreCopy(
+      Hoisted &hoisted, ID3D12Resource *pDst, UINT DstSubresource, ID3D12Resource *pSrc, UINT SrcSubresource
+  ) {
+    auto render = allocator_->encoder_current;
+    D3D12_HEAP_PROPERTIES heap{};
+    if (!HoistsCopies() || !render || render->type != EncoderType::Render || render != targets_pass_ ||
+        predication_region_ || !LeftBefore(pDst, DstSubresource, D3D12_RESOURCE_STATE_COPY_DEST) ||
+        !((SUCCEEDED(pSrc->GetHeapProperties(&heap, nullptr)) && heap.Type == D3D12_HEAP_TYPE_UPLOAD) ||
+          LeftBefore(pSrc, SrcSubresource, D3D12_RESOURCE_STATE_COPY_SOURCE)))
+      return PreBlit();
+    if (hoisted_for_ != render || hoisted_ != allocator_->encoder_last) {
+      // a pass of its own, after the passes before the render pass, which follows it when it ends
+      allocator_->encoder_current = nullptr;
+      hoisted_ = allocator_->AllocatePass<BlitEncoderData>();
+      hoisted_->type = EncoderType::Blit;
+      hoisted_->cmd_head.type = WMTBlitCommandNop;
+      hoisted_->cmd_head.next.set(0);
+      hoisted_->cmd_tail = (wmtcmd_base *)&hoisted_->cmd_head;
+      allocator_->InvalidateCurrentPass();
+      hoisted_for_ = render;
+    }
+    hoisted.list = this;
+    hoisted.render = render;
+    allocator_->encoder_current = hoisted_;
+    return true;
+  }
+
   void STDMETHODCALLTYPE
   CopyBufferRegion(
       ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT64 ByteCount
@@ -1678,7 +2000,8 @@ public:
     PredicatedPasses predicated(this);
     if (!pDstBuffer || !pSrcBuffer)
       return;
-    if (!PreBlit())
+    Hoisted hoisted{this};
+    if (!PreCopy(hoisted, pDstBuffer, 0, pSrcBuffer, 0))
       return;
 
     auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
@@ -1691,7 +2014,7 @@ public:
   };
 
   // a copy between textures. Metal copies within one format: formats of one type group copy from a view of the source
-  // in the destination's. what has no such view (depth, and a reinterpret copy: CopyResource's Remarks) goes by its
+  // in the destination's, where the source has one. what has no such view (depth, and a reinterpret copy: CopyResource's Remarks) goes by its
   // bytes through a buffer, where a block of a compressed format is a texel of the other. `dst_extent` is the
   // destination level's
   void
@@ -1702,7 +2025,9 @@ public:
   ) {
     bool same = src->pixelFormat() == dst->pixelFormat();
     if (same || (DXGIFormatType(src_format.PlaneFormat) == DXGIFormatType(dst_format.PlaneFormat) &&
-                 !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat()))) {
+                 !DepthStencilPlanarFlags(src->pixelFormat()) && !DepthStencilPlanarFlags(dst->pixelFormat()) &&
+                 (Forget_sRGB(src->pixelFormat()) == Forget_sRGB(dst->pixelFormat()) ||
+                  (src->usage() & WMTTextureUsagePixelFormatView)))) {
       auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
       cmd.type = WMTBlitCommandCopyFromTextureToTexture;
       cmd.src = same ? src->current()->texture()
@@ -1760,11 +2085,21 @@ public:
     PredicatedPasses predicated(this);
     if (!pDst || !pSrc)
       return;
-    if (!PreBlit())
-      return;
-
     auto src_desc = pSrc->pResource->GetDesc();
     auto dst_desc = pDst->pResource->GetDesc();
+    // a copy into a texture may run before the render pass, but not one of RGB32 or D24 texels, which a kernel
+    // converts
+    Hoisted hoisted{this};
+    MTL_DXGI_FORMAT_DESC hoisted_format;
+    if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_desc.Format, hoisted_format)) &&
+        !(hoisted_format.Flag & (MTL_DXGI_FORMAT_EMULATED_RGB32 | MTL_DXGI_FORMAT_EMULATED_D24))) {
+      if (!PreCopy(hoisted, pDst->pResource, pDst->SubresourceIndex, pSrc->pResource,
+                   pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? pSrc->SubresourceIndex : 0))
+        return;
+    } else if (!PreBlit())
+      return;
+
     uint32_t src_level = 0, src_slice = 0, src_planar = 0;
     uint32_t dst_level = 0, dst_slice = 0, dst_planar = 0;
     D3D12_BOX src_box, full_src_box;
@@ -1843,6 +2178,16 @@ public:
               true, src->current()->buffer(), src_offset, upload, upload_offset,
               {pSrc->PlacedFootprint.Footprint.RowPitch, src_depth_pitch, row_pitch, image_pitch}, size
           );
+        }
+        // a D24 footprint stores UNORM24 codes (D3D11.3 19.1.3.1); Metal stores them as float32.
+        if (!dst_planar && (dst_format.Flag & MTL_DXGI_FORMAT_EMULATED_D24)) {
+          WMTSize size{src_box.right - src_box.left, src_box.bottom - src_box.top, 1};
+          row_pitch = align(size.width * sizeof(float), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+          std::tie(upload, upload_offset) =
+              allocator_->AllocateTempBuffer(row_pitch * size.height, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+          if (!allocator_->CopyD24(true, src->current()->buffer(), src_offset,
+                                   pSrc->PlacedFootprint.Footprint.RowPitch, upload, upload_offset, row_pitch, size))
+            return;
         }
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
@@ -1993,6 +2338,8 @@ public:
               false, download, download_offset, dst->current()->buffer(), dst_offset,
               {row_pitch, image_pitch, pDst->PlacedFootprint.Footprint.RowPitch, dst_depth_pitch}, size
           );
+        if (!src_planar && (src_format.Flag & MTL_DXGI_FORMAT_EMULATED_D24))
+          allocator_->CopyD24(false, download, download_offset, row_pitch, download, download_offset, row_pitch, size);
       } else {
         // between buffers there is CopyBufferRegion: one end of this copy is a texture
         ERR("CopyTextureRegion: both the source and the destination are footprints in buffers");
@@ -2013,7 +2360,14 @@ public:
     if (DstDesc.Dimension != SrcDesc.Dimension)
       return;
 
-    if (!PreBlit())
+    // a texture of two planes copies itself through CopyTextureRegion
+    Hoisted hoisted{this};
+    if (DstDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !(pSrc->texture->chroma || pDst->texture->chroma)) {
+      if (!PreCopy(hoisted, pDstResource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, pSrcResource,
+                   D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))
+        return;
+    } else if (!PreBlit())
       return;
 
     if (DstDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -2149,11 +2503,13 @@ public:
 
   void STDMETHODCALLTYPE
   IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY Topology) {
-    if (Record([=](auto *l) { l->IASetPrimitiveTopology(Topology); }))
+    if (Bundled() && Record([=](auto *l) { l->IASetPrimitiveTopology(Topology); }))
       return;
     // a geometry pipeline has one Metal pipeline for strips and one for lists. a pipeline without a geometry shader
     // becomes one for a topology with adjacency, and binds its arguments to other stages
     if (pso_graphics_ && (pso_graphics_->geometry_shader || pso_graphics_->adjacency) && Strip(Topology) != Strip(topology_))
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+    if (pso_graphics_ && pso_graphics_->patches && Topology != topology_)
       dirty_state_.set(DirtyState::GraphicsPipelineState);
     if (pso_graphics_ && pso_graphics_->adjacency && Adjacency(Topology) != Adjacency(topology_))
       dirty_state_.set(
@@ -2191,7 +2547,7 @@ public:
     // NULL is a factor of ones
     decltype(blend_factor_) f;
     BlendFactors ? (void)std::copy_n(BlendFactors, std::size(f), f) : (void)std::fill_n(f, std::size(f), 1.0f);
-    if (Record([=](auto *l) { l->OMSetBlendFactor(f); }))
+    if (Bundled() && Record([=](auto *l) { l->OMSetBlendFactor(f); }))
       return;
     std::copy_n(f, std::size(f), blend_factor_);
     dirty_state_.set(DirtyState::BlendFactor);
@@ -2204,7 +2560,7 @@ public:
 
   void STDMETHODCALLTYPE
   OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) {
-    if (Record([=](auto *l) { l->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef); }))
+    if (Bundled() && Record([=](auto *l) { l->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef); }))
       return;
     if (stencil_ref_ == (UINT8)FrontStencilRef && back_stencil_ref_ == (UINT8)BackStencilRef)
       return;
@@ -2215,7 +2571,7 @@ public:
 
   void STDMETHODCALLTYPE
   SetPipelineState(ID3D12PipelineState *pPSO) {
-    if (Record([pso = Com<ID3D12PipelineState>(pPSO)](auto *l) { l->SetPipelineState(pso.ptr()); }))
+    if (Bundled() && Record([pso = Com<ID3D12PipelineState>(pPSO)](auto *l) { l->SetPipelineState(pso.ptr()); }))
       return;
     if (!pPSO) {
       pso_graphics_ = nullptr;
@@ -2241,19 +2597,46 @@ public:
     // tessellation, geometry shaders and stream output bind root arguments to other stages
     auto stages = [&](MTLD3D12GraphicsPipelineState *p) {
       bool adjacency = p->adjacency && Adjacency(topology_);
-      return (p->threads_per_patch || p->geometry_shader || p->mesh_shader || adjacency) | (p->so_raster && !adjacency) << 1;
+      return p->threads_per_patch || p->geometry_shader || p->mesh_shader || adjacency;
     };
     if (!pso_graphics_ || stages(pso_graphics_.ptr()) != stages(graphics_pso))
-      dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+      dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature, DirtyState::VertexBuffer);
+    // the vertex buffer table has an entry for each slot the pipeline reads, and is bound to the stages above
+    if (!pso_graphics_ || pso_graphics_->slot_mask != graphics_pso->slot_mask)
+      dirty_state_.set(DirtyState::VertexBuffer);
     if (!pso_graphics_ || pso_graphics_->forced_sample_count != graphics_pso->forced_sample_count ||
         ((pso_graphics_->rtv_mask ^ graphics_pso->rtv_mask) & ((1u << num_rtvs) - 1)) ||
         (dsv.Texture && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
       allocator_->InvalidateCurrentPass();
+    if (graphics_pso->shader_blend)
+      dirty_state_.set(DirtyState::BlendFactor);
     pso_graphics_ = graphics_pso;
     pso_compute_ = nullptr;
-    dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState, DirtyState::VertexBuffer);
+    dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState);
     dirty_state_.set(DirtyState::DepthBounds);
   };
+
+  // a barrier on `resource`, or on any (null): a clear of it before can no longer fold into a pass after (PendingClear)
+  void
+  BarrierNames(ID3D12Resource *resource) {
+    if (!resource) {
+      clears_.clear();
+      return;
+    }
+    if (auto texture = static_cast<MTLD3D12Resource *>(resource)->texture.ptr())
+      UsedTexture(texture);
+  }
+
+  // whether the open render pass's draws may have written `resource` (null: any resource): it is one of the pass's
+  // targets, or they wrote through UAVs or stream output. a buffer is never a target
+  bool
+  PassWrote(ID3D12Resource *resource) {
+    auto pass = allocator_->encoder_current;
+    if (!resource || !pass || pass->type != EncoderType::Render || pass == uav_draw_pass_ || pass != targets_pass_)
+      return true;
+    auto texture = static_cast<MTLD3D12Resource *>(resource)->texture.ptr();
+    return texture && std::ranges::find(targets_, texture) != targets_.end();
+  }
 
   // passes are already ordered by the queue's fence (each waits for the one before), so a barrier matters only inside
   // a pass, where draws and dispatches run unordered. one that orders writes a draw made (UAV, render target, depth,
@@ -2273,6 +2656,7 @@ public:
   }
 
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
+    OrderingPoint();
     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
                        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
     // Metal orders nothing between passes that reach one memory through a reserved buffer and through another
@@ -2280,14 +2664,29 @@ public:
     if (std::ranges::any_of(std::span(barriers, Count), [](auto &barrier) {
           return barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
         }) && !device_->SparseBufferMappings().empty()) {
+      va_found_ = nullptr;
+      clears_.clear();
+      named_.clear();
       allocator_->InvalidateCurrentPass();
       allocator_->AllocatePass<EncoderData>()->type = EncoderType::Settle;
       allocator_->InvalidateCurrentPass();
       return;
     }
+    barrier_serial_++;
     for (auto &barrier : std::span(barriers, Count)) {
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
-        clear_joinable_ = false;
+        clear_joinable_ = false, va_found_ = nullptr;
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+        BarrierLeaves(barrier.Transition.pResource, barrier.Transition.Subresource,
+                      barrier.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY ? D3D12_RESOURCE_STATES(0)
+                                                                            : barrier.Transition.StateAfter);
+      else
+        BarrierLeaves(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV ? barrier.UAV.pResource : nullptr,
+                      D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATES(0));
+      if (!clears_.empty())
+        BarrierNames(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? barrier.Transition.pResource
+                     : barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV      ? barrier.UAV.pResource
+                                                                            : nullptr);
       // a UAV barrier orders UAV accesses alone: a render pass whose draws used none keeps going, as a dispatch's would
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && allocator_->encoder_current &&
           allocator_->encoder_current->type == EncoderType::Render &&
@@ -2298,7 +2697,8 @@ public:
       }
       bool other = barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
       auto &states = barrier.Transition;
-      if (Order(other || (states.StateBefore & draw_writes), other || ((states.StateBefore | states.StateAfter) & uav)))
+      if (Order(other || ((states.StateBefore & draw_writes) && PassWrote(states.pResource)),
+                other || ((states.StateBefore | states.StateAfter) & uav)))
         return;
     }
   };
@@ -2310,7 +2710,7 @@ public:
   };
 
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
-    if (Record([heaps = std::vector<Com<ID3D12DescriptorHeap>>(Heaps, Heaps + HeapCount)](auto *l) { l->SetDescriptorHeaps(heaps.size(), reinterpret_cast<ID3D12DescriptorHeap *const *>(heaps.data())); }))
+    if (Bundled() && Record([heaps = std::vector<Com<ID3D12DescriptorHeap>>(Heaps, Heaps + HeapCount)](auto *l) { l->SetDescriptorHeaps(heaps.size(), reinterpret_cast<ID3D12DescriptorHeap *const *>(heaps.data())); }))
       return;
     // tables carry their full address in their root argument; only directly indexed heaps need the heaps
     for (unsigned i = 0; i < HeapCount; i++) {
@@ -2326,7 +2726,7 @@ public:
 
   void STDMETHODCALLTYPE
   SetComputeRootSignature(ID3D12RootSignature *pRootSignature) {
-    if (Record([rs = Com<ID3D12RootSignature>(pRootSignature)](auto *l) { l->SetComputeRootSignature(rs.ptr()); }))
+    if (Bundled() && Record([rs = Com<ID3D12RootSignature>(pRootSignature)](auto *l) { l->SetComputeRootSignature(rs.ptr()); }))
       return;
     if (rootsig_compute_.ptr() == pRootSignature)
       return;
@@ -2342,7 +2742,7 @@ public:
 
   void STDMETHODCALLTYPE
   SetGraphicsRootSignature(ID3D12RootSignature *pRootSignature) {
-    if (Record([rs = Com<ID3D12RootSignature>(pRootSignature)](auto *l) { l->SetGraphicsRootSignature(rs.ptr()); }))
+    if (Bundled() && Record([rs = Com<ID3D12RootSignature>(pRootSignature)](auto *l) { l->SetGraphicsRootSignature(rs.ptr()); }))
       return;
     if (rootsig_graphics_.ptr() == pRootSignature)
       return;
@@ -2356,160 +2756,120 @@ public:
     dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
   };
 
+  // a root argument that changes dirties the arguments, which the next draw or dispatch uploads again; one set to what
+  // it is already leaves the uploaded copy bound
+  void
+  SetRootQword(MTLD3D12RootSignature *rootsig, uint64_t *staging, DirtyState dirty, UINT Index, uint64_t Value) {
+    if (!rootsig || Index >= rootsig->ParameterSlots)
+      return;
+    auto &slot = staging[rootsig->SlotQwordOffsets[Index]];
+    if (slot == Value)
+      return;
+    slot = Value;
+    dirty_state_.set(dirty);
+  }
+
+  void
+  SetRootConstants(
+      MTLD3D12RootSignature *rootsig, uint64_t *staging, DirtyState dirty, UINT Index, UINT Count, const void *Data,
+      UINT DstOffset
+  ) {
+    if (!rootsig || Index >= rootsig->ParameterSlots)
+      return;
+    auto dst = reinterpret_cast<uint32_t *>(staging + rootsig->SlotQwordOffsets[Index]) + DstOffset;
+    if (!memcmp(dst, Data, Count * sizeof(uint32_t)))
+      return;
+    memcpy(dst, Data, Count * sizeof(uint32_t));
+    dirty_state_.set(dirty);
+  }
+
   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
-    if (Record([=](auto *l) { l->SetComputeRootDescriptorTable(Index, BaseDescriptor); }))
+    if (Bundled() && Record([=](auto *l) { l->SetComputeRootDescriptorTable(Index, BaseDescriptor); }))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index >= rootsig_compute_->ParameterSlots)
-      return;
-    rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = BaseDescriptor.ptr;
-    dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootQword(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, BaseDescriptor.ptr);
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
-    if (Record([=](auto *l) { l->SetGraphicsRootDescriptorTable(Index, BaseDescriptor); }))
+    if (Bundled() && Record([=](auto *l) { l->SetGraphicsRootDescriptorTable(Index, BaseDescriptor); }))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index >= rootsig_graphics_->ParameterSlots)
-      return;
-    rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = BaseDescriptor.ptr;
-    dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootQword(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, BaseDescriptor.ptr);
   };
 
   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
-    if (Record([=](auto *l) { l->SetComputeRoot32BitConstant(Index, Data, DstOffset); }))
+    if (Bundled() && Record([=](auto *l) { l->SetComputeRoot32BitConstant(Index, Data, DstOffset); }))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index >= rootsig_compute_->ParameterSlots)
-      return;
-    auto dst = reinterpret_cast<uint32_t *>(rootarg_compute_staging_ + rootsig_compute_->SlotQwordOffsets[Index]);
-    dst[DstOffset] = Data;
-    dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootConstants(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, 1, &Data, DstOffset);
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
-    if (Record([=](auto *l) { l->SetGraphicsRoot32BitConstant(Index, Data, DstOffset); }))
+    if (Bundled() && Record([=](auto *l) { l->SetGraphicsRoot32BitConstant(Index, Data, DstOffset); }))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index >= rootsig_graphics_->ParameterSlots)
-      return;
-    auto dst = reinterpret_cast<uint32_t *>(rootarg_graphics_staging_ + rootsig_graphics_->SlotQwordOffsets[Index]);
-    dst[DstOffset] = Data;
-    dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootConstants(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, 1, &Data, DstOffset);
   };
 
   void STDMETHODCALLTYPE
   SetComputeRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
-    if (Record([=, v = std::vector((const UINT *)pData, (const UINT *)pData + ConstantCount)](auto *l) { l->SetComputeRoot32BitConstants(Index, ConstantCount, v.data(), DstOffset); }))
+    if (Bundled() && Record([=, v = std::vector((const UINT *)pData, (const UINT *)pData + ConstantCount)](auto *l) { l->SetComputeRoot32BitConstants(Index, ConstantCount, v.data(), DstOffset); }))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index >= rootsig_compute_->ParameterSlots)
-      return;
-    auto src = reinterpret_cast<const uint32_t *>(pData);
-    auto dst = reinterpret_cast<uint32_t *>(rootarg_compute_staging_ + rootsig_compute_->SlotQwordOffsets[Index]);
-    for (unsigned i = 0; i < ConstantCount; i++) {
-      dst[i + DstOffset] = src[i];
-    }
-    dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootConstants(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, ConstantCount, pData, DstOffset);
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
-    if (Record([=, v = std::vector((const UINT *)pData, (const UINT *)pData + ConstantCount)](auto *l) { l->SetGraphicsRoot32BitConstants(Index, ConstantCount, v.data(), DstOffset); }))
+    if (Bundled() && Record([=, v = std::vector((const UINT *)pData, (const UINT *)pData + ConstantCount)](auto *l) { l->SetGraphicsRoot32BitConstants(Index, ConstantCount, v.data(), DstOffset); }))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index >= rootsig_graphics_->ParameterSlots)
-      return;
-    auto src = reinterpret_cast<const uint32_t *>(pData);
-    auto dst = reinterpret_cast<uint32_t *>(rootarg_graphics_staging_ + rootsig_graphics_->SlotQwordOffsets[Index]);
-    for (unsigned i = 0; i < ConstantCount; i++) {
-      dst[i + DstOffset] = src[i];
-    }
-    dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootConstants(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, ConstantCount, pData, DstOffset);
   };
 
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    if (Record([=](auto *l) { l->SetComputeRootConstantBufferView(Index, VA); }))
+    if (Bundled() && Record([=](auto *l) { l->SetComputeRootConstantBufferView(Index, VA); }))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index >= rootsig_compute_->ParameterSlots)
-      return;
-    rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
-    dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootQword(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, VA);
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    if (Record([=](auto *l) { l->SetGraphicsRootConstantBufferView(Index, VA); }))
+    if (Bundled() && Record([=](auto *l) { l->SetGraphicsRootConstantBufferView(Index, VA); }))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index >= rootsig_graphics_->ParameterSlots)
-      return;
-    rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
-    dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootQword(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, VA);
   };
 
   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    if (Record([=](auto *l) { l->SetComputeRootShaderResourceView(Index, VA); }))
+    if (Bundled() && Record([=](auto *l) { l->SetComputeRootShaderResourceView(Index, VA); }))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index >= rootsig_compute_->ParameterSlots)
-      return;
-    rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
-    dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootQword(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, VA);
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    if (Record([=](auto *l) { l->SetGraphicsRootShaderResourceView(Index, VA); }))
+    if (Bundled() && Record([=](auto *l) { l->SetGraphicsRootShaderResourceView(Index, VA); }))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index >= rootsig_graphics_->ParameterSlots)
-      return;
-    rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
-    dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootQword(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, VA);
   };
 
   void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    if (Record([=](auto *l) { l->SetComputeRootUnorderedAccessView(Index, VA); }))
+    if (Bundled() && Record([=](auto *l) { l->SetComputeRootUnorderedAccessView(Index, VA); }))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index >= rootsig_compute_->ParameterSlots)
-      return;
-    rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
-    dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootQword(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, VA);
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
-    if (Record([=](auto *l) { l->SetGraphicsRootUnorderedAccessView(Index, VA); }))
+    if (Bundled() && Record([=](auto *l) { l->SetGraphicsRootUnorderedAccessView(Index, VA); }))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index >= rootsig_graphics_->ParameterSlots)
-      return;
-    rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
-    dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootQword(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, VA);
   };
 
   void STDMETHODCALLTYPE
   IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *pView) {
-    if (Record([view = pView ? std::optional(*pView) : std::nullopt](auto *l) { l->IASetIndexBuffer(view ? &*view : nullptr); }))
+    if (Bundled() && Record([view = pView ? std::optional(*pView) : std::nullopt](auto *l) { l->IASetIndexBuffer(view ? &*view : nullptr); }))
       return;
-    auto index_buffer_allocation = pView ? device_->LookupBufferByVA(pView->BufferLocation, &index_offset) : nullptr;
+    // the view bound already: games set one per draw
+    if (pView ? index_buffer_address && !memcmp(pView, &index_view_, sizeof(*pView)) : !index_buffer_address)
+      return;
+    auto index_buffer_allocation = pView ? LookupBuffer(pView->BufferLocation, &index_offset) : nullptr;
     index_view_ = index_buffer_allocation ? *pView : D3D12_INDEX_BUFFER_VIEW{};
     if (index_buffer_allocation) {
       index_buffer_address = pView->BufferLocation;
@@ -2525,11 +2885,13 @@ public:
 
   void STDMETHODCALLTYPE
   IASetVertexBuffers(UINT StartSlot, UINT Count, const D3D12_VERTEX_BUFFER_VIEW *Views) {
-    if (Record([=, v = Views ? std::vector(Views, Views + Count) : std::vector<D3D12_VERTEX_BUFFER_VIEW>()](auto *l) { l->IASetVertexBuffers(StartSlot, Count, Views ? v.data() : nullptr); }))
+    if (Bundled() && Record([=, v = Views ? std::vector(Views, Views + Count) : std::vector<D3D12_VERTEX_BUFFER_VIEW>()](auto *l) { l->IASetVertexBuffers(StartSlot, Count, Views ? v.data() : nullptr); }))
       return;
     if (!Views)
       return;
-    
+    // the vertex buffer table is written again only for views that change
+    if (!memcmp(&vertex_buffers_[StartSlot], Views, Count * sizeof(*Views)))
+      return;
     for (unsigned Slot = StartSlot; Slot < StartSlot + Count; Slot++) {
       vertex_buffers_[Slot] = Views[Slot - StartSlot];
     }
@@ -2579,7 +2941,18 @@ public:
     auto CheckedFlags = Flags & DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
     if (!CheckedFlags)
       return;
+    if ((CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) &&
+        (AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM ||
+         AttachmentDesc.DepthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT)) {
+      auto maximum = AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM ? UINT16_MAX : kD24UnormMax;
+      auto code = std::lround(std::fmin(std::fmax(double(Depth), 0.0), 1.0) * maximum);
+      Depth = float(double(code) / maximum);
+      // a Metal clear may truncate; an upper float keeps the rounded D16 code (D3D11.3 3.2.3.6).
+      if (AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM)
+        Depth = std::nextafter(Depth, 1.0f);
+    }
     if (Rects) {
+      UsedTexture(AttachmentDesc.Texture);
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
       for (unsigned i = 0; i < RectCount; i++) {
         auto rect = Rects[i];
@@ -2595,10 +2968,13 @@ public:
       return;
     }
     auto encoder_info = JoinableClear(AttachmentDesc);
-    if (encoder_info && (encoder_info->depth.attachment || encoder_info->stencil.attachment))
+    if (encoder_info && (encoder_info->depth.attachment || encoder_info->stencil.attachment ||
+                         ClearTextures(encoder_info, AttachmentDesc.Texture)))
       encoder_info = nullptr;
     if (!encoder_info)
       encoder_info = StartClearPass(AttachmentDesc);
+    if (!clears_.empty() && clears_.back().pass == encoder_info)
+      clears_.back().textures.back() = AttachmentDesc.Texture;
     if (CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) {
       auto &rt = encoder_info->depth;
       rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
@@ -2624,7 +3000,10 @@ public:
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
     if (!AttachmentDesc.Texture)
       return;
+    auto stored = RenderTargetColor(AttachmentDesc.Format, Color);
+    Color = stored.data();
     if (Rects) {
+      UsedTexture(AttachmentDesc.Texture);
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
       for (unsigned i = 0; i < RectCount; i++) {
         auto rect = Rects[i];
@@ -2642,12 +3021,22 @@ public:
       allocator_->clear_rtv_.end();
       return;
     }
+    // the first free color of a clear pass of the same size, which has no view of the texture yet
     auto encoder_info = JoinableClear(AttachmentDesc);
-    if (encoder_info && encoder_info->colors[0].attachment)
-      encoder_info = nullptr;
-    if (!encoder_info)
+    unsigned slot = 0;
+    if (encoder_info) {
+      while (slot < std::size(encoder_info->colors) && encoder_info->colors[slot].attachment)
+        slot++;
+      if (slot == std::size(encoder_info->colors) || ClearTextures(encoder_info, AttachmentDesc.Texture))
+        encoder_info = nullptr;
+    }
+    if (!encoder_info) {
       encoder_info = StartClearPass(AttachmentDesc);
-    auto &rt = encoder_info->colors[0];
+      slot = 0;
+    }
+    if (!clears_.empty() && clears_.back().pass == encoder_info)
+      clears_.back().textures[slot] = AttachmentDesc.Texture;
+    auto &rt = encoder_info->colors[slot];
     rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
     rt.depth_plane = AttachmentDesc.DepthPlane;
     rt.load_action = WMTLoadActionClear;
@@ -2669,12 +3058,22 @@ public:
     clear->clear_sample_count = Desc.Texture->sampleCount();
     allocator_->InvalidateCurrentPass();
     clear_joinable_ = true;
+    clears_.push_back({clear});
     return clear;
   }
 
-  // the clear pass just before, which a full clear of a view of the same size can join (a color clear's a depth
-  // stencil clear's, or that one's a color clear's): Metal clears the attachments of one pass for about the cost of
-  // one. nothing between the two orders them, but an aliasing barrier, which ends the chance
+  // whether a clear pass clears a view of `texture` already: one pass takes one view of each, the latest clear's.
+  // a pass no later pass can take (PendingClear) is taken as clearing every texture
+  bool
+  ClearTextures(RenderEncoderData *clear, const Texture *texture) {
+    if (clears_.empty() || clears_.back().pass != clear)
+      return true;
+    return std::ranges::find(clears_.back().textures, texture) != clears_.back().textures.end();
+  }
+
+  // the clear pass just before, which a full clear of a view of the same size can join (a color clear another color's
+  // or a depth stencil clear's, or that one a color clear's): Metal clears the attachments of one pass for about the
+  // cost of one. nothing between the two orders them, but an aliasing barrier, which ends the chance
   RenderEncoderData *
   JoinableClear(const MTL_RENDER_TARGET_DESC &Desc) {
     auto last = allocator_->encoder_last;
@@ -2687,6 +3086,50 @@ public:
       return nullptr;
     return clear;
   }
+
+  // a UAV clear of a buffer to a value of four equal bytes, when no compute pass is open, is a blit fill: one more
+  // command in an open blit pass, or a pass that needs no pipeline. the elements are D3D12's (element_stride words)
+  bool
+  FillBufferClear(const UAVBufferCPUStorage &View, uint32_t Value, UINT RectCount, const D3D12_RECT *pRects) {
+    if (Value != (Value & 0xff) * 0x01010101u || View.buffer->current()->sparse_tile_bytes ||
+        (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Compute))
+      return false;
+    UINT element_stride = View.slice.byteLength / (View.slice.elementCount * sizeof(uint32_t));
+    int64_t first = View.slice.byteOffset >> 2, words = View.slice.byteLength >> 2;
+    D3D12_RECT whole{0, 0, (LONG)(words / element_stride), 1};
+    for (auto &rect : RectCount ? std::span(pRects, RectCount) : std::span(&whole, 1)) {
+      int64_t left = std::max<int64_t>(rect.left, 0), right = std::min<int64_t>(rect.right, words / element_stride);
+      if (right <= left || rect.bottom <= std::max<LONG>(rect.top, 0) || rect.top >= 1)
+        continue;
+      PreBlit();
+      auto &fill = allocator_->EncodeBlitCommand<wmtcmd_blit_fillbuffer>();
+      fill.type = WMTBlitCommandFillBuffer;
+      fill.buffer = View.buffer->current()->buffer();
+      fill.offset = (first + left * element_stride) * sizeof(uint32_t);
+      fill.length = (right - left) * element_stride * sizeof(uint32_t);
+      fill.value = Value & 0xff;
+    }
+    return true;
+  }
+
+  // the clear's kernel joins the open compute pass (share_compute_), and the list's next dispatch binds its own
+  // pipeline and arguments again
+  struct SharedComputePass {
+    MTLD3D12GraphicsCommandListImpl *list;
+    bool shared;
+    SharedComputePass(MTLD3D12GraphicsCommandListImpl *list) :
+        list(list),
+        shared(list->allocator_->encoder_current && list->allocator_->encoder_current->type == EncoderType::Compute) {
+      list->allocator_->share_compute_ = shared;
+    }
+    ~SharedComputePass() {
+      list->allocator_->share_compute_ = false;
+      if (shared)
+        list->dirty_state_.set(
+            DirtyState::ComputePipelineState, DirtyState::ComputeRootArguments, DirtyState::ComputeRootSignature
+        );
+    }
+  };
 
   void STDMETHODCALLTYPE
   ClearUnorderedAccessViewUint(
@@ -2708,6 +3151,10 @@ public:
           Descriptor.UAVTexelBuffer.slice, RectCount, pRects);
       return;
     }
+    if (Descriptor.type == ShaderVisibleDescriptorType::UAVBuffer &&
+        FillBufferClear(Descriptor.UAVBuffer, color[0], RectCount, pRects))
+      return;
+    SharedComputePass shared(this);
     D3D12_RECT full_rect;
     UINT element_stride = 1, first_slice = 0, slice_count = 0;
     switch (Descriptor.type) {
@@ -2780,6 +3227,10 @@ public:
           Descriptor.UAVTexelBuffer.slice, RectCount, pRects);
       return;
     }
+    if (Descriptor.type == ShaderVisibleDescriptorType::UAVBuffer &&
+        FillBufferClear(Descriptor.UAVBuffer, std::bit_cast<uint32_t>(color[0]), RectCount, pRects))
+      return;
+    SharedComputePass shared(this);
     D3D12_RECT full_rect;
     UINT element_stride = 1, first_slice = 0, slice_count = 0;
     switch (Descriptor.type) {
@@ -2843,6 +3294,7 @@ public:
 
   void STDMETHODCALLTYPE
   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+    OrderingPoint();
     // pipeline statistics count the draws and dispatches captured from here
     if (Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS || Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1) {
       auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
@@ -2879,6 +3331,7 @@ public:
 
   void STDMETHODCALLTYPE
   EndQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+    OrderingPoint();
     auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
     if (Type >= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 && Type <= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3) {
       so_statistics_[Type - D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0] = 0;
@@ -2905,8 +3358,16 @@ public:
     }
     if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
       // the clock "at the instant that the GPU is finished with all the preceding workload" (D3D11.3 20.4.3): the
-      // pass that work ends with samples it as it ends, a render pass or the pass of the query before. other work
-      // gets a blit encoder: Metal samples only encoders that do something
+      // pass that work ends with samples it as it ends, a render pass or the pass of the query before. an open pass
+      // goes on, and its end is the clock, later than the query but not by more than its own work, as MoltenVK's
+      // timestamps in a pass are: ending it for the query costs a pass. other work gets a blit encoder: Metal
+      // samples only encoders that do something
+      if (auto open = allocator_->encoder_current;
+          open && (open->type == EncoderType::Render || open->type == EncoderType::Compute ||
+                   open->type == EncoderType::Blit)) {
+        open->stamps = new (allocator_->AllocateCommandData<Stamp>(1)) Stamp{heap, Index, open->stamps};
+        return;
+      }
       allocator_->InvalidateCurrentPass();
       auto pass = allocator_->encoder_last;
       if (!pass->stamps && pass->type != EncoderType::Render && pass->type != EncoderType::Clear) {
@@ -2944,8 +3405,54 @@ public:
       ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT QueryCount, ID3D12Resource *pDstBuffer,
       UINT64 AlignedDstBufferOffset
   ) {
+    OrderingPoint();
     auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
-    auto dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
+    auto resource = static_cast<MTLD3D12Resource *>(pDstBuffer);
+    D3D12_QUERY_HEAP_TYPE heap_type;
+    // Microsoft Learn, Queries: only timestamps are supported outside direct lists.
+    switch (Type) {
+    case D3D12_QUERY_TYPE_OCCLUSION:
+    case D3D12_QUERY_TYPE_BINARY_OCCLUSION:
+      heap_type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+      break;
+    case D3D12_QUERY_TYPE_TIMESTAMP:
+      heap_type = type_ == D3D12_COMMAND_LIST_TYPE_COPY ? D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+                                                     : D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+      break;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS:
+      heap_type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+      break;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS1:
+      heap_type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1;
+      break;
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
+      heap_type = D3D12_QUERY_HEAP_TYPE_SO_STATISTICS;
+      break;
+    default:
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    if (!heap || !resource || heap->desc.Type != heap_type ||
+        (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT &&
+         !(Type == D3D12_QUERY_TYPE_TIMESTAMP &&
+           (type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE || type_ == D3D12_COMMAND_LIST_TYPE_COPY)))) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    auto desc = resource->GetDesc();
+    // ResolveQueryData validates ranges before recording; subtraction keeps overflowing inputs out of them.
+    if (StartIndex > heap->desc.Count || QueryCount > heap->desc.Count - StartIndex ||
+        AlignedDstBufferOffset % sizeof(uint64_t) || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        AlignedDstBufferOffset > desc.Width || QueryCount > (desc.Width - AlignedDstBufferOffset) / heap->result_size) {
+      recording_error_ = E_INVALIDARG;
+      return;
+    }
+    if (!QueryCount)
+      return;
+    auto dst = resource->buffer->current()->buffer();
     SumOcclusion();
     SumStatistics();
     if (!heap->timestamps.empty()) {
@@ -2981,6 +3488,7 @@ public:
 
   // the region's work follows the predicate as it is when the region starts
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
+    OrderingPoint();
     EndPredication();
     if (!pBuffer)
       return;
@@ -3015,83 +3523,39 @@ public:
     allocator_->InvalidateCurrentPass();
   };
 
-  // annotations for capture tools, with no effect on rendering; D3D11 here treats them the same way
+  // a marker is an instant, between passes or inside one, which no pass is named by
   void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {};
 
-  // annotations for capture tools, with no effect on rendering. when passes are named (MULLION_DIAG=profile,
-  // MULLION_D3D12_GPU_ERRORS), the events a pipeline runs inside name its runs: see RunName
-  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {
-    if (!device_->NamesPasses())
+  void STDMETHODCALLTYPE
+  BeginEvent(UINT Metadata, const void *data, UINT size) {
+    if (!diag::events)
       return;
-    events_.push_back(EventName(Metadata, data, size));
-    SetEventPath();
+    auto bytes = static_cast<const char *>(data);
+    if (Record([=, blob = std::vector<char>(bytes, bytes + size)](auto *l) { l->BeginEvent(Metadata, blob.data(), size); }))
+      return;
+    std::string path = events_.empty() ? "" : events_.back();
+    diag::PushEvent(path, diag::EventName(Metadata, data, size));
+    auto copy = static_cast<char *>(allocator_->AllocateCPUHeap(path.size() + 1, 1));
+    allocator_->event = events_.emplace_back(strcpy(copy, path.c_str()));
   };
 
-  void STDMETHODCALLTYPE EndEvent() {
-    if (!device_->NamesPasses() || events_.empty())
+  void STDMETHODCALLTYPE
+  EndEvent() {
+    if (!diag::events || Record([](auto *l) { l->EndEvent(); }) || events_.empty())
       return;
     events_.pop_back();
-    SetEventPath();
+    allocator_->event = events_.empty() ? nullptr : events_.back();
   };
 
-  // the name of a BeginEvent: a UTF-16 string (metadata 0), an ANSI string (1), or a blob of WinPixEventRuntime's
-  // (2): words of the event and its color, the word that says how the string is stored, then the string, NUL-ended
-  static std::string
-  EventName(UINT Metadata, const void *Data, UINT Size) {
-    auto utf16 = [](const WCHAR *chars, size_t count) {
-      std::string name;
-      for (size_t i = 0; i < count && chars[i]; i++)
-        name += chars[i] >= 0x20 && chars[i] < 0x7f ? char(chars[i]) : '?';
-      return name;
-    };
-    auto ansi = [](const char *chars, size_t count) {
-      std::string name;
-      for (size_t i = 0; i < count && chars[i]; i++)
-        name += chars[i] >= 0x20 && chars[i] < 0x7f ? chars[i] : '?';
-      return name;
-    };
-    std::string name;
-    if (Data && Size) {
-      if (Metadata == 0)
-        name = utf16(static_cast<const WCHAR *>(Data), Size / sizeof(WCHAR));
-      else if (Metadata == 1)
-        name = ansi(static_cast<const char *>(Data), Size);
-      else if (Metadata == 2 && Size >= 4 * sizeof(uint64_t)) {
-        auto words = static_cast<const uint64_t *>(Data);
-        auto chars = Size - 3 * sizeof(uint64_t);
-        name = (words[2] >> 54) & 1 ? ansi(reinterpret_cast<const char *>(words + 3), chars)
-                                    : utf16(reinterpret_cast<const WCHAR *>(words + 3), chars / sizeof(WCHAR));
-      }
-    }
-    if (name.size() > 48)
-      name.resize(48);
-    return name.empty() ? "event" : name;
-  }
-
-  // the innermost events, outermost first
-  void
-  SetEventPath() {
-    event_path_.clear();
-    for (size_t i = events_.size() > 3 ? events_.size() - 3 : 0; i < events_.size(); i++) {
-      if (!event_path_.empty())
-        event_path_ += '/';
-      event_path_ += events_[i];
-    }
-  }
-
-  // what a pipeline's runs are called: the events it runs inside, then its name or Metal handle
-  std::string
-  RunName(const std::string &Pipeline, obj_handle_t Metal) {
-    if (event_path_.empty())
-      return Pipeline;
-    return event_path_ + '/' + (Pipeline.empty() ? str::format("pipeline ", Metal) : Pipeline);
-  }
+  // the paths of the open events, in the allocator's memory as the passes that carry them are; a pass that goes on
+  // past an event's start or end keeps the path it began in
+  std::vector<const char *> events_;
 
   void STDMETHODCALLTYPE ExecuteIndirect(
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
       UINT64 ArgBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset
   ) {
-    if (Record([=, sig = Com<ID3D12CommandSignature>(pCommandSignature), args = Com<ID3D12Resource>(pArgBuffer), count = Com<ID3D12Resource>(pCountBuffer)](auto *l) { l->ExecuteIndirect(sig.ptr(), MaxCommandCount, args.ptr(), ArgBufferOffset, count.ptr(), CountBufferOffset); }))
+    if (Bundled() && Record([=, sig = Com<ID3D12CommandSignature>(pCommandSignature), args = Com<ID3D12Resource>(pArgBuffer), count = Com<ID3D12Resource>(pCountBuffer)](auto *l) { l->ExecuteIndirect(sig.ptr(), MaxCommandCount, args.ptr(), ArgBufferOffset, count.ptr(), CountBufferOffset); }))
       return;
     auto sig = static_cast<MTLD3D12CommandSignature *>(pCommandSignature);
     auto arg_buffer = static_cast<MTLD3D12Resource *>(pArgBuffer);
@@ -3105,6 +3569,10 @@ public:
       CountBufferAddress = count_buffer->buffer->current()->gpuAddress() + CountBufferOffset;
     }
     bool rays = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    if (!MaxCommandCount) {
+      ResetIndirectState(sig, rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
+      return;
+    }
     if (rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
       IndirectComputeCommandData *cmd;
       bool parts = !rays && pso_compute_ && pso_compute_->groups_work_together;
@@ -3145,8 +3613,7 @@ public:
         cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
         cmd->static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
         cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
-        ResetIndirectState(sig, rootarg_compute_staging_);
-        dirty_state_.set(DirtyState::ComputeRootArguments);
+        ResetIndirectState(sig, true);
       }
       if (parts) {
         auto [mapped, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(D3D12_DISPATCH_ARGUMENTS),
@@ -3208,10 +3675,6 @@ public:
     // a tessellated command binds every buffer itself, as does a geometry pipeline's and a mesh shader pipeline's
     bool geometry = pso_graphics_ && Geometry();
     bool tessellation = pso_graphics_ && (pso_graphics_->threads_per_patch || geometry || dispatch_mesh);
-    if (pso_graphics_ && pso_graphics_->stream_output) {
-      ERR("ExecuteIndirect: stream output is not implemented yet");
-      return;
-    }
     bool encode_binding = tessellation || sig->UpdateRootArguments || sig->UpdateIndexBuffer || sig->UpdateVertexBuffers;
     DrawCallStatus status = PreDraw(encode_binding);
     if (status == DrawCallStatus::Invalid)
@@ -3240,8 +3703,11 @@ public:
     }
     auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), Pipeline(), MaxCommandCount,
                                                        tessellation, statistics_cuts);
+    ForgetBuffers();
     cmd->statistics = statistics;
     cmd->pixel_statistics = pixel_statistics;
+    cmd->depth_ranges = depth_ranges_;
+    cmd->raster_scale = raster_scale_;
     if (statistics) {
       auto [first, step] = get_primitive_vertex_count(topology_);
       cmd->statistics_first = dispatch_mesh ? 0 : first;
@@ -3294,15 +3760,30 @@ public:
     auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount, sig->UpdateVertexBuffers);
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
-    ResetIndirectState(sig, rootarg_graphics_staging_);
-    for (unsigned slot = 0; slot < vertex_buffers_.size(); slot++)
-      if (sig->ResetVertexBuffers & (1u << slot))
-        vertex_buffers_[slot] = {};
-    if (sig->UpdateIndexBuffer)
-      IASetIndexBuffer(nullptr);
-    dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::VertexBuffer);
+    ResetIndirectState(sig, false);
     if (!cmd->draws)
       return;
+    // stream output runs each command as a direct draw (StreamOut), one after another in the list's scratch area
+    if (pso_graphics_->stream_output) {
+      if (!allocator_->so_scratch_size_) {
+        auto budget = device_->so_scratch_budget.load();
+        auto [Scratch, ScratchOffset] = allocator_->AllocateGPUHeap(budget, 16);
+        // a list whose scratch no heap has room for fails when it is closed
+        if (!Scratch)
+          return;
+        allocator_->so_scratch_offset_ = ScratchOffset;
+        allocator_->so_scratch_size_ = budget;
+      }
+      auto [Targets, TargetsOffset] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(SM50_STREAM_OUTPUT_TARGETS), 16);
+      if (!Targets)
+        return;
+      auto targets = StreamOutputTargets();
+      targets.scratch = allocator_->gpu_heap_buffer_address_ + allocator_->so_scratch_offset_;
+      std::fill_n(static_cast<SM50_STREAM_OUTPUT_TARGETS *>(Targets), MaxCommandCount, targets);
+      cmd->so_targets = allocator_->gpu_heap_buffer_address_ + TargetsOffset;
+      cmd->so_scratch_size = allocator_->so_scratch_size_;
+      cmd->so_invocations = cmd->geometry_threads * pso_graphics_->gs_instances;
+    }
     // a GPU without mesh commands in indirect command buffers: every command is a draw of its own, which binds what
     // the command's stages read and has the threadgroups the resolver left for it (none past the count)
     auto heap = allocator_->gpu_heap_buffer_address_;
@@ -3341,19 +3822,42 @@ public:
             WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, arguments), SM50_BINDING_INDEX_DRAW_ARGUMENTS
         );
       }
-      auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
-      draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
-      draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      draw.indirect_args_offset = at + offsetof(IndirectMeshDraw, threadgroups);
-      draw.object_threadgroup_size = object;
-      draw.mesh_threadgroup_size = mesh;
+      auto draw = [&] {
+        auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
+        draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
+        draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+        draw.indirect_args_offset = at + offsetof(IndirectMeshDraw, threadgroups);
+        draw.object_threadgroup_size = object;
+        draw.mesh_threadgroup_size = mesh;
+      };
+      if (!cmd->so_targets) {
+        draw();
+        continue;
+      }
+      StreamOut(cmd->so_targets - heap + i * sizeof(SM50_STREAM_OUTPUT_TARGETS), allocator_->so_scratch_offset_, draw, [&] {
+        auto &zero = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+        zero.type = WMTRenderCommandDrawIndirect;
+        zero.primitive_type = WMTPrimitiveTypePoint;
+        zero.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+        zero.indirect_args_offset = at + offsetof(IndirectMeshDraw, zero);
+      });
     }
   };
 
-  // the root argument half of D3D12's reset after ExecuteIndirect
-  void ResetIndirectState(MTLD3D12CommandSignature *sig, uint64_t *rootargs) {
+  void ResetIndirectState(MTLD3D12CommandSignature *sig, bool compute) {
+    auto rootargs = compute ? rootarg_compute_staging_ : rootarg_graphics_staging_;
     for (auto [offset, count] : sig->ResetRootDwords)
       std::fill_n(reinterpret_cast<uint32_t *>(rootargs) + offset, count, 0u);
+    if (compute) {
+      dirty_state_.set(DirtyState::ComputeRootArguments);
+      return;
+    }
+    for (unsigned slot = 0; slot < vertex_buffers_.size(); slot++)
+      if (sig->ResetVertexBuffers & (1u << slot))
+        vertex_buffers_[slot] = {};
+    if (sig->UpdateIndexBuffer)
+      IASetIndexBuffer(nullptr);
+    dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::VertexBuffer);
   }
 
   void STDMETHODCALLTYPE
@@ -3375,7 +3879,7 @@ public:
 
   void STDMETHODCALLTYPE
   OMSetDepthBounds(FLOAT Min, FLOAT Max) {
-    if (Record([=](auto *l) { l->OMSetDepthBounds(Min, Max); }))
+    if (Bundled() && Record([=](auto *l) { l->OMSetDepthBounds(Min, Max); }))
       return;
     float bounds[2] = {std::isnan(Min) ? 0.0f : Min, std::isnan(Max) ? 0.0f : Max};
     depth_bounds_stale_ |= bounds[0] != depth_bounds_[0] || bounds[1] != depth_bounds_[1];
@@ -3484,6 +3988,9 @@ public:
     auto *dst = static_cast<MTLD3D12Resource *>(pDstResource), *src = static_cast<MTLD3D12Resource *>(pSrcResource);
     if (!dst->texture || !src->texture || (dst == src && ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS))
       return;
+    // a render pass's attachment, which needs no barrier for EndRenderPass's resolves
+    UsedTexture(src->texture.ptr());
+    UsedTexture(dst->texture.ptr());
     MTL_DXGI_FORMAT_DESC format;
     if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format)) ||
         ((format.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
@@ -3503,13 +4010,13 @@ public:
     UINT level[2], slice[2], plane[2];
     DecomposeSubresource(dst->GetDesc(), DstSubresource, &level[0], &slice[0], &plane[0]);
     DecomposeSubresource(src->GetDesc(), SrcSubresource, &level[1], &slice[1], &plane[1]);
-    // a color subresource is seen in the resolve's format, a depth or stencil plane in the only one it has, which for
-    // reading stencil beside depth is the stencil view of both
+    // a color subresource is seen in the resolve's format without its swizzle, as its channels are stored, a depth or
+    // stencil plane in the only one it has, which for reading stencil beside depth is the stencil view of both
     auto view = [&](MTLD3D12Resource *resource, bool source) {
       auto &texture = resource->texture;
       auto planes = DepthStencilPlanarFlags(texture->pixelFormat());
       TextureViewDescriptor desc;
-      desc.format = !planes                             ? format.PixelFormat
+      desc.format = !planes                             ? WMTPixelFormat(ORIGINAL_FORMAT(format.PixelFormat))
                     : source && planes == 3 && plane[1] ? WMTPixelFormatX32_Stencil8
                                                         : texture->pixelFormat();
       desc.type = texture->sampleCount() > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
@@ -3521,15 +4028,29 @@ public:
     D3D12_RECT whole{0, 0, (LONG)src->texture->width(src_view), (LONG)src->texture->height(src_view)},
         rect = pSrcRect ? *pSrcRect : whole;
     auto planes = DepthStencilPlanarFlags(dst->texture->pixelFormat());
-    // Metal's own resolve is of a whole attachment into one as large, by averaging colors
-    if (ResolveMode == D3D12_RESOLVE_MODE_AVERAGE && !planes && !IsIntegerFormat(format.PixelFormat) && !DstX && !DstY &&
+    // Metal's own resolve is of a whole attachment into one as large, by averaging colors of the formats it resolves
+    if (ResolveMode == D3D12_RESOLVE_MODE_AVERAGE && !planes &&
+        any_bit_set(device_->GetMTLPixelFormatCapability(format.PixelFormat) & FormatCapability::Resolve) && !DstX && !DstY &&
         !memcmp(&rect, &whole, sizeof(rect)) && dst->texture->width(dst_view) == (UINT)whole.right &&
         dst->texture->height(dst_view) == (UINT)whole.bottom) {
       allocator_->InvalidateCurrentPass();
+      auto &source = src->texture->view(src_view), &destination = dst->texture->view(dst_view);
+      // the view the render pass just before drew to is resolved as that pass stores it, as D3D11's are
+      // (ArgumentEncodingContext::isResolveSignatureMatched): nothing came between to write it
+      if (auto last = allocator_->encoder_last; last->type == EncoderType::Render) {
+        for (auto &color : static_cast<RenderEncoderData *>(last)->colors) {
+          if (!color.attachment || color.store_action != WMTStoreActionStore || color.resolve_attachment ||
+              color.attachment->allocation != source.allocation || !(color.attachment->key == source.key))
+            continue;
+          color.store_action = WMTStoreActionStoreAndMultisampleResolve;
+          color.resolve_attachment = destination;
+          return;
+        }
+      }
       auto resolve = allocator_->AllocatePass<ResolveEncoderData>();
       resolve->type = EncoderType::Resolve;
-      resolve->src = src->texture->view(src_view);
-      resolve->dst = dst->texture->view(dst_view);
+      resolve->src = source;
+      resolve->dst = destination;
       allocator_->InvalidateCurrentPass();
       return;
     }
@@ -3565,7 +4086,7 @@ public:
   std::pair<obj_handle_t, uint64_t>
   At(D3D12_GPU_VIRTUAL_ADDRESS VA) {
     uint64_t offset = 0;
-    auto allocation = device_->LookupBufferByVA(VA, &offset);
+    auto allocation = LookupBuffer(VA, &offset);
     return {allocation ? allocation->buffer().handle : 0, offset};
   }
 
@@ -3587,7 +4108,7 @@ public:
   void
   WriteImmediate(D3D12_GPU_VIRTUAL_ADDRESS VA, const void *Data, size_t Length) {
     uint64_t offset;
-    auto allocation = device_->LookupBufferByVA(VA, &offset);
+    auto allocation = LookupBuffer(VA, &offset);
     if (!allocation || !PreBlit())
       return;
     auto [Mapped, Offset] = allocator_->AllocateGPUHeap(Length, sizeof(uint64_t));
@@ -3814,7 +4335,8 @@ public:
       count = allocator_->gpu_heap_buffer_;
       count_offset = offset;
     }
-    auto geometries = allocator_->AllocateCommandData<WMTAccelerationStructureGeometry>(top ? 0 : inputs.NumDescs);
+    auto geometries =
+        allocator_->AllocateCommandData<WMTAccelerationStructureGeometry>(top ? 0 : std::max(inputs.NumDescs, 1u));
     auto info = AccelerationStructureInfo(device_, inputs, geometries, true, 0, count, count_offset);
     // elements a stride of zero apart are one element, which Metal reads as many: it is repeated, twice as many with
     // each copy. elements of 16-bit components may lie at any even address ("D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC",
@@ -4130,8 +4652,9 @@ public:
       return false;
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
       StartComputePass();
+    static_cast<ComputeEncoderData *>(allocator_->encoder_current)->rays = true;
     if (device_->NamesPasses())
-      device_->NamePass(allocator_->encoder_current, RunName(state_object_->name, pipeline), pipeline);
+      device_->NamePass(allocator_->encoder_current, state_object_->name, pipeline);
     auto &pso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
     pso.type = WMTComputeCommandSetPSO;
     pso.pso = pipeline;
@@ -4182,7 +4705,7 @@ public:
 
   void STDMETHODCALLTYPE
   DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
-    if (Record([=](auto *l) { l->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ); }))
+    if (Bundled() && Record([=](auto *l) { l->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ); }))
       return;
     if (!pso_graphics_ || !pso_graphics_->mesh_shader || !ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ)
       return;
@@ -4201,6 +4724,8 @@ public:
   // enhanced barriers order work as ResourceBarrier does
   void STDMETHODCALLTYPE
   Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups) {
+    barrier_serial_++;
+    OrderingPoint();
     constexpr auto uav = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, draw_writes = uav | D3D12_BARRIER_ACCESS_RENDER_TARGET |
                        D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_STREAM_OUTPUT;
     // common access is any access, writes included
@@ -4215,7 +4740,13 @@ public:
                 : group.Type == D3D12_BARRIER_TYPE_TEXTURE
                       ? std::pair{group.pTextureBarriers[i].AccessBefore, group.pTextureBarriers[i].AccessAfter}
                       : std::pair{group.pBufferBarriers[i].AccessBefore, group.pBufferBarriers[i].AccessAfter};
-        if (Order(any(before, draw_writes), any(before, uav) || any(after, uav)))
+        auto resource = group.Type == D3D12_BARRIER_TYPE_GLOBAL    ? nullptr
+                        : group.Type == D3D12_BARRIER_TYPE_TEXTURE ? group.pTextureBarriers[i].pResource
+                                                                   : group.pBufferBarriers[i].pResource;
+        if (!clears_.empty())
+          BarrierNames(resource);
+        BarrierLeaves(resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATES(0));
+        if (Order(any(before, draw_writes) && PassWrote(resource), any(before, uav) || any(after, uav)))
           return;
       }
   }
@@ -4227,7 +4758,7 @@ MTLD3D12CommandAllocatorImpl::CreateCommandList(
     void **ppCommandList
 ) {
   if (Type != type_)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(device_, Type));
   HRESULT hr = cmd_list->Initialize(this, pInitialPipelineState);

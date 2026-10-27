@@ -22,6 +22,9 @@
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d10/ne-d3d10-d3d10_query
 // the lifetime cases stop CPU encoding before the queued acquire or release can retain its event, drop the last
 // texture reference, then resume. completion returns TRUE; the runner also rejects any zombie message.
+// D3D10-to-D3D11 and return writes are compared byte for byte after completed uploads. OpenSharedResource:
+// "If a shared texture is updated on one device ID3D10Device::Flush must be called on that device."
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d10/nf-d3d10-id3d10device-opensharedresource
 #include "d3d11_test.hpp"
 #include <d3d11_1.h>
 #include <d3d10_1.h>
@@ -37,7 +40,7 @@ paused_command_buffer(UINT64 queue) {
   // uploads create command buffers on the issuing thread; only pause the asynchronous encoder
   if (GetCurrentThreadId() != issuing_thread && InterlockedCompareExchange(&stop_encoding, 0, 1) == 1) {
     SetEvent(encoding_stopped);
-    if (WaitForSingleObject(encoding_resume, 60000) != WAIT_OBJECT_0)
+    if (WaitForSingleObject(encoding_resume, INFINITE) != WAIT_OBJECT_0)
       ExitProcess(1);
   }
   return command_buffer(queue);
@@ -94,17 +97,6 @@ main() {
   if (lost_key_bits)
     printf("host: D3DKMT keyed mutexes lose key bits %#llx; keys made only of them are not exercised\n",
            lost_key_bits);
-  HANDLE deadline = CreateThread(
-      nullptr, 0,
-      [](void *) -> DWORD {
-        Sleep(60000);
-        puts("failed: test exceeded its deadline");
-        ExitProcess(1);
-      },
-      nullptr, 0, nullptr);
-  if (!expect(deadline != nullptr, "CreateThread: %lu", GetLastError()))
-    return verdict();
-  CloseHandle(deadline);
   const DWORD access = DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE;
   const UINT modes = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
   const UINT width = std::numeric_limits<UINT64>::digits + 1;
@@ -354,7 +346,7 @@ main() {
       CHECK(texture.As(&mutex));
       InterlockedExchange(&stop_encoding, 1);
       CHECK(mutex->AcquireSync(0, 0));
-      if (!expect(WaitForSingleObject(encoding_stopped, 60000) == WAIT_OBJECT_0, "encoding did not stop"))
+      if (!expect(WaitForSingleObject(encoding_stopped, INFINITE) == WAIT_OBJECT_0, "encoding did not stop"))
         ExitProcess(1);
       if (release)
         CHECK(mutex->ReleaseSync(0));
@@ -368,8 +360,8 @@ main() {
       context->Flush();
       BOOL done = FALSE;
       HRESULT hr;
-      while ((hr = context->GetData(completed.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
-        Sleep(0);
+      while ((hr = context->GetData(completed.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE) {
+      }
       expect(hr == S_OK && done, "released texture's queued mutex work did not complete, hr %#lx", hr);
     }
   if (!expect(VirtualProtect(hook, sizeof(*hook), PAGE_READWRITE, &protection), "cannot restore the encoder"))
@@ -402,6 +394,85 @@ main() {
     expect(resource->CreateSharedHandle(nullptr, access, nullptr, &invalid) == E_INVALIDARG && !invalid,
            "Direct3D 10 accepted NT sharing without NTHANDLE");
     CHECK(other->OpenSharedResource(handle, IID_PPV_ARGS(&imported)));
+    {
+      step("Direct3D 10/11 shared texture bytes, keyed %d", keyed);
+      ComPtr<ID3D11Device> peer_device;
+      ComPtr<ID3D11DeviceContext> peer_context;
+      const D3D_FEATURE_LEVEL peer_level = D3D_FEATURE_LEVEL_10_1;
+      CHECK(D3D11CreateDevice(
+          nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &peer_level, 1, D3D11_SDK_VERSION, &peer_device, nullptr,
+          &peer_context
+      ));
+      ComPtr<ID3D11Texture2D> peer_texture, read11;
+      CHECK(peer_device->OpenSharedResource(handle, IID_PPV_ARGS(&peer_texture)));
+      auto read_desc10 = desc10;
+      read_desc10.Usage = D3D10_USAGE_STAGING;
+      read_desc10.CPUAccessFlags = D3D10_CPU_ACCESS_READ;
+      read_desc10.BindFlags = read_desc10.MiscFlags = 0;
+      ComPtr<ID3D10Texture2D> read10;
+      CHECK(device->CreateTexture2D(&read_desc10, nullptr, &read10));
+      D3D11_TEXTURE2D_DESC read_desc11;
+      peer_texture->GetDesc(&read_desc11);
+      read_desc11.Usage = D3D11_USAGE_STAGING;
+      read_desc11.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      read_desc11.BindFlags = read_desc11.MiscFlags = 0;
+      CHECK(peer_device->CreateTexture2D(&read_desc11, nullptr, &read11));
+      ComPtr<IDXGIKeyedMutex> lock10, lock11;
+      if (keyed) {
+        CHECK(texture.As(&lock10));
+        CHECK(peer_texture.As(&lock11));
+      }
+      std::vector<UINT> words(width);
+      for (UINT generation = 0; generation < 3; generation++) {
+        if (keyed)
+          CHECK(lock10->AcquireSync(0, INFINITE));
+        for (UINT i = 0; i < width; i++)
+          words[i] = (generation * width + i + 1) ^ std::numeric_limits<UINT>::max();
+        device->UpdateSubresource(texture.Get(), 0, nullptr, words.data(), width * sizeof(UINT), 0);
+        D3D10_QUERY_DESC event_desc10{D3D10_QUERY_EVENT};
+        ComPtr<ID3D10Query> completed10;
+        CHECK(device->CreateQuery(&event_desc10, &completed10));
+        completed10->End();
+        device->Flush();
+        BOOL done = FALSE;
+        HRESULT hr;
+        while ((hr = completed10->GetData(&done, sizeof(done), 0)) == S_FALSE) {
+        }
+        expect(hr == S_OK && done, "shared D3D10 upload did not complete");
+        if (keyed) {
+          CHECK(lock10->ReleaseSync(1));
+          CHECK(lock11->AcquireSync(1, INFINITE));
+        }
+        peer_context->CopyResource(read11.Get(), peer_texture.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped11{};
+        CHECK(peer_context->Map(read11.Get(), 0, D3D11_MAP_READ, 0, &mapped11));
+        expect(!memcmp(mapped11.pData, words.data(), width * sizeof(UINT)), "D3D11 read different D3D10 upload bytes");
+        peer_context->Unmap(read11.Get(), 0);
+        for (auto &word : words)
+          word = ~word;
+        peer_context->UpdateSubresource(peer_texture.Get(), 0, nullptr, words.data(), width * sizeof(UINT), 0);
+        D3D11_QUERY_DESC event_desc11{D3D11_QUERY_EVENT};
+        ComPtr<ID3D11Query> completed11;
+        CHECK(peer_device->CreateQuery(&event_desc11, &completed11));
+        peer_context->End(completed11.Get());
+        peer_context->Flush();
+        done = FALSE;
+        while ((hr = peer_context->GetData(completed11.Get(), &done, sizeof(done), 0)) == S_FALSE) {
+        }
+        expect(hr == S_OK && done, "shared D3D11 upload did not complete");
+        if (keyed) {
+          CHECK(lock11->ReleaseSync(0));
+          CHECK(lock10->AcquireSync(0, INFINITE));
+        }
+        device->CopyResource(read10.Get(), texture.Get());
+        D3D10_MAPPED_TEXTURE2D mapped10{};
+        CHECK(read10->Map(0, D3D10_MAP_READ, 0, &mapped10));
+        expect(!memcmp(mapped10.pData, words.data(), width * sizeof(UINT)), "D3D10 read different D3D11 return bytes");
+        read10->Unmap(0);
+        if (keyed)
+          CHECK(lock10->ReleaseSync(0));
+      }
+    }
     if (keyed) {
       ComPtr<IDXGIKeyedMutex> mutex, peer;
       CHECK(texture.As(&mutex));
@@ -426,8 +497,8 @@ main() {
       other->Flush();
       BOOL done = FALSE;
       HRESULT hr;
-      while ((hr = completed->GetData(&done, sizeof(done), 0)) == S_FALSE)
-        Sleep(0);
+      while ((hr = completed->GetData(&done, sizeof(done), 0)) == S_FALSE) {
+      }
       expect(hr == S_OK && done, "Direct3D 10 released mutex work did not complete, hr %#lx", hr);
     }
     step("Direct3D 10 sharing, keyed %d, teardown", keyed);

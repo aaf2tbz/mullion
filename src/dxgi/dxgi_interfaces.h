@@ -65,6 +65,11 @@ DEFINE_COM_INTERFACE("14d37310-be0f-4275-a5d0-bbff1e87300a", IMTLD3D11On12Source
   SignalEventAtFence(ID3D12Fence * pFence, UINT64 FenceValue, WMT::SharedEvent Event, UINT64 Value) = 0;
 };
 
+DEFINE_COM_INTERFACE("c9f9c239-56b1-4fe6-b04d-3bf035f409cb", IMTLDXGISwapChain)
+    : public IDXGISwapChain4 {
+  virtual HRESULT STDMETHODCALLTYPE SetWindowReservation(IUnknown *reservation) = 0;
+};
+
 static constexpr IID MULLION_NVEXT_GUID = mullion::guid::make_guid("ba0af616-4a43-4259-815c-db3b89829905");
 
 namespace mullion {

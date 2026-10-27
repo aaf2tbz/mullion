@@ -249,7 +249,7 @@ CreateCommandAllocator(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, RE
   case D3D12_COMMAND_LIST_TYPE_COPY:
     break;
   default:
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   }
   auto command_allocator = Com(new MTLD3D12CommandAllocatorImpl(pDevice, Type));
   HRESULT hr = command_allocator->Initialize();
@@ -266,7 +266,7 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   {
     std::lock_guard<mullion::mutex> lock(recording.mutex);
     if (!recording.commands.Initialize() || !recording.arguments.Initialize())
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
     if (!recording.buffer) {
       WMTBufferInfo buffer_info;
       buffer_info.memory.set(recording.arguments.base);
@@ -280,7 +280,7 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
       recording.address = buffer_info.gpu_address;
     }
     if (!recording.zeros && !(recording.zeros = recording.arguments.Acquire(1)))
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
   }
   cpu_heap_ = recording.commands.base, gpu_heap_ = recording.arguments.base;
   gpu_heap_buffer_ = recording.buffer, gpu_heap_buffer_address_ = recording.address;
@@ -313,7 +313,7 @@ HRESULT
 STDMETHODCALLTYPE
 MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
   if (ppvObject == nullptr)
-    return E_POINTER;
+    return FAIL(E_POINTER);
 
   *ppvObject = nullptr;
 
@@ -333,7 +333,7 @@ MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
 HRESULT STDMETHODCALLTYPE
 MTLD3D12CommandAllocatorImpl::Reset() {
   if (encoder_last)
-    return E_FAIL;
+    return FAIL(E_FAIL);
   // "the runtime will not allow a reset while a command list is still being executed": the lists' recording is what
   // the GPU still reads
   if (pending)
@@ -492,8 +492,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  // an indexed command of an ordinary pipeline is two: its indices in the view, and zeros for those past it
-  size_t each = !tessellation && pCmdSig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? 2 : 1;
+  // an indexed command of an ordinary pipeline is kIndexedCommands (IndirectRenderCommandData::zeros)
+  size_t each = !tessellation && pCmdSig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? kIndexedCommands : 1;
   WMT::IndirectCommandBuffer icb;
   if (!draws)
     icb = AcquireICB(info, MaxCount * each, WMTResourceStorageModePrivate);
@@ -539,23 +539,28 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   data->zeros = each > 1 ? gpu_heap_buffer_address_ + zeros.offset : 0;
   data->zero_count = zeros.length / sizeof(uint16_t);
   data->draws = 0;
+  data->so_targets = data->so_scratch_size = data->so_invocations = data->so_lacked = 0;
   if (draws) {
     auto [records, at] = AllocateGPUHeap(MaxCount * sizeof(IndirectMeshDraw), alignof(IndirectMeshDraw));
     memset(records, 0, MaxCount * sizeof(IndirectMeshDraw));
     data->draws = gpu_heap_buffer_address_ + at;
   }
 
-  data->omitted = 0;
-  if (draws && !pPSO->threads_per_patch && !pPSO->mesh_shader) {
-    // a word for each command, which its resolver thread writes
+  // a word for each command, which its resolver thread writes, for the queue to read when the pass completes
+  auto omitted = [&](bool scratch) {
     size_t words = std::max<size_t>(MaxCount, 1);
     auto [word, offset] = AllocateGPUHeap(words * sizeof(uint32_t), alignof(uint32_t));
     memset(word, 0, words * sizeof(uint32_t));
-    data->omitted = gpu_heap_buffer_address_ + offset;
     auto render = static_cast<RenderEncoderData *>(encoder_current);
     render->omitted = new (AllocateCPUHeap(sizeof(RenderEncoderData::Omitted), alignof(RenderEncoderData::Omitted)))
-        RenderEncoderData::Omitted{gpu_heap_buffer_, offset, words, render->omitted};
-  }
+        RenderEncoderData::Omitted{gpu_heap_buffer_, offset, words, render->omitted, scratch};
+    return gpu_heap_buffer_address_ + offset;
+  };
+  data->omitted = 0;
+  if (draws && !pPSO->threads_per_patch && !pPSO->mesh_shader)
+    data->omitted = omitted(false);
+  if (draws && pPSO->stream_output)
+    data->so_lacked = omitted(true);
   data->most = 0;
   if (diag::errors) {
     auto [words, offset] = AllocateGPUHeap(kMostWords * sizeof(uint32_t), sizeof(uint32_t));
@@ -627,21 +632,16 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
 template <>
 WMT::Reference<WMT::ComputePipelineState>
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::getComputePipeline(std::string name) {
-  auto lib = ctx.device_->GetLib().getLibrary();
-  auto func = lib.newFunction(name.c_str());
-  if (!func)
-    return {};
-  WMT::Reference<WMT::Error> err;
-  auto pso = ctx.device_->GetMTLDevice().newComputePipelineState(func, err);
-  if (err) {
-    ERR("Failed to create compute PSO: ", err.description().getUTF8String());
-  }
-  return pso;
+  return ctx.device_->GetLib().ComputePipeline(name);
 }
 
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startComputePass() {
+  if (ctx.share_compute_ && ctx.encoder_current && ctx.encoder_current->type == EncoderType::Compute) {
+    ctx.OrderDispatches();
+    return;
+  }
   ctx.InvalidateCurrentPass();
   auto compute = ctx.AllocatePass<ComputeEncoderData>();
   compute->type = EncoderType::Compute;
@@ -653,6 +653,10 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startComputePass() {
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::endPass() {
+  if (ctx.share_compute_ && ctx.encoder_current && ctx.encoder_current->type == EncoderType::Compute) {
+    ctx.OrderDispatches();
+    return;
+  }
   ctx.InvalidateCurrentPass();
 }
 
@@ -743,6 +747,32 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeBytes(uint32_t ind
   setmeta.length = length;
   setmeta.index = index;
   return temp;
+}
+
+bool
+MTLD3D12CommandAllocatorImpl::CopyD24(
+    bool to_float, WMT::Buffer src, uint64_t src_offset, UINT src_pitch, WMT::Buffer dst,
+    uint64_t dst_offset, UINT dst_pitch, WMTSize size
+) {
+  SimpleCommandContext<MTLD3D12CommandAllocatorImpl> ctx{*this};
+  auto &pso = d24_copy_pso_[to_float];
+  if (!pso)
+    pso = ctx.getComputePipeline(to_float ? "cs_unpack_d24" : "cs_pack_d24");
+  if (!pso || !src || !dst) {
+    exhausted_ = true;
+    return false;
+  }
+  ctx.endPass();
+  ctx.startComputePass();
+  ctx.setComputePSO(pso, {pso.threadExecutionWidth(), 1, 1});
+  ctx.setComputeBuffer(0, src, src_offset);
+  ctx.setComputeBuffer(1, dst, dst_offset);
+  const UINT pitches[] = {src_pitch, dst_pitch};
+  memcpy(ctx.setComputeBytes(2, sizeof(pitches)), pitches, sizeof(pitches));
+  ctx.dispatch(size);
+  ctx.endPass();
+  ctx.startBlitPass();
+  return true;
 }
 
 template <>

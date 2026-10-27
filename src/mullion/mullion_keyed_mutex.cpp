@@ -55,7 +55,7 @@ makeUniqueName(char (&out)[54]) {
   uint64_t r2 = dis(gen);
 
   std::snprintf(
-      out, 54, "MULLION_shared_resource_%016llx%016llx", static_cast<unsigned long long>(r1),
+      out, sizeof(out), "MULLION_shared_%016llx%016llx", static_cast<unsigned long long>(r1),
       static_cast<unsigned long long>(r2)
   );
 }

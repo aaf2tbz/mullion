@@ -9,6 +9,9 @@
 // Microsoft Learn D3D11_DEPTH_STENCIL_DESC and D3D11_BLEND_DESC tables, through the SDK's default constructors.
 // enums, target counts and anisotropy bounds come from the API header. padding is deliberately initialized
 // differently on equivalent descriptions and never compared as returned data. no shaders are needed.
+// COM failure contract: "All out pointer parameters must explicitly be set to NULL."
+// https://learn.microsoft.com/en-us/windows/win32/com/memory-management-rules
+// Wine's Windows state-creation witnesses above require E_INVALIDARG for null descriptions.
 #include "d3d11_test.hpp"
 #include <d3d11_1.h>
 #include <d3d10_1.h>
@@ -24,12 +27,38 @@ main() {
                          &device, nullptr, nullptr));
   ComPtr<ID3D11Device1> device1;
   CHECK(device.As(&device1));
+  step("null output-merger descriptions clear output pointers");
+  auto empty_state = [&]<typename T>(T *typed, auto create, const char *name) {
+    auto sentinel = reinterpret_cast<T *>(uintptr_t(1));
+    typed = sentinel;
+    HRESULT hr = create(&typed);
+    expect(hr == E_INVALIDARG && !typed, "%s returned %08lx, output %p", name, hr, typed);
+    if (typed && typed != sentinel)
+      typed->Release();
+  };
+  empty_state(static_cast<ID3D11BlendState *>(nullptr),
+              [&](auto out) { return device->CreateBlendState(nullptr, out); }, "CreateBlendState");
+  empty_state(static_cast<ID3D11BlendState1 *>(nullptr),
+              [&](auto out) { return device1->CreateBlendState1(nullptr, out); }, "CreateBlendState1");
+  empty_state(static_cast<ID3D11DepthStencilState *>(nullptr),
+              [&](auto out) { return device->CreateDepthStencilState(nullptr, out); }, "CreateDepthStencilState");
   ComPtr<ID3DDeviceContextState> compatibility;
   const D3D_FEATURE_LEVEL legacy_level = D3D_FEATURE_LEVEL_10_1;
   CHECK(device1->CreateDeviceContextState(0, &legacy_level, 1, D3D11_SDK_VERSION, __uuidof(ID3D10Device1),
                                          nullptr, &compatibility));
   ComPtr<ID3D10Device1> device10;
   CHECK(device.As(&device10));
+  ComPtr<ID3D11DeviceContext1> context1;
+  ComPtr<ID3DDeviceContextState> previous;
+  device1->GetImmediateContext1(&context1);
+  context1->SwapDeviceContextState(compatibility.Get(), &previous);
+  empty_state(static_cast<ID3D10BlendState *>(nullptr),
+              [&](auto out) { return device10->CreateBlendState(nullptr, out); }, "Direct3D 10 CreateBlendState");
+  empty_state(static_cast<ID3D10BlendState1 *>(nullptr),
+              [&](auto out) { return device10->CreateBlendState1(nullptr, out); }, "Direct3D 10.1 CreateBlendState1");
+  empty_state(static_cast<ID3D10DepthStencilState *>(nullptr),
+              [&](auto out) { return device10->CreateDepthStencilState(nullptr, out); }, "Direct3D 10 CreateDepthStencilState");
+  context1->SwapDeviceContextState(previous.Get(), nullptr);
   const BOOL enables[] = {FALSE, TRUE, std::numeric_limits<BOOL>::min(), std::numeric_limits<BOOL>::max()};
   const UINT filter_types = D3D11_FILTER_TYPE_LINEAR - D3D11_FILTER_TYPE_POINT + 1;
   const UINT basic_filters = filter_types * filter_types * filter_types;
@@ -247,7 +276,10 @@ main() {
           if (different_mask)
             desc.RenderTargetWriteMask[target] = D3D10_COLOR_WRITE_ENABLE_RED;
           ComPtr<ID3D10BlendState> legacy;
-          CHECK(device10->CreateBlendState(&desc, &legacy));
+          context1->SwapDeviceContextState(compatibility.Get(), &previous);
+          HRESULT legacy_hr = device10->CreateBlendState(&desc, &legacy);
+          context1->SwapDeviceContextState(previous.Get(), nullptr);
+          CHECK(legacy_hr);
           ComPtr<ID3D11BlendState> first, same;
           CHECK(legacy.As(&first));
           D3D11_BLEND_DESC got{};

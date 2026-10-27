@@ -72,22 +72,87 @@ EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalComma
 }
 
 WMT::RenderPipelineState InternalCommandLibrary::PipelineStatistics(bool scan) {
-  std::lock_guard lock(statistics_mutex_);
-  auto &pipeline = pipeline_statistics_draw_[scan];
+  return VertexPipeline(pipeline_statistics_draw_[scan], scan ? "pipeline_statistics_strip" : "pipeline_statistics_draw");
+}
+
+WMT::RenderPipelineState InternalCommandLibrary::ZeroWords() {
+  return VertexPipeline(zero_words_, "zero_words");
+}
+
+WMT::RenderPipelineState
+InternalCommandLibrary::VertexPipeline(WMT::Reference<WMT::RenderPipelineState> &pipeline, const char *name) {
+  std::lock_guard lock(pipelines_mutex_);
   if (!pipeline) {
     WMTRenderPipelineInfo info;
     WMT::InitializeRenderPipelineInfo(info);
-    auto function = library_.newFunction(scan ? "pipeline_statistics_strip" : "pipeline_statistics_draw");
+    auto function = library_.newFunction(name);
     info.vertex_function = function;
     info.rasterization_enabled = false;
     WMT::Reference<WMT::Error> error;
     pipeline = device_.newRenderPipelineState(info, error);
     if (!pipeline) {
-      ERR("Failed to create statistics pipeline: ", error.description().getUTF8String());
+      ERR("Failed to create pipeline ", name, ": ", error.description().getUTF8String());
       abort();
     }
   }
   return pipeline;
+}
+
+WMT::Reference<WMT::ComputePipelineState>
+InternalCommandLibrary::ComputePipeline(const std::string &name) {
+  std::lock_guard lock(pipelines_mutex_);
+  auto &pipeline = compute_pipelines_[name];
+  if (!pipeline) {
+    auto function = library_.newFunction(name.c_str());
+    if (!function)
+      return {};
+    WMT::Reference<WMT::Error> err;
+    pipeline = device_.newComputePipelineState(function, err);
+    if (err)
+      ERR("Failed to create compute PSO: ", err.description().getUTF8String());
+  }
+  return pipeline;
+}
+
+InternalCommandLibrary::StandIn
+InternalCommandLibrary::UnboundTexture(WMTTextureType type, SM50_SAMPLE_TYPE sample, bool write) {
+  std::lock_guard lock(pipelines_mutex_);
+  auto [at, fresh] = unbound_textures_.try_emplace(type | sample << 4 | write << 6);
+  auto &unbound = at->second;
+  if (fresh) {
+    bool ms = type == WMTTextureType2DMultisample || type == WMTTextureType2DMultisampleArray;
+    // a float texture a shader only reads may be a depth texture it compares with: Metal has depth textures of the
+    // 2D and cube types, and a shader reads them as colors too
+    bool depth = sample == SM50_SAMPLE_FLOAT && !write &&
+                 (ms || type == WMTTextureType2D || type == WMTTextureType2DArray || type == WMTTextureTypeCube ||
+                  type == WMTTextureTypeCubeArray);
+    WMTTextureInfo info{};
+    info.pixel_format = depth                        ? WMTPixelFormatDepth32Float
+                        : sample == SM50_SAMPLE_UINT ? WMTPixelFormatR32Uint
+                        : sample == SM50_SAMPLE_INT  ? WMTPixelFormatR32Sint
+                                                     : WMTPixelFormatRGBA16Float;
+    info.width = info.height = info.depth = info.array_length = info.mipmap_level_count = 1;
+    info.type = type;
+    info.sample_count = ms ? 4 : 1;
+    info.usage = WMTTextureUsageShaderRead;
+    if (write)
+      info.usage = WMTTextureUsage(
+          info.usage | WMTTextureUsageShaderWrite | (sample != SM50_SAMPLE_FLOAT ? WMTTextureUsageShaderAtomic : 0)
+      );
+    info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked;
+    if (type == WMTTextureTypeTextureBuffer) {
+      auto bytes = device_.minimumLinearTextureAlignmentForPixelFormat(info.pixel_format);
+      WMTBufferInfo backing{bytes, info.options};
+      unbound.backing = device_.newBuffer(backing);
+      unbound.texture = unbound.backing.newTexture(info, 0, bytes);
+    } else {
+      unbound.texture = device_.newTexture(info);
+    }
+    if (!unbound.texture)
+      ERR("Failed to create the stand-in of an unbound texture of type ", type);
+    unbound.id = info.gpu_resource_id;
+  }
+  return {unbound.texture, unbound.id, unbound.backing, fresh};
 }
 
 void

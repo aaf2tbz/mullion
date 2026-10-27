@@ -20,6 +20,9 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+// the system counter mach_absolute_time reads on Apple silicon runs at 24 MHz (CNTFRQ_EL0, which a Windows program
+// cannot read)
+constexpr UINT64 host_hz = 24000000;
 
 static constexpr UINT frames = 4, concurrent_frames = 12, width = 8, height = 4, turns = 4096, threads = 32;
 static constexpr UINT indices[] = {0, 1, 2}, instances[] = {1, 2};
@@ -76,13 +79,18 @@ sha1(const std::string &code) {
   return name;
 }
 
+// the profile's clock is nanoseconds
+static UINT64
+nanoseconds(UINT64 ticks, UINT64 frequency) {
+  return ticks / frequency * 1'000'000'000 + ticks % frequency * 1'000'000'000 / frequency;
+}
+
 static UINT64
 now() {
   LARGE_INTEGER ticks, frequency;
   QueryPerformanceCounter(&ticks);
   QueryPerformanceFrequency(&frequency);
-  return ticks.QuadPart / frequency.QuadPart * 1'000'000'000 +
-         ticks.QuadPart % frequency.QuadPart * 1'000'000'000 / frequency.QuadPart;
+  return nanoseconds(ticks.QuadPart, frequency.QuadPart);
 }
 
 static int
@@ -260,6 +268,8 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   std::ofstream result(std::string(argv[3]) + "\\pixels", std::ios::binary);
   ComPtr<ID3D12Fence> held;
   CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&held)));
+  UINT64 frequency;
+  CHECK(queues[0]->GetTimestampFrequency(&frequency));
   for (UINT frame = 0; frame < frames; frame++) {
     step("child frame %u: replay two pipelines, two kernels and timestamps", frame);
     ID3D12CommandList *submitted[] = {lists[0].Get(), lists[1].Get()};
@@ -309,7 +319,7 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
       expect(clock[i * query_desc.Count + 1] > clock[i * query_desc.Count],
              "timestamp query did not bracket kernel %u", i);
     auto long_query = clock + (std::size(compute) - 1) * query_desc.Count;
-    facts << long_query[0] << ' ' << long_query[1] << '\n';
+    facts << nanoseconds(long_query[0], frequency) << ' ' << nanoseconds(long_query[1], frequency) << '\n';
     queries->Unmap(0, nullptr);
     CHECK(chains[0]->Present(0, 0));
   }
@@ -330,7 +340,8 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   UINT64 *clock;
   CHECK(queries->Map(0, nullptr, (void **)&clock));
   expect(clock[1] > clock[0], "overflow lost application timestamps");
-  facts << clock[0] << '\n' << clock[1] << '\n';
+  CHECK(queues[1]->GetTimestampFrequency(&frequency));
+  facts << nanoseconds(clock[0], frequency) << '\n' << nanoseconds(clock[1], frequency) << '\n';
   queries->Unmap(0, nullptr);
   auto go = CreateEventA(nullptr, TRUE, FALSE, nullptr);
   struct Present {
@@ -339,7 +350,7 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   } present{chains[1].Get(), go};
   auto thread = CreateThread(
       nullptr, 0,
-      [](void *argument) -> DWORD {
+      [](void *argument) WINAPI -> DWORD {
         auto &present = *(Present *)argument;
         if (WaitForSingleObject(present.go, 60000) != WAIT_OBJECT_0)
           return 1;
@@ -425,10 +436,7 @@ main(int argc, char **argv) {
     auto setting = settings[run];
     const bool profiling = setting && !strcmp(setting, "profile");
     step("child MULLION_DIAG=%s, run %u", setting ? setting : "unset", run);
-    if (!expect(GetTempFileNameA(temporary, "prf", 0, directory), "no temporary name"))
-      return verdict();
-    DeleteFileA(directory);
-    if (!expect(CreateDirectoryA(directory, nullptr), "no temporary directory"))
+    if (!expect(temporary_directory(temporary, "prf", directory), "no temporary directory"))
       return verdict();
     WCHAR wide[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, directory, -1, wide, std::size(wide));
@@ -495,7 +503,9 @@ main(int argc, char **argv) {
     std::map<Key, std::array<UINT64, 4>> calibrations;
     std::vector<std::vector<std::string>> passes, presents;
     std::map<std::string, UINT> frame_counts;
-    UINT files = 0, clocks = 0, spans = 0;
+    UINT files = 0, clocks = 0, spans = 0, statistics = 0, totals = 0;
+    // the bridge's calls a 'unix' record counts, each named once before (mullion_diag.hpp's Calls)
+    std::set<UINT64> named;
     std::map<UINT64, UINT> list_counts;
     UINT64 last_frame = 0, held_began = ~UINT64(0), held_took = 0;
     for (auto &entry : std::filesystem::directory_iterator(directory)) {
@@ -521,7 +531,8 @@ main(int argc, char **argv) {
           expect(began <= number(row[3]) && number(row[3]) <= number(row[4]) && number(row[4]) <= ended,
                  "command buffer CPU clocks outside run");
           expect(number(row[5]) <= number(row[6]), "command buffer GPU times reversed");
-        } else if (row[0] == "frame" && expect(row.size() == 4, "malformed frame")) {
+        } else if (row[0] == "frame" && expect(row.size() == 5, "malformed frame")) {
+          number(row[4]);
           expect(number(row[3]) >= last_frame, "concurrent frames out of time order");
           expect(began <= number(row[3]) && number(row[3]) <= ended, "frame clock outside run");
           last_frame = number(row[3]);
@@ -529,8 +540,26 @@ main(int argc, char **argv) {
           presents.push_back(row);
         } else if (row[0] == "pass" && expect(row.size() == 9 || row.size() == 11, "malformed pass")) {
           passes.push_back(row);
+        } else if (row[0] == "gpu") {
+          // the driver's statistics at the frame's end, name=value each
+          statistics++;
+          for (size_t i = 1; i < row.size(); i++)
+            if (auto at = row[i].find('='); expect(at && at != row[i].npos, "malformed statistic %s", row[i].c_str()))
+              number(row[i].substr(at + 1));
+        } else if (row[0] == "call" && expect(row.size() == 3 && !row[2].empty(), "malformed call")) {
+          expect(named.insert(number(row[1])).second, "call %s named twice", row[1].c_str());
+        } else if (row[0] == "unix") {
+          totals++;
+          for (size_t i = 1; i < row.size(); i++)
+            if (auto call = fields(row[i], ':'); expect(call.size() == 3, "malformed call total %s", row[i].c_str())) {
+              expect(named.count(number(call[0])) && number(call[1]), "call total %s unnamed or empty", row[i].c_str());
+              number(call[2]);
+            }
+        } else if (row[0] == "span" && row.size() >= 6 && row[1] != "execute") {
+          expect(row[1] == "encode" || row[1] == "present" || row[1] == "wait", "unexpected span kind %s", row[1].c_str());
+          expect(number(row[3]) && began <= number(row[4]) && number(row[4]) + number(row[5]) <= ended,
+                 "%s span outside run", row[1].c_str());
         } else if (row[0] == "span" && expect(row.size() == 6, "malformed span")) {
-          expect(row[1] == "execute", "unexpected span kind");
           spans++;
           list_counts[number(row[2])]++;
           expect(number(row[3]) && number(row[5]) && began <= number(row[4]) &&
@@ -561,8 +590,8 @@ main(int argc, char **argv) {
         return cpu0 + delta * (cpu1 - cpu0) / (gpu1 - gpu0);
       };
       // the calibrations' host times come from a clock of 24 MHz on Apple silicon (mach_absolute_time), so a stage
-      // converted with them may land up to a tick, 41.7 ns, outside the command buffer's GPU times
-      const UINT64 host_tick = 42;
+      // converted with them may land up to a tick, outside the command buffer's GPU times
+      const UINT64 host_tick = (1000000000 + host_hz - 1) / host_hz;
       expect(clocks == 2, "one clock pair per queue");
       expect(spans == frames + 1 && list_counts[2] == frames && list_counts[1] == 1, "execute spans lost list counts");
       // ID3D12CommandQueue::Wait: "waits until the specified fence reaches or exceeds the specified value": the
@@ -573,6 +602,7 @@ main(int argc, char **argv) {
         expect(number(row[3]) < held_began || number(row[3]) >= signaled,
                "command buffer committed ahead of a Wait's fence");
       expect(presents.size() == frames + 2 * concurrent_frames && frame_counts.size() == 2, "presents missing");
+      expect(statistics == presents.size() && totals == presents.size(), "frames without GPU statistics or call totals");
       if (!presents.empty()) {
         const auto queue = presents.front()[1];
         expect(frame_counts[queue] == frames + concurrent_frames, "main queue presents misattributed");
@@ -618,7 +648,7 @@ main(int argc, char **argv) {
           } else {
             expect(a <= b && host_time(key, a) + rounding + host_tick >= start &&
                        host_time(key, b) <= finish + rounding + host_tick,
-                   "stage outside command buffer");
+                   "stage %llu to %llu outside command buffer %llu to %llu", a, b, start, finish);
             gpu += b - a;
           }
         }
@@ -637,7 +667,8 @@ main(int argc, char **argv) {
             if (runs[0] == compute_runs[1] && times.size() < frames) {
               auto &query = sampled_queries[times.size()];
               expect(query[0] <= number(row[7]) && number(row[8]) <= query[1],
-                     "application query does not bracket the sampled kernel");
+                     "application query %llu to %llu does not bracket the sampled kernel %llu to %llu", query[0],
+                     query[1], number(row[7]), number(row[8]));
               auto at = size_t(&row - passes.data());
               if (expect(at > 0 && at + 1 < passes.size(), "kernel has no surrounding query passes")) {
                 // a query has the clock as the pass before it ends (20.4.3): each one here follows a kernel or a

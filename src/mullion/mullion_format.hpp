@@ -7,6 +7,9 @@
 #include <map>
 
 namespace mullion {
+
+// dxgiformat.h of the toolchain ends before the Agility SDK's 4-bit format
+constexpr auto DXGI_FORMAT_A4B4G4R4_UNORM = (DXGI_FORMAT)191;
 enum class FormatCapability : int {
   None = 0,
   Atomic = 0x1,
@@ -43,6 +46,12 @@ Is_sRGBVariant(WMTPixelFormat format) {
 }
 
 bool IsBlockCompressionFormat(WMTPixelFormat format);
+
+// mipmap generation of a8unorm is borked, so it goes through an r8unorm view
+inline WMTPixelFormat
+MipmapFormat(WMTPixelFormat format) {
+  return format == WMTPixelFormatA8Unorm ? WMTPixelFormatR8Unorm : format;
+}
 
 uint32_t DepthStencilPlanarFlags(WMTPixelFormat format);
 
@@ -88,13 +97,31 @@ uint32_t MTLGetTexelSize(WMTPixelFormat format);
 
 FormatCapability MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability capability);
 
+// a typed unordered access view is of a buffer as well as a texture: `texture` is the format's capability, `buffer`
+// its buffer pixel format's
+bool TypedUnorderedAccess(FormatCapability texture, FormatCapability buffer);
+
 WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);
 
 bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);
 
 bool IsIntegerFormat(WMTPixelFormat format);
 
+// whether a texture of the format may be viewed in another of its type group that Metal reinterprets only through a
+// pixel format view, which it waives for sRGB twins. `fully_typed` takes D3D12's casts of fully typed resources, which
+// keep _FLOAT and other formats apart (DirectX-Specs, D3D12 Relaxed Format Casting Rules)
+bool CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed);
+
 void SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color);
+
+// the stored channel red, green, blue and alpha each land in: a view's component swizzle is undone for render target
+// writes, clears and write masks, which bypass it (B4G4R4A4 stores its channels rotated)
+std::array<uint8_t, 4> RenderTargetChannels(WMTPixelFormat format);
+
+WMTColorWriteMask RenderTargetWriteMask(WMTPixelFormat format, WMTColorWriteMask mask);
+
+// a clear color in the channels a render target stores
+std::array<float, 4> RenderTargetColor(WMTPixelFormat format, const float color[4]);
 
 // the range a border color clamps to before filtering (D3D11.3 7.18.9.1): normalized formats' own, the rest as their
 // clear colors clamp

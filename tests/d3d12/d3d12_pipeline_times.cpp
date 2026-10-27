@@ -391,10 +391,7 @@ main(int argc, char **argv) {
   for (const char *mode : {"never", "first", "second"})
     for (const char *setting : {static_cast<const char *>(nullptr), "0", "2"}) {
       step("%s child, MULLION_D3D12_GPU_ERRORS=%s", mode, setting ? setting : "unset");
-      if (!expect(GetTempFileNameA(temporary, "pso", 0, directory), "temporary name found"))
-        return verdict();
-      DeleteFileA(directory);
-      if (!expect(CreateDirectoryA(directory, nullptr), "log directory created"))
+      if (!expect(temporary_directory(temporary, "pso", directory), "log directory created"))
         return verdict();
       SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
       SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");

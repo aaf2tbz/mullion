@@ -86,6 +86,9 @@ enum class MTLAttributeFormat {
   Half = 53,
   FloatRG11B10 = 54,
   FloatRGB9E5 = 55,
+  // WMTAttributeFormat's encodings past Metal's
+  UInt1010102 = 0x100,
+  UChar4Normalized_BGRX,
 };
 
 AIRBuilderResult pull_vec4_from_addr(

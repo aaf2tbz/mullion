@@ -31,6 +31,7 @@
 #include "mullion_format.hpp"
 #include "mullion_info.hpp"
 #include "mullion_presenter.hpp"
+#include "mullion_ring_bump_allocator.hpp"
 #include "mullion_texture.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
@@ -41,6 +42,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 
 #define IMPLEMENT_ME                                                                                                   \
   do {                                                                                                                 \
@@ -137,10 +139,12 @@ extern const std::string dump_frames;
 
 class MTLD3D12CommandQueue : public ID3D12CommandQueue {
 public:
-  // `swapchain` owns the presenter and what it draws with: a present the queue holds back keeps it
+  // `swapchain` owns the presenter and what it draws with: a present the queue holds back keeps it. `copies` take
+  // `previous` onto every slice of `backbuffer` first; `view` of it is shown
   virtual HRESULT Present(
-      IUnknown *swapchain, Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
-      uint64_t id, uint64_t number
+      IUnknown *swapchain, Presenter *presenter, ID3D12Resource *backbuffer, TextureViewKey view,
+      HANDLE hLantecyWaitable, double after, uint64_t id, uint64_t number, ID3D12Resource *previous = nullptr,
+      std::vector<PresentCopy> copies = {}
   ) = 0;
 };
 
@@ -276,18 +280,26 @@ class MTLD3D12Heap : public ID3D12Heap {
 public:
   WMT::Reference<WMT::Heap> heap;
   std::shared_ptr<void> memory;
+  // a heap of textures alone that the CPU never reaches is private, as its textures then are (Metal places only
+  // resources of the heap's storage mode)
+  bool private_storage = false;
 };
 
 struct Reached {
   std::atomic<uint64_t> value;
 
+  virtual ~Reached() = default;
+
   // a signal runs those that wait for its value or less, each once and before it returns. what waited is not asked
   // again when the value is taken back: a queue's Wait is over once the fence has had its value (vkd3d-proton's
   // test_cpu_signal_fence and test_fence_signal_availability have both from Windows)
   void
-  Reach(uint64_t reached) {
+  Reach(uint64_t reached, bool terminal = false) {
     decltype(waiting_) done; // ends after the lock: what a waiter kept alive may come back in here as it goes
     std::lock_guard<mullion::mutex> lock(mutex_);
+    if (terminal_)
+      return;
+    terminal_ = terminal;
     value = reached;
     std::erase_if(waiting_, [&](auto &wait) {
       return wait.first <= reached && (wait.second(), done.push_back(std::move(wait)), true);
@@ -297,7 +309,10 @@ struct Reached {
   void
   Expect(uint64_t expected, std::function<void()> &&reached) {
     std::lock_guard<mullion::mutex> lock(mutex_);
-    expected <= value ? reached() : (void)waiting_.emplace_back(expected, std::move(reached));
+    if (expected <= value)
+      return reached();
+    waiting_.emplace_back(expected, std::move(reached));
+    Waiting(expected);
   }
 
   // a flag for a thread to wait on
@@ -311,15 +326,26 @@ struct Reached {
     return reached;
   }
 
+protected:
+  // a value that others can reach too is watched for once something waits for it
+  virtual void
+  Waiting(uint64_t expected) {}
+
 private:
   mullion::mutex mutex_;
+  bool terminal_ = false;
   std::vector<std::pair<uint64_t, std::function<void()>>> waiting_;
 };
 
-class MTLD3D12Fence : public ID3D12Fence1, public Reached {
+class MTLD3D12Fence : public ID3D12Fence1 {
 public:
+  std::shared_ptr<Reached> completion = std::make_shared<Reached>();
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
+  // the fence's value from now on, which a shared fence also gives the devices it is shared with
+  virtual void Signaled(uint64_t value) = 0;
+  // a shared fence's D3DKMT allocation, which a handle shares; 0 for a fence that is not shared
+  virtual D3DKMT_HANDLE SharedAllocation() = 0;
 };
 
 class MTLD3D12RootSignature : public ID3D12RootSignature {
@@ -380,6 +406,7 @@ public:
 
 class MTLD3D12QueryHeap : public ID3D12QueryHeap {
 public:
+  D3D12_QUERY_HEAP_DESC desc;
   // occlusion results, one 64-bit value per query, stream output statistics (two) or pipeline statistics
   WMT::Reference<WMT::Buffer> results;
   uint64_t results_address = 0;
@@ -408,8 +435,9 @@ public:
   // writes shaders that failed to compile to MULLION_SHADER_DUMP_PATH, when set, as <sha1>.dxbc for airconv's CLI
   static void DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
 
-  // the SHA-1 of each of its shaders, which is what logs call the pipeline. with MULLION_LOG_LEVEL=trace every shader
-  // is also written as DumpShaders writes them, so that a pass a log names can be looked at
+  // the SHA-1 of each of its shaders, which is what logs call the pipeline. with MULLION_LOG_LEVEL=trace or
+  // MULLION_SHADER_DUMP_ALL=1 every shader is also written as DumpShaders writes them, so that a pass a log or a
+  // profile names can be looked at
   std::string name;
   void Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
 };
@@ -426,6 +454,8 @@ public:
   bool geometry_shader = false;
   // a stage reads or writes a UAV: only then can a UAV barrier order anything a draw of it does inside a render pass
   bool uses_uav = false;
+  // its pixel shader blends a target itself, reading the blend factor after the depth ranges (SM50_SHADER_BLEND)
+  bool shader_blend = false;
   WMT::Reference<WMT::RenderPipelineState> pso_strip;
   // the vertex shader's output registers, which size a geometry pipeline's object threadgroups (get_gs_vertex_count)
   uint32_t vertex_registers = 0;
@@ -438,12 +468,11 @@ public:
   // the mesh threadgroups an object threadgroup starts for each primitive: the geometry shader's instances, 1 when
   // the mesh stage only passes primitives on, 0 when it starts none (stream output alone)
   uint32_t mesh_instances = 0;
-  // stream output without a geometry shader streams from the object stage, and rasterizes with this ordinary pipeline
-  WMT::Reference<WMT::RenderPipelineState> so_raster;
   // a pipeline without a geometry shader, whose topologies with adjacency run as geometry pipelines that pass the
-  // primitives on: by strip, and for stream output's counting pass. null when it cannot be made
-  bool adjacency = false;
-  virtual WMT::RenderPipelineState AdjacencyPipeline(bool strip, bool counting) = 0;
+  // primitives on; and one of stream output alone of patches, whose control points only the topology tells. their
+  // Metal pipelines are made by topology, and for stream output's counting pass. null when it cannot be made
+  bool adjacency = false, patches = false;
+  virtual WMT::RenderPipelineState TopologyPipeline(D3D12_PRIMITIVE_TOPOLOGY topology, bool counting) = 0;
   // a mesh shader pipeline: its amplification shader's threadgroup size (ones without one) and its mesh shader's
   bool mesh_shader = false;
   uint32_t object_threads[3] = {1, 1, 1}, mesh_threads[3] = {1, 1, 1};
@@ -496,6 +525,10 @@ class MTLD3D12Device : public ID3D12Device10 {
 public:
   virtual WMT::Device GetMTLDevice() = 0;
   TimestampSamples timestamp_samples;
+  struct {
+    mullion::mutex mutex;
+    std::unordered_set<std::shared_ptr<Reached>> values;
+  } fences;
 
   // the most mesh threadgroups an object threadgroup may start, which a pipeline tells; 0 until one has
   std::atomic<uint32_t> max_mesh_threadgroups{0};
@@ -528,6 +561,12 @@ public:
 
   // the GPU address of the lock words of 64-bit atomics, which every root signature carries (AtomicLocksQword)
   virtual uint64_t GetAtomicLocks() = 0;
+  // the GPU address of zeros as many as a constant buffer holds, where a null buffer view points: a shader's load
+  // past a view's end reads the view's start and drops what it read (dxbc_converter_base.cpp LoadBufferValue), and
+  // an Apple GPU may fault on memory that is not there
+  virtual uint64_t GetNullBuffer() = 0;
+  // the buffer of those zeros
+  virtual obj_handle_t GetNullBufferHandle() = 0;
   // removes the device if a 64-bit atomic gave up waiting for its lock (dxil_converter.cpp)
   virtual void CheckAtomicLocks() = 0;
 
@@ -536,6 +575,9 @@ public:
   virtual HRESULT GetAdapter(REFIID riid, void **ppAdapter) = 0;
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
+  // what shared fences need, made with the first: a D3DKMT device, and a listener for their events
+  virtual D3DKMT_HANDLE GetLocalD3DKMT() = 0;
+  virtual EventListener &GetEventListener() = 0;
   // commits the global residency set's changes; queues call it before committing a command buffer
   virtual void CommitResidency() = 0;
   // MULLION_D3D12_GPU_ERRORS: passes carry the names of their pipelines to Metal, whose report of a command buffer
@@ -548,6 +590,12 @@ public:
   virtual void PipelineMade(const std::string &name, const char *kind, std::chrono::steady_clock::time_point start) = 0;
   virtual void ReportPipelineTotals() = 0;
 
+  bool
+  UsesMetal4() {
+    static const bool enabled = env::getEnvVar("MULLION_D3D12_METAL4") != "0";
+    return enabled && GetMTLDevice().supportsFamily(WMTGPUFamilyMetal4);
+  }
+
   virtual HRESULT RegisterResidency(WMT::Allocation allocation) = 0;
 
   virtual HRESULT UnregisterResidency(WMT::Allocation allocation) = 0;
@@ -556,7 +604,9 @@ public:
 
   virtual HRESULT UnregisterResidencyAndVA(BufferAllocation *allocation) = 0;
 
-  virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
+  // pEnd, when given, is where the addresses that find the same buffer end: its end, or the next buffer's start
+  virtual BufferAllocation *
+  LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pEnd = nullptr) = 0;
 
   virtual void UpdateSparseBufferMappings(
       BufferAllocation *buffer, const std::vector<WMTSparseBufferMapping> &ranges
@@ -603,6 +653,10 @@ public:
   // whether acceleration structures keep what they were built from, which serializing and decoding them gives back
   // (d3d12.keepAccelerationStructureInputs)
   bool keep_structure_inputs = true;
+
+  // the scratch area each list's indirect stream output commands share, from D3D11's start (kStagingBlockSize): a
+  // command that lacked room was not run, and grows it for lists recorded later
+  std::atomic<uint64_t> so_scratch_budget = kStagingBlockSize;
 };
 
 HRESULT CreateD3D12Device(IMTLDXGIAdapter *adapter, REFIID riid, void **ppDevice);
@@ -643,6 +697,7 @@ struct D3D12SwapChainBufferRefs {
   mullion::mutex mutex;
 };
 
+// pTexture: the texture it is, which another module made
 HRESULT CreateCommittedTexture(
     MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags,
     const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue,
@@ -708,6 +763,12 @@ CreateSwapChain(
 
 HRESULT
 CreateFence(MTLD3D12Device *pDevice, UINT64 InitialValue, D3D12_FENCE_FLAGS Flags, REFIID riid, void **ppFence);
+
+// the fence a handle shares (ID3D12Device::OpenSharedHandle), whose event and D3DKMT allocation openSharedEvent gave
+HRESULT OpenFence(
+    MTLD3D12Device *pDevice, WMT::Reference<WMT::SharedEvent> &&Event, D3DKMT_HANDLE Allocation, REFIID riid,
+    void **ppFence
+);
 
 void PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC const &Desc);
 

@@ -9,6 +9,9 @@
 // "represents the index value" (8.16). every vertex is a point at its own pixel; additive blending counts each read,
 // including repeated zeros at BaseVertexLocation. indices behind the view name other pixels. CASE=n (argv[2]) selects
 // one draw; only indirect starts far past the allocation run in child processes, so a GPU fault is isolated.
+// an index-view argument is reset to null after ExecuteIndirect (Microsoft Learn, Indirect Drawing), while a
+// signature without that argument preserves the bound view. a second indexed draw in the same list checks this.
+// https://learn.microsoft.com/en-us/windows/win32/direct3d12/indirect-drawing
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <limits>
@@ -45,12 +48,11 @@ main(int argc, char **argv) {
       const UINT period = last / index_size + 1;
       const UINT zeros = system.dwAllocationGranularity / (mode ? sizeof(UINT16) : index_size);
       for (auto [start, count] : {std::pair<UINT, UINT>{0, 0}, {0, there}, {there - 1, 2},
-                                 {there, 1}, {there + 1, there + 1}, {last, 1}, {period, 1},
+                                 {there, 1}, {there + 1, there + 1}, {last, 1}, {last, 2}, {last, there + 2}, {period, 1},
                                  {there, zeros - 1}, {there, zeros}})
         cases.push_back({format, mode, start, count});
       if (!mode)
-        for (auto [start, count] : {std::pair<UINT, UINT>{there, zeros + 1}, {last, 2}, {last, there + 2}})
-          cases.push_back({format, mode, start, count});
+        cases.push_back({format, mode, there, zeros + 1});
     }
   int only = -1;
   for (int i = 2; i < argc; i++)
@@ -137,7 +139,9 @@ main(int argc, char **argv) {
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT64 bytes;
   device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+  const UINT64 alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+  const UINT64 second_offset = (bytes + alignment - 1) / alignment * alignment;
+  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, second_offset + bytes, D3D12_RESOURCE_STATE_COPY_DEST);
   auto vertices = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, width * sizeof(UINT), D3D12_RESOURCE_STATE_GENERIC_READ);
   UINT *columns;
   CHECK(vertices->Map(0, nullptr, (void **)&columns));
@@ -220,6 +224,13 @@ main(int argc, char **argv) {
         dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {.PlacedFootprint = footprint}};
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    list->DrawIndexedInstanced(1, 1, 0, 0, 0);
+    transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto after_dst = dst;
+    after_dst.PlacedFootprint.Offset += second_offset;
+    list->CopyTextureRegion(&after_dst, 0, 0, 0, &src, nullptr);
+    transition(list.Get(), target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     CHECK(submit(device.Get(), queue.Get(), list.Get()));
     std::vector<float> want(width);
     for (UINT i = 0; i < count; i++) {
@@ -230,6 +241,9 @@ main(int argc, char **argv) {
     CHECK(readback->Map(0, nullptr, (void **)&pixels));
     for (UINT x = 0; x < width; x++)
       expect(pixels[x] == want[x], "pixel %u counts %.0f indices, want %.0f", x, pixels[x], want[x]);
+    const float *after = reinterpret_cast<const float *>(reinterpret_cast<const char *>(pixels) + second_offset);
+    for (UINT x = 0; x < width; x++)
+      expect(after[x] == float(x == (mode == 2 ? 0 : indices[0])), "after argument reset, pixel %u is %.0f", x, after[x]);
     readback->Unmap(0, nullptr);
     expect(device->GetDeviceRemovedReason() == S_OK, "device removed after the indexed draw");
 

@@ -185,7 +185,7 @@ public:
   QueryInterface(REFIID riid, void **ppvObject) final {
 
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -215,7 +215,7 @@ public:
   STDMETHODCALLTYPE
   GetDesc(DXGI_OUTPUT_DESC *pDesc) final {
     if (pDesc == nullptr)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     if (!wsi::getDesktopCoordinates(monitor_, &pDesc->DesktopCoordinates)) {
       ERR("Failed to query monitor coords");
@@ -238,7 +238,7 @@ public:
   GetDisplayModeList(DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes,
                      DXGI_MODE_DESC *pDesc) final {
     if (pNumModes == nullptr)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     std::vector<DXGI_MODE_DESC1> modes;
 
@@ -268,7 +268,7 @@ public:
                           DXGI_MODE_DESC *pClosestMatch,
                           IUnknown *pConcernedDevice) final {
     if (!pModeToMatch || !pClosestMatch)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     DXGI_MODE_DESC1 modeToMatch;
     modeToMatch.Width = pModeToMatch->Width;
@@ -316,7 +316,7 @@ public:
   GetGammaControlCapabilities(
       DXGI_GAMMA_CONTROL_CAPABILITIES *gamma_caps) final {
     if (gamma_caps == nullptr || !monitor_state_.fullscreens)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     gamma_caps->ScaleAndOffsetSupported = false;
     gamma_caps->MaxConvertedValue = 1.0f;
@@ -330,8 +330,8 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   SetGammaControl(const DXGI_GAMMA_CONTROL *gamma_control) final {
-    if (gamma_control == nullptr)
-      return DXGI_ERROR_INVALID_CALL;
+    if (gamma_control == nullptr || !monitor_state_.fullscreens)
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     for (uint32_t i = 0; i < MULLION_GAMMA_CP_COUNT; i++) {
       monitor_state_.gamma.red[i] = gamma_control->GammaCurve[i].Red;
@@ -345,8 +345,8 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetGammaControl(DXGI_GAMMA_CONTROL *gamma_control) final {
-    if (gamma_control == nullptr)
-      return DXGI_ERROR_INVALID_CALL;
+    if (gamma_control == nullptr || !monitor_state_.fullscreens)
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     gamma_control->Scale = { 1.0f, 1.0f, 1.0f };
     gamma_control->Offset = { 0.0f, 0.0f, 0.0f };
@@ -385,7 +385,7 @@ public:
   GetDisplayModeList1(DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes,
                       DXGI_MODE_DESC1 *pDesc) final {
     if (pNumModes == nullptr)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     // Special case, just return zero modes
     if (EnumFormat == DXGI_FORMAT_UNKNOWN) {
@@ -466,14 +466,14 @@ public:
                            DXGI_MODE_DESC1 *pClosestMatch,
                            IUnknown *pConcernedDevice) final {
     if (!pModeToMatch || !pClosestMatch)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     if (pModeToMatch->Format == DXGI_FORMAT_UNKNOWN && !pConcernedDevice)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     // Both or neither must be zero
     if ((pModeToMatch->Width == 0) ^ (pModeToMatch->Height == 0))
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     wsi::WsiMode activeWsiMode = {};
     wsi::getCurrentDisplayMode(monitor_, &activeWsiMode);
@@ -514,7 +514,7 @@ public:
     }
 
     UINT modeCount = 0;
-    GetDisplayModeList1(targetFormat, DXGI_ENUM_MODES_SCALING, &modeCount,
+    GetDisplayModeList1(targetFormat, DXGI_ENUM_MODES_SCALING | DXGI_ENUM_MODES_INTERLACED, &modeCount,
                         nullptr);
 
     if (modeCount == 0) {
@@ -523,7 +523,7 @@ public:
     }
 
     std::vector<DXGI_MODE_DESC1> modes(modeCount);
-    GetDisplayModeList1(targetFormat, DXGI_ENUM_MODES_SCALING, &modeCount,
+    GetDisplayModeList1(targetFormat, DXGI_ENUM_MODES_SCALING | DXGI_ENUM_MODES_INTERLACED, &modeCount,
                         modes.data());
 
     FilterModesByDesc(modes, *pModeToMatch);
@@ -560,15 +560,8 @@ public:
   STDMETHODCALLTYPE
   DuplicateOutput(IUnknown *pDevice,
                   IDXGIOutputDuplication **ppOutputDuplication) final {
-    InitReturnPtr(ppOutputDuplication);
-
-    if (!pDevice)
-      return E_INVALIDARG;
-
-    ERR("Not implemented");
-
-    // At least return a valid error code
-    return DXGI_ERROR_UNSUPPORTED;
+    const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    return DuplicateOutput1(pDevice, 0, 1, &format, ppOutputDuplication);
   }
 
   HRESULT
@@ -596,7 +589,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_OUTPUT_DESC1 *pDesc) override {
     if (pDesc == nullptr)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     if (!wsi::getDesktopCoordinates(monitor_, &pDesc->DesktopCoordinates)) {
       ERR("Failed to query monitor coords");
@@ -647,8 +640,17 @@ public:
                    const DXGI_FORMAT *formats,
                    IDXGIOutputDuplication **ppOutputDuplication) override {
     InitReturnPtr(ppOutputDuplication);
-    if (!pDevice)
-      return E_INVALIDARG;
+    Com<IDXGIDevice> device;
+    if (!ppOutputDuplication || !pDevice || FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&device))))
+      return FAIL(E_INVALIDARG);
+    Com<IDXGIAdapter> adapter;
+    Com<IDXGIFactory1> factory;
+    DXGI_ADAPTER_DESC desc{}, own_desc{};
+    if (FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetParent(IID_PPV_ARGS(&factory))) ||
+        FAILED(adapter->GetDesc(&desc)) || FAILED(adapter_->GetDesc(&own_desc)) ||
+        desc.AdapterLuid.LowPart != own_desc.AdapterLuid.LowPart ||
+        desc.AdapterLuid.HighPart != own_desc.AdapterLuid.HighPart)
+      return FAIL(E_INVALIDARG);
 
     ERR("Not implemented");
 

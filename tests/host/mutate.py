@@ -7,6 +7,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -282,6 +283,65 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                             process.kill()
                         process.join(5)
 
+    def test_runner_installation_lifetime(self):
+        ctx = multiprocessing.get_context("fork")
+        first, second, started, release = (ctx.Event() for _ in range(4))
+        with tempfile.TemporaryDirectory() as tmp:
+            def runner(entered, wait):
+                temporary = Path(tmp) / str(os.getpid())
+                temporary.mkdir()
+                def environment(_):
+                    entered.set()
+                    return [], None, {}
+
+                def own(*_):
+                    if wait and not release.wait(5):
+                        raise RuntimeError("runner was not released")
+                    return 0
+
+                with patch.object(sys, "argv", ["run.py", "--build", tmp, "--wine", tmp]), \
+                     patch.object(tempfile, "gettempdir", return_value=str(temporary)), \
+                     patch.object(tool.test_run, "chosen", return_value=[]), \
+                     patch.object(tool.test_run, "environment", environment), \
+                     patch.object(tool.test_run, "own", own):
+                    started.set()
+                    tool.test_run.main()
+
+            processes = [ctx.Process(target=runner, args=(first, True)), ctx.Process(target=runner, args=(second, False))]
+            try:
+                processes[0].start()
+                self.assertTrue(first.wait(5))
+                started.clear()
+                processes[1].start()
+                self.assertTrue(started.wait(5))
+                self.assertFalse(second.wait(0.3), "another runner installed DLLs before the running test finished")
+                release.set()
+                self.assertTrue(second.wait(5))
+                for process in processes:
+                    process.join(5)
+                    self.assertEqual(process.exitcode, 0)
+            finally:
+                release.set()
+                for process in processes:
+                    if process.pid is not None:
+                        if process.is_alive():
+                            process.kill()
+                        process.join(5)
+
+    def test_runner_readonly_wine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wine = Path(tmp) / "wine"
+            wine.mkdir(mode=0o500)
+            try:
+                with patch.object(sys, "argv", ["run.py", "--build", tmp, "--wine", str(wine), "--no-install"]), \
+                     patch.object(tool.test_run, "chosen", return_value=[]), \
+                     patch.object(tool.test_run, "environment", return_value=([], None, {})), \
+                     patch.object(tool.test_run, "own", return_value=0), self.assertRaises(SystemExit) as ended:
+                    tool.test_run.main()
+                self.assertEqual(ended.exception.code, 0)
+            finally:
+                wine.chmod(0o700)
+
     def test_lock_dead_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock = Path(tmp) / "gpu.lock"
@@ -393,8 +453,186 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             from argparse import Namespace
             args = Namespace(build=[root], tests=["test"], suite=[], exact=True)
             self.assertEqual([t["name"] for t in run.chosen(args)], ["test"])
-            args.exact = False
+            # a whole name that is not a test is a mistake, not a smaller selection
+            args.tests = ["test", "tset"]
+            with self.assertRaises(SystemExit):
+                run.chosen(args)
+            args.tests, args.exact = ["test"], False
             self.assertEqual(len(run.chosen(args)), 2)
+            (root / "meson-info/intro-benchmarks.json").write_text(json.dumps([
+                {"name": "test", "cmd": [str(exe), "bench"], "suite": []}]))
+            args.benchmark = True
+            self.assertEqual([t["cmd"] for t in run.chosen(args)], [[str(exe), "bench"]])
+
+    def test_runner_schedule(self):
+        # --jobs runs tests side by side, one meson declares not parallel after them by itself, and a test that failed
+        # beside others again alone, which a test already run alone is not
+        import run
+        from argparse import Namespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = ("import sys, time; name, at = sys.argv[1], sys.argv[2]; log = open(at + '/runs', 'a', buffering=1)\n"
+                      "log.write(f'start {name} {time.time()}\\n'); time.sleep(0.5)\n"
+                      "first = name != 'flaky' or not __import__('os').path.exists(at + '/flaky')\n"
+                      "name == 'flaky' and open(at + '/flaky', 'a'); log.write(f'end {name} {time.time()}\\n')\n"
+                      "ok = name != 'serial' and (name != 'flaky' or not first)\n"
+                      "print('passed: ok' if ok else 'failed: wrong'); sys.exit(0 if ok else 1)")
+            tests = [{"name": name, "cmd": [sys.executable, "-c", script, name, tmp], "env": {}, "timeout": 30,
+                      "is_parallel": name != "serial"} for name in ["a", "b", "flaky", "serial"]]
+            args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=len(tests))
+            run.KNOWN = root / "known.txt"
+            with redirect_stdout(StringIO()) as out:
+                failed = run.own(args, tests, [root], None, dict(os.environ))
+            runs = [line.split() for line in (root / "runs").read_text().splitlines()]
+            at = {}
+            for word, name, t in runs:
+                at.setdefault((word, name), []).append(float(t))
+            self.assertEqual(failed, 1, out.getvalue())
+            self.assertLess(at["start", "b"][0], at["end", "a"][0])
+            self.assertLess(at["start", "a"][0], at["end", "b"][0])
+            self.assertGreaterEqual(at["start", "serial"][0],
+                                    max(at["end", name][0] for name in ["a", "b", "flaky"]))
+            self.assertEqual((len(at["start", "serial"]), len(at["start", "flaky"])), (1, 2))
+            self.assertIn("passed alone after failing beside others: native flaky", out.getvalue())
+
+    def test_runner_known(self):
+        # a failure or skip counts unless tests/known.txt has it by what the test said; a listed test that passes counts
+        # too, so a known line never outlives its cause and hides the next failure of that test. a test that stopped
+        # early cannot be listed: it hides every case after where it stopped
+        import run
+        from argparse import Namespace
+        said = {"same": "failed: 3 wrong results", "other": "failed: 3 wrong results", "fixed": "passed: 0 wrong results",
+                "fresh": "failed: hr (line 280)", "skip": "skipped: no 16x", "fine": "passed: 0 wrong results"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+            (root / "a.txt").write_text("wrong: a\n")
+            three, two, one = (run.signature(f"failed: {n} wrong results", root / "a.txt") for n in (3, 2, 1))
+            run.KNOWN = root / "known.txt"
+            run.KNOWN.write_text(f"# a comment\nnative({chip}) same {three} -- the cause\n"
+                                 f"native({chip}) other {two} -- the cause\n"
+                                 f"native({chip}) fixed {one} -- the cause\n"
+                                 f"9 same {three} -- another family's\n")
+            tests = [{"name": name, "cmd": [sys.executable, "-c", "import sys; print(('wrong: a\\n' if 'wrong' in sys.argv[1] "
+                                            "else '') + sys.argv[1]); sys.exit({'passed': 0, 'skipped': 77}"
+                                            ".get(sys.argv[1].split(':')[0], 1))", text],
+                      "env": {}, "timeout": 2, "is_parallel": True} for name, text in said.items()]
+            args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1)
+            with redirect_stdout(StringIO()) as out:
+                counted = run.own(args, tests, [root], None, dict(os.environ))
+            lines = out.getvalue().splitlines()
+            self.assertEqual(sorted(re.findall(r"^(?:new|passes, still listed as known): native\([^)]*\) (\S+)",
+                                               out.getvalue(), re.M)), ["fixed", "fresh", "other", "skip"], out.getvalue())
+            self.assertEqual(counted, 4)
+            self.assertIn(f"new: native({chip}) other {three} (known: {two})", lines)
+            self.assertIn("1 known, each with its cause in " + str(run.KNOWN), lines)
+            for line in [f"9 same {three}", "9 fresh failed: hr (line 280) -- the cause", "9 same failed: 3 wrong results -- the cause"]:
+                run.KNOWN.write_text(line + "\n")
+                with self.assertRaises(SystemExit, msg=line):
+                    run.known()
+            run.KNOWN.write_text("9 skip skipped: no 16x -- the cause\n")
+            self.assertEqual(run.known(), {("9", "skip"): "skipped: no 16x"})
+            # a list to compare with that is not there is a mistake, not an empty list
+            with self.assertRaises(SystemExit), redirect_stdout(StringIO()):
+                run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, known=root / "none.txt"),
+                        tests[:1], [root], None, dict(os.environ))
+            # a validated run is compared with its own list
+            run.KNOWN_VALIDATED = root / "known-validated.txt"
+            run.KNOWN_VALIDATED.write_text(f"native({chip}) skip skipped: no 16x -- the cause\n")
+            with redirect_stdout(StringIO()) as out:
+                counted = run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, validate=True),
+                                  [test for test in tests if test["name"] == "skip"], [root], None, dict(os.environ))
+            self.assertEqual(counted, 0, out.getvalue())
+            self.assertIn("1 known, each with its cause in " + str(run.KNOWN_VALIDATED), out.getvalue().splitlines())
+
+    def test_runner_answers(self):
+        # one count of wrong results is two failures when the results differ, and a test that answers differently on
+        # a repeat has failed, whatever it said each time
+        import run
+        from argparse import Namespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+            (root / "a.txt").write_text("wrong: a 1,1 = 0\nfailed: 1 wrong results\n")
+            (root / "hung.txt").write_text("step: 2\n")
+            self.assertEqual(run.signature("still running after 31 s: step: 2", root / "hung.txt"), "still running")
+            run.KNOWN = root / "known.txt"
+            known = run.signature("failed: 1 wrong results", root / "a.txt")
+            run.KNOWN.write_text("".join(f"native({chip}) {name} {known} -- the cause\n" for name in ["same", "twin"]))
+            script = ("import sys; name, at = sys.argv[1], sys.argv[2]; open(at, 'a').write('x'); runs = len(open(at).read())\n"
+                      "said = {'same': 'a', 'twin': 'b', 'flip': 'a' if runs == 1 else None}[name]\n"
+                      "print(f'wrong: {said} 1,1 = 0\\nfailed: 1 wrong results' if said else 'passed: 0 wrong results')\n"
+                      "sys.exit(1 if said else 0)")
+            tests = [{"name": name, "cmd": [sys.executable, "-c", script, name, str(root / name)], "env": {},
+                      "timeout": 30, "is_parallel": True} for name in ["same", "twin", "flip"]]
+            args = Namespace(late=None, family="native", benchmark=False, repeat=2, jobs=1, record=root / "record.txt")
+            with redirect_stdout(StringIO()) as out:
+                counted = run.own(args, tests, [root], None, dict(os.environ))
+            self.assertEqual(sorted(re.findall(r"^new: native\([^)]*\) (\S+)", out.getvalue(), re.M)), ["flip", "twin"],
+                             out.getvalue())
+            # what a run records is what a later run compares with: every failure, the unstable one included, which
+            # cannot be compared with
+            recorded = args.record.read_text().splitlines()
+            self.assertEqual(sorted(re.match(r"native\([^)]*\) (\S+)", line)[1] for line in recorded), ["flip", "same", "twin"])
+            with self.assertRaises(SystemExit):
+                run.known(args.record)
+            args.record.write_text("".join(line + "\n" for line in recorded if " flip " not in line))
+            self.assertEqual(run.known(args.record)[f"native({chip})", "same"], known)
+            self.assertEqual(set(run.known(args.record)), {(f"native({chip})", "same"), (f"native({chip})", "twin")})
+            self.assertEqual(counted, 2)
+            self.assertRegex(out.getvalue(), r"failed +flip .*unstable: ")
+            self.assertEqual([len((root / name).read_text()) for name in ["same", "twin", "flip"]], [2, 2, 2])
+
+    def test_faults(self):
+        # a fault is caught only when its test answers differently than on the unfaulted build, whatever known.txt holds:
+        # a test that already fails, and fails the same with the fault, has not caught it. the fault is built from the
+        # faulted source alone, without the fault before it, and one that does not apply, build or run is not caught
+        import faults
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, breaks = root / "src", root / "src" / "tests" / "breaks"
+            breaks.mkdir(parents=True)
+            (source / "meson.build").write_text("project('t', 'c')\nexecutable('value', 'value.c')\n")
+            (source / "value.c").write_text('#include <stdio.h>\nint main(void) { puts("1"); return 0; }\n')
+            (source / "other.txt").write_text("a\n")
+            value = lambda said: f'--- a/value.c\n+++ b/value.c\n@@ -2 +2 @@\n-int main(void) {{ puts("1"); return 0; }}\n+{said}\n'
+            (breaks / "t.1.patch").write_text("# a value the test sees\n# family 9\n" + value('int main(void) { puts("2"); return 0; }'))
+            (breaks / "t.2.patch").write_text("# a change the test does not see\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n")
+            (breaks / "t.3.patch").write_text("# made for another source\n" + value("x").replace('"1"', '"3"', 1))
+            (breaks / "u.patch").write_text("# does not compile\n" + value("int main(void) {"))
+            (breaks / "v.patch").write_text("# its test does not run\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+c\n")
+            subprocess.run(["meson", "setup", root / "lib", source, "-Dbuildtype=release"], check=True, capture_output=True)
+            subprocess.run(["ninja", "-C", root / "lib"], check=True, capture_output=True)
+            (root / "tests" / "meson-info").mkdir(parents=True)
+            (root / "tests" / "meson-info" / "intro-tests.json").write_text(json.dumps([{"name": n} for n in ["t", "t_dxil", "v"]]))
+            calls = root / "calls"
+            # the unfaulted value 1 fails the test, as a known failure would; only another value is a new answer
+            (root / "run.py").write_text(
+                "import subprocess, sys\n"
+                f"a = sys.argv; open({str(calls)!r}, 'a').write(' '.join(a[1:]) + '\\n')\n"
+                "if a[a.index('--exact') + 1] == 'v':\n    sys.exit('no such test')\n"
+                "said = subprocess.run([a[2] + '/value'], capture_output=True, text=True).stdout.strip()\n"
+                "answer = '' if said == '0' else f'9 t failed: {said}'\n"
+                "if '--record' in a:\n    open(a[a.index('--record') + 1], 'w').write(answer + ' -- before\\n' if answer else '')\n"
+                "known = open(a[a.index('--known') + 1]).read() if '--known' in a else ''\n"
+                "print('0 known, each with its cause in known.txt')\n"
+                "if answer and answer + ' -- before' not in known:\n    print('new: ' + answer)\n")
+            faults.SOURCE, faults.RUN = source, root / "run.py"
+            with redirect_stdout(StringIO()) as out:
+                missed = faults.main(["--build", str(root / "lib"), "--build", str(root / "tests"), "--wine", str(root),
+                                      "t", "u", "v"])
+            self.assertEqual(out.getvalue().splitlines(), ["t.1.patch: caught, 9 t failed: 2", "t.2.patch: NOT CAUGHT",
+                                                           "t.3.patch: does not apply", "u.patch: does not build",
+                                                           "v.patch: did not run: no such test"])
+            self.assertEqual(missed, 4)
+            ran = calls.read_text().splitlines()
+            self.assertEqual(len(ran), 5, ran)
+            self.assertTrue(ran[0].startswith("--build " + str(root / "lib") + " ") and "--record" in ran[0], ran[0])
+            self.assertTrue(ran[1].startswith("--build " + str(root / "lib-fault") + " ") and "--known" in ran[1], ran[1])
+            self.assertIn("--build " + str(root / "tests"), ran[1])
+            self.assertIn("--family 9 --known", ran[1])
+            self.assertTrue(ran[1].endswith("--exact t t_dxil"), ran[1])
+            self.assertIn("--family native --record", ran[2])
 
     def test_stop_and_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:

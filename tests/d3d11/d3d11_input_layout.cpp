@@ -9,6 +9,7 @@
 // https://gitlab.winehq.org/wine/wine/-/blob/wine-11.0/dlls/d3d11/tests/d3d11.c
 // a zero-element layout covers an empty signature. InputSlotClass "must be same for all Elements at same InputSlot"
 // (D3D11.3 8.1.3), including unused elements; different slots may have different classifications.
+// InstanceDataStepRate "must be the same for all Elements at same InputSlot" and must be zero for per-vertex data.
 #define INITGUID
 #include "d3d11_test.hpp"
 #include <d3d10_1.h>
@@ -106,16 +107,18 @@ main() {
     auto id = [](const char *name) { return !_stricmp(name, "SV_VertexID") || !_stricmp(name, "SV_InstanceID"); };
     const UINT slots =
         sig.d3d10 ? D3D10_1_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT : D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
-    const UINT missing_all = parameters.size() + 2, mixed_slot = missing_all + 1, separate_slot = mixed_slot + 1;
+    const UINT missing_all = parameters.size() + 2, mixed_slot = missing_all + 1, separate_slot = mixed_slot + 1,
+               mixed_rate = separate_slot + 1;
     for (bool lower : {false, true})
       for (bool reverse : {false, true})
         for (auto classification : {D3D11_INPUT_PER_VERTEX_DATA, D3D11_INPUT_PER_INSTANCE_DATA})
           for (UINT slot : {0u, slots - 1})
-            for (UINT omitted = 0; omitted <= (sig.count == 1 ? separate_slot : missing_all); omitted++) {
+            for (UINT omitted = 0; omitted <= (sig.count == 1 ? mixed_rate : missing_all); omitted++) {
               const char *excluded = omitted == 0                    ? "none"
                                      : omitted == missing_all       ? "all"
                                      : omitted == mixed_slot        ? "unused element, mixed class in same slot"
                                      : omitted == separate_slot     ? "unused element, mixed class in different slot"
+                                     : omitted == mixed_rate        ? "unused element, different rate in same slot"
                                      : omitted > parameters.size()  ? "both IDs"
                                                                     : parameters[omitted - 1].SemanticName;
               step("D3D%u %s COUNT=%u lower=%u reverse=%u class=%u slot=%u omitted=%u (%s)", sig.d3d10 ? 10 : 11,
@@ -152,6 +155,10 @@ main() {
                   unused.InputSlot = slot ? 0 : slots - 1;
                 else
                   wanted = E_INVALIDARG;
+                elements.push_back(unused);
+              } else if (omitted == mixed_rate) {
+                unused.InstanceDataStepRate = 1;
+                wanted = E_INVALIDARG;
                 elements.push_back(unused);
               }
               const UINT num_elements = elements.size();

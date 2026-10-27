@@ -26,13 +26,15 @@ public:
     }
 
     VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
-        pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled});
+        pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled, pDesc->ClipDistances != 0});
 
     if (pDesc->PixelShader) {
       PixelShader = pDesc->PixelShader->get_pixel_shader(ShaderVariantPixel{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
-          unorm_output_reg_mask, pDesc->PipelineStatistics}, {rtv_formats, num_rtvs});
+          unorm_output_reg_mask, pDesc->PipelineStatistics, pDesc->BlendState->IsAlphaToCoverage(),
+          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->ClipDistances},
+          {rtv_formats, num_rtvs}, pDesc->BlendState);
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;
@@ -91,6 +93,9 @@ public:
     if (pBlendState) {
       pBlendState->SetupMetalPipelineDescriptor((WMTRenderPipelineBlendInfo *)&info, num_rtvs, ps_valid_render_targets);
     }
+    // explicit shader coverage disables A2C (D3D11.3 17.18)
+    if (description->PixelShader && description->PixelShader->reflection().PixelShader.HasCoverageOutput)
+      info.alpha_to_coverage_enabled = false;
 
     info.input_primitive_topology = topology_class;
     info.raster_sample_count = SampleCount;

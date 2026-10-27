@@ -6,8 +6,14 @@
 // "the runtime obtains the size from the output window" for zero dimensions (CreateSwapChainForHwnd, Remarks).
 // every size combination meets the same window and queue restrictions for both supported flip effects; two is the
 // minimum flip-model buffer count (Microsoft Learn, Direct3D 12 Swap Chains, Swap effects).
+// DXGI_SWAP_CHAIN_DESC1: "you must set the BufferCount member to from two to sixteen."
+// https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ns-dxgi1_2-dxgi_swap_chain_desc1
+// that page also requires SampleDesc {1,0}. CreateSwapChainForHwnd: "Only one flip presentation model swap chain
+// ... at a time may be associated with an HWND."
+// https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgifactory2-createswapchainforhwnd
 #include "d3d12_test.hpp"
 #include <dxgi1_4.h>
+#include <limits>
 
 int
 main() {
@@ -27,6 +33,85 @@ main() {
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   ComPtr<IDXGIFactory4> factory;
   CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+  {
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    ComPtr<ID3D12CommandQueue> queue;
+    CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
+    for (bool legacy : {false, true}) {
+      auto create = [&](const DXGI_SWAP_CHAIN_DESC1 &desc, ComPtr<IDXGISwapChain> &chain) {
+        if (legacy) {
+          DXGI_SWAP_CHAIN_DESC old{{desc.Width, desc.Height, {}, desc.Format}, desc.SampleDesc, desc.BufferUsage,
+                                   desc.BufferCount, window, TRUE, desc.SwapEffect, desc.Flags};
+          return factory->CreateSwapChain(queue.Get(), &old, &chain);
+        }
+        ComPtr<IDXGISwapChain1> made;
+        HRESULT hr = factory->CreateSwapChainForHwnd(queue.Get(), window, &desc, nullptr, nullptr, &made);
+        if (made)
+          expect(made.As(&chain) == S_OK, "swapchain interface");
+        return hr;
+      };
+      for (auto effect : {DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_SWAP_EFFECT_FLIP_DISCARD}) {
+        DXGI_SWAP_CHAIN_DESC1 desc{3, 5, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0},
+                                   DXGI_USAGE_RENDER_TARGET_OUTPUT, buffer_count};
+        desc.SwapEffect = effect;
+        for (UINT count = 0; count <= DXGI_MAX_SWAP_CHAIN_BUFFERS + 1; count++) {
+          step("%s effect %u buffer count %u", legacy ? "legacy" : "HWND", effect, count);
+          desc.BufferCount = count;
+          ComPtr<IDXGISwapChain> chain;
+          HRESULT hr = create(desc, chain);
+          bool valid = count >= buffer_count && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
+          expect(valid ? hr == S_OK : FAILED(hr), "count validation: %#lx", hr);
+          expect(bool(chain) == valid, "count validation output");
+          if (!valid || !chain)
+            continue;
+          for (UINT i = 0; i < count; i++) {
+            ComPtr<ID3D12Resource> back;
+            CHECK(chain->GetBuffer(i, IID_PPV_ARGS(&back)));
+            auto got = back->GetDesc();
+            expect(got.Width == desc.Width && got.Height == desc.Height && got.Format == desc.Format &&
+                       got.SampleDesc.Count == desc.SampleDesc.Count && got.SampleDesc.Quality == desc.SampleDesc.Quality,
+                   "buffer %u descriptor", i);
+          }
+          ComPtr<ID3D12Resource> past;
+          expect(FAILED(chain->GetBuffer(count, IID_PPV_ARGS(&past))) && !past, "GetBuffer past count");
+          for (bool extended : {false, true}) {
+            ComPtr<IDXGISwapChain3> chain3;
+            CHECK(chain.As(&chain3));
+            const UINT node = 1;
+            IUnknown *present_queue = queue.Get();
+            HRESULT resized = extended ? chain3->ResizeBuffers1(1, desc.Width, desc.Height, DXGI_FORMAT_UNKNOWN,
+                                                                 0, &node, &present_queue)
+                                       : chain->ResizeBuffers(1, desc.Width, desc.Height, DXGI_FORMAT_UNKNOWN, 0);
+            expect(FAILED(resized), "one-buffer flip ResizeBuffers%s: %#lx", extended ? "1" : "", resized);
+            DXGI_SWAP_CHAIN_DESC got{};
+            CHECK(chain->GetDesc(&got));
+            expect(got.BufferCount == count, "refused resize changed buffer count");
+          }
+        }
+        desc.BufferCount = buffer_count;
+        for (UINT samples : {0u, 1u, 2u, UINT(D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT),
+                             UINT(D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT) + 1, std::numeric_limits<UINT>::max()})
+          for (UINT quality : {0u, 1u, std::numeric_limits<UINT>::max()}) {
+            step("%s effect %u samples %u quality %u", legacy ? "legacy" : "HWND", effect, samples, quality);
+            desc.SampleDesc = {samples, quality};
+            ComPtr<IDXGISwapChain> chain;
+            HRESULT hr = create(desc, chain);
+            const bool valid = samples == 1 && !quality;
+            expect(valid ? hr == S_OK : FAILED(hr), "sample validation: %#lx", hr);
+            expect(bool(chain) == valid, "sample validation output");
+          }
+        desc.SampleDesc = {1, 0};
+        step("%s effect %u duplicate HWND and release/recreate", legacy ? "legacy" : "HWND", effect);
+        ComPtr<IDXGISwapChain> first, duplicate;
+        CHECK(create(desc, first));
+        HRESULT hr = create(desc, duplicate);
+        expect(FAILED(hr) && !duplicate, "second flip chain for HWND: %#lx", hr);
+        duplicate.Reset();
+        first.Reset();
+        CHECK(create(desc, first));
+      }
+    }
+  }
   for (int type = D3D12_COMMAND_LIST_TYPE_DIRECT; type <= D3D12_COMMAND_LIST_TYPE_COPY; type++) {
     if (type == D3D12_COMMAND_LIST_TYPE_BUNDLE)
       continue;
