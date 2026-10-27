@@ -210,10 +210,9 @@ def available():
 
 
 def measured(command, env):
-    """what a test runs as in PEAKS: its program, its arguments and the settings that change what memory it takes"""
-    return " ".join([*(Path(part).name for part in command),
-                     *(f"{name}={env[name]}" for name in ("MULLION_GPU_FAMILY", "MULLION_D3D12_METAL4", "MTL_DEBUG_LAYER")
-                       if name in env)])
+    """what a test runs as in PEAKS: its program and arguments, and Metal's validation, which multiplies its memory. a
+    family or a Metal version takes the test's other paths, whose peaks the most it took holds as well"""
+    return " ".join([*(Path(part).name for part in command), *(["validated"] if "MTL_DEBUG_LAYER" in env else [])])
 
 
 def peaks():
