@@ -755,6 +755,7 @@ struct ConservativeTriangle {
   using Weights = pvalue[3][3];
   Weights over_w, linear;                      // each point's weights of the corners
   pvalue position[3], rcp_w[3];                // each point's, and the plane's 1/w there
+  pvalue sum[3];                               // each point's sum of its linear weights, which blends divide by
   pvalue window[SM50_CONSERVATIVE_CORNERS][2]; // the polygon the pixel shader tests pixels against
   pvalue culled;                               // nothing of it is drawn
 };

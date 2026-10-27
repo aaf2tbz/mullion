@@ -3871,7 +3871,7 @@ convert_dxil(
           auto part = ir.CreateFMul(parts[u][k], real(word(conservative_vertices, corner[k], column)));
           sum = sum ? ir.CreateFAdd(sum, part) : part;
         }
-        return sum;
+        return ir.CreateFDiv(sum, triangle.sum[u]);
       };
       Value *vertex_base = ir.CreateMul(f, ir.getInt32(3)), *primitive = f;
       for (uint32_t u = 0; u < 3; u++) {

@@ -119,7 +119,7 @@ inline void compare(const Case &c, unsigned tier, const char *rows, size_t pitch
         for (unsigned lane = 0; lane < lanes; lane++)
           valid &= got[lane] == 0;
       if (!valid && wrong++ < 4)
-        expect(false, "conservative pixel %u,%u = {%g,%g,%g,%g}, required %u allowed %u", x, y, got[0], got[1], got[2],
+        expect(false, "conservative pixel %u,%u = {%.9g,%.9g,%.9g,%.9g}, required %u allowed %u", x, y, got[0], got[1], got[2],
                got[3], required, allowed);
     }
   if (!culled && tier >= 2)

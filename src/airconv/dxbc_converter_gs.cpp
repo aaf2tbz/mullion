@@ -288,22 +288,27 @@ conservative_triangle(
           use_moved, moved[u][axis], builder.CreateSelect(clockwise, box[u][axis], box[mirrored][axis])
       );
     auto [x, y] = ndc(point[0], point[1]);
-    pvalue weight[3], rcp_w = f(0), z = f(0);
+    // in floats the window barycentrics sum to about 1, so what is blended is divided by their sum: a constant
+    // input stays exact
+    pvalue weight[3], linear[3], rcp_w = f(0), z = f(0), sum = f(0);
     for (uint32_t j = 0; j < 3; j++) {
       weight[j] = div(add(add(mul(row[j][0], x), mul(row[j][1], y)), row[j][2]), det);
+      linear[j] = mul(weight[j], at(clip[j], 3));
       rcp_w = add(rcp_w, weight[j]);
       z = add(z, mul(weight[j], at(clip[j], 2)));
+      sum = add(sum, linear[j]);
     }
     for (uint32_t j = 0; j < 3; j++) {
       auto first = f(j == 0 ? 1.0 : 0.0);
       out.over_w[u][j] = builder.CreateSelect(degenerate, first, weight[j]);
-      out.linear[u][j] = builder.CreateSelect(degenerate, first, mul(weight[j], at(clip[j], 3)));
+      out.linear[u][j] = builder.CreateSelect(degenerate, first, linear[j]);
     }
-    out.rcp_w[u] = builder.CreateSelect(degenerate, f(1), rcp_w);
+    out.sum[u] = builder.CreateSelect(degenerate, f(1), sum);
+    out.rcp_w[u] = builder.CreateSelect(degenerate, f(1), div(rcp_w, sum));
     pvalue position = llvm::UndefValue::get(types._float4);
     position = builder.CreateInsertElement(position, x, uint64_t(0));
     position = builder.CreateInsertElement(position, y, uint64_t(1));
-    position = builder.CreateInsertElement(position, builder.CreateSelect(degenerate, first_depth, z), uint64_t(2));
+    position = builder.CreateInsertElement(position, builder.CreateSelect(degenerate, first_depth, div(z, sum)), uint64_t(2));
     out.position[u] = builder.CreateInsertElement(position, f(1), uint64_t(3));
   }
   return out;
@@ -347,7 +352,7 @@ conservative_point(
           auto part = builder.CreateFMul(parts[u][k], real(at(k)));
           sum = sum ? builder.CreateFAdd(sum, part) : part;
         }
-        component = builder.CreateBitCast(sum, types._int);
+        component = builder.CreateBitCast(builder.CreateFDiv(sum, triangle.sum[u]), types._int);
       }
       value = builder.CreateInsertElement(value, component, c);
     }
@@ -1736,7 +1741,7 @@ convert_pass_through_geometry_shader(
       auto part = builder.CreateFMul(parts[j][k], real(bits(k)));
       value = value ? builder.CreateFAdd(value, part) : part;
     }
-    return value;
+    return builder.CreateFDiv(value, triangle->sum[j]);
   };
   // a quadrilateral's corners are its ends' to either side, the first end's two then the second's
   for (uint32_t u = 0; u < corners; u++) {
