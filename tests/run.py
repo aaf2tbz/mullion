@@ -215,7 +215,7 @@ def finish(command, env, seconds, log):
                                 level = pressure()
                                 if level > 1:
                                     with PRESSED:
-                                        if process.pid == max(set(RUNNING), key=footprint):
+                                        if process.pid == max(set(RUNNING), key=footprint) and process.poll() is None:
                                             os.killpg(process.pid, signal.SIGKILL)
                                             with open(log, "a") as note:
                                                 note.write(f"failed: ended at the kernel's memory pressure level {level}, "
