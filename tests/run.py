@@ -79,12 +79,17 @@ def builtin(pe):
 
 
 def install(wine, prefix, unix, pe):
+    windows = prefix / "drive_c" / "windows"
     for path in pe.values():
-        shutil.copy2(path, prefix / "drive_c" / "windows" / "system32")
+        # a 32-bit library's system directory in a 64-bit prefix is syswow64
+        wow64 = windows / "syswow64"
+        shutil.copy2(path, wow64 if machine(path) == "i386" and wow64.is_dir() else windows / "system32")
         if builtin(path):
             shutil.copy2(path, wine / "lib" / "wine" / f"{machine(path)}-windows")
         if path.stem + ".so" in unix:
-            shutil.copy2(unix[path.stem + ".so"], wine / "lib" / "wine" / f"{machine(path)}-unix")
+            # a WoW64 Wine runs a 32-bit library's unix side as the host's, from the one unix directory it has
+            own = wine / "lib" / "wine" / f"{machine(path)}-unix"
+            shutil.copy2(unix[path.stem + ".so"], own if own.is_dir() else next((wine / "lib" / "wine").glob("*-unix")))
 
 
 # what the library and Metal say when the GPU's work went wrong under a test: a command buffer that failed

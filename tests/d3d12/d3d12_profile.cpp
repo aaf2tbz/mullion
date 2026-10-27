@@ -350,7 +350,7 @@ child(char **argv, const ComPtr<ID3D12Device> &device, const std::string &vs, co
   } present{chains[1].Get(), go};
   auto thread = CreateThread(
       nullptr, 0,
-      [](void *argument) -> DWORD {
+      [](void *argument) WINAPI -> DWORD {
         auto &present = *(Present *)argument;
         if (WaitForSingleObject(present.go, 60000) != WAIT_OBJECT_0)
           return 1;
