@@ -3,8 +3,8 @@
 // https://learn.microsoft.com/windows/win32/api/d3d12/ns-d3d12-d3d12_resource_uav_barrier).
 // timestamps sample "at the instant that the GPU is finished with all the preceding workload" (D3D11.3 functional
 // specification, 20.4.3). "Encodes a compute pass and other memory operations into a command buffer." (Apple,
-// MTL4ComputeCommandEncoder.h). a timestamp is sampled where its encoder ends, so one between draws ends the render
-// pass.
+// MTL4ComputeCommandEncoder.h). a timestamp is sampled where its encoder ends, and one between draws where the open
+// render pass ends: the draws on both sides of it share the pass.
 #include "d3d12_test.hpp"
 #include "../../src/winemetal/winemetal.h"
 #include <algorithm>
@@ -321,7 +321,7 @@ main(int argc, char **argv) {
       }
     }
     expect(traced != 0, "no D3D12 encoder trace");
-    expect(render == 2, "render passes: %u", render);
+    expect(render == 1, "render passes: %u", render);
     // Metal 3 begins an encoder where the kind of work changes: a size's dispatches are three, its copies three (one,
     // one, and the readbacks together), and the resolves and the texture's copy after the draws one more
     expect(
