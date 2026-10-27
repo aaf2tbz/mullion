@@ -1220,10 +1220,7 @@ public:
         default:
           break;
         }
-        auto wait = [&](auto &encoder) {
-          for (unsigned i = 0; i < sync.wait_count; i++)
-            encoder.waitForFence(sync.waits[i]);
-        };
+        auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
         // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder (NextSync)
         auto end = [&](auto &encoder) {
           if constexpr (Metal4) {
@@ -1339,13 +1336,24 @@ public:
           if (current->type == EncoderType::Clear)
             encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
           // the object and mesh stages read what earlier passes wrote as the vertex stage does. a pass that draws to what
-          // one of its group drew to waits for that one's pixels before its own
+          // one of its group drew to waits for that one's pixels before its own. the waits go to Metal in one call
+          std::array<wmtcmd_render_fence_op, std::tuple_size_v<decltype(sync.waits)> + 1 +
+                                                 std::tuple_size_v<decltype(sync.pixels)>>
+              waits;
+          unsigned waited = 0;
+          auto wait_for = [&](WMT::Fence fence, WMTRenderStages stages) {
+            auto &op = waits[waited] = {WMTRenderCommandWaitForFence, {}, {}, fence.handle, stages};
+            if (waited++)
+              waits[waited - 2].next.set(&op);
+          };
           for (unsigned i = 0; i < sync.wait_count; i++)
-            encoder.waitForFence(sync.waits[i], WMTRenderStagePreRaster);
+            wait_for(sync.waits[i], WMTRenderStagePreRaster);
           if (data->before_head.next.get() && sync.update.handle)
-            encoder.waitForFence(sync.update, WMTRenderStagePreRaster);
+            wait_for(sync.update, WMTRenderStagePreRaster);
           for (unsigned i = 0; i < sync.pixel_count; i++)
-            encoder.waitForFence(sync.pixels[i], WMTRenderStageFragment);
+            wait_for(sync.pixels[i], WMTRenderStageFragment);
+          if (waited)
+            encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(waits.data()));
           if (sparse_mappings) {
             scope.inflight->sparse_mappings = sparse_mappings;
             encoder.setVertexBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
@@ -1388,7 +1396,9 @@ public:
             scope.inflight->physical[WMTMetal4AccelerationStructure]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.accelerationStructureCommandEncoder(attachment)
                                                   : cmdbuf.accelerationStructureCommandEncoder();
-          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+          PassSync all;
+          WaitAll([&](WMT::Fence fence) { all.waits[all.wait_count++] = fence; });
+          encoder.waitForFences(all.waits, all.wait_count);
           encoder.encodeCommands(&data->cmd_head);
           if constexpr (!Metal4)
             encoder.updateFence(fence_);

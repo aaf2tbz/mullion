@@ -1,6 +1,7 @@
 #pragma once
 
 #include "./winemetal.h"
+#include <array>
 #include <cstddef>
 #include <string>
 #include <cstring>
@@ -360,6 +361,20 @@ public:
   setLabel(String label) {
     MTLCommandEncoder_setLabel(handle, label);
   }
+
+protected:
+  // the waits for the first count fences, linked to go to Metal in one call
+  template <typename Op, size_t N>
+  static std::array<Op, N>
+  fenceWaits(decltype(Op::type) type, const std::array<Fence, N> &fences, unsigned count) {
+    std::array<Op, N> ops{};
+    for (unsigned i = 0; i < count; i++) {
+      ops[i].type = type;
+      ops[i].fence = fences[i].handle;
+      ops[i].next.set(i + 1 < count ? &ops[i + 1] : nullptr);
+    }
+    return ops;
+  }
 };
 
 class VisibleFunctionTable : public Object {
@@ -576,6 +591,14 @@ public:
     MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
+  template <size_t N>
+  void
+  waitForFences(const std::array<Fence, N> &fences, unsigned count) {
+    auto ops = fenceWaits<wmtcmd_blit_fence_op>(WMTBlitCommandWaitForFence, fences, count);
+    if (count)
+      encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(ops.data()));
+  }
+
   void
   updateFence(Fence fence) {
     struct wmtcmd_blit_fence_op cmd;
@@ -628,6 +651,14 @@ public:
     MTLAccelerationStructureCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
+  template <size_t N>
+  void
+  waitForFences(const std::array<Fence, N> &fences, unsigned count) {
+    auto ops = fenceWaits<wmtcmd_accelerationstructure_fence_op>(WMTAccelerationStructureCommandWaitForFence, fences, count);
+    if (count)
+      encodeCommands(reinterpret_cast<const wmtcmd_accelerationstructure_nop *>(ops.data()));
+  }
+
   void
   updateFence(Fence fence) {
     struct wmtcmd_accelerationstructure_fence_op cmd;
@@ -652,6 +683,14 @@ public:
     cmd.next.set(nullptr);
     cmd.fence = fence.handle;
     MTLComputeCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  template <size_t N>
+  void
+  waitForFences(const std::array<Fence, N> &fences, unsigned count) {
+    auto ops = fenceWaits<wmtcmd_compute_fence_op>(WMTComputeCommandWaitForFence, fences, count);
+    if (count)
+      encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(ops.data()));
   }
 
   void
@@ -913,6 +952,14 @@ public:
     wmtcmd_compute_fence_op cmd{.type = WMTComputeCommandWaitForFence, .fence = fence.handle};
     cmd.next.set(nullptr);
     encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&cmd));
+  }
+
+  template <size_t N>
+  void
+  waitForFences(const std::array<Fence, N> &fences, unsigned count) {
+    auto ops = fenceWaits<wmtcmd_compute_fence_op>(WMTComputeCommandWaitForFence, fences, count);
+    if (count)
+      encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(ops.data()));
   }
   void
   copyFromBuffer(
