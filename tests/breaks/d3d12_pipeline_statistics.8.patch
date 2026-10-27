@@ -1,4 +1,5 @@
 # a pipeline without a pixel shader takes the pixel shader's variants
+# family 9
 --- a/src/d3d12/d3d12_pipeline_graphics.cpp
 +++ b/src/d3d12/d3d12_pipeline_graphics.cpp
 @@ -1642,7 +1642,7 @@

@@ -1,42 +1,12 @@
-# the CPU collects and clears the warning before its command buffer executes
+# the CPU never collects what an indirect command left out
 --- a/src/d3d12/d3d12_command_queue.cpp
 +++ b/src/d3d12/d3d12_command_queue.cpp
-@@ -484,13 +484,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
-         memcpy(resolve.to, &resolve.heap->timestamps[resolve.first], resolve.count * sizeof(uint64_t));
+@@ -523,7 +523,7 @@
        }
        sample(inflight.sampled.size());
--      uint32_t omitted = 0;
+       uint32_t omitted[2] = {};
 -      if (inflight.cmdbuf.status() == WMTCommandBufferStatusCompleted)
--        for (auto &[buffer, words] : inflight.omitted)
--          for (auto word : words)
--            omitted = std::max(omitted, word);
--      if (omitted)
--        WARN("Omitted indirect mesh draw (GS) because of too many object threadgroups (", omitted, ")");
-       for (auto &allocator : inflight.allocators)
-         if (allocator)
-           allocator->pending--;
-@@ -545,6 +538,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
-     WMT::Reference<MetalCommandBuffer>
-     End() {
-       auto ended = inflight->cmdbuf;
-+      uint32_t omitted = 0;
-+      if (inflight->cmdbuf.status() == WMTCommandBufferStatusCompleted)
-+        for (auto &[buffer, words] : inflight->omitted)
-+          for (auto word : words)
-+            omitted = std::max(omitted, word);
-+      if (omitted)
-+        WARN("Omitted indirect mesh draw (GS) because of too many object threadgroups (", omitted, ")");
-+      for (auto &[buffer, words] : inflight->omitted)
-+        for (auto &word : words)
-+          const_cast<uint32_t &>(word) = 0;
-       if (diag::trace_encoders) {
-         auto &counts = inflight->physical;
-         uint32_t render = counts[WMTMetal4Render], compute = counts[WMTMetal4Compute], blit = counts[WMTMetal4Blit];
-@@ -1128,6 +1131,7 @@ public:
-                 device_->LoseDevice();
-                 return;
-               }
-+              std::fill_n(static_cast<uint32_t *>(info.memory.get()), count, 0u);
-               // a replay may overwrite the resolver's words before the completion thread runs
-               if (diag::trace_encoders)
-                 scope.inflight->physical[WMTMetal4Blit]++;
++      if (false)
+         for (auto &[buffer, words, scratch] : inflight.omitted)
+           for (auto word : words)
+             omitted[scratch] = std::max(omitted[scratch], word);
