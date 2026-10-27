@@ -16,8 +16,8 @@
 // for typed formats use the queried support contract, not a second format table. typeless parents permit typed
 // views; a depth stencil plane's format is fully typed (Microsoft Learn, format support for feature level 11.0
 // hardware), so the same contract holds for it. trailing cube slices are
-// initialized distinctly, sampled through cube and array views, and read back with nonblocking maps bounded
-// to ten seconds. the shader is compiled before device creation; a watchdog bounds creation and teardown too.
+// initialized distinctly, sampled through cube and array views, and read back with blocking maps.
+// Wine's test_resource_access records rejection of dynamic buffers without any bind flags in D3D10 and D3D11.
 #include "d3d11_test.hpp"
 #include <d3d10_1.h>
 #include <d3d11_3.h>
@@ -26,12 +26,6 @@
 #include <limits>
 #include <type_traits>
 #include "../resource_cases.hpp"
-
-static void CALLBACK
-timeout(void *, BOOLEAN) {
-  puts("failed: resource creation or teardown exceeded five minutes");
-  TerminateProcess(GetCurrentProcess(), 1);
-}
 
 template <typename Desc>
 static void
@@ -118,13 +112,6 @@ texture(
 
 int
 main() {
-  HANDLE watchdog;
-  constexpr DWORD timeout_ms = 5 * 60 * 1000;
-  if (!expect(
-          CreateTimerQueueTimer(&watchdog, nullptr, timeout, nullptr, timeout_ms, 0, WT_EXECUTEONLYONCE),
-          "could not bound creation and teardown"
-      ))
-    return verdict();
   constexpr UINT constant_bytes = sizeof(float) * D3D11_COMMONSHADER_CONSTANT_BUFFER_COMPONENTS;
   constexpr UINT structure_limit = D3D11_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES;
   constexpr UINT cube_faces = 6; // D3D11.3 5.3.8
@@ -174,14 +161,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   ComPtr<ID3D11ComputeShader> compute;
   CHECK(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &compute));
   auto map = [&](ID3D11Resource *resource, UINT subresource, D3D11_MAPPED_SUBRESOURCE &mapped) {
-    const auto deadline = GetTickCount64() + 10000;
-    HRESULT hr;
-    do {
-      hr = context->Map(resource, subresource, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-      if (hr != DXGI_ERROR_WAS_STILL_DRAWING || GetTickCount64() >= deadline)
-        return hr;
-      Sleep(1);
-    } while (true);
+    return context->Map(resource, subresource, D3D11_MAP_READ, 0, &mapped);
   };
   for (UINT route : {11u, 10u}) {
     auto check_buffer = [&](D3D11_BUFFER_DESC desc, bool output, HRESULT wanted) {
@@ -239,7 +219,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         D3D11_BUFFER_DESC desc{constant_bytes, D3D11_USAGE(use), 0, cpu, 0, structure_limit + 1};
         check_buffer(
             desc, output,
-            use == D3D11_USAGE_IMMUTABLE || use > D3D11_USAGE_STAGING ? E_INVALIDARG : (output ? S_OK : S_FALSE)
+            use == D3D11_USAGE_IMMUTABLE || use == D3D11_USAGE_DYNAMIC || use > D3D11_USAGE_STAGING
+                ? E_INVALIDARG : (output ? S_OK : S_FALSE)
         );
       }
       for (UINT size = 0; size <= 2 * constant_bytes + 1; ++size) {

@@ -23,6 +23,7 @@
 #include "mullion_sampler.hpp"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_state_object.hpp"
+#include <bit>
 
 namespace mullion {
 
@@ -100,17 +101,6 @@ constexpr WMTBlendOperation kBlendOpMap[] = {
     WMTBlendOperationReverseSubtract,
     WMTBlendOperationMin,
     WMTBlendOperationMax,
-};
-
-constexpr WMTLogicOperation kLogicOpMap[] = {
-    WMTLogicOperationClear,      WMTLogicOperationSet,
-    WMTLogicOperationCopy,       WMTLogicOperationCopyInverted,
-    WMTLogicOperationNoOp,       WMTLogicOperationInvert,
-    WMTLogicOperationAnd,        WMTLogicOperationNand,
-    WMTLogicOperationOr,         WMTLogicOperationNor,
-    WMTLogicOperationXor,        WMTLogicOperationEquiv,
-    WMTLogicOperationAndReverse, WMTLogicOperationAndInverted,
-    WMTLogicOperationOrReverse,  WMTLogicOperationOrInverted,
 };
 
 constexpr WMTBlendFactor kBlendFactorMap[] = {
@@ -313,15 +303,27 @@ public:
   }
 
   bool IsDualSourceBlending() { return dual_source_blending_; }
+  bool IsAlphaToCoverage() { return desc_.AlphaToCoverageEnable; }
 
-  void SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *info, uint32_t num_rt, uint32_t valid_rt) {
+  std::array<SM50_SHADER_BLEND, 8>
+  SetupMetalPipelineDescriptor(WMTRenderPipelineBlendInfo *info, uint32_t num_rt, uint32_t valid_rt) {
+    /*
+    D3D11.3 Spec:
+    Configuration of logic op is constrained in the following way:
+    (a) for logic ops to be used, IndependentBlendEnable must be set to false, so the logic op that has meaning comes
+        from the first RT blend desc and applies to all RTs.
+    (b) when logic blending all RenderTargets bound must have a UINT format (undefined rendering otherwise).
+    */
+    bool logic = !desc_.IndependentBlendEnable && desc_.RenderTarget[0].LogicOpEnable;
+    std::array<SM50_SHADER_BLEND, 8> blend{};
     for (unsigned rt = 0; rt < num_rt; rt++) {
       if (!(valid_rt & (1 << rt)))
         continue;
       auto i = desc_.IndependentBlendEnable ? rt : 0;
       auto &renderTarget = desc_.RenderTarget[i];
       auto &attachment_desc = info->colors[rt];
-      attachment_desc.write_mask = kColorWriteMaskMap[renderTarget.RenderTargetWriteMask];
+      attachment_desc.write_mask =
+          RenderTargetWriteMask(attachment_desc.pixel_format, kColorWriteMaskMap[renderTarget.RenderTargetWriteMask]);
       if (renderTarget.BlendEnable && attachment_desc.pixel_format != WMTPixelFormatInvalid) {
         if (!any_bit_set(m_parent->GetMTLPixelFormatCapability(attachment_desc.pixel_format) & FormatCapability::Blend)) {
           WARN("Blending is enabled on RTV of non-blendable format ", attachment_desc.pixel_format);
@@ -335,24 +337,13 @@ public:
         attachment_desc.dst_alpha_blend_factor = kBlendAlphaFactorMap[renderTarget.DestBlendAlpha];
         attachment_desc.dst_rgb_blend_factor = kBlendFactorMap[renderTarget.DestBlend];
       }
+      if (attachment_desc.pixel_format != WMTPixelFormatInvalid)
+        blend[rt] = ShaderBlend(attachment_desc, renderTarget, logic);
     }
-    /*
-    D3D11.3 Spec:
-    Configuration of logic op is constrained in the following way:
-    (a) for logic ops to be used, IndependentBlendEnable must be set to false, so the logic op that has meaning comes
-        from the first RT blend desc and applies to all RTs.
-    (b) when logic blending all RenderTargets bound must have a UINT format (undefined rendering otherwise).
-    */
-    if (!desc_.IndependentBlendEnable && desc_.RenderTarget[0].LogicOpEnable) {
-#ifdef MULLION_NO_PRIVATE_API
-      ERR("OutputMerger LogicOp is not supported");
-      continue;
-#else
-      info->logic_operation_enabled = true;
-      info->logic_operation = kLogicOpMap[desc_.RenderTarget[0].LogicOp];
-#endif
-    }
-    info->alpha_to_coverage_enabled = desc_.AlphaToCoverageEnable;
+    // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
+    info->alpha_to_coverage_enabled =
+        desc_.AlphaToCoverageEnable && !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info->colors[0].pixel_format)));
+    return blend;
   }
 
 private:
@@ -462,10 +453,6 @@ public:
       // nop , we don't support this
     }
 
-    if (desc_.MultisampleEnable) {
-      // used in combination with AntialiasedLineEnable, not supported yet.
-    }
-
     // desc_.ScissorEnable : handled outside
 
     // desc_.ForcedSampleCount : handled outside
@@ -473,7 +460,11 @@ public:
 
   bool IsScissorEnabled() { return desc_.ScissorEnable; }
 
-  uint32_t UAVOnlySampleCount() { return std::max(1u, desc_.ForcedSampleCount); }
+  uint32_t ForcedSampleCount() { return desc_.ForcedSampleCount; }
+
+  bool QuadrilateralLines() { return desc_.MultisampleEnable; }
+
+  bool HasReferences() const { return m_refPrivate.load() != 0; }
 
 private:
   const D3D11_RASTERIZER_DESC2 desc_;
@@ -487,14 +478,23 @@ class MTLD3D11DepthStencilState
 
 public:
   friend class MTLD3D11DeviceContext;
-  MTLD3D11DepthStencilState(MTLD3D11Device *device,
-                            WMT::DepthStencilState state,
-                            WMT::DepthStencilState stencil_disabled,
-                            WMT::DepthStencilState depthsteancil_disabled,
+  MTLD3D11DepthStencilState(MTLD3D11Device *device, const WMTDepthStencilInfo &info,
                             const D3D11_DEPTH_STENCIL_DESC &desc)
-      : ManagedDeviceChild<IMTLD3D11DepthStencilState>(device), desc_(desc), d3d10_(this),
-        state_default_(state), state_stencil_disabled_(stencil_disabled),
-        state_depthstencil_disabled_(depthsteancil_disabled) {}
+      : ManagedDeviceChild<IMTLD3D11DepthStencilState>(device), desc_(desc), d3d10_(this) {
+    // a plane the view lacks is not tested, and one it binds read-only keeps its values (D3D11_DSV_FLAG)
+    for (uint32_t planes = 0; planes < 4; planes++)
+      for (uint32_t readonly = 0; readonly < 4; readonly++) {
+        auto effective = info;
+        if (!(planes & 1))
+          effective.depth_compare_function = WMTCompareFunctionAlways;
+        effective.depth_write_enabled &= (planes & ~readonly & 1) != 0;
+        effective.front_stencil.enabled &= (planes & 2) != 0;
+        effective.back_stencil.enabled &= (planes & 2) != 0;
+        if (readonly & 2)
+          effective.front_stencil.write_mask = effective.back_stencil.write_mask = 0;
+        states_[planes][readonly] = device->GetMTLDevice().newDepthStencilState(effective);
+      }
+  }
   ~MTLD3D11DepthStencilState() {};
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -529,18 +529,8 @@ public:
     *pDesc = desc_;
   }
 
-  virtual WMT::DepthStencilState GetDepthStencilState(uint32_t planar_flags) {
-    switch (planar_flags) {
-    case 0:
-      return state_depthstencil_disabled_;
-    case 1: /* depth without stencil */
-      return state_stencil_disabled_;
-    case 2: /* stencil without depth */
-      ERR("stencil only dsv is not properly handled");
-      return state_default_;
-    default:
-      return state_default_;
-    }
+  virtual WMT::DepthStencilState GetDepthStencilState(uint32_t planar_flags, uint32_t readonly_flags) {
+    return states_[planar_flags & 3][readonly_flags & 3];
   }
 
   virtual bool IsEnabled() {
@@ -550,9 +540,7 @@ public:
 private:
   const D3D11_DEPTH_STENCIL_DESC desc_;
   MTLD3D10DepthStencilState d3d10_;
-  WMT::Reference<WMT::DepthStencilState> state_default_;
-  WMT::Reference<WMT::DepthStencilState> state_stencil_disabled_;
-  WMT::Reference<WMT::DepthStencilState> state_depthstencil_disabled_;
+  WMT::Reference<WMT::DepthStencilState> states_[4][4];
 };
 
 template <>
@@ -626,41 +614,7 @@ HRESULT StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState>::
     }
   }
 
-  auto state_default = device->GetMTLDevice().newDepthStencilState(info);
-
-  if (pDesc->StencilEnable) {
-    info.front_stencil.enabled = false;
-    info.back_stencil.enabled = false;
-    auto stencil_effective_disabled = device->GetMTLDevice().newDepthStencilState(info);
-    if (pDesc->DepthEnable) {
-      info.depth_compare_function = WMTCompareFunctionAlways;
-      info.depth_write_enabled = false;
-      auto depthstencil_effective_disabled = device->GetMTLDevice().newDepthStencilState(info);
-      cache.emplace(*pDesc,
-                    std::make_unique<MTLD3D11DepthStencilState>(
-                        device, state_default, stencil_effective_disabled,
-                        depthstencil_effective_disabled, *pDesc));
-    } else {
-      // stencil_effective_disabled has no depth either...
-      cache.emplace(*pDesc,
-                    std::make_unique<MTLD3D11DepthStencilState>(
-                        device, state_default, stencil_effective_disabled,
-                        stencil_effective_disabled, *pDesc));
-    }
-  } else {
-    if (pDesc->DepthEnable) {
-      info.depth_compare_function = WMTCompareFunctionAlways;
-      info.depth_write_enabled = false;
-      auto depth_effective_disabled = device->GetMTLDevice().newDepthStencilState(info);
-      cache.emplace(*pDesc, std::make_unique<MTLD3D11DepthStencilState>(
-                                device, state_default, state_default,
-                                depth_effective_disabled, *pDesc));
-    } else {
-      cache.emplace(*pDesc, std::make_unique<MTLD3D11DepthStencilState>(
-                                device, state_default, state_default,
-                                state_default, *pDesc));
-    }
-  }
+  cache.emplace(*pDesc, std::make_unique<MTLD3D11DepthStencilState>(device, info, *pDesc));
   cache.at(*pDesc)->QueryInterface(IID_PPV_ARGS(ppDepthStencilState));
   return S_OK;
 }
@@ -672,15 +626,31 @@ HRESULT StateObjectCache<D3D11_RASTERIZER_DESC2, IMTLD3D11RasterizerState>::
   std::lock_guard<mullion::mutex> lock(mutex_cache);
   InitReturnPtr(ppRasterizerState);
 
-  // TODO: validate
-  if (!pRasterizerDesc)
+  if (!pRasterizerDesc || pRasterizerDesc->FillMode < D3D11_FILL_WIREFRAME ||
+      pRasterizerDesc->FillMode > D3D11_FILL_SOLID || pRasterizerDesc->CullMode < D3D11_CULL_NONE ||
+      pRasterizerDesc->CullMode > D3D11_CULL_BACK ||
+      pRasterizerDesc->ConservativeRaster != D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF)
+    return E_INVALIDARG;
+
+  // D3D11_RASTERIZER_DESC1::ForcedSampleCount permits 0, 1, 2, 4, 8 and optionally 16 (Microsoft Learn).
+  const auto samples = pRasterizerDesc->ForcedSampleCount;
+  if (samples &&
+      (!std::has_single_bit(samples) || samples > 16 || !device->GetMTLDevice().supportsTextureSampleCount(samples)))
     return E_INVALIDARG;
 
   if (!ppRasterizerState)
     return S_FALSE;
 
-  if (cache.contains(*pRasterizerDesc)) {
-    cache.at(*pRasterizerDesc)->QueryInterface(IID_PPV_ARGS(ppRasterizerState));
+  auto found = cache.find(*pRasterizerDesc);
+  if (cache.size() >= D3D11_REQ_RASTERIZER_OBJECT_COUNT_PER_DEVICE &&
+      (found == cache.end() || !static_cast<MTLD3D11RasterizerState *>(found->second.get())->HasReferences()) &&
+      std::count_if(cache.begin(), cache.end(), [](const auto &entry) {
+        return static_cast<MTLD3D11RasterizerState *>(entry.second.get())->HasReferences();
+      }) >= D3D11_REQ_RASTERIZER_OBJECT_COUNT_PER_DEVICE)
+    return D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS;
+
+  if (found != cache.end()) {
+    found->second->QueryInterface(IID_PPV_ARGS(ppRasterizerState));
     return S_OK;
   }
 

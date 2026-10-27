@@ -1,3 +1,6 @@
+// alpha-to-coverage endpoints: "alpha of 0 (or less) must map to no coverage and alpha of 1 (or greater) must
+// map to full coverage"; "An alpha value of NaN results in a no coverage (zero) mask." and "If the Pixel Shader
+// outputs oMask (output coverage), Alpha-to-Coverage is disabled." (D3D11.3 17.18).
 // contract: the view interprets the pixel shader's register bits, then converts to its storage format.
 // "There is no data type associated with registers; Shader instructions determine how the data stored in
 // registers is interpreted." (D3D11.3 7.8.1). "The application is given control over the data type interpretation for
@@ -21,8 +24,8 @@
 #include <climits>
 #include <cfloat>
 #include <cmath>
+#include <limits>
 #include <d3d10.h>
-#include <d3d11_1.h>
 
 static constexpr UINT TARGETS = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
 static constexpr UINT SIDE = 4, SAMPLES = 4;
@@ -40,8 +43,12 @@ enum Mode {
   SampleFrequency,
   Geometry,
   Tessellation,
+  AlphaToCoverage,
+  CoverageOverridesAlpha,
   MODES
 };
+
+static const float alphas[] = {-INFINITY, -1, -0.0f, 0, 1, 2, INFINITY, std::numeric_limits<float>::quiet_NaN()};
 
 static const char hlsl[] = R"hlsl(
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -74,6 +81,9 @@ int4 out_int(float4 v) { return asint(v); }
 struct Outputs {
   TYPE0 colour : TARGET;
   TYPE1 other : OTHER_TARGET;
+#if COVERAGE_OUTPUT
+  uint coverage : SV_Coverage;
+#endif
 #if DEPTH
   float z : SV_Depth;
 #endif
@@ -87,7 +97,14 @@ Outputs ps(float4 pos : SV_Position
   uint sid = 0;
 #endif
   float4 v = float4((1 + ((uint)pos.x + sid) % 3) * 0.25, -0.5, 0.5, 1);
+#if ALPHA_COVERAGE
+  static const uint bits[] = {ALPHA_VALUES};
+  v.a = asfloat(bits[((uint)pos.y * SIDE + (uint)pos.x) % ALPHA_COUNT]);
+#endif
   Outputs o;
+#if COVERAGE_OUTPUT
+  o.coverage = ~0u;
+#endif
   o.colour = CONVERT0(v).CHANNELS;
   o.other = CONVERT1(float4(0.5, 0.25, 1, 0.75));
 #if DEPTH
@@ -131,6 +148,7 @@ format(Kind kind, UINT components) {
 // ideal output conversion and its tolerances, D3D11.3 3.2.3.4, 3.2.3.6 and 3.2.3.8
 static double
 scaled(Format f, float value, UINT channel) {
+  if (std::isnan(value)) value = 0;
   if (f.kind == Snorm)
     return std::clamp(double(value), -1.0, 1.0) * INT8_MAX;
   double v = std::clamp(double(value), 0.0, 1.0);
@@ -152,7 +170,7 @@ stored(Format f, float value, UINT channel) {
 static bool
 matches(Format f, UINT got, float value, UINT channel, bool sampled) {
   if (f.bits == sizeof(UINT) * CHAR_BIT)
-    return got == stored(f, value, channel);
+    return f.kind == Float && std::isnan(value) ? std::isnan(std::bit_cast<float>(got)) : got == stored(f, value, channel);
   double actual = f.kind == Snorm ? int(int8_t(got)) : int(got);
   double tolerance = D3D10_FLOAT32_TO_INTEGER_TOLERANCE_IN_ULP;
   if (sampled) {
@@ -170,7 +188,15 @@ defines(UINT kind, UINT slot, UINT mode) {
   const char *types[] = {"float", "int", "uint"}, *conversions[] = {"out_float", "out_int", "out_uint"};
   UINT components = mode == Fewer ? 1 : mode == Mask ? 2 : 4;
   std::string suffix = components == 1 ? "" : std::to_string(components);
-  return {std::string("TYPE0=") + types[kind] + suffix,
+  std::string alpha_values;
+  for (auto alpha : alphas) {
+    if (!alpha_values.empty()) alpha_values += ",";
+    alpha_values += std::to_string(std::bit_cast<UINT>(alpha)) + "u";
+  }
+  return {"ALPHA_COVERAGE=" + std::to_string(mode == AlphaToCoverage || mode == CoverageOverridesAlpha),
+          "COVERAGE_OUTPUT=" + std::to_string(mode == CoverageOverridesAlpha),
+          "ALPHA_COUNT=" + std::to_string(std::size(alphas)), "ALPHA_VALUES=" + alpha_values,
+          std::string("TYPE0=") + types[kind] + suffix,
           std::string("TYPE1=") + types[(kind + 1) % std::size(types)] + "4",
           std::string("CONVERT0=") + conversions[kind],
           std::string("CONVERT1=") + conversions[(kind + 1) % std::size(types)],
@@ -221,13 +247,6 @@ main() {
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
   CHECK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr,
                           &context));
-  ComPtr<ID3D11Device1> device1;
-  ComPtr<ID3DDeviceContextState> context_state;
-  CHECK(device.As(&device1));
-  CHECK(device1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr,
-                                          &context_state));
-  ComPtr<ID3D10Device> device10;
-  CHECK(device.As(&device10));
   ComPtr<ID3D11VertexShader> vs;
   CHECK(device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &vs));
   ComPtr<ID3D11GeometryShader> gs;
@@ -271,7 +290,8 @@ main() {
         for (UINT slot = 0; slot < (mode ? 1 : TARGETS); slot++)
           for (UINT view = 0; view <= Uint; view++) {
             auto target_kind = Kind(cycle ? Uint - view : view);
-            bool dual = mode == Dual, multisample = mode == PixelFrequency || mode == SampleFrequency;
+            bool dual = mode == Dual, multisample = mode == PixelFrequency || mode == SampleFrequency ||
+                mode == AlphaToCoverage || mode == CoverageOverridesAlpha;
             if (dual && (target_kind == Sint || target_kind == Uint))
               continue;
             step("cycle %u, output %u, view %u, slot %u, mode %u", cycle, kind, target_kind, slot, mode);
@@ -326,6 +346,7 @@ main() {
             }
             D3D11_BLEND_DESC blend_desc{};
             blend_desc.IndependentBlendEnable = !dual;
+            blend_desc.AlphaToCoverageEnable = mode == AlphaToCoverage || mode == CoverageOverridesAlpha;
             for (auto &rt : blend_desc.RenderTarget) {
               rt.SrcBlend = rt.SrcBlendAlpha = D3D11_BLEND_ONE;
               rt.DestBlend = rt.DestBlendAlpha = D3D11_BLEND_ZERO;
@@ -343,7 +364,7 @@ main() {
             ComPtr<ID3D11BlendState> blend_state;
             CHECK(device->CreateBlendState(&blend_desc, &blend_state));
             UINT sample_mask = ~0u;
-            if (mode == PixelFrequency) {
+            if (mode == PixelFrequency || mode == AlphaToCoverage || mode == CoverageOverridesAlpha) {
               sample_mask = 0;
               for (UINT s = 0; s < samples; s += 2)
                 sample_mask |= 1u << s;
@@ -366,14 +387,7 @@ main() {
             context->DSSetShader(mode == Tessellation ? ds.Get() : nullptr, nullptr, 0);
             context->IASetPrimitiveTopology(mode == Tessellation ? D3D11_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
                                                                  : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            if ((cycle || layered) && mode != Tessellation) {
-              ComPtr<ID3D10PixelShader> pixel;
-              CHECK(shaders[kind][mode][slot].As(&pixel));
-              device10->PSSetShader(pixel.Get());
-              device10->Draw(3, 0);
-            } else {
-              context->Draw(3, 0);
-            }
+            context->Draw(3, 0);
             context->OMSetRenderTargets(0, nullptr, nullptr);
             for (UINT i = 0; i < (dual ? 1u : UINT(std::size(textures))); i++) {
               const char *bytes = nullptr;
@@ -415,9 +429,12 @@ main() {
                 for (UINT x = 0; x < SIDE; x++)
                   for (UINT s = 0; s < samples; s++) {
                     float colour[] = {(1 + (x + (mode == SampleFrequency ? s : 0)) % 3) * 0.25f, -0.5f, 0.5f, 1};
+                    if (mode == AlphaToCoverage || mode == CoverageOverridesAlpha)
+                      colour[3] = alphas[(y * SIDE + x) % std::size(alphas)];
                     const float secondary[] = {0.5, 0.25, 1, 0.75};
                     for (UINT c = 0; c < formats[i].components; c++) {
                       bool written = (i || (blend.RenderTargetWriteMask >> c & 1)) && (sample_mask >> s & 1);
+                      if (mode == AlphaToCoverage && !(colour[3] > 0)) written = false;
                       if (!i && c >= components && written)
                         continue;
                       float value = i ? secondary[c] : colour[c];

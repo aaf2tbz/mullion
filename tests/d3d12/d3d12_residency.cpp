@@ -32,7 +32,9 @@ groupshared uint place, ready, done;
     GroupMemoryBarrierWithGroupSync();
     if (thread == 0) {
       done = state[FINISHED];
-      ready = place < CHAIN ? released[place] : 0;
+      // FXC reads both sides of ?:, and a root descriptor has no bounds ("Root descriptors don't support any out of
+      // bounds checking", Root Signature Version 1.1): the place a read takes stays in the line
+      ready = place < CHAIN ? released[min(place, CHAIN - 1)] : 0;
     }
     GroupMemoryBarrierWithGroupSync();
     if (done)

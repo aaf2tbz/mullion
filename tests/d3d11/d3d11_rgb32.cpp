@@ -314,7 +314,7 @@ float4 main(float4 p:SV_Position):SV_Target { return float4(tex.Load(int3(p.xy,0
                 std::vector<uint8_t> elements(texel, 0xa5);
                 elements.insert(elements.end(), expected.begin(), expected.end());
                 elements.insert(elements.end(), texel, 0x5a);
-                D3D11_BUFFER_DESC buffer_desc{UINT(elements.size()), D3D11_USAGE_IMMUTABLE,
+                D3D11_BUFFER_DESC buffer_desc{UINT(elements.size()), D3D11_USAGE_DEFAULT,
                                               D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS};
                 D3D11_SUBRESOURCE_DATA buffer_data{elements.data()};
                 CHECK(device->CreateBuffer(&buffer_desc, &buffer_data, &typed_buffer));

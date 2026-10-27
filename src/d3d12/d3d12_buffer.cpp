@@ -38,7 +38,7 @@ public:
       const D3D12_CLEAR_VALUE *OptimizedClearValue, MTLD3D12Heap *pHeap, UINT64 Offset, bool Reserved = false
   ) {
     if (OptimizedClearValue)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     // TODO: validate and normalize
     desc_ = *pDesc;
@@ -48,7 +48,7 @@ public:
 
     if (desc_.Alignment) {
       if (desc_.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     } else {
       desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     }
@@ -56,7 +56,7 @@ public:
     if (pHeap && !pHeap->memory) {
       auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
       if (size_and_align.size + Offset > pHeap->GetDesc().SizeInBytes)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     }
 
     std::shared_ptr<void> memory;
@@ -65,7 +65,7 @@ public:
       auto size = pHeap->GetDesc().SizeInBytes;
       length = align(length, desc_.Alignment);
       if (Offset % desc_.Alignment || Offset > size || length > size - Offset)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       memory = std::shared_ptr<void>(pHeap->memory, (char *)pHeap->memory.get() + Offset);
     } else if (HeapFlags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) {
       SYSTEM_INFO system;
@@ -76,7 +76,7 @@ public:
           [](void *address) { if (address) VirtualFree(address, 0, MEM_RELEASE); }
       );
       if (!memory)
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
     }
     buffer = new Buffer(length, device_->GetMTLDevice());
 
@@ -90,7 +90,7 @@ public:
     else
       buffer->rename(buffer->allocate(flags));
     if (!buffer->current()->buffer())
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
     device_->RegisterResidencyAndVA(buffer->current());
 
     return S_OK;
@@ -105,7 +105,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -126,9 +126,9 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   Map(UINT Subresource, const D3D12_RANGE *pReadRange, void **ppData) {
     if (Subresource)
-      return E_INVALIDARG;
-    if (heap_props_.Type == D3D12_HEAP_TYPE_DEFAULT)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
+    if (!IsCpuVisibleHeap(&heap_props_))
+      return FAIL(E_INVALIDARG);
     if (ppData)
       *ppData = buffer->current()->mappedMemory(0);
     return S_OK;
@@ -153,20 +153,20 @@ public:
   WriteToSubresource(
       UINT DstSubresource, const D3D12_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch, UINT SrcSlicePitch
   ) {
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   };
 
   virtual HRESULT STDMETHODCALLTYPE
   ReadFromSubresource(
       void *pDstData, UINT DstRowPitch, UINT DstSlicePitch, UINT SrcSubresource, const D3D12_BOX *pSrcBox
   ) {
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   };
 
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {
     if (reserved_)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (pHeapProps)
       *pHeapProps = heap_props_;
     if (pFlags)
@@ -187,7 +187,7 @@ public:
     }
 
     if (ViewDesc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
     BufferSlice Slice;
@@ -207,6 +207,10 @@ public:
       ERR("D3D12Buffer::CreateShaderResourceView: not an ordinary or packed format: ", ViewDesc.Format);
       return E_FAIL;
     }
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ViewDesc.Format};
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER))
+      return FAIL(E_INVALIDARG);
     BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
     Slice.firstElement = ViewDesc.Buffer.FirstElement * (Format.BytesPerTexel / MTLGetTexelSize(Format.BufferPixelFormat));
     Slice.elementCount = ViewDesc.Buffer.NumElements |
@@ -233,7 +237,7 @@ public:
     }
 
     if (ViewDesc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
     BufferSlice Slice;
@@ -261,8 +265,13 @@ public:
     }
     // R32G32B32 has no typed unordered access (Format support for Direct3D Feature Level 11.0 hardware)
     if (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
-      return E_INVALIDARG;
-    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
+      return FAIL(E_INVALIDARG);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ViewDesc.Format};
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW))
+      return FAIL(E_INVALIDARG);
+    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat, true};
     Slice.firstElement = ViewDesc.Buffer.FirstElement;
     Slice.elementCount = ViewDesc.Buffer.NumElements;
     Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;
@@ -282,7 +291,7 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   CreateDepthStencilView(const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
     // Direct3D 12 has no depth stencil view of a buffer
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   };
 
   // a buffer's tiles are 64 KB runs of its bytes, all in its one subresource
@@ -344,7 +353,7 @@ CreatePlacedBuffer(
   D3D12_HEAP_DESC heap_desc = pHeap->GetDesc();
 
   if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   HRESULT hr = buffer->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, OptimizedClearValue, pHeap, Offset);
   if (FAILED(hr))

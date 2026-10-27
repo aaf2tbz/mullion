@@ -530,11 +530,51 @@ struct unixcall_mtlcommandbuffer_sampledcommandencoder {
   obj_handle_t ret;
   enum WMTSampledEncoder type;
 };
+struct unixcall_wmtgpu_statistics {
+  obj_handle_t device;
+  struct WMTMemoryPointer buffer;
+  uint64_t size;
+  uint64_t ret;
+};
+
 struct unixcall_wmtdiag_write {
   struct WMTConstMemoryPointer directory, lines;
   uint64_t length;
   uint32_t ret;
 };
+
+struct unixcall_wmtflight_write {
+  struct WMTConstMemoryPointer reason, directory, executable, records;
+  uint64_t count, frequency, now, lost, overwritten;
+};
+struct unixcall_metal4_new {
+  obj_handle_t queue, fence, event, residency;
+  uint64_t value;
+  struct WMTMetal4BindingCounts bindings;
+  uint32_t padding;
+  obj_handle_t ret;
+};
+struct unixcall_metal4_encoder {
+  obj_handle_t buffer;
+  struct WMTConstMemoryPointer render;
+  struct WMTMemoryPointer samples;
+  uint64_t kind;
+  obj_handle_t ret;
+};
+struct unixcall_metal4_commands {
+  obj_handle_t encoder;
+  struct WMTConstMemoryPointer head;
+  uint64_t kind;
+};
+struct unixcall_metal4_feedback {
+  obj_handle_t buffer;
+  struct WMTMetal4Feedback ret;
+};
+
+STATIC_ASSERT(sizeof(struct unixcall_metal4_new) == 64);
+STATIC_ASSERT(sizeof(struct unixcall_metal4_encoder) == 40);
+STATIC_ASSERT(sizeof(struct unixcall_metal4_commands) == 24);
+STATIC_ASSERT(sizeof(struct unixcall_metal4_feedback) == 48);
 
 #pragma pack(pop)
 

@@ -1,14 +1,16 @@
-# a release wakes events but leaves the queue wait flags unset
---- a/src/d3d12/d3d12_device.hpp
-+++ b/src/d3d12/d3d12_device.hpp
-@@ -219,8 +219,8 @@
-   std::shared_ptr<std::atomic<bool>>
-   Expect(uint64_t expected) {
-     auto reached = std::make_shared<std::atomic<bool>>();
--    Expect(expected, [reached] {
--      *reached = true;
-+    Expect(expected, [this, reached] {
-+      *reached = value != UINT64_MAX;
-       reached->notify_all();
-     });
-     return reached;
+# a released fence signals events but leaves queue waits closed
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -1390,7 +1390,11 @@
+   Wait(ID3D12Fence *pFence, UINT64 Value) {
+     auto gate = std::make_shared<Gate>();
+     gate->closed = true;
+-    static_cast<MTLD3D12Fence *>(pFence)->completion->Expect(Value, [gate] { gate->Open(); });
++    auto completion = static_cast<MTLD3D12Fence *>(pFence)->completion;
++    completion->Expect(Value, [gate, completion] {
++      if (completion->value != UINT64_MAX)
++        gate->Open();
++    });
+     auto work = [this, gate] {
+       gate_->closed.wait(true);
+       {

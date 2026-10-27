@@ -24,6 +24,7 @@ main(int argc, char **argv) {
   }
   // the direct constant, the indirect one, and room for every slot either could mark
   const UINT direct = 7, indirect = 5, slots = 8;
+  const bool empty = argc > 2 && !strcmp(argv[2], "zero");
 
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
@@ -68,7 +69,7 @@ main(int argc, char **argv) {
   list->SetComputeRootSignature(rs.Get());
   list->SetComputeRootUnorderedAccessView(1, dst->GetGPUVirtualAddress());
   list->SetComputeRoot32BitConstant(0, direct, 0);
-  list->ExecuteIndirect(sig.Get(), 1, args.Get(), 0, nullptr, 0);
+  list->ExecuteIndirect(sig.Get(), empty ? 0 : 1, args.Get(), 0, nullptr, 0);
   D3D12_RESOURCE_BARRIER uav{D3D12_RESOURCE_BARRIER_TYPE_UAV};
   uav.UAV.pResource = dst.Get();
   list->ResourceBarrier(1, &uav);
@@ -82,7 +83,7 @@ main(int argc, char **argv) {
   // the indirect dispatch marks its own slot, the direct one slot 0
   unsigned mismatches = 0;
   for (UINT i = 0; i < slots; i++) {
-    UINT want = i == indirect || i == 0 ? i + 1 : 0;
+    UINT want = (!empty && i == indirect) || i == 0 ? i + 1 : 0;
     if (out[i] != want && ++mismatches)
       printf("slot %u: got %u, want %u\n", i, out[i], want);
   }

@@ -1,7 +1,8 @@
 # a draw that writes depth leaves the samples in the bounds as they were
+# family 9
 --- a/src/d3d12/d3d12_command_list.cpp
 +++ b/src/d3d12/d3d12_command_list.cpp
-@@ -1049,7 +1049,7 @@
+@@ -1094,7 +1094,7 @@
        }
      }
      // a draw that writes depth changes which samples are in the bounds

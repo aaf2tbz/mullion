@@ -132,6 +132,8 @@ struct EncoderData {
   FenceSet fence_wait;
   FenceSet fence_update;
   EncoderBarrierState barrier_state;
+  // the path of the application's events the pass began in, each name ended by diag::kEventEnd (diag::events)
+  const char *event_path = nullptr;
 };
 
 struct GSDispatchArgumentsMarshal {
@@ -215,6 +217,7 @@ struct RenderEncoderData : EncoderData {
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;
   uint8_t default_raster_sample_count;
+  uint8_t center_samples = 0;
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;
@@ -260,6 +263,8 @@ struct ComputeEncoderData : EncoderData {
   WMT::Buffer allocated_argbuf;
   uint64_t allocated_argbuf_offset;
   void *allocated_argbuf_mapping;
+  WMT::ComputePipelineState last_pso = {};
+  WMTSize threadgroup_size = {};
 };
 
 struct BlitEncoderData : EncoderData {
@@ -755,13 +760,23 @@ public:
   template <typename T>
   T *
   allocate() {
-    return (new (allocate_cpu_heap(sizeof(T), alignof(T))) T());
+    auto data = new (allocate_cpu_heap(sizeof(T), alignof(T))) T();
+    if constexpr (std::is_base_of_v<EncoderData, T>)
+      if (!events.empty())
+        data->event_path = strcpy(static_cast<char *>(allocate_cpu_heap(events.size() + 1, 1)), events.c_str());
+    return data;
   };
 
-  void present(Rc<Texture> &texture, Rc<Presenter> &presenter, double after, Presenter::PresentState state);
+  // the path of the application's open events, which the passes begun in them carry; it outlives a chunk, so each
+  // pass carries a copy in the chunk's memory
+  std::string events;
+
+  void present(
+      Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, Presenter::PresentState state
+  );
   void copyBufferRenderTarget(const Rc<Texture> &texture, bool load);
 
-  void upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);
+  void upscale(Rc<Texture> &texture, TextureViewKey view, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);
 
   void upscaleTemporal(
       Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, Rc<Texture> &motion_vector, TextureViewKey mvViewId,
@@ -882,6 +897,7 @@ public:
   void endVisibilityResultQuery(Rc<VisibilityResultQuery> &&query);
   bool pipelineStatisticsActive() const { return !pipeline_queries_.empty(); }
   void countPipelineStatistics(PipelineStatisticsDraw draw);
+  void countComputePipelineStatistics(WMTSize groups, WMT::Buffer arguments = {}, uint64_t arguments_offset = 0);
   void countPipelineStatistics(uint64_t vertices, uint64_t instances, std::pair<uint32_t, uint32_t> topology,
                                uint32_t index_stride = 0, uint64_t index_offset = 0, uint32_t start = 0,
                                uint64_t arguments = 0);
@@ -1026,6 +1042,7 @@ private:
   std::vector<Rc<VisibilityResultQuery>> pipeline_queries_;
   Rc<Buffer> statistics_page_;
   uint32_t statistics_offset_ = 0;
+  WMT::Reference<WMT::ComputePipelineState> dispatch_statistics_pso_;
   uint64_t visibility_result_size_;
   std::vector<uint64_t> visibility_result_offsets_;
   TimestampQueryState timestamp_state_;

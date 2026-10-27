@@ -115,9 +115,10 @@ void STDMETHODCALLTYPE
 MTLD3D10Device::IASetVertexBuffers(
     UINT StartSlot, UINT NumBuffers, ID3D10Buffer *const *ppVertexBuffers, const UINT *pStrides, const UINT *pOffsets
 ) {
-  ID3D11Buffer *d3d11_buffers[D3D10_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
-
-  if (NumBuffers > D3D10_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
+  ID3D11Buffer *d3d11_buffers[D3D10_1_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+  const UINT slots = GetFeatureLevel() >= D3D10_FEATURE_LEVEL_10_1 ? D3D10_1_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT
+                                                                : D3D10_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+  if (StartSlot > slots || NumBuffers > slots - StartSlot)
     return;
 
   for (unsigned i = 0; i < NumBuffers; i++)
@@ -472,7 +473,11 @@ void STDMETHODCALLTYPE
 MTLD3D10Device::IAGetVertexBuffers(
     UINT StartSlot, UINT NumBuffers, ID3D10Buffer **ppVertexBuffers, UINT *pStrides, UINT *pOffsets
 ) {
-  ID3D11Buffer *d3d11_buffers[D3D10_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+  ID3D11Buffer *d3d11_buffers[D3D10_1_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+  const UINT slots = GetFeatureLevel() >= D3D10_FEATURE_LEVEL_10_1 ? D3D10_1_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT
+                                                                : D3D10_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+  if (StartSlot > slots || NumBuffers > slots - StartSlot)
+    return;
 
   d3d11_context_->IAGetVertexBuffers(
       StartSlot, NumBuffers, ppVertexBuffers ? d3d11_buffers : nullptr, pStrides, pOffsets
@@ -686,7 +691,10 @@ MTLD3D10Device::RSGetState(ID3D10RasterizerState **ppRasterizerState) {
 void STDMETHODCALLTYPE
 MTLD3D10Device::RSGetViewports(UINT *NumViewports, D3D10_VIEWPORT *pViewports) {
   D3D11_VIEWPORT vp[D3D10_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-  d3d11_context_->RSGetViewports(NumViewports, pViewports != nullptr ? vp : nullptr);
+  const UINT requested = *NumViewports;
+  UINT available = std::size(vp);
+  d3d11_context_->RSGetViewports(&available, pViewports != nullptr ? vp : nullptr);
+  *NumViewports = pViewports ? std::min(requested, available) : available;
 
   if (pViewports != nullptr) {
     for (unsigned i = 0; i < *NumViewports; i++) {
@@ -697,12 +705,16 @@ MTLD3D10Device::RSGetViewports(UINT *NumViewports, D3D10_VIEWPORT *pViewports) {
       pViewports[i].MinDepth = vp[i].MinDepth;
       pViewports[i].MaxDepth = vp[i].MaxDepth;
     }
+    std::fill(pViewports + *NumViewports, pViewports + requested, D3D10_VIEWPORT{});
   }
 }
 
 void STDMETHODCALLTYPE
 MTLD3D10Device::RSGetScissorRects(UINT *NumRects, D3D10_RECT *pRects) {
+  const UINT requested = *NumRects;
   d3d11_context_->RSGetScissorRects(NumRects, pRects);
+  if (pRects)
+    *NumRects = std::min(requested, *NumRects);
 }
 
 HRESULT STDMETHODCALLTYPE
@@ -1155,6 +1167,8 @@ MTLD3D10Device::CreateRasterizerState(
       reinterpret_cast<const D3D11_RASTERIZER_DESC *>(pRasterizerDesc), ppRasterizerState ? &d3d11_state : nullptr
   );
 
+  if (hr == D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS)
+    return D3D10_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS;
   if (hr != S_OK)
     return hr;
 
@@ -1195,7 +1209,7 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D10Device::CreateQuery(const D3D10_QUERY_DESC *pQueryDesc, ID3D10Query **ppQuery) {
   InitReturnPtr(ppQuery);
 
-  if (pQueryDesc == nullptr)
+  if (pQueryDesc == nullptr || UINT(pQueryDesc->Query) > D3D10_QUERY_SO_OVERFLOW_PREDICATE)
     return E_INVALIDARG;
 
   D3D11_QUERY_DESC d3d11_desc;
@@ -1236,7 +1250,7 @@ MTLD3D10Device::CreateCounter(const D3D10_COUNTER_DESC *pCounterDesc, ID3D10Coun
   InitReturnPtr(ppCounter);
   // the device has no counters of its own, and does not support the well-known ones (ID3D10Device::CreateCounter:
   // E_INVALIDARG for an out-of-range counter, DXGI_ERROR_UNSUPPORTED for a well-known one the device lacks)
-  if (!pCounterDesc || pCounterDesc->Counter >= D3D10_COUNTER_DEVICE_DEPENDENT_0)
+  if (!pCounterDesc || UINT(pCounterDesc->Counter) > D3D10_COUNTER_TEXTURE_CACHE_HIT_RATE)
     return E_INVALIDARG;
   return DXGI_ERROR_UNSUPPORTED;
 }
@@ -1270,7 +1284,7 @@ MTLD3D10Device::CheckCounter(
     const D3D10_COUNTER_DESC *pDesc, D3D10_COUNTER_TYPE *pType, UINT *pActiveCounters, char *name, UINT *pNameLength,
     char *units, UINT *pUnitsLength, char *description, UINT *pDescriptionLength
 ) {
-  if (!pDesc || pDesc->Counter >= D3D10_COUNTER_DEVICE_DEPENDENT_0)
+  if (!pDesc || UINT(pDesc->Counter) > D3D10_COUNTER_TEXTURE_CACHE_HIT_RATE)
     return E_INVALIDARG;
   return DXGI_ERROR_UNSUPPORTED;
 }

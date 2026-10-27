@@ -103,7 +103,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -137,13 +137,13 @@ CreateComputePipelineState(
   Com<ID3D12RootSignature> embedded;
   if (!desc.pRootSignature) {
     if (!ShaderContainerHolds(desc.CS.pShaderBytecode, desc.CS.BytecodeLength))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     HRESULT hr = CreateRootSignature(
         pDevice, 0, desc.CS.pShaderBytecode, desc.CS.BytecodeLength, __uuidof(ID3D12RootSignature),
         reinterpret_cast<void **>(&embedded)
     );
     if (FAILED(hr))
-      return hr == E_FAIL ? E_INVALIDARG : hr;
+      return hr == E_FAIL ? FAIL(E_INVALIDARG) : hr;
     desc.pRootSignature = embedded.ptr();
   }
   auto pso = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
@@ -184,12 +184,13 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
   Load(LPCWSTR name, const PipelineStateStream &desc, REFIID iid, void **pipeline) try {
     InitReturnPtr(pipeline);
     if (!name)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     Sha1Digest key;
     if (HRESULT hr = desc.Key(key); FAILED(hr))
       return hr;
     std::unique_lock lock(mutex_);
     auto found = entries_.find(name);
+    // a miss is what LoadPipeline answers for a pipeline not stored yet, not a refusal: it says nothing
     if (found == entries_.end() || found->second.key != key)
       return E_INVALIDARG;
     if (!found->second.pipeline) {
@@ -207,7 +208,7 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
     }
     return found->second.pipeline->QueryInterface(iid, pipeline);
   } catch (const std::bad_alloc &) {
-    return E_OUTOFMEMORY;
+    return FAIL(E_OUTOFMEMORY);
   }
 
 public:
@@ -219,7 +220,7 @@ public:
     if (!size)
       return S_OK;
     if (!blob || size < kHeaderSize || memcmp(blob, kMagic, sizeof(kMagic)))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto data = static_cast<const char *>(blob);
     SIZE_T offset = sizeof(kMagic);
     auto read = [&](auto &value) {
@@ -237,22 +238,22 @@ public:
     hash.update(data, kHeaderSize - sizeof(checksum));
     hash.update(data + kHeaderSize, size - kHeaderSize);
     if (hash.final() != checksum)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (version != AIRCONV_VERSION)
       return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     if (adapter != device_->GetMTLDevice().registryID())
       return D3D12_ERROR_ADAPTER_NOT_FOUND;
     uint64_t shaders;
     if (!read(shaders) || shaders > (size - offset) / (sizeof(Sha1Digest) + sizeof(uint64_t)))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     for (uint64_t i = 0; i < shaders; i++) {
       Sha1Digest key;
       uint64_t length;
       if (!read(key) || !read(length) || !length || length > size - offset || shaders_.contains(key))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto compiled = WMT::MakeDispatchData(uint64_t(data + offset), length);
       if (!compiled)
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
       shaders_.emplace(key, std::move(compiled));
       offset += length;
     }
@@ -260,21 +261,21 @@ public:
       uint64_t length, count;
       Entry entry{};
       if (!read(length) || !read(entry.key) || !read(count) || !count || count > (size - offset) / sizeof(Sha1Digest))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       for (uint64_t i = 0; i < count; i++) {
         Sha1Digest key;
         read(key);
         if (!shaders_.contains(key))
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         entry.shaders.push_back(key);
       }
       if (length > (size - offset) / sizeof(WCHAR))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       std::wstring name(length, L'\0');
       memcpy(name.data(), data + offset, length * sizeof(WCHAR));
       offset += length * sizeof(WCHAR);
       if (name.find(L'\0') != std::wstring::npos || !entries_.try_emplace(std::move(name), std::move(entry)).second)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
     }
     return S_OK;
   }
@@ -282,7 +283,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   QueryInterface(REFIID iid, void **object) override {
     if (!object)
-      return E_POINTER;
+      return FAIL(E_POINTER);
     *object = nullptr;
     if (iid == __uuidof(IUnknown) || iid == __uuidof(ID3D12Object) || iid == __uuidof(ID3D12DeviceChild) ||
         iid == __uuidof(ID3D12PipelineLibrary) || iid == __uuidof(ID3D12PipelineLibrary1))
@@ -293,15 +294,15 @@ public:
   HRESULT STDMETHODCALLTYPE
   StorePipeline(LPCWSTR name, ID3D12PipelineState *pipeline) override {
     if (!pipeline)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     Com<ID3D12Device> parent;
     if (FAILED(pipeline->GetDevice(__uuidof(ID3D12Device), (void **)&parent)) || parent.ptr() != device_)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     std::lock_guard lock(mutex_);
     try {
       auto state = static_cast<MTLD3D12PipelineState *>(pipeline);
       if (entries_.contains(name ? name : L""))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       Entry entry{state->library_key, state, {}};
       std::lock_guard shader_lock(state->shader_mutex);
       for (auto &[key, data] : state->cached_shaders) {
@@ -311,7 +312,7 @@ public:
       entries_.emplace(name ? name : L"", std::move(entry));
       return S_OK;
     } catch (const std::bad_alloc &) {
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
     }
   }
 
@@ -321,7 +322,7 @@ public:
   ) override {
     InitReturnPtr(pipeline);
     if (!desc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     PipelineStateStream description;
     description.desc_graphics = *desc;
     return Load(name, description, iid, pipeline);
@@ -333,7 +334,7 @@ public:
   ) override {
     InitReturnPtr(pipeline);
     if (!desc)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     PipelineStateStream description;
     description.desc_cs = *desc;
     return Load(name, description, iid, pipeline);
@@ -359,7 +360,7 @@ public:
     std::lock_guard lock(mutex_);
     auto required = SerializedSize();
     if (!blob || size < required)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto data_ptr = static_cast<char *>(blob);
     SIZE_T offset = 0;
     auto write = [&](const void *value, SIZE_T bytes) {
@@ -403,7 +404,7 @@ CreatePipelineLibrary(MTLD3D12Device *Device, const void *Blob, SIZE_T Size, REF
       return hr;
     return Library ? library->QueryInterface(Iid, Library) : S_FALSE;
   } catch (const std::bad_alloc &) {
-    return E_OUTOFMEMORY;
+    return FAIL(E_OUTOFMEMORY);
   }
 }
 

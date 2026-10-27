@@ -13,6 +13,8 @@
 //   CheckFormatSupport answers with D3D10_FORMAT_SUPPORT bits only, the device has no counters (D3D10_COUNTER_INFO:
 //   LastDeviceDependentCounter 0; CreateCounter: DXGI_ERROR_UNSUPPORTED for a well-known counter, E_INVALIDARG past
 //   them), and the exception mode set is the one got.
+// CreateCounter: "E_INVALIDARG is returned whenever an out-of-range well-known or device-dependent counter is requested".
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d10/nf-d3d10-id3d10device-createcounter
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d10_1.h>
@@ -55,8 +57,15 @@ compile(const char *entry, const char *profile, UINT count) {
   return code;
 }
 
-int
-main() {
+static int
+testing(D3D10_FEATURE_LEVEL1 level) {
+  const UINT count = 8;
+  auto vs_code = compile("vs", "vs_4_0", count), gs_code = compile("gs", "gs_4_0", count),
+       ps_code = compile("ps", "ps_4_0", count);
+  if (!vs_code || !gs_code || !ps_code) {
+    printf("failed: HLSL did not compile\n");
+    return 1;
+  }
   // from d3d10_1.dll itself: the toolchain has no import library for it
   auto create = reinterpret_cast<decltype(&D3D10CreateDevice1)>(
       (void *)GetProcAddress(LoadLibraryA("d3d10_1.dll"), "D3D10CreateDevice1")
@@ -66,19 +75,13 @@ main() {
     return 1;
   }
   ComPtr<ID3D10Device1> device;
-  CHECK(create(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, D3D10_FEATURE_LEVEL_10_1, D3D10_1_SDK_VERSION, &device));
+  CHECK(create(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, level, D3D10_1_SDK_VERSION, &device));
   unsigned wrong = 0, checks = 0;
   auto expect = [&](bool ok, const char *what) {
     checks++;
     if (!ok && wrong++ < 16)
       printf("%s\n", what);
   };
-  const UINT count = 8;
-  auto vs_code = compile("vs", "vs_4_0", count), gs_code = compile("gs", "gs_4_0", count), ps_code = compile("ps", "ps_4_0", count);
-  if (!vs_code || !gs_code || !ps_code) {
-    printf("failed: HLSL did not compile\n");
-    return 1;
-  }
 
   // an object and its Direct3D 11 self; a view's reference
   D3D10_TEXTURE2D_DESC target_desc{count, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D10_USAGE_DEFAULT, D3D10_BIND_RENDER_TARGET};
@@ -285,10 +288,9 @@ main() {
     query->Begin();
     query->End();
     HRESULT hr = S_FALSE;
-    for (int attempt = 0; attempt < 1000 && hr == S_FALSE; attempt++) {
+    do {
       hr = query->GetData(&data, sizeof(data), 0);
-      Sleep(1);
-    }
+    } while (hr == S_FALSE);
     expect(hr == S_OK, "pipeline statistics are not read at Direct3D 10's size");
     UINT support = 0;
     CHECK(device->CheckFormatSupport(DXGI_FORMAT_R8G8B8A8_UNORM, &support));
@@ -297,10 +299,37 @@ main() {
     D3D10_COUNTER_INFO info{D3D10_COUNTER_DEVICE_DEPENDENT_0, 1, 1};
     device->CheckCounterInfo(&info);
     expect(info.LastDeviceDependentCounter == 0 && info.NumSimultaneousCounters == 0, "the device says it has counters");
-    D3D10_COUNTER_DESC well_known{D3D10_COUNTER_GPU_IDLE}, past{D3D10_COUNTER_DEVICE_DEPENDENT_0};
-    ComPtr<ID3D10Counter> counter;
-    expect(device->CreateCounter(&well_known, &counter) == DXGI_ERROR_UNSUPPORTED, "a well-known counter is not unsupported");
-    expect(device->CreateCounter(&past, &counter) == E_INVALIDARG, "a counter the device does not have is not out of range");
+    for (UINT kind = D3D10_COUNTER_GPU_IDLE; kind <= D3D10_COUNTER_TEXTURE_CACHE_HIT_RATE; kind++) {
+      D3D10_COUNTER_DESC desc{D3D10_COUNTER(kind)};
+      ComPtr<ID3D10Counter> counter;
+      HRESULT created = device->CreateCounter(&desc, &counter);
+      D3D10_COUNTER_TYPE type{};
+      UINT active = 0;
+      HRESULT checked =
+          device->CheckCounter(&desc, &type, &active, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+      if (created != DXGI_ERROR_UNSUPPORTED || checked != DXGI_ERROR_UNSUPPORTED || counter)
+        printf("counter %u create=%#lx check=%#lx\n", kind, created, checked);
+      expect(
+          created == DXGI_ERROR_UNSUPPORTED && checked == DXGI_ERROR_UNSUPPORTED && !counter,
+          "a well-known counter is not unsupported despite the device reporting no counters"
+      );
+    }
+    const UINT invalid_counters[] = {
+        D3D10_COUNTER_TEXTURE_CACHE_HIT_RATE + 1, D3D10_COUNTER_DEVICE_DEPENDENT_0 - 1,
+        D3D10_COUNTER_DEVICE_DEPENDENT_0, D3D10_COUNTER_DEVICE_DEPENDENT_0 + 1, ~0u
+    };
+    for (UINT kind : invalid_counters) {
+      D3D10_COUNTER_DESC desc{D3D10_COUNTER(kind)};
+      ComPtr<ID3D10Counter> counter;
+      HRESULT created = device->CreateCounter(&desc, &counter);
+      D3D10_COUNTER_TYPE type{};
+      UINT active = 0;
+      HRESULT checked =
+          device->CheckCounter(&desc, &type, &active, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+      if (created != E_INVALIDARG || checked != E_INVALIDARG || counter)
+        printf("invalid counter %u create=%#lx check=%#lx\n", kind, created, checked);
+      expect(created == E_INVALIDARG && checked == E_INVALIDARG && !counter, "an out-of-range counter has the wrong failure code");
+    }
     expect(device->SetExceptionMode(D3D10_RAISE_FLAG_DRIVER_INTERNAL_ERROR) == S_OK &&
                device->GetExceptionMode() == D3D10_RAISE_FLAG_DRIVER_INTERNAL_ERROR,
            "the exception mode set is not the one got");
@@ -308,4 +337,12 @@ main() {
   }
   printf("%s: %u wrong of %u checks\n", wrong ? "failed" : "passed", wrong, checks);
   return wrong != 0;
+}
+
+int
+main() {
+  for (auto level : {D3D10_FEATURE_LEVEL_10_0, D3D10_FEATURE_LEVEL_10_1})
+    if (int status = testing(level))
+      return status;
+  return 0;
 }

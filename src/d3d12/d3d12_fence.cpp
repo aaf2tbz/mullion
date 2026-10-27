@@ -23,18 +23,102 @@
 
 namespace mullion {
 
+// a shared fence's value is its event's, which the devices it is shared with signal too. Metal's events only rise, so
+// a shared fence is not set back
+struct Completion : Reached, std::enable_shared_from_this<Completion> {
+  WMT::Reference<WMT::SharedEvent> event;
+  EventListener *listener;
+
+  // the listener sets `reached` once the event has `expected`, which gives the completion, if it still lives, the
+  // event's value. a watch the event never reaches stays, without the completion
+  void
+  Waiting(uint64_t expected) override {
+    if (!event)
+      return;
+    struct Watch {
+      std::weak_ptr<Completion> completion;
+      HANDLE reached;
+    };
+    auto watch = new Watch{weak_from_this(), CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    auto wait = CreateThreadpoolWait(
+        [](PTP_CALLBACK_INSTANCE, void *context, PTP_WAIT wait, TP_WAIT_RESULT) {
+          auto watch = static_cast<Watch *>(context);
+          if (auto completion = watch->completion.lock())
+            completion->Reach(completion->event.signaledValue());
+          CloseThreadpoolWait(wait);
+          CloseHandle(watch->reached);
+          delete watch;
+        },
+        watch, nullptr
+    );
+    SetThreadpoolWait(wait, watch->reached, nullptr);
+    listener->setEventOnValue(event, watch->reached, expected);
+  }
+};
+
 class MTLD3D12FenceImpl : public MTLD3D12DeviceChild<MTLD3D12Fence> {
   D3D12_FENCE_FLAGS flags_;
+  std::shared_ptr<Completion> completion_ = std::make_shared<Completion>();
+  D3DKMT_HANDLE allocation_ = 0;
 
 public:
-  MTLD3D12FenceImpl(MTLD3D12Device *pDevice, D3D12_FENCE_FLAGS flags) :
+  MTLD3D12FenceImpl(
+      MTLD3D12Device *pDevice, D3D12_FENCE_FLAGS flags, WMT::Reference<WMT::SharedEvent> &&event = {},
+      D3DKMT_HANDLE allocation = 0
+  ) :
       MTLD3D12DeviceChild<MTLD3D12Fence>(pDevice),
-      flags_(flags) {}
+      flags_(flags),
+      allocation_(allocation) {
+    completion = completion_;
+    completion_->event = std::move(event);
+    completion_->listener = &device_->GetEventListener();
+  }
 
+  ~MTLD3D12FenceImpl() {
+    {
+      std::lock_guard lock(device_->fences.mutex);
+      device_->fences.values.erase(completion);
+    }
+    if (allocation_) {
+      D3DKMT_DESTROYALLOCATION destroy = {};
+      destroy.hDevice = device_->GetLocalD3DKMT();
+      destroy.hResource = allocation_;
+      D3DKMTDestroyAllocation(&destroy);
+    }
+  }
+
+  // a removed device has reached every fence it has (LoseDevice)
   HRESULT
   Initialize(UINT64 InitialValue) {
-    value = InitialValue;
+    auto &event = completion_->event;
+    if (event)
+      completion_->value = event.signaledValue();
+    else if (flags_ & (D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER)) {
+      if (!(event = device_->GetMTLDevice().newSharedEvent()))
+        return E_OUTOFMEMORY;
+      event.signalValue(InitialValue);
+      if (!(allocation_ = shareEvent(device_->GetLocalD3DKMT(), event)))
+        return E_FAIL;
+    }
+    if (!event)
+      completion_->value = InitialValue;
+    std::lock_guard lock(device_->fences.mutex);
+    if (FAILED(device_->GetDeviceRemovedReason()))
+      return DXGI_ERROR_DEVICE_REMOVED;
+    device_->fences.values.insert(completion);
     return S_OK;
+  }
+
+  void
+  Signaled(uint64_t Value) override {
+    completion_->Reach(Value);
+    if (completion_->event)
+      completion_->event.signalValue(Value);
+  }
+
+  D3DKMT_HANDLE
+  SharedAllocation() override {
+    return allocation_;
   }
 
   ULONG STDMETHODCALLTYPE
@@ -42,7 +126,7 @@ public:
     uint32_t refCount = --m_refCount;
     if (!refCount) {
       // pending signals keep the object alive after the last public release has unblocked its waiters
-      Reach(UINT64_MAX);
+      completion->Reach(UINT64_MAX);
       ReleasePrivate();
     }
     return refCount;
@@ -52,7 +136,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -72,15 +156,29 @@ public:
   UINT64 STDMETHODCALLTYPE
   GetCompletedValue() {
     // "if the device has been removed, the return value will be UINT64_MAX" (ID3D12Fence::GetCompletedValue)
-    return FAILED(device_->GetDeviceRemovedReason()) ? UINT64_MAX : value.load();
+    auto &event = completion_->event;
+    return FAILED(device_->GetDeviceRemovedReason()) ? UINT64_MAX : event ? event.signaledValue() : completion->value.load();
   }
 
   HRESULT STDMETHODCALLTYPE
   SetEventOnCompletion(UINT64 Value, HANDLE Event) {
     if (Logger::logLevel() == LogLevel::Trace)
-      TRACE("fence ", this, " at ", value.load(), ": thread ", GetCurrentThreadId(),
+      TRACE("fence ", this, " at ", completion->value.load(), ": thread ", GetCurrentThreadId(),
             Event ? " sets an event at " : " waits for ", Value);
-    Event ? Expect(Value, [Event] { SetEvent(Event); }) : Expect(Value)->wait(false);
+    // the caller is taken to wait from here, as it does for a fence it waits on
+    auto waited = [began = diag::profile ? diag::Now() : 0, thread = GetCurrentThreadId()] {
+      if (began)
+        diag::Waited("fence", began, thread);
+    };
+    if (Event)
+      completion->Expect(Value, [Event, waited] {
+        waited();
+        SetEvent(Event);
+      });
+    else {
+      completion->Expect(Value)->wait(false);
+      waited();
+    }
     return S_OK;
   }
 
@@ -88,7 +186,7 @@ public:
   Signal(UINT64 Value) {
     if (Logger::logLevel() == LogLevel::Trace)
       TRACE("fence ", this, " signaled to ", Value, " by thread ", GetCurrentThreadId());
-    Reach(Value);
+    Signaled(Value);
     return S_OK;
   }
 
@@ -100,9 +198,25 @@ public:
 
 HRESULT
 CreateFence(MTLD3D12Device *pDevice, UINT64 InitialValue, D3D12_FENCE_FLAGS Flags, REFIID riid, void **ppFence) {
+  InitReturnPtr(ppFence);
   auto fence = Com(new MTLD3D12FenceImpl(pDevice, Flags));
   HRESULT hr = fence->Initialize(InitialValue);
   if (FAILED(hr))
+    return hr;
+  if (!ppFence)
+    return S_FALSE;
+  return fence->QueryInterface(riid, ppFence);
+}
+
+HRESULT
+OpenFence(
+    MTLD3D12Device *pDevice, WMT::Reference<WMT::SharedEvent> &&Event, D3DKMT_HANDLE Allocation, REFIID riid,
+    void **ppFence
+) {
+  if (!Event)
+    return E_INVALIDARG;
+  auto fence = Com(new MTLD3D12FenceImpl(pDevice, D3D12_FENCE_FLAG_SHARED, std::move(Event), Allocation));
+  if (HRESULT hr = fence->Initialize(0); FAILED(hr))
     return hr;
   if (!ppFence)
     return S_FALSE;

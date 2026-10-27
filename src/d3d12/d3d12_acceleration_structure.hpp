@@ -262,9 +262,9 @@ AccelerationStructureVertexFormat(DXGI_FORMAT Format) {
   }
 }
 
-// Metal's description of a build's inputs. `geometries` holds a bottom-level structure's NumDescs geometries; a
-// top-level structure's instances come from `instances`, converted, and their count from a uint32 in `count`. a
-// prebuild query has no buffers to give: its addresses may be placeholders, and sizes do not depend on them
+// Metal's description of a build's inputs. `geometries` holds a bottom-level structure's NumDescs geometries, at
+// least one; a top-level structure's instances come from `instances`, converted, and their count from a uint32 in
+// `count`. a prebuild query has no buffers to give: its addresses may be placeholders, and sizes do not depend on them
 inline WMTAccelerationStructureInfo
 AccelerationStructureInfo(
     MTLD3D12Device *device, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS &inputs,
@@ -290,7 +290,11 @@ AccelerationStructureInfo(
     buffer = allocation ? allocation->buffer().handle : 0;
   };
   info.geometries.set(geometries);
-  info.geometry_count = inputs.NumDescs;
+  // Metal builds no structure of no geometries: an empty one has a geometry of no triangles, in the null buffer
+  info.geometry_count = std::max(inputs.NumDescs, 1u);
+  geometries[0] = {};
+  geometries[0].vertex_format = WMTAttributeFormatFloat3;
+  geometries[0].buffer = device->GetNullBufferHandle();
   for (UINT i = 0; i < inputs.NumDescs; i++) {
     auto &desc = inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY ? inputs.pGeometryDescs[i] : *inputs.ppGeometryDescs[i];
     auto &geometry = geometries[i] = {};

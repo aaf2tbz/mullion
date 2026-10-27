@@ -309,7 +309,10 @@ void handle_signature_ps(
              interpolation == air::Interpolation::sample_no_perspective)
       sm50_shader->ps_noperspective_input_mask |= 1u << reg;
     signature_handlers.push_back([=](SignatureContext &ctx) {
-      bool pull_mode = bool(ctx.pull_mode_reg_mask & (1 << reg)) && interpolation != air::Interpolation::flat;
+      bool centroid = interpolation == air::Interpolation::centroid_perspective ||
+                      interpolation == air::Interpolation::centroid_no_perspective;
+      bool pull_mode = (bool(ctx.pull_mode_reg_mask & (1 << reg)) || (ctx.pull_centroids && centroid)) &&
+                       interpolation != air::Interpolation::flat;
       for (unsigned c = 0; c < 4; c++) {
         if (!(mask >> c & 1))
           continue;
@@ -376,6 +379,7 @@ void handle_signature_ps(
     switch (RegType) {
     case D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK: {
       auto assigned_index = func_signature.DefineInput(InputInputCoverage{});
+      sm50_shader->ps_has_coverage_input = 1;
       signature_handlers.push_back([=](SignatureContext &ctx) {
         ctx.prologue << make_effect([=](struct context ctx) {
           auto attr = ctx.function->getArg(assigned_index);
@@ -544,18 +548,32 @@ void handle_signature_ps(
               ? DepthArgument::less
               : DepthArgument::any
         });
+        // a written depth is clamped to its viewport's range (D3D11.3 17.10), and NaN to its MinDepth, which Metal
+        // does only in its clamp mode and discards
+        auto ranges = ctx.func_signature.DefineInput(ArgumentBindingBuffer{
+          .location_index = SM50_BINDING_INDEX_DEPTH_RANGES,
+          .array_size = 1,
+          .memory_access = MemoryAccess::read,
+          .address_space = AddressSpace::constant,
+          .type = msl_float,
+          .arg_name = "depth_ranges",
+        });
+        auto viewport = ctx.func_signature.DefineInput(InputViewportArrayIndex{});
         ctx.epilogue >> [=](pvalue v) {
           return make_irvalue([=](struct context ctx) {
-            return ctx.builder.CreateInsertValue(
-              v,
-              ctx.builder.CreateLoad(
-                ctx.types._float,
-                ctx.builder.CreateConstInBoundsGEP1_32(
-                  ctx.types._float, ctx.resource.depth_output_reg, 0
-                )
-              ),
-              {assigned_index}
+            auto &ir = ctx.builder;
+            auto range = [&](unsigned end) {
+              auto index = ir.CreateAdd(ir.CreateShl(ctx.function->getArg(viewport), 1), ir.getInt32(end));
+              return ir.CreateLoad(ctx.types._float, ir.CreateGEP(ctx.types._float, ctx.function->getArg(ranges), index));
+            };
+            llvm::Value *depth = ir.CreateLoad(
+              ctx.types._float, ir.CreateConstInBoundsGEP1_32(ctx.types._float, ctx.resource.depth_output_reg, 0)
             );
+            using llvm::air::AIRBuilder;
+            depth = ctx.air.CreateFPBinOp(
+              AIRBuilder::fmin, range(1), ctx.air.CreateFPBinOp(AIRBuilder::fmax, range(0), depth, false), false
+            );
+            return ir.CreateInsertValue(v, depth, {assigned_index});
           });
         };
       });
@@ -599,12 +617,14 @@ void handle_signature_ps(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         ctx.epilogue >> [=](pvalue v) {
           return make_irvalue([=](struct context ctx) {
-            auto odepth = ctx.builder.CreateLoad(
+            llvm::Value *odepth = ctx.builder.CreateLoad(
               ctx.types._int,
               ctx.builder.CreateConstInBoundsGEP1_32(
                 ctx.types._int, ctx.resource.coverage_mask_reg, 0
               )
             );
+            if (ctx.resource.kept_samples)
+              odepth = ctx.builder.CreateAnd(odepth, ctx.resource.kept_samples);
             return ctx.builder.CreateInsertValue(
               v,
               ctx.pso_sample_mask != 0xffffffff
@@ -631,12 +651,13 @@ void handle_signature_ps(
       if (sig.mask() == 0) break;
       auto sig_type = sig.componentType();
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        auto type = component_type_from_pixel_format(ctx.pixel_formats[reg]);
+        auto format = uint32_t(ctx.pixel_formats[reg]);
+        auto type = component_type_from_pixel_format(air::MTLPixelFormat(format & 0xff));
         if (type == RegisterComponentType::Unknown)
           type = sig_type;
         uint32_t assigned_index;
         if (ctx.dual_source_blending) {
-          if (reg > 1 || reg < 0)
+          if (reg > 1 || (reg == 1 && ctx.shader_blends_dual_source))
             return;
           assigned_index = ctx.func_signature.DefineOutput(OutputRenderTarget{
             .dual_source_blending = true,
@@ -652,6 +673,10 @@ void handle_signature_ps(
         }
         if (type == RegisterComponentType::Float && ctx.unorm_output_reg_mask & (1 << reg))
           ctx.epilogue >> pop_output_reg_fix_unorm(reg, mask, assigned_index);
+        else if (format & SM50_PIXEL_FORMAT_CHANNELS)
+          ctx.epilogue >> pop_output_reg(reg, mask, assigned_index,
+                                         {int(SM50_PIXEL_FORMAT_CHANNEL(format, 0)), int(SM50_PIXEL_FORMAT_CHANNEL(format, 1)),
+                                          int(SM50_PIXEL_FORMAT_CHANNEL(format, 2)), int(SM50_PIXEL_FORMAT_CHANNEL(format, 3))});
         else
           ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
       });

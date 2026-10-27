@@ -1,9 +1,12 @@
 # opening a shared fence creates an independent Metal event
-diff --git a/src/d3d11/d3d11_fence.cpp b/src/d3d11/d3d11_fence.cpp
-index b481320..c7d607c 100644
---- a/src/d3d11/d3d11_fence.cpp
-+++ b/src/d3d11/d3d11_fence.cpp
-@@ -196,2 +196,2 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
--  fence->event = pDevice->GetMTLDevice().newSharedEventWithMachPort(mach_port);
-+  fence->event = pDevice->GetMTLDevice().newSharedEvent();
-   if (!fence->event)
+--- a/src/mullion/mullion_fence.cpp
++++ b/src/mullion/mullion_fence.cpp
+@@ -179,7 +179,7 @@
+     ERR("openSharedEvent: Failed to look up mach port");
+     return {};
+   }
+-  return mtl.newSharedEventWithMachPort(mach_port);
++  return mtl.newSharedEvent();
+ }
+ 
+ HRESULT

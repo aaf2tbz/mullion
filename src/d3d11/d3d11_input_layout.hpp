@@ -11,8 +11,8 @@ struct MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC {
   uint32_t Slot;
   uint32_t Offset;
   uint32_t Format; // the same as WMTAttributeFormat
-  D3D11_INPUT_CLASSIFICATION StepFunction : 1;
-  uint32_t InstanceStepRate : 31 = 0;
+  D3D11_INPUT_CLASSIFICATION StepFunction;
+  uint32_t InstanceStepRate = 0;
 };
 
 namespace mullion {

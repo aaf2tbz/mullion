@@ -5,6 +5,7 @@
 #include "d3d11_device.hpp"
 #include "d3d11_device_child.hpp"
 #include "d3d11_input_layout.hpp"
+#include "d3d11_state_object.hpp"
 #include "sha1/sha1_util.hpp"
 #include "log/log.hpp"
 #include "mullion_shader_cache.hpp"
@@ -16,6 +17,12 @@ struct MTL_COMPILED_SHADER {
   */
   WMT::Function Function;
 };
+
+// a shader blend is its bytes, which have no padding
+inline bool
+operator==(const SM50_SHADER_BLEND &a, const SM50_SHADER_BLEND &b) {
+  return !memcmp(&a, &b, sizeof(a));
+}
 
 namespace mullion {
 class Shader;
@@ -95,10 +102,12 @@ struct ShaderVariantVertex {
   ManagedInputLayout input_layout_handle;
   uint32_t gs_passthrough;
   bool rasterization_disabled;
+  bool clip_distance_varyings;
   bool operator==(const this_type &rhs) const {
     return input_layout_handle == rhs.input_layout_handle &&
            gs_passthrough == rhs.gs_passthrough &&
-           rasterization_disabled == rhs.rasterization_disabled;
+           rasterization_disabled == rhs.rasterization_disabled &&
+           clip_distance_varyings == rhs.clip_distance_varyings;
   }
 };
 
@@ -109,7 +118,12 @@ struct ShaderVariantPixel {
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
   bool pipeline_statistics = false;
-  std::array<uint8_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
+  bool alpha_to_coverage = false;
+  bool centered_samples = false;
+  bool single_raster_sample = false;
+  uint32_t clip_distances = 0;
+  std::array<uint32_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
+  std::array<SM50_SHADER_BLEND, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.blend)> blend{};
   bool operator==(const this_type &rhs) const = default;
 };
 
@@ -135,18 +149,20 @@ struct ShaderVariantTessellationDomain {
   bool rasterization_disabled;
   ManagedShader geometry_shader_handle;
   uint32_t max_mesh_threadgroups;
+  bool clip_distance_varyings;
   bool operator==(const this_type &rhs) const = default;
 };
 
 // what stream output adds to a geometry pipeline's two stages: its layout (null for none) and whether this is the
 // pass that only counts. and what a pipeline without a geometry shader needs: the input primitive
-// (D3D10_SB_PRIMITIVE), and whether its mesh stage passes the primitives on to the rasterizer
+// (D3D10_SB_PRIMITIVE), and whether its mesh stage passes the primitives on to the rasterizer, lines as quadrilaterals
 struct ShaderVariantStreamOutput {
   using this_type = ShaderVariantStreamOutput;
   IMTLD3D11StreamOutputLayout *layout;
   bool counting;
   uint32_t input_primitive;
   bool pass_through;
+  bool quad_lines;
   bool operator==(const this_type &rhs) const = default;
 };
 
@@ -166,6 +182,8 @@ struct ShaderVariantGeometry {
   ManagedShader vertex_shader_handle;
   bool strip_topology;
   ShaderVariantStreamOutput stream_output;
+  bool pipeline_statistics;
+  bool clip_distance_varyings;
   bool operator==(const this_type &rhs) const = default;
 };
 
@@ -207,8 +225,15 @@ public:
   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
-  CompiledShader *get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats) {
+  CompiledShader *
+  get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats, IMTLD3D11BlendState *blend) {
     variant.pixel_formats = PixelShaderOutputFormats(reflection().PixelShader, formats, variant.dual_source_blending);
+    WMTRenderPipelineBlendInfo targets{};
+    for (unsigned i = 0; i < formats.size(); i++)
+      targets.colors[i].pixel_format = formats[i];
+    variant.blend = blend->SetupMetalPipelineDescriptor(&targets, formats.size(), reflection().PSValidRenderTargets);
+    variant.alpha_to_coverage &= !reflection().PixelShader.HasCoverageOutput && !formats.empty() &&
+                                 IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(formats[0])));
     return get_shader(variant);
   }
   virtual const Sha1Digest& sha1() = 0;

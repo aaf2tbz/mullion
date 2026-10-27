@@ -35,6 +35,9 @@
 // its first texel with WRAP and last with CLAMP: "t = floor(scaledU)" (7.18.7), "scaledU = scaledU % numTexelsU;"
 // and "scaledU = max( 0, min( scaledU, numTexelsU - 1 ) );" (7.18.9).
 // readback copies disable predication after its snapshot: "CopyResource" honors predication (D3D11.3 20.2).
+// context state swaps exchange every binding and preserve active queries: "Active queries are not affected by
+// SwapDeviceContextState." a null state has no effect (Microsoft Learn, SwapDeviceContextState, Remarks).
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/nf-d3d11_1-id3d11devicecontext1-swapdevicecontextstate
 #include "d3d11_test.hpp"
 #include <d3d11_3.h>
 #include <algorithm>
@@ -796,6 +799,53 @@ main() {
   context->ExecuteCommandList(no_inputs.Get(), TRUE);
   snapshot(context.Get(), 0);
   CHECK(output(context.Get(), 0));
+
+  step("context state objects exchange all slots and keep active queries");
+  context->ClearState();
+  ComPtr<ID3DDeviceContextState> blank, saved_a, saved_b, same;
+  D3D_FEATURE_LEVEL chosen{};
+  CHECK(device3->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1),
+                                          &chosen, &blank));
+  expect(chosen == level, "context state feature level differs");
+  D3D11_QUERY_DESC query_desc{D3D11_QUERY_PIPELINE_STATISTICS};
+  ComPtr<ID3D11Query> active;
+  CHECK(device->CreateQuery(&query_desc, &active));
+  bind(context.Get(), 0);
+  context->Begin(active.Get());
+  CHECK(output(context.Get(), 0));
+  context->SwapDeviceContextState(blank.Get(), &saved_a);
+  expect(saved_a && saved_a != blank, "first swap did not return a distinct state object");
+  snapshot(context.Get(), -1);
+  bind(context.Get(), 1);
+  CHECK(output(context.Get(), 1));
+  context->End(active.Get());
+  context->SwapDeviceContextState(saved_a.Get(), &saved_b);
+  expect(saved_b == blank, "second swap did not return the installed object");
+  snapshot(context.Get(), 0);
+  CHECK(output(context.Get(), 0));
+  context->SwapDeviceContextState(nullptr, nullptr);
+  snapshot(context.Get(), 0);
+  context->SwapDeviceContextState(saved_a.Get(), &same);
+  expect(same == saved_a, "same-object swap did not return that object");
+  snapshot(context.Get(), 0);
+  context->SwapDeviceContextState(saved_b.Get(), nullptr);
+  snapshot(context.Get(), 1);
+  CHECK(output(context.Get(), 1));
+  context->ClearState();
+  snapshot(context.Get(), -1);
+  context->SwapDeviceContextState(saved_a.Get(), nullptr);
+  snapshot(context.Get(), 0);
+  CHECK(output(context.Get(), 0));
+  context->ClearState();
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS statistics{};
+  context->Flush();
+  HRESULT ready;
+  do {
+    ready = context->GetData(active.Get(), &statistics, sizeof(statistics), 0);
+  } while (ready == S_FALSE);
+  expect(ready == S_OK && statistics.IAVertices == 2 * 3 && statistics.CSInvocations == 2,
+         "query spanning swap: HRESULT %#lx, IA vertices %llu, CS invocations %llu", ready,
+         statistics.IAVertices, statistics.CSInvocations);
 
   for (auto &out : captures) {
     step("read back %s", out.name.c_str());

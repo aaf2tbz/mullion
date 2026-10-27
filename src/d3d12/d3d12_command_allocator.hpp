@@ -66,12 +66,14 @@ struct IndirectRays {
 
 // a command of a tessellated, geometry or mesh ExecuteIndirect on a GPU without mesh commands in indirect command
 // buffers (they come with Apple9): what its object stage reads, laid out as a direct draw's TessellationInputs and
-// arguments are, and the threadgroups of its draw. the resolver writes it
+// arguments are, and the threadgroups of its draw. the resolver writes it. with stream output, `zero` is the draw of
+// its scratch's words to zero (zero_words)
 struct IndirectMeshDraw {
   D3D12_INDEX_BUFFER_VIEW view;
   alignas(16) uint32_t control_points;
   alignas(16) uint32_t arguments[sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) / sizeof(uint32_t)];
   uint32_t threadgroups[3];
+  uint32_t zero[sizeof(D3D12_DRAW_ARGUMENTS) / sizeof(uint32_t)];
 };
 
 struct IndirectRenderCommandData {
@@ -114,15 +116,27 @@ struct IndirectRenderCommandData {
   uint64_t omitted;
   // the commands' IndirectMeshDraws, where the resolver writes those instead of commands; zero otherwise
   uint64_t draws;
-  // indexed commands of ordinary pipelines are two commands each: the indices the view has, then, for the indices
-  // past it, as many of these zero indices of 16 bits (D3D11.3 8.19.2: "the return is 0"), `zero_count` at most
+  // indexed commands of ordinary pipelines are kIndexedCommands commands each: the indices the view has, then, for the
+  // indices past it, as many of these zero indices of 16 bits (D3D11.3 8.19.2: "the return is 0"), `zero_count` at
+  // most; and the same again where the byte address wraps back to the view's start (8.19.1)
   uint64_t zeros;
   uint32_t zero_count;
   uint64_t pixel_statistics;
+  // the pass's SM50_BINDING_INDEX_DEPTH_RANGES and SM50_BINDING_INDEX_RASTER_SCALE
+  uint64_t depth_ranges, raster_scale;
   uint64_t statistics;
+  // with stream output, each command's SM50_STREAM_OUTPUT_TARGETS, whose grid the resolver fills in, zero otherwise;
+  // the scratch area they share and the geometry invocations of an object threadgroup, which bound a command's grid;
+  // and a word for each command, the scratch it needed when it had not that much
+  uint64_t so_targets;
+  uint64_t so_scratch_size;
+  uint32_t so_invocations;
+  uint64_t so_lacked;
   uint32_t statistics_first, statistics_step, statistics_cut, statistics_cuts;
   WMTIndirectCommandBufferExecutionRange execution_range;
 };
+
+constexpr unsigned kIndexedCommands = 4;
 
 // the words of IndirectRenderCommandData::most: five numbers of the commands and how many commands there were
 constexpr unsigned kMostWords = 6;
@@ -161,10 +175,17 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   void *gpu_heap_ = nullptr;
   Cursor gpu_cursor_;
   uint64_t gpu_heap_buffer_address_;
+  // the scratch area the recording list's indirect stream output commands share, one after another, at an offset in
+  // the GPU heap; no size until the first
+  uint64_t so_scratch_offset_ = 0, so_scratch_size_ = 0;
 
   EncoderData *encoder_last;
   EncoderData *encoder_current;
   size_t encoder_count_;
+public:
+  // the recording list's open events, which the passes it begins carry
+  const char *event = nullptr;
+private:
 
   // a list keeps its root's address until the queue has committed it, while later lists add roots
   std::deque<EncoderData> encoder_lists_;
@@ -191,6 +212,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   // and the inputs they kept, which a rebuilt structure replaces
   std::vector<std::shared_ptr<const AccelerationStructureInputs>> acceleration_structure_inputs_;
 
+  WMT::Reference<WMT::ComputePipelineState> d24_copy_pso_[2];
   RGB32Copy<MTLD3D12CommandAllocatorImpl> rgb32_copy_{*this};
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
   // a UAV clear joins the open compute pass, behind and before memory barriers, instead of a pass of its own
@@ -205,6 +227,10 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   uint64_t copy_temp_version_;
 
 public:
+  bool
+  CopyD24(bool to_float, WMT::Buffer src, uint64_t src_offset, UINT src_pitch, WMT::Buffer dst,
+          uint64_t dst_offset, UINT dst_pitch, WMTSize size);
+
   template <typename T>
   void
   ClearSparseTexelBuffer(
@@ -221,7 +247,7 @@ public:
       return;
     }
     auto format = buffer->pixelFormat(view);
-    auto texel_view = texel->createView({format});
+    auto texel_view = texel->createView({format, true});
     clear_uav_.begin(color, texel.ptr(), texel_view);
     clear_uav_.clear(0, 0, 1, 1);
     clear_uav_.end();
@@ -285,21 +311,23 @@ public:
   HRESULT
   StartRecord(EncoderData **pStartEncoder) {
     if (encoder_last)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     *pStartEncoder = encoder_last = &encoder_lists_.emplace_back(EncoderType::Null, nullptr);
+    so_scratch_size_ = 0;
+    event = nullptr;
     return S_OK;
   }
 
   HRESULT
   EndRecord(size_t *pEncoderCount) {
     if (!encoder_last)
-      return E_FAIL;
+      return FAIL(E_FAIL);
     if (encoder_current)
       InvalidateCurrentPass();
     encoder_last = nullptr;
     *pEncoderCount = encoder_count_;
     encoder_count_ = 0;
-    return exhausted_ ? E_OUTOFMEMORY : S_OK;
+    return exhausted_ ? FAIL(E_OUTOFMEMORY) : S_OK;
   }
 
   // where in an arena `Length` bytes are: after the cursor, or in a new run of the arena's when the cursor's has no
@@ -340,6 +368,7 @@ public:
     // what logs call the pass
     static std::atomic<uint64_t> passes;
     p->id = ++passes;
+    p->event_path = event;
     encoder_current = p;
     return p;
   };

@@ -25,6 +25,7 @@
 #include "mullion_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
+#include <bit>
 #include <cstring>
 #include <vector>
 #include "../d3d10/d3d10_blob.hpp"
@@ -86,7 +87,7 @@ SerializeVersionedRootSignatureImpl(
 
   add_segment(1, &RootSig);
   if (!RootSig)
-    return E_OUTOFMEMORY;
+    return FAIL(E_OUTOFMEMORY);
 
   RootSig->Version = (uint32_t)Version;
   RootSig->Flags = (uint32_t)pDesc->Flags;
@@ -98,7 +99,7 @@ SerializeVersionedRootSignatureImpl(
   RawRootParameter *Parameters = nullptr;
   RootSig->RootParametersOffset = add_segment(pDesc->NumParameters, &Parameters);
   if (pDesc->NumParameters && !Parameters)
-    return E_OUTOFMEMORY;
+    return FAIL(E_OUTOFMEMORY);
 
   for (UINT i = 0; i < pDesc->NumParameters; i++) {
     const ROOT_PARAMETER *RootParameter = &pDesc->pParameters[i];
@@ -110,12 +111,12 @@ SerializeVersionedRootSignatureImpl(
       RawRootDescriptorTable *OutTable = nullptr;
       Out->PayloadOffset = add_segment(1, &OutTable);
       if (!OutTable)
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
       OutTable->NumDescriptorRanges = RootParameter->DescriptorTable.NumDescriptorRanges;
       DESCRIPTOR_RANGE *OutRanges = nullptr;
       OutTable->DescriptorRangesOffset = add_segment(RootParameter->DescriptorTable.NumDescriptorRanges, &OutRanges);
       if (OutTable->NumDescriptorRanges && !OutRanges)
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
       for (UINT j = 0; j < RootParameter->DescriptorTable.NumDescriptorRanges; j++) {
         const DESCRIPTOR_RANGE *Range = &RootParameter->DescriptorTable.pDescriptorRanges[j];
         DESCRIPTOR_RANGE *OutRange = &OutRanges[j];
@@ -132,7 +133,7 @@ SerializeVersionedRootSignatureImpl(
       D3D12_ROOT_CONSTANTS *OutConstants = nullptr;
       Out->PayloadOffset = add_segment(1, &OutConstants);
       if (!OutConstants)
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
       *OutConstants = RootParameter->Constants;
       break;
     }
@@ -142,7 +143,7 @@ SerializeVersionedRootSignatureImpl(
       ROOT_DESCRIPTOR *OutDescriptor = nullptr;
       Out->PayloadOffset = add_segment(1, &OutDescriptor);
       if (!OutDescriptor)
-        return E_OUTOFMEMORY;
+        return FAIL(E_OUTOFMEMORY);
       OutDescriptor->ShaderRegister = RootParameter->Descriptor.ShaderRegister;
       OutDescriptor->RegisterSpace = RootParameter->Descriptor.RegisterSpace;
       SetFlag(OutDescriptor, &RootParameter->Descriptor);
@@ -157,7 +158,7 @@ SerializeVersionedRootSignatureImpl(
   RootSig->StaticSamplersOffset = add_segment(pDesc->NumStaticSamplers, &StaticSamplers);
   if (pDesc->NumStaticSamplers) {
     if (!StaticSamplers)
-      return E_OUTOFMEMORY;
+      return FAIL(E_OUTOFMEMORY);
     memcpy(StaticSamplers, pDesc->pStaticSamplers, sizeof(STATIC_SAMPLER) * pDesc->NumStaticSamplers);
   }
 
@@ -205,7 +206,7 @@ D3D12SerializeVersionedRootSignature(
   InitReturnPtr(ppErrorBlob);
 
   if (!ppBlob)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   switch (pRootSignatureDesc->Version) {
   default:
@@ -225,7 +226,7 @@ D3D12SerializeVersionedRootSignature(
     );
   }
 
-  return E_INVALIDARG;
+  return FAIL(E_INVALIDARG);
 }
 
 extern "C" HRESULT WINAPI
@@ -237,7 +238,7 @@ D3D12SerializeRootSignature(
   InitReturnPtr(ppErrorBlob);
 
   if (!ppBlob || Version != D3D_ROOT_SIGNATURE_VERSION_1_0)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
 
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_desc;
   versioned_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -253,7 +254,7 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     if (riid == __uuidof(Base)) {
       *ppvObject = ref_and_cast<Base>(this);
@@ -283,7 +284,7 @@ public:
       *ppDesc = reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *>(&impl_.desc_1_2_);
       break;
     default:
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     }
     return S_OK;
   }
@@ -330,7 +331,7 @@ RootSignaturePart(
   if (!pBytecode || Length < sizeof(microsoft::DXBCHeader) ||
       microsoft::DXBCGetSizeAssumingValidPointer(pBytecode) > Length ||
       !ShaderContainerHolds(pBytecode, microsoft::DXBCGetSizeAssumingValidPointer(pBytecode)))
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   if (!Name && SUCCEEDED(microsoft::DXBCGetRootSignature(pBytecode, ppPart, pSize)))
     return S_OK;
   bool found = false;
@@ -340,14 +341,14 @@ RootSignaturePart(
     if (!(Name ? (global || local) && subobject.name == Name : global))
       continue;
     if (found || subobject.bytes.empty())
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     found = true;
     *ppPart = subobject.bytes.data();
     *pSize = subobject.bytes.size();
   }
   if (FromLibrary)
     *FromLibrary = found;
-  return found ? S_OK : E_FAIL;
+  return found ? S_OK : FAIL(E_FAIL);
 }
 
 extern "C" HRESULT WINAPI
@@ -373,7 +374,7 @@ HRESULT
 DeserializeLibraryRootSignature(const void *Library, SIZE_T Size, LPCWSTR Name, REFIID riid, void **Deserializer) {
   InitReturnPtr(Deserializer);
   if (!Name)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   const void *part;
   UINT length;
   HRESULT hr = RootSignaturePart(Library, Size, &part, &length, Name);
@@ -468,14 +469,14 @@ public:
 
     uint32_t Version;
     if (RawRootSigSize < sizeof(Version))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     memcpy(&Version, pRawRootSig, sizeof(Version));
     D3D12_FEATURE_DATA_ROOT_SIGNATURE support{RootSignatureVersion12};
     hr = device_->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &support, sizeof(support));
     if (FAILED(hr))
       return hr;
     if (support.HighestVersion < Version)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     RootSignatureDeserializer deserializer;
     hr = deserializer.Deserialize(pRawRootSig, RawRootSigSize);
@@ -493,19 +494,69 @@ public:
     }
 
     if (desc.NumParameters) {
-      if (desc.NumParameters > D3D12_MAX_ROOT_COST)
-        return E_INVALIDARG;
-
+      const bool local = desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
+      constexpr auto local_limit =
+          D3D12_RAYTRACING_MAX_SHADER_RECORD_STRIDE - D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+      uint64_t root_cost = 0, local_bytes = 0;
       for (unsigned i = 0; i < desc.NumParameters; i++) {
         if (!desc.pParameters)
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         auto &parameter = desc.pParameters[i];
+        // DXR, Shader table memory initialization: local arguments use their byte sizes and alignment.
+        if (local) {
+          if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+            local_bytes += uint64_t(parameter.Constants.Num32BitValues) * sizeof(UINT);
+          else {
+            auto bytes = parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+                             ? sizeof(D3D12_GPU_DESCRIPTOR_HANDLE) : sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+            local_bytes = align(local_bytes, uint64_t(bytes)) + bytes;
+          }
+          if (local_bytes > local_limit)
+            return FAIL(E_INVALIDARG);
+        }
+        // Microsoft Learn, Root Signature Limits: constants cost a DWORD, tables one, root descriptors two.
+        switch (parameter.ParameterType) {
+        case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+          root_cost++;
+          break;
+        case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+          root_cost += parameter.Constants.Num32BitValues;
+          break;
+        case D3D12_ROOT_PARAMETER_TYPE_CBV:
+        case D3D12_ROOT_PARAMETER_TYPE_SRV:
+        case D3D12_ROOT_PARAMETER_TYPE_UAV: {
+          root_cost += sizeof(D3D12_GPU_VIRTUAL_ADDRESS) / sizeof(UINT);
+          auto flags = parameter.Descriptor.Flags;
+          constexpr auto data = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE |
+                                D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE |
+                                D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC;
+          if ((flags & ~data) || std::popcount(UINT(flags)) > 1)
+            return FAIL(E_INVALIDARG);
+          break;
+        }
+        }
+        if (!local && root_cost > D3D12_MAX_ROOT_COST)
+          return FAIL(E_INVALIDARG);
         if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
           bool is_normal_range = false, is_sampler_range = false;
           for (unsigned j = 0; j < parameter.DescriptorTable.NumDescriptorRanges; j++) {
             if (!parameter.DescriptorTable.pDescriptorRanges)
-              return E_INVALIDARG;
+              return FAIL(E_INVALIDARG);
             auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
+            auto flags = range.Flags;
+            constexpr auto data = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE |
+                                  D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE |
+                                  D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC;
+            constexpr auto descriptors = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+                                         D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS;
+            // Resource Binding: static-bounds descriptors keep static properties, so cannot also be volatile.
+            if ((flags & ~(data | descriptors)) || std::popcount(UINT(flags & data)) > 1 ||
+                std::popcount(UINT(flags & descriptors)) > 1 ||
+                ((flags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE) &&
+                 (flags & D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC)) ||
+                (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER &&
+                 (flags & data)))
+              return FAIL(E_INVALIDARG);
             switch (range.RangeType) {
             case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
             case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
@@ -516,11 +567,11 @@ public:
               is_sampler_range = true;
               break;
             default:
-              return E_INVALIDARG;
+              return FAIL(E_INVALIDARG);
             }
           }
           if (is_normal_range && is_sampler_range)
-            return E_INVALIDARG;
+            return FAIL(E_INVALIDARG);
         }
       }
     }
@@ -544,7 +595,7 @@ public:
         WMTBufferInfo info{static_samplers_encoded_.size() * sizeof(uint64_t), WMTResourceStorageModeShared};
         static_samplers_buffer_ = device_->GetMTLDevice().newBuffer(info);
         if (!static_samplers_buffer_)
-          return E_OUTOFMEMORY;
+          return FAIL(E_OUTOFMEMORY);
         memcpy(info.memory.get(), EncodedStaticSamplers, info.length);
         StaticSamplersAddress = info.gpu_address;
         device_->RegisterResidency(static_samplers_buffer_);
@@ -570,7 +621,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 

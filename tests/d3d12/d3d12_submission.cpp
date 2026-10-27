@@ -19,7 +19,7 @@ main() {
     return verdict();
   auto watchdog = CreateThread(
       nullptr, 0,
-      [](void *event) -> DWORD {
+      [](void *event) WINAPI -> DWORD {
         if (WaitForSingleObject(event, test_timeout_ms) != WAIT_OBJECT_0) {
           printf("failed: test did not finish within %lu ms\n", test_timeout_ms);
           ExitProcess(1);
@@ -106,7 +106,7 @@ main() {
     DWORD timeout{};
     HRESULT result = S_OK;
   };
-  auto submit_thread = [](void *data) -> DWORD {
+  auto submit_thread = [](void *data) WINAPI -> DWORD {
     auto &s = *static_cast<Submission *>(data);
     if (!ReleaseSemaphore(s.ready, 1, nullptr) || WaitForSingleObject(s.go, s.timeout) != WAIT_OBJECT_0) {
       s.result = E_FAIL;

@@ -19,11 +19,11 @@ Both columns were measured on the same Mac. The God of War numbers are premature
 | ![Black Myth: Wukong benchmark result on Mullion](docs/wukong-mullion.jpg) | ![The same benchmark on D3DMetal](docs/wukong-d3dmetal.jpg) |
 | ![God of War Ragnarök on Mullion](docs/gow-mullion.jpg) | ![The same place on D3DMetal](docs/gow-d3dmetal.jpg) |
 
-Direct3D 12 is supported at feature level 12_1 with shader models up to 6.6, including conservative rasterization (tier 1, emulated), ray tracing at tier 1.1, mesh and amplification shaders, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats. Direct3D 10 and 11 are supported at feature level 11_1. Next for Direct3D 12 are shader model 6.7, D3D11On12, a Metal 4 backend, and more work on performance and reliability.
+Direct3D 12 is supported at feature level 12_2 with shader models up to 6.7, including ray tracing at tier 1.1, mesh and amplification shaders, conservative rasterization at tier 3, variable rate shading at tier 2, tiled resources at tier 3, the depth bounds test, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats, and D3D11On12. On macOS 26 it runs on Metal 4, and on Metal 3 before that. Direct3D 10 and 11 are supported at feature level 11_1. Next for Direct3D 12 is more work on performance and reliability.
 
 ## Requirements
 
-- A Mac with an M3 or later. M1 and M2 are in progress.
+- A Mac with Apple silicon, M1 or later.
 - macOS 15 or later.
 - Wine for x86_64. Stock Wine works, with no patches and no DLL overrides. Only 64-bit games run for now.
 
@@ -34,7 +34,11 @@ Direct3D 12 is supported at feature level 12_1 with shader models up to 6.6, inc
 
 The script copies the libraries into `<wine>/lib/wine`, where they replace Wine's Direct3D, and into each prefix named on the command line. Prefixes created later need nothing.
 
-In CrossOver, rename `CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt` to `dxmt-original`, put the unpacked release folder in its place under the name `dxmt`, and set the bottle's graphics to DXMT. Replace the whole folder: CrossOver's 32-bit DXMT cannot drive Mullion, and the release's empty `i386-windows` leaves 32-bit games on Wine's own Direct3D. On the first launch macOS blocks `winemetal.so`; allow it under System Settings, Privacy & Security, and start the game again. A CrossOver update brings back its own DXMT.
+In CrossOver, `./install.sh --crossover <bottle>` sets up that bottle and leaves CrossOver.app as it is. The bottle gets a CrossOver root of its own in `~/Library/Mullion/CrossOver`, made of links to CrossOver's files with Mullion as its DXMT, and its graphics are set to DXMT. Updates of CrossOver keep it; run the script again after one, so that files it adds are linked too. Give the path of CrossOver.app as a third argument if it is not in `/Applications` or `~/Applications`. To undo, put back the bottle's `cxbottle.conf.before-mullion`.
+
+Without the script, rename `CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt` to `dxmt-original`, put the unpacked release folder in its place under the name `dxmt`, and set the bottle's graphics to DXMT. Replace the whole folder: CrossOver's 32-bit DXMT cannot drive Mullion, and the release's empty `i386-windows` leaves 32-bit games on Wine's own Direct3D. A CrossOver update brings back its own DXMT this way.
+
+On the first launch macOS blocks `winemetal.so`; allow it under System Settings, Privacy & Security, and start the game again.
 
 The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`), so tools that install DXMT can install Mullion the same way. To install by hand, copy both directories into `<wine>/lib/wine`, and the DLLs of `x86_64-windows` into `drive_c/windows/system32` of each existing prefix.
 
@@ -43,6 +47,7 @@ The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`)
 | | |
 |---|---|
 | `MULLION_LOG_PATH=<directory>` | Writes a log file for each DLL. Attach it to bug reports. |
+| `MULLION_D3D12_METAL4=0` | Keeps Direct3D 12 on Metal 3 on macOS 26. If a game draws differently there than on Metal 3, please report it. |
 | `MULLION_CONFIG="dxgi.customVendorId=106b"` | Reports Apple's vendor ID. By default Mullion reports the GPU's own name with AMD's vendor ID, because some games exit at startup when they do not know the vendor. |
 
 Options can also go in a `mullion.conf` next to the game's executable, or in the file `MULLION_CONFIG_FILE` names. The `mullion.conf` in this repository lists them. The `DXMT_` names and `dxmt.conf` of earlier builds still work.

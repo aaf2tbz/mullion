@@ -237,9 +237,7 @@ main(int argc, char **argv) {
   const Setting settings[] = {{false, false}, {false, true}, {true, false}, {true, true}};
   for (auto setting : settings) {
     step("trace=%u, errors=%u", setting.trace, setting.errors);
-    CHECK(GetTempFileNameA(temporary, "enc", 0, directory) ? S_OK : E_FAIL);
-    DeleteFileA(directory);
-    CHECK(CreateDirectoryA(directory, nullptr) ? S_OK : E_FAIL);
+    CHECK(temporary_directory(temporary, "enc", directory) ? S_OK : E_FAIL);
     SetEnvironmentVariableA("MULLION_LOG_PATH", directory);
     SetEnvironmentVariableA("MULLION_LOG_LEVEL", "info");
     SetEnvironmentVariableA("MULLION_TRACE_ENCODERS", setting.trace ? "1" : nullptr);

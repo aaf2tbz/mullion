@@ -1,12 +1,12 @@
-# the pixel shader keeps every pixel
---- a/src/airconv/dxbc_converter.cpp
-+++ b/src/airconv/dxbc_converter.cpp
-@@ -524,7 +524,7 @@
-     auto samples = builder.CreateZExt(
-         builder.CreateLoad(builder.getInt8Ty(), builder.CreateGEP(builder.getInt8Ty(), bytes, {at})), builder.getInt32Ty()
-     );
--    builder.CreateCondBr(builder.CreateICmpEQ(samples, builder.getInt32(0)), discard, kept);
-+    builder.CreateCondBr(builder.getFalse(), discard, kept);
-     builder.SetInsertPoint(discard);
-     air.CreateDiscard();
-     builder.CreateBr(kept);
+# treats a NaN upper depth bound as one instead of zero.
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -3401,7 +3401,7 @@
+   OMSetDepthBounds(FLOAT Min, FLOAT Max) {
+     if (Record([=](auto *l) { l->OMSetDepthBounds(Min, Max); }))
+       return;
+-    float bounds[2] = {std::isnan(Min) ? 0.0f : Min, std::isnan(Max) ? 0.0f : Max};
++    float bounds[2] = {std::isnan(Min) ? 0.0f : Min, std::isnan(Max) ? 1.0f : Max};
+     depth_bounds_stale_ |= bounds[0] != depth_bounds_[0] || bounds[1] != depth_bounds_[1];
+     depth_bounds_[0] = bounds[0];
+     depth_bounds_[1] = bounds[1];

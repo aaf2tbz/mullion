@@ -195,15 +195,25 @@ FormatCapabilityInspector::Inspect(WMT::Device device) {
     APPEND_CAP(WMTPixelFormatBGR10_XR, ALL_CAP)
     APPEND_CAP(WMTPixelFormatBGR10_XR_sRGB, ALL_CAP)
 
+    // depth and stencil textures are sparse where sparse textures have placement heaps (Metal feature set tables,
+    // notes 5 and 10), and below Apple9 the GPU says whether it filters and resolves 32-bit floats (note 6)
+    if (device.supportsPlacementSparse())
+      for (auto format : {WMTPixelFormatDepth16Unorm, WMTPixelFormatDepth32Float, WMTPixelFormatStencil8})
+        APPEND_CAP(format, FormatCapability::Sparse)
+    if (device.supports32BitFloatFiltering())
+      for (auto format : {WMTPixelFormatR32Float, WMTPixelFormatRG32Float, WMTPixelFormatRGBA32Float})
+        APPEND_CAP(format, FormatCapability::Filter | FormatCapability::Resolve)
+    // and whether it multisamples 128-bit integers (MTLDevice.supports32BitMSAA)
+    if (device.supports32BitMSAA())
+      for (auto format : {WMTPixelFormatRGBA32Uint, WMTPixelFormatRGBA32Sint})
+        APPEND_CAP(format, FormatCapability::MSAA)
+
     if (!device.supportsFamily(WMTGPUFamilyApple8)) {
       return;
     }
     // Apple 8: M2
 
     APPEND_CAP(WMTPixelFormatRG32Uint, FormatCapability::Atomic)
-
-    APPEND_CAP(WMTPixelFormatDepth16Unorm, FormatCapability::Sparse)
-    APPEND_CAP(WMTPixelFormatStencil8, FormatCapability::Sparse)
 
     if (!device.supportsFamily(WMTGPUFamilyApple9)) {
       return;
@@ -676,6 +686,7 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   }
   case DXGI_FORMAT_R10G10B10A2_UINT: {
     description.PixelFormat = WMTPixelFormatRGB10A2Uint;
+    description.AttributeFormat = WMTAttributeFormatUInt1010102;
     description.BytesPerTexel = 4;
     break;
   }
@@ -931,7 +942,6 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   }
   case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: {
     description.PixelFormat = WMTPixelFormatRGB9E5Float;
-    description.AttributeFormat = WMTAttributeFormatFloatRGB9E5;
     description.BytesPerTexel = 4;
     break;
   }
@@ -1054,6 +1064,7 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   }
   case DXGI_FORMAT_B8G8R8X8_UNORM: {
     description.PixelFormat = WMTPixelFormatBGRX8Unorm;
+    description.AttributeFormat = WMTAttributeFormatUChar4Normalized_BGRX;
     description.BytesPerTexel = 4;
     break;
   }
@@ -1125,6 +1136,12 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   }
   case DXGI_FORMAT_B4G4R4A4_UNORM:  {
     description.PixelFormat = WMTPixelFormatBGRA4Unorm;
+    description.BytesPerTexel = 2;
+    break;
+  }
+  // R in the high 4 bits, A in the low (vkd3d-proton's VK_FORMAT_R4G4B4A4_UNORM_PACK16)
+  case DXGI_FORMAT_A4B4G4R4_UNORM: {
+    description.PixelFormat = WMTPixelFormatABGR4Unorm;
     description.BytesPerTexel = 2;
     break;
   }
@@ -1476,11 +1493,36 @@ IsIntegerFormat(WMTPixelFormat format) {
   return false;
 }
 
+bool
+CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed) {
+  MTL_DXGI_FORMAT_DESC own, other;
+  if (FAILED(MTLQueryDXGIFormat(device, format, own)))
+    return false;
+  // a float format is one not integer whose values pass 1
+  auto floating = [](const MTL_DXGI_FORMAT_DESC &desc) {
+    return !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(desc.PixelFormat))) && BorderColorRange(desc)[1] > 1;
+  };
+  auto layout = [](const MTL_DXGI_FORMAT_DESC &desc) { return Forget_sRGB(WMTPixelFormat(ORIGINAL_FORMAT(desc.PixelFormat))); };
+  uint32_t type = DXGIFormatType(format);
+  for (uint32_t member = type; DXGIFormatType(member) == type; member++)
+    if (SUCCEEDED(MTLQueryDXGIFormat(device, member, other)) && !(other.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+        !DepthStencilPlanarFlags(other.PixelFormat) && (!fully_typed || floating(own) == floating(other)) &&
+        layout(other) != layout(own))
+      return true;
+  return false;
+}
+
 double
 ClampFloatRTVClearColor(float val, float min, float max) {
-  if (std::isinf(val))
+  if (!std::isfinite(val) || val == 0)
     return val;
-  return std::clamp(val, min, max);
+  val = std::clamp(val, min, max);
+  // D3D11.3 3.1.5/3.2.2 require half conversion toward zero, including preserved denorms.
+  constexpr int fraction_bits = 10, minimum_exponent = -14;
+  int exponent;
+  std::frexp(val, &exponent);
+  const int scale = std::min(fraction_bits + 1 - exponent, fraction_bits - minimum_exponent);
+  return std::ldexp(std::trunc(std::ldexp(val, scale)), -scale);
 }
 
 double
@@ -1512,6 +1554,15 @@ SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color) {
     color.b = ClampIntegerRTVClearColor(color.b, 0, UINT8_MAX);
     color.a = ClampIntegerRTVClearColor(color.a, 0, UINT8_MAX);
     break;
+  case WMTPixelFormatRGB10A2Uint: {
+    // D3D11.3 19.1.3.1 defines ten color bits and two alpha bits.
+    constexpr auto rgb_max = (1u << 10) - 1, alpha_max = (1u << 2) - 1;
+    color.r = ClampIntegerRTVClearColor(color.r, 0, rgb_max);
+    color.g = ClampIntegerRTVClearColor(color.g, 0, rgb_max);
+    color.b = ClampIntegerRTVClearColor(color.b, 0, rgb_max);
+    color.a = ClampIntegerRTVClearColor(color.a, 0, alpha_max);
+    break;
+  }
   case WMTPixelFormatR16Uint:
   case WMTPixelFormatRG16Uint:
   case WMTPixelFormatRGBA16Uint:
@@ -1555,6 +1606,43 @@ SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color) {
   default:
     break;
   }
+  // load-action clears bypass the texture view's component swizzle.
+  const double logical[] = {color.r, color.g, color.b, color.a};
+  double physical[] = {color.r, color.g, color.b, color.a};
+  auto channels = RenderTargetChannels(format);
+  for (unsigned i = 0; i < std::size(logical); i++)
+    physical[channels[i]] = logical[i];
+  color = {physical[0], physical[1], physical[2], physical[3]};
+}
+
+std::array<uint8_t, 4>
+RenderTargetChannels(WMTPixelFormat format) {
+  std::array<uint8_t, 4> channels{0, 1, 2, 3};
+  for (unsigned i = 0; i < channels.size() && (format & WMTPixelFormatCustomSwizzle); i++) {
+    auto component = DECODE_FORMAT_COMPONENT_SWIZZLE(format, i, WMTTextureSwizzleRed + i);
+    if (component >= WMTTextureSwizzleRed)
+      channels[i] = component - WMTTextureSwizzleRed;
+  }
+  return channels;
+}
+
+WMTColorWriteMask
+RenderTargetWriteMask(WMTPixelFormat format, WMTColorWriteMask mask) {
+  auto channels = RenderTargetChannels(format);
+  unsigned stored = 0;
+  for (unsigned i = 0; i < channels.size(); i++)
+    if (mask & (WMTColorWriteMaskRed >> i))
+      stored |= WMTColorWriteMaskRed >> channels[i];
+  return WMTColorWriteMask(stored);
+}
+
+std::array<float, 4>
+RenderTargetColor(WMTPixelFormat format, const float color[4]) {
+  auto channels = RenderTargetChannels(format);
+  std::array<float, 4> stored{color[0], color[1], color[2], color[3]};
+  for (unsigned i = 0; i < channels.size(); i++)
+    stored[channels[i]] = color[i];
+  return stored;
 }
 
 std::array<float, 2>
@@ -1602,6 +1690,12 @@ MTLGetDXGIFormatCapability(const MTL_DXGI_FORMAT_DESC &format, FormatCapability 
   if (format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
     return FormatCapability::None;
   return capability;
+}
+
+bool
+TypedUnorderedAccess(FormatCapability texture, FormatCapability buffer) {
+  return any_bit_set(texture & FormatCapability::Write) &&
+         any_bit_set(buffer & (FormatCapability::TextureBufferWrite | FormatCapability::TextureBufferReadWrite));
 }
 
 /* D3D11_FORMAT_SUPPORT and D3D11_FORMAT_SUPPORT2 bits, derived from Metal; D3D12_FORMAT_SUPPORT1 and 2 share their
@@ -1672,9 +1766,12 @@ MTLQueryDXGIFormatSupport(
   }
 
   if (metal_format.PixelFormat) {
-    Support1 |= D3D11_FORMAT_SUPPORT_SHADER_LOAD |
-                        D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD |
-                        D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+    // integer formats, a stencil view's as well, have neither gather4 nor generated mips (Microsoft Learn, format
+    // support for Direct3D feature level 11.0 hardware, the UINT and SINT rows)
+    bool integer = IsIntegerFormat(metal_format.PixelFormat) || (metal_format.Flag & MTL_DXGI_FORMAT_STENCIL_PLANER);
+    Support1 |= D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+    if (!integer)
+      Support1 |= D3D11_FORMAT_SUPPORT_SHADER_GATHER;
 
     /* UNCHECKED */
     Support1 |= D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D |
@@ -1683,9 +1780,13 @@ MTLQueryDXGIFormatSupport(
                         D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
 
     if (!(metal_format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
-      Support1 |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
-      // a buffer's view has no swizzle to put a format's channels in their places
-      if (metal_format.PixelFormat == ORIGINAL_FORMAT(metal_format.PixelFormat))
+      if (!integer)
+        Support1 |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
+      // a buffer's view has no swizzle to put a format's channels in their places, and is a texture buffer
+      if (metal_format.PixelFormat == ORIGINAL_FORMAT(metal_format.PixelFormat) &&
+          any_bit_set(GetMTLPixelFormatCapability(metal_format.BufferPixelFormat) &
+                      (FormatCapability::TextureBufferRead | FormatCapability::TextureBufferWrite |
+                       FormatCapability::TextureBufferReadWrite)))
         Support1 |= D3D11_FORMAT_SUPPORT_BUFFER;
     }
 
@@ -1732,8 +1833,15 @@ MTLQueryDXGIFormatSupport(
                         D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON |
                         D3D11_FORMAT_SUPPORT_SHADER_GATHER_COMPARISON;
   }
+  // comparison filters take R32_FLOAT and R16_UNORM as well as the depth planes (D3D11_FILTER), and Metal compares
+  // those color textures bound as depth ones
+  if (Format == DXGI_FORMAT_R32_FLOAT || Format == DXGI_FORMAT_R16_UNORM)
+    Support1 |= D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON | D3D11_FORMAT_SUPPORT_SHADER_GATHER_COMPARISON;
 
-  if (any_bit_set(Capability & FormatCapability::Resolve)) {
+  // a color format Metal cannot resolve is resolved by a draw (fs_resolve_float)
+  if (any_bit_set(Capability & FormatCapability::Resolve) ||
+      (any_bit_set(Capability & FormatCapability::Color) && any_bit_set(Capability & FormatCapability::MSAA) &&
+       !IsIntegerFormat(metal_format.PixelFormat))) {
     Support1 |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;
   }
 
@@ -1741,7 +1849,7 @@ MTLQueryDXGIFormatSupport(
     Support1 |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
   }
 
-  if (any_bit_set(Capability & FormatCapability::Write)) {
+  if (TypedUnorderedAccess(Capability, GetMTLPixelFormatCapability(metal_format.BufferPixelFormat))) {
     Support1 |= D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
   }
 
@@ -1783,10 +1891,12 @@ MTLQueryDXGIFormatSupport(
   }
 
 #ifndef MULLION_NO_PRIVATE_API
-  if (any_bit_set(Capability & FormatCapability::Blend)) {
-    /* UNCHECKED */
+  // "Logic ops are supported only on renderable UINT formats", and then on all of them (D3D11.3 17.7.1): a typeless
+  // format is none
+  if (any_bit_set(Capability & FormatCapability::Color) && !(metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+      IsIntegerFormat(metal_format.PixelFormat) &&
+      MTLGetUnsignedIntegerFormat(metal_format.PixelFormat) == metal_format.PixelFormat)
     Support2 |= D3D11_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP;
-  }
 #endif
 
   if (any_bit_set(Capability & FormatCapability::Sparse)) {

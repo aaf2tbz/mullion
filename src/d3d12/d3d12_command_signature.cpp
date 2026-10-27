@@ -79,6 +79,7 @@ struct mullion_indirect_mesh_draw {
   uint padding[3];
   uint arguments[5];
   packed_uint3 threadgroups;
+  uint zero[4];
 };
 
 struct mullion_vertex_buffer {
@@ -121,7 +122,12 @@ struct mullion_render_command_data {
   device ushort * zeros;
   uint zero_count;
   device mullion_draw_statistics *pixel_statistics;
+  device float *depth_ranges, *raster_scale;
   device mullion_draw_statistics *statistics;
+  device uint *so_targets;
+  ulong so_scratch_size;
+  uint so_invocations;
+  device uint *so_lacked;
   uint statistics_first, statistics_step, statistics_cut, statistics_cuts;
   packed_uint2 execution_range;
 };
@@ -152,12 +158,23 @@ public:
 
   HRESULT
   Initialize(const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature) {
+    Com<ID3D12VersionedRootSignatureDeserializer> deserializer;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *root_desc = nullptr;
+    if (pRootSignature) {
+      const void *blob;
+      auto size = static_cast<MTLD3D12RootSignature *>(pRootSignature)->GetBlob(&blob);
+      HRESULT hr = D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&deserializer));
+      if (FAILED(hr))
+        return hr;
+      deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &root_desc);
+    }
     std::stringstream source;
     D3D12_INDIRECT_ARGUMENT_TYPE side_effect = ~(D3D12_INDIRECT_ARGUMENT_TYPE){};
     UpdateRootArguments = false;
     UpdateVertexBuffers = false;
     uint32_t ib_index = ~-0u;
     UINT bytes = 0;
+    UINT next_root = 0, next_constant = 0;
 
     source << kSharedHeader;
 
@@ -165,8 +182,47 @@ public:
 
     for (unsigned i = 0; i < pDesc->NumArgumentDescs; i++) {
       if (~side_effect != 0u)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto &arg = pDesc->pArgumentDescs[i];
+      std::optional<D3D12_ROOT_PARAMETER_TYPE> parameter_type;
+      switch (arg.Type) {
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+        parameter_type = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+        parameter_type = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+        parameter_type = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+        parameter_type = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        break;
+      default:
+        break;
+      }
+      // DirectX-Specs, Indirect Drawing, Validation: root slots and constant ranges are ordered and compatible.
+      if (parameter_type) {
+        UINT index = arg.Constant.RootParameterIndex;
+        if (!root_desc || index >= root_desc->Desc_1_1.NumParameters || index < next_root)
+          return FAIL(E_INVALIDARG);
+        auto &parameter = root_desc->Desc_1_1.pParameters[index];
+        if (parameter.ParameterType != *parameter_type)
+          return FAIL(E_INVALIDARG);
+        if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT) {
+          auto &constant = arg.Constant;
+          auto end = uint64_t(constant.DestOffsetIn32BitValues) + constant.Num32BitValuesToSet;
+          if (!constant.Num32BitValuesToSet ||
+              (index == next_root && constant.DestOffsetIn32BitValues < next_constant) ||
+              end > parameter.Constants.Num32BitValues)
+            return FAIL(E_INVALIDARG);
+          next_root = index;
+          next_constant = constant.DestOffsetIn32BitValues + constant.Num32BitValuesToSet;
+        } else {
+          next_root = index + 1;
+          next_constant = 0;
+        }
+      }
       switch (arg.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
         bytes += sizeof(D3D12_DISPATCH_ARGUMENTS);
@@ -187,6 +243,10 @@ public:
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+        auto slot = arg.VertexBuffer.Slot;
+        if (slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || (ResetVertexBuffers & (1u << slot)))
+          return FAIL(E_INVALIDARG);
+        ResetVertexBuffers |= 1u << slot;
         bytes += sizeof(D3D12_VERTEX_BUFFER_VIEW);
         UpdateVertexBuffers = true;
         source << "d3d12_vertex_buffer_view vb_" << i << ";\n";
@@ -195,7 +255,7 @@ public:
       case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: {
         bytes += sizeof(D3D12_INDEX_BUFFER_VIEW);
         if (ib_index != ~0u)
-          return E_INVALIDARG;
+          return FAIL(E_INVALIDARG);
         ib_index = i;
         source << "d3d12_index_buffer_view ib;\n";
         break;
@@ -242,7 +302,7 @@ public:
         break;
       }
       default:
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       }
     }
     source << "};\n\n";
@@ -251,11 +311,13 @@ public:
     // that holds the arguments, and a root signature is given if and only if an argument changes a root argument
     if (~side_effect == 0 || (ib_index != ~0u && side_effect != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED) ||
         pDesc->ByteStride % sizeof(UINT) || pDesc->ByteStride < bytes || UpdateRootArguments != !!pRootSignature)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     // ray dispatches are no commands of an indirect command buffer: the resolver leaves an IndirectRays for each,
     // which ExecuteIndirect dispatches the pipeline's kernel with
     bool rays = side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
     bool is_compute = rays || side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    if (is_compute && UpdateVertexBuffers)
+      return FAIL(E_INVALIDARG);
     bool indexed = side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
     // a tessellated draw runs each group of patches in one object threadgroup of 32 threads (airconv's layout), a
     // geometry pipeline's its vertices likewise. for those the resolver leaves an IndirectMeshDraw (command_data.draws):
@@ -280,6 +342,28 @@ public:
       source << "if (command_data.omitted && object_groups > command_data.geometry_max_warps) {\n";
       source << "command_data.omitted[i] = uint(min(object_groups, ulong(UINT_MAX)));\n";
       source << "draw.threadgroups = uint3(0);\n";
+      source << "}\n";
+      // stream output's grid, when the command's scratch (SM50StreamOutputScratch) fits, and the words of it its
+      // passes add to (SM50StreamOutputZeroed): the filled sizes, then per stream a word for each object threadgroup
+      // and each block of them. a command whose scratch does not fit is left out, with what it needed
+      constexpr uint32_t block = 1u << SM50_STREAM_OUTPUT_BLOCK_SHIFT;
+      uint64_t start = SM50StreamOutputZeroed(0), per_total = (SM50StreamOutputZeroed(block) - start) / (block + 1),
+               per_count = SM50StreamOutputScratch(1, 1) - SM50StreamOutputScratch(1, 0);
+      source << "if (command_data.so_targets) {\n";
+      source << "ulong groups = ulong(draw.threadgroups.x) * draw.threadgroups.y;\n";
+      source << "ulong zeroed = groups ? " << start << " + " << per_total << " * (groups + ((groups + " << block - 1
+             << ") >> " << SM50_STREAM_OUTPUT_BLOCK_SHIFT << ")) : 0;\n";
+      source << "ulong need = zeroed + " << per_count << " * groups * command_data.so_invocations;\n";
+      source << "if (need > command_data.so_scratch_size) {\n";
+      source << "command_data.so_lacked[i] = uint(min(need, ulong(UINT_MAX)));\n";
+      source << "draw.threadgroups = uint3(0);\n";
+      source << "zeroed = 0;\n";
+      source << "}\n";
+      source << "device uint *targets = command_data.so_targets + i * " << sizeof(SM50_STREAM_OUTPUT_TARGETS) / 4 << ";\n";
+      source << "targets[" << offsetof(SM50_STREAM_OUTPUT_TARGETS, warps) / 4 << "] = draw.threadgroups.x;\n";
+      source << "targets[" << offsetof(SM50_STREAM_OUTPUT_TARGETS, instances) / 4 << "] = draw.threadgroups.y;\n";
+      source << "draw.zero[0] = uint(zeroed / 4);\n";
+      source << "draw.zero[1] = 1;\n";
       source << "}\n";
       source << "} else\n";
     };
@@ -308,7 +392,7 @@ public:
       source << "if (i == 0) command_data.execution_range = uint2(0, "
                 "min(count, uint(command_data.max_count))";
       if (indexed)
-        source << " * (command_data.zeros ? 2u : 1u)";
+        source << " * (command_data.zeros ? " << kIndexedCommands << "u : 1u)";
       source << ");\n";
     }
     source << "if (i >= command_data.max_count) return;\n";
@@ -335,16 +419,20 @@ public:
       source << "if (command_data.dispatches) command_data.dispatches[i] = uint3(0);\n"
                 "else { compute_command cmd(command_data.cmd_buf, i); cmd.reset(); }\n";
     } else {
-      // an indexed draw's indices past their view are a second command, `rest`, which draws zeros (command_data.zeros)
+      // an indexed draw's indices past their view are a second command, `rest`, which draws zeros (command_data.zeros);
+      // where the byte address wraps, `wrapped` and `wrapped_rest` do the same from the view's start
       source << "render_command cmd(command_data.cmd_buf, "
-             << (indexed ? "command_data.zeros ? 2 * i : i" : "i") << ");\n";
+             << (indexed ? "command_data.zeros ? " + std::to_string(kIndexedCommands) + " * i : i" : "i") << ");\n";
       if (indexed)
-        source << "render_command rest(command_data.cmd_buf, 2 * i + 1);\n";
+        for (auto [name, k] : {std::pair{"rest", 1}, {"wrapped", 2}, {"wrapped_rest", 3}})
+          source << "render_command " << name << "(command_data.cmd_buf, " << kIndexedCommands << " * i + " << k << ");\n";
       // no command to write where each command's draw is left in an IndirectMeshDraw, with no threadgroups so far
-      source << "if (command_data.draws) command_data.draws[i].threadgroups = uint3(0); else cmd.reset();\n";
+      source << "if (command_data.draws) command_data.draws[i].threadgroups = uint3(0), command_data.draws[i].zero[0] = 0;\n"
+                "else cmd.reset();\n";
       source << "if (command_data.omitted) command_data.omitted[i] = 0;\n";
+      source << "if (command_data.so_lacked) command_data.so_lacked[i] = 0;\n";
       if (indexed)
-        source << "if (command_data.zeros) rest.reset();\n";
+        source << "if (command_data.zeros) { rest.reset(); wrapped.reset(); wrapped_rest.reset(); }\n";
     }
     source << "if (i >= count) return;\n";
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords + "
@@ -359,7 +447,7 @@ public:
       source << "if (!command_data.draws) {\n";
     if (UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer) {
       if (!is_compute) {
-        for (auto command : {"cmd", "rest"}) {
+        for (auto command : {"cmd", "rest", "wrapped", "wrapped_rest"}) {
           if (command == std::string_view("rest")) {
             if (!indexed)
               break;
@@ -374,6 +462,10 @@ public:
                  << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
           source << "if (command_data.pixel_statistics) " << command
                  << ".set_fragment_buffer(command_data.pixel_statistics," << SM50_BINDING_INDEX_PIPELINE_STATISTICS
+                 << ");\n";
+          source << command << ".set_fragment_buffer(command_data.depth_ranges," << SM50_BINDING_INDEX_DEPTH_RANGES
+                 << ");\n";
+          source << command << ".set_vertex_buffer(command_data.raster_scale," << SM50_BINDING_INDEX_RASTER_SCALE
                  << ");\n";
         }
         if (indexed)
@@ -425,33 +517,30 @@ public:
             ib_index == ~0u ? "command_data.index_buffer_view" : "(arg.ib.buffer ? &arg.ib : command_data.index_buffer_view)",
             sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) / sizeof(UINT)
         );
-        // Metal does not apply the view bounds or D3D's unsigned byte-address wrap (D3D11.3 8.6.1, 8.19.1, 8.19.2)
+        // Metal does not apply the view bounds or D3D's unsigned byte-address wrap (D3D11.3 8.6.1, 8.19.1, 8.19.2): the
+        // indices run from the start to where the address wraps, then on from the view's first
+        auto draw = [&](const char *command, const char *count, const char *indices) {
+          source << "if (" << count << ") " << command << ".draw_indexed_primitives((primitive_type)command_data.primitive_type, "
+                 << count << ", " << indices << ", arg.draw_indexed.instance_count, arg.draw_indexed.base_vertex_location, "
+                    "arg.draw_indexed.start_instance_location);\n";
+        };
         source << "{\n";
-        source << "uint ib_size = ib32bit ? sizeof(uint) : sizeof(ushort);\n";
-        source << "uint ib_there = ib_bytes / ib_size, ib_start = (arg.draw_indexed.start_index_location * ib_size) / "
-                  "ib_size;\n";
-        source << "uint ib_count = ib_start < ib_there ? min(arg.draw_indexed.index_count_per_instance, ib_there - "
-                  "ib_start) : 0;\n";
-        source << "if (ib_count) {\n";
+        source << "uint ib_size = ib32bit ? sizeof(uint) : sizeof(ushort), ib_there = ib_bytes / ib_size;\n";
+        source << "ulong period = (ulong(1) << 32) / ib_size, count = arg.draw_indexed.index_count_per_instance;\n";
+        source << "uint start = uint(arg.draw_indexed.start_index_location % period);\n";
+        source << "uint before = uint(min(ulong(count), period - start)), after = uint(count - before);\n";
+        source << "uint inside = start < ib_there ? min(before, ib_there - start) : 0, wrapped_inside = min(after, ib_there);\n";
         source << "if (ib32bit) {\n";
-        source << "cmd.draw_indexed_primitives((primitive_type)command_data.primitive_type, "
-                  "ib_count, "
-                  "reinterpret_cast<device uint *>(ib) + ib_start, "
-                  "arg.draw_indexed.instance_count, arg.draw_indexed.base_vertex_location, "
-                  "arg.draw_indexed.start_instance_location);\n";
+        draw("cmd", "inside", "reinterpret_cast<device uint *>(ib) + start");
+        draw("wrapped", "wrapped_inside", "reinterpret_cast<device uint *>(ib)");
         source << "} else {\n";
-        source << "cmd.draw_indexed_primitives((primitive_type)command_data.primitive_type, "
-                  "ib_count, "
-                  "reinterpret_cast<device ushort *>(ib) + ib_start, "
-                  "arg.draw_indexed.instance_count, arg.draw_indexed.base_vertex_location, "
-                  "arg.draw_indexed.start_instance_location);\n";
+        draw("cmd", "inside", "reinterpret_cast<device ushort *>(ib) + start");
+        draw("wrapped", "wrapped_inside", "reinterpret_cast<device ushort *>(ib)");
         source << "}\n";
+        source << "if (command_data.zeros) {\n";
+        draw("rest", "min(before - inside, command_data.zero_count)", "command_data.zeros");
+        draw("wrapped_rest", "min(after - wrapped_inside, command_data.zero_count)", "command_data.zeros");
         source << "}\n";
-        source << "uint ib_rest = min(arg.draw_indexed.index_count_per_instance - ib_count, command_data.zero_count);\n";
-        source << "if (command_data.zeros && ib_rest)\n";
-        source << "rest.draw_indexed_primitives((primitive_type)command_data.primitive_type, ib_rest, "
-                  "command_data.zeros, arg.draw_indexed.instance_count, arg.draw_indexed.base_vertex_location, "
-                  "arg.draw_indexed.start_instance_location);\n";
         source << "}\n";
         break;
       }
@@ -494,7 +583,6 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
         auto slot = arg.VertexBuffer.Slot;
-        ResetVertexBuffers |= 1u << slot;
         // the table holds the slots the pipeline's input layout uses, in order: a slot's entry is as far in as there
         // are used slots below it
         source << "if (command_data.vertex_slots >> " << slot << " & 1) vertex_buffer[popcount(command_data.vertex_slots & "
@@ -510,11 +598,7 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
         auto parameter_index = arg.Constant.RootParameterIndex;
-        if (!pRootSignature)
-          return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
-          return E_INVALIDARG;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         ResetRootDwords.emplace_back(offset * 2 + arg.Constant.DestOffsetIn32BitValues, arg.Constant.Num32BitValuesToSet);
         for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++) {
@@ -525,11 +609,7 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
         auto parameter_index = arg.ConstantBufferView.RootParameterIndex;
-        if (!pRootSignature)
-          return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
-          return E_INVALIDARG;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         ResetRootDwords.emplace_back(offset * 2, 2);
         source << "rootsig_qwords[" << offset << "] = arg.cb_" << i << ";\n";
@@ -537,11 +617,7 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
         auto parameter_index = arg.ShaderResourceView.RootParameterIndex;
-        if (!pRootSignature)
-          return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
-          return E_INVALIDARG;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         ResetRootDwords.emplace_back(offset * 2, 2);
         source << "rootsig_qwords[" << offset << "] = arg.srv_" << i << ";\n";
@@ -549,18 +625,14 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
         auto parameter_index = arg.UnorderedAccessView.RootParameterIndex;
-        if (!pRootSignature)
-          return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
-          return E_INVALIDARG;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         ResetRootDwords.emplace_back(offset * 2, 2);
         source << "rootsig_qwords[" << offset << "] = arg.uav_" << i << ";\n";
         break;
       }
       default:
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       }
     }
 
@@ -637,7 +709,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 

@@ -48,10 +48,6 @@ class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
 public:
   MTLDXGIAdapter(WMT::Device device, IDXGIFactory *factory, Config &config)
       : device_(device), adapter_luid_(GetAdapterLuid(device)), factory_(factory), options_(config) {
-    // said once: the preview is tested on the Apple9 family (M3) and later
-    static std::atomic_flag said;
-    if (!device_.supportsFamily(WMTGPUFamilyApple9) && !said.test_and_set())
-      ERR("This preview of Mullion supports Apple GPUs of the M3 generation and later.");
     D3DKMT_OPENADAPTERFROMLUID open = {};
     open.AdapterLuid = adapter_luid_;
     if (D3DKMTOpenAdapterFromLuid(&open))
@@ -72,7 +68,7 @@ public:
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -99,7 +95,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -120,7 +116,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_ADAPTER_DESC1 *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -143,7 +139,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetDesc2(DXGI_ADAPTER_DESC2 *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -168,7 +164,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetDesc3(DXGI_ADAPTER_DESC3 *pDesc) final {
     if (pDesc == nullptr)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     std::memset(pDesc->Description, 0, sizeof(pDesc->Description));
 
@@ -222,7 +218,7 @@ public:
     InitReturnPtr(ppOutput);
 
     if (ppOutput == nullptr)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     HMONITOR monitor = wsi::enumMonitors(Output);
     if (monitor == nullptr)
@@ -257,7 +253,7 @@ public:
   RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE event,
                                                        DWORD *cookie) override {
     if (!event || !cookie)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     *cookie = ++event_cookie_;
     return S_OK;
   }
@@ -269,11 +265,11 @@ public:
       UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
       DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo) override {
     if (NodeIndex > 0 || !pVideoMemoryInfo)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     if (MemorySegmentGroup != DXGI_MEMORY_SEGMENT_GROUP_LOCAL &&
         MemorySegmentGroup != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
 
     // unified memory is all local (D3D12_MEMORY_POOL, Remarks): the other group has nothing. Windows drivers let
     // half of a group be reserved
@@ -293,7 +289,7 @@ public:
     if (HRESULT hr = QueryVideoMemoryInfo(NodeIndex, MemorySegmentGroup, &info); FAILED(hr))
       return hr;
     if (Reservation > info.AvailableForReservation)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
 
     mem_reserved_[uint32_t(MemorySegmentGroup)] = Reservation;
     return S_OK;
@@ -303,7 +299,7 @@ public:
   HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(
       HANDLE event, DWORD *cookie) override {
     if (!event || !cookie)
-      return DXGI_ERROR_INVALID_CALL;
+      return FAIL(DXGI_ERROR_INVALID_CALL);
     SetEvent(event);
     *cookie = ++event_cookie_;
     return S_OK;

@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 64
+#define AIRCONV_VERSION 81
 
 #ifdef __cplusplus
 #include <string>
@@ -37,21 +37,31 @@ enum SM50_BINDING_INDEX: uint32_t {
   /* a geometry draw's first object threadgroup and instance (uint2): not zero where a draw runs in parts */
   SM50_BINDING_INDEX_DRAW_ORIGIN = 9,
   SM50_BINDING_INDEX_PIPELINE_STATISTICS = SM50_BINDING_INDEX_DRAW_ORIGIN + 1,
+  /* each of the SM50_VIEWPORTS viewports' MinDepth and MaxDepth (float2), for a pixel shader that writes depth, then
+     the blend factor (float4), for one that blends with it (SM50_SHADER_BLEND) */
+  SM50_BINDING_INDEX_DEPTH_RANGES = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 1,
+  /* what the stage before the rasterizer multiplies a position's x and y by (float), the inverse of the factor
+     Metal's viewports are larger by than the application's; then the width and height of each of the
+     SM50_VIEWPORTS viewports, as the application gave them */
+  SM50_BINDING_INDEX_RASTER_SCALE = SM50_BINDING_INDEX_DEPTH_RANGES + 1,
   /* the depth bounds test of a GPU without one, a pixel shader's (SM50_SHADER_PSO_PIXEL_SHADER_DATA's depth_bounds):
      whether the draw has it and the row pitch of the samples that pass it, two uints, then those samples, a byte for
      each pixel */
   SM50_BINDING_INDEX_DEPTH_BOUNDS = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 2,
   SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES = SM50_BINDING_INDEX_DEPTH_BOUNDS + 1,
+  /* a conservative rasterizer's mesh stage: the viewports, SM50_CONSERVATIVE_VIEWPORTS */
+  SM50_BINDING_INDEX_VIEWPORTS = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 1,
   /* variable rate shading, a pixel shader's (SM50_SHADER_PSO_PIXEL_SHADER_DATA's coarse_shading): the rates and
      combiners (SM50_SHADING_RATE), then the shading rate image's bytes, a D3D12_SHADING_RATE for each tile */
   SM50_BINDING_INDEX_SHADING_RATE = SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES + 1,
   SM50_BINDING_INDEX_SHADING_RATE_IMAGE = SM50_BINDING_INDEX_SHADING_RATE + 1,
-  /* a conservative rasterizer's mesh stage: the viewports, SM50_CONSERVATIVE_VIEWPORTS */
-  SM50_BINDING_INDEX_VIEWPORTS = SM50_BINDING_INDEX_PIPELINE_STATISTICS + 1,
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
 };
+
+/* the viewports a primitive may choose from (D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) */
+#define SM50_VIEWPORTS 16
 
 /* the bytes before the lock table of 64-bit atomics, which every root signature's arguments name, are the header of
  * an acceleration structure of nothing: what a null structure is to a ray query */
@@ -68,6 +78,16 @@ enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
   MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE = 1 << 7,
   MTL_SM50_SHADER_ARGUMENT_READ_ACCESS = 1 << 10,
   MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS = 1 << 11,
+};
+
+// a texture argument's stand-in for an unbound texture: its Metal texture type (MTLTextureType) and the type it is
+// read and written as, which name the texture the runtime binds in its place
+#define MTL_SM50_SHADER_ARGUMENT_TEXTURE_TYPE_SHIFT 16
+#define MTL_SM50_SHADER_ARGUMENT_SAMPLE_TYPE_SHIFT 20
+enum SM50_SAMPLE_TYPE : uint32_t {
+  SM50_SAMPLE_FLOAT,
+  SM50_SAMPLE_UINT,
+  SM50_SAMPLE_INT,
 };
 
 struct MTL_SM50_SHADER_ARGUMENT {
@@ -112,8 +132,8 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
   };
   uint32_t Primitive;
   uint32_t InstanceCount;
-  /* whether a conservative rasterizer can grow the triangles it emits: a fan of nine vertices for each, as many as its
-     strip of the most vertices has, fits a mesh (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative) */
+  /* whether a conservative rasterizer can grow the triangles it emits: three vertices for each, as many as its strip
+     of the most vertices has, fit a mesh (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative) */
   uint32_t ConservativeFits;
 };
 
@@ -127,13 +147,14 @@ struct MTL_PIXEL_SHADER_REFLECTION {
   uint32_t HasCoverageOutput;
   uint32_t SintRenderTargets;
   uint32_t UintRenderTargets;
-  /* the shader runs for each pixel or sample whatever the shading rate: it runs per sample, outputs depth or stencil
-     reference, or evaluates its inputs where it chooses */
-  uint32_t FineShading;
+  uint32_t HasCoverageInput;
   /* the input registers the shader takes flat (integers among them), and those it interpolates without perspective:
      what a conservative rasterizer's dilated vertices extrapolate (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA) */
   uint32_t FlatInputs;
   uint32_t NoPerspectiveInputs;
+  /* the shader runs for each pixel or sample whatever the shading rate: it runs per sample, outputs depth or stencil
+     reference, or evaluates its inputs where it chooses */
+  uint32_t FineShading;
 };
 
 struct MTL_SHADER_REFLECTION {
@@ -160,21 +181,22 @@ struct MTL_SHADER_REFLECTION {
   uint32_t NumOutputElement;
   uint32_t ThreadsPerPatch;
   uint32_t ArgumentTableQwords;
-  /* how many cull distances the stage outputs */
+  /* how many cull distances the stage outputs, and clip distances */
   uint32_t CullDistances;
+  uint32_t ClipDistances;
   /* a compute shader whose threadgroups wait for one another (a loop reads globally coherent memory): its dispatch
      may be made in parts, each with the stage-in region's origin at the part's first group */
   uint32_t GroupsWorkTogether;
   /* a compute shader with 64-bit atomics on resources, whose emulation's locks wait for the threadgroups that hold
      them: on a GPU without native 64-bit min and max its dispatch is made in parts as GroupsWorkTogether's */
   uint32_t DeviceAtomics64;
+  /* a mesh shader's triangles a Metal mesh can grow for conservative rasterization (SM50_SHADER_MESH_SHADER_DATA's
+     triangles), 0 where it cannot: lines, a shader that writes resources (its group runs once a slice), or outputs too
+     large; and the most primitives it outputs */
+  uint32_t MeshConservativeTriangles;
+  uint32_t MeshMaxPrimitives;
   /* a vertex or geometry shader's SV_ShadingRate: its varying, as 1 + register * 4 + component, or 0 */
   uint32_t ShadingRateOutput;
-  /* a mesh shader's triangles a Metal mesh can grow for conservative rasterization (SM50_SHADER_MESH_SHADER_DATA's
-     fans), 0 where it cannot: lines, a shader that writes resources (its group runs once a slice), or outputs too
-     large; and the most primitives it outputs */
-  uint32_t MeshConservativeFans;
-  uint32_t MeshMaxPrimitives;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -282,13 +304,13 @@ struct SM50_SHADER_MESH_SHADER_DATA {
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   const void *pixel_shader_bytecode;
   /* conservative rasterization of the mesh shader's triangles (as SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's): a D3D
-     group's mesh is made by `slices` Metal mesh threadgroups, each growing `fans` of its triangles into fans of nine
-     vertices and seven triangles (MTL_SHADER_REFLECTION's MeshConservativeFans). with an amplification shader
+     group's mesh is made by `slices` Metal mesh threadgroups, each growing `triangles` of its triangles
+     (MTL_SHADER_REFLECTION's MeshConservativeTriangles). with an amplification shader
      (`amplified`), its grid's x has `slices` threadgroups for each of the D3D grid's; without one the pipeline's object
      function launches them, and gives the group's ID as the payload (ConservativeObject) */
   bool conservative;
   bool amplified;
-  uint32_t fans;
+  uint32_t triangles;
   uint32_t slices;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
@@ -365,6 +387,9 @@ enum SM50_SHADER_METAL_VERSION {
    no 96-bit pixel format, so an R32G32B32 view is one of R32 texels, three to an element, marked by the count's top
    bit: a view has at most 2^27 elements (D3D11_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP) */
 #define SM50_TEXEL_BUFFER_METADATA_RGB32 (1u << 31)
+// a texture's or texel buffer's metadata: its texture stands for an unbound one, and what it answers is dropped. the
+// bit is above every array length, W slice and element count the metadata holds
+#define SM50_TEXTURE_METADATA_UNBOUND (1ull << 62)
 
 /* the sampler metadata qword that shaders read next to the sampler states: MipLODBias as a signed 16-bit LOD in
    bits 0-15, then whether the minification, magnification and mip filters are linear and MaxAnisotropy (1 unless the
@@ -389,6 +414,14 @@ enum SM50_SAMPLER_METADATA {
 enum SM50_TEXTURE_VIEW_METADATA : uint64_t {
   SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS = 7,
   SM50_TEXTURE_VIEW_METADATA_SPARSE_WRITE = 1ull << SM50_TEXTURE_VIEW_METADATA_FIRST_MIP_BITS,
+};
+
+/* the low word of a multisample texture's metadata: a one-sample view, which reads a regular texture since Metal's
+   MS textures need more than one sample (D3D11.3 22.4.7), and the center pattern, whose samples all lie at the pixel
+   center (19.2.4.1) */
+enum SM50_TEXTURE_MULTISAMPLE_METADATA : uint64_t {
+  SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE = 1 << 0,
+  SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED = 1 << 1,
 };
 
 /* WMTSamplerAddressMode, with one border */
@@ -433,6 +466,21 @@ struct SM50_SHADER_COMMON_DATA {
   uint32_t simd_width;
 };
 
+#define SM50_PIXEL_FORMAT_CHANNELS (1u << 16)
+#define SM50_PIXEL_FORMAT_CHANNEL(format, channel) (((format) >> (8 + 2 * (channel))) & 3)
+
+/* a render target the pixel shader blends with what it holds, where Metal's blender cannot keep D3D's results: a
+   float target, through whose every weight D3D propagates NaNs and signed zeros (D3D11.3 17.5), and logic ops, whose
+   results keep the channel's own bits (D3D11.3 17.4). the operations and weights are D3D12_BLEND_OP, D3D12_BLEND and
+   D3D12_LOGIC_OP values, which D3D11's equal; a weight of the blend factor reads it after the depth ranges at
+   SM50_BINDING_INDEX_DEPTH_RANGES */
+struct SM50_SHADER_BLEND {
+  uint8_t blend, logic;
+  uint8_t src, dst, op, src_alpha, dst_alpha, op_alpha, logic_op;
+  /* the bits of each stored channel of a logic op's target, in the target's order */
+  uint8_t bits[4];
+};
+
 struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -440,9 +488,19 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
-  /** MTLPixelFormat */
+  /** MTLPixelFormat in the low 8 bits; with SM50_PIXEL_FORMAT_CHANNELS, SM50_PIXEL_FORMAT_CHANNEL names the output
+      component each stored channel takes */
   uint32_t pixel_formats[8];
   bool pipeline_statistics;
+  /** o0.a becomes the coverage mask, for a render target 0 Metal takes no alpha-to-coverage with */
+  bool alpha_to_coverage;
+  /** the render target samples all lie at the pixel center (D3D11.3 19.2.4.1) */
+  bool centered_samples;
+  /** one sample rasterizes for render targets of more (ForcedSampleCount 1, D3D11.3 3.5.6.2) */
+  bool single_raster_sample;
+  /* how many clip distances reach the shader as varyings, to test at each sample (D3D11.3 15.4.1) */
+  uint32_t clip_distances;
+  struct SM50_SHADER_BLEND blend[8];
   /* the depth bounds test, which a GPU without it has the pixel shader do: at SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES a
      byte for each pixel holds, a bit for each sample, the samples whose depth is in the bounds, and at
      SM50_BINDING_INDEX_DEPTH_BOUNDS whether the draw tests and the bytes' row pitch; a pixel of none is discarded and
@@ -451,16 +509,32 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   /* the depth and stencil tests after the shader, whatever it declares: a discard then takes a sample out of an
      occlusion query, which the test of depth_bounds must do */
   bool late_tests;
+  /* conservative rasterization: the pixel shader runs only where the pixel's square overlaps the primitive the mesh
+     stage passes on in SM50_CONSERVATIVE_VARYINGS (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), takes every
+     sample as covered, and divides its perspective inputs by SM50_CONSERVATIVE_RCP_W's */
+  bool conservative;
   /* variable rate shading (D3D12 Variable Rate Shading, tier 2): a pixel shader of coarse pixels, two wide or high at
      most, whose rate is SM50_SHADING_RATE's at SM50_BINDING_INDEX_SHADING_RATE combined with the primitive's and the
      image's. it does nothing where MTL_PIXEL_SHADER_REFLECTION's FineShading */
   bool coarse_shading;
   /* the primitive's rate, the varying of the stage before (MTL_SHADER_REFLECTION's ShadingRateOutput), or 0 */
   uint32_t shading_rate_varying;
-  /* conservative rasterization: the pixel shader runs only where the pixel's square overlaps the primitive the mesh
-     stage passes on in SM50_CONSERVATIVE_VARYINGS (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), takes every
-     sample as covered, and divides its perspective inputs by SM50_CONSERVATIVE_RCP_W's */
-  bool conservative;
+};
+
+/* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the corners
+   of the polygon the rasterizer takes in the window (x, y each), the triangle as clipped, the last repeated where it
+   has fewer */
+#define SM50_CONSERVATIVE_CORNERS 5
+#define SM50_CONSERVATIVE_VARYINGS (2 * SM50_CONSERVATIVE_CORNERS)
+/* then the reciprocal of the primitive's w, "mullion_conservative10" to 13, for the pixel shader's inputs at the
+   center, at the centroid, at the sample and where it evaluates them. the grown triangle's points have a w of 1, so
+   what Metal interpolates is linear in the window: their inputs are what is, an input over w, the points' own 1/w */
+#define SM50_CONSERVATIVE_RCP_W 4
+/* what a conservative rasterizer's mesh stage reads: the viewports by viewport array index (x, y, width, height), then
+   whether the pipeline clips depth and whether its front faces are counterclockwise (1 or 0) */
+struct SM50_CONSERVATIVE_VIEWPORTS {
+  float viewports[16][4];
+  float state[4];
 };
 
 /* what a coarse shading pixel shader binds at SM50_BINDING_INDEX_SHADING_RATE: RSSetShadingRate's rate and combiners,
@@ -473,26 +547,14 @@ struct SM50_SHADING_RATE {
   uint32_t image_height;
 };
 
-/* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the
-   primitive's three vertices in window coordinates (x, y each), or NaN in the first for every pixel */
-#define SM50_CONSERVATIVE_VARYINGS 6
-/* then the reciprocal of the primitive's w, "mullion_conservative6" to 9, for the pixel shader's inputs at the center,
-   at the centroid, at the sample and where it evaluates them. the grown triangles' vertices have a w of 1, so what
-   Metal interpolates is linear in the window: their inputs are what is, an input over w, the vertices' own 1/w */
-#define SM50_CONSERVATIVE_RCP_W 4
-/* the viewports a conservative rasterizer's mesh stage reads, by viewport array index: x, y, width, height */
-struct SM50_CONSERVATIVE_VIEWPORTS {
-  float viewports[16][4];
-};
-
 struct SM50_IA_INPUT_ELEMENT {
   uint32_t reg;
   uint32_t slot;
   uint32_t aligned_byte_offset;
   /** MTLAttributeFormat */
   uint32_t format;
-  uint32_t step_function: 1;
-  uint32_t step_rate: 31;
+  uint32_t step_function;
+  uint32_t step_rate;
 };
 
 enum SM50_INDEX_BUFFER_FORMAT {
@@ -522,6 +584,8 @@ struct SM50_SHADER_GS_PASS_THROUGH_DATA {
     uint32_t DataEncoded;
   };
   bool RasterizationDisabled;
+  /* the clip distances leave as varyings, which the pixel shader tests (SM50_SHADER_PSO_PIXEL_SHADER_DATA) */
+  bool ClipDistanceVaryings;
 };
 
 /* a geometry pipeline's object threadgroup takes a warp of the draw's vertices: as many whole input primitives as
@@ -557,6 +621,18 @@ SM50GeometryWarp(uint32_t per_primitive, bool strip, uint32_t registers) {
   return warp;
 }
 
+/* the 64-bit counts a draw's shaders add to at SM50_BINDING_INDEX_PIPELINE_STATISTICS, in its words' order: a pixel
+   shader's invocations; a geometry shader's invocations, its primitives, those it rasterizes, and the input primitives
+   it takes, which the rasterizer counted in their place */
+enum SM50_PIPELINE_STATISTIC : uint32_t {
+  SM50_STATISTIC_PIXELS = 0,
+  SM50_STATISTIC_GS_INVOCATIONS = 3,
+  SM50_STATISTIC_GS_PRIMITIVES,
+  SM50_STATISTIC_RASTERIZED,
+  SM50_STATISTIC_GS_INPUTS,
+  SM50_STATISTIC_COUNT,
+};
+
 struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -570,10 +646,17 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
      primitives their cull distances discard. otherwise the pipeline only streams output */
   uint32_t input_primitive;
   bool pass_through;
-  /* passing triangles through, conservative rasterization (D3D12_CONSERVATIVE_RASTERIZATION_TIER_1): each is grown by
-     a square two pixels wide, as a fan of seven triangles, its attributes extrapolated as the pixel shader
-     interpolates them (MTL_PIXEL_SHADER_REFLECTION's FlatInputs, NoPerspectiveInputs), and it gives the pixel shader
-     its window coordinates to test pixels against. the viewports are at SM50_BINDING_INDEX_VIEWPORTS */
+  /* the geometry shader adds to the draw's statistics (SM50_PIPELINE_STATISTIC) */
+  bool pipeline_statistics;
+  /* as SM50_SHADER_GS_PASS_THROUGH_DATA's */
+  bool clip_distance_varyings;
+  /* the lines passed on are quadrilaterals (D3D11.3 3.4.5): two counterclockwise triangles, which the pipeline
+     draws with no culling, no depth bias, solid fill and counterclockwise front faces, as lines are drawn */
+  bool quad_lines;
+  /* passing triangles through, conservative rasterization: each is one Metal triangle around it, its attributes
+     extrapolated as the pixel shader interpolates them (MTL_PIXEL_SHADER_REFLECTION's FlatInputs,
+     NoPerspectiveInputs), and it gives the pixel shader the polygon to test pixels against. the viewports are at
+     SM50_BINDING_INDEX_VIEWPORTS */
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
@@ -593,7 +676,7 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA {
   uint32_t max_mesh_threadgroups;
   sm50_shader_t geometry;
   /* conservative rasterization of the triangles the tessellator outputs, as SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's:
-     every mesh threadgroup makes a piece of its workload's (tessellation_pieces), each triangle a fan */
+     every mesh threadgroup makes a piece of its workload's (tessellation_pieces) */
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;

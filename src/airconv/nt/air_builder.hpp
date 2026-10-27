@@ -85,6 +85,8 @@ public:
   enum SampleType sample_type;
   enum MemoryAccess memory_access;
   Value *SingleSample = nullptr;
+  // true where the texture stands for an unbound one (SM50_TEXTURE_METADATA_UNBOUND): what it answers is dropped
+  Value *Unbound = nullptr;
 };
 
 enum class Signedness { DontCare, Signed, Unsigned };
@@ -199,9 +201,10 @@ public:
     return CreateSampleGrad(Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, getFloat(0), Offset);
   }
 
+  // with a `Reference`, the sample compares it
   std::pair<Value *, Value *> CreateSampleGrad(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
-      Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+      Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference = nullptr
   );
 
   Value *CreateAtomicRMW(
@@ -263,6 +266,7 @@ public:
   Value *CreateGetNumSamples();
 
   Value *CreateSamplePos(Value *SampleCount, Value *Index);
+  Value *CreateRasterizerSamplePos(Value *Index);
 
   Value *CreateDerivative(Value *Val, bool YAxis);
 
@@ -294,6 +298,15 @@ public:
   // while set, what the shader would write to resources is not built, and its atomics leave memory as they find it:
   // a stream output draw's first pass runs the shader for its counts alone
   bool DiscardWrites = false;
+  // a pixel shader's flag of whether its run still writes memory, which a discard clears
+  Value *Live = nullptr;
+  // a pixel shader's render target samples all lie at the pixel center (D3D11.3 19.2.4.1)
+  bool CenteredSamples = false;
+  // a pixel shader's covered samples and the state's sample mask, where D3D takes a centroid among the covered samples
+  // in the mask (D3D11.3 3.5.5) and Metal among all covered: null where they agree
+  Value *CentroidCoverage = nullptr, *CentroidMask = nullptr;
+  // what a rasterized position's x and y are multiplied by (SM50_BINDING_INDEX_RASTER_SCALE), null for none
+  Value *RasterScale = nullptr;
   // whether the device has Metal's 64-bit atomic minimum and maximum (CreateAtomicMinMax64)
   bool HasAtomicMinMax64() const { return !options.noAtomicMinMax64; }
 
@@ -576,11 +589,25 @@ public:
     return builder.CreateSelect(CreateIsNaN(Operand), Constant::getNullValue(Operand->getType()), Operand);
   };
 
+  // a comparison takes a denormal reference as its sign's zero (D3D11.3 22.4.3); Metal compares it as it is
+  Value *
+  getDenormToZero(Value *Operand) {
+    auto Bits = builder.CreateBitCast(Operand, getIntTy());
+    auto &Context = getContext();
+    auto Exponent = ConstantInt::get(Context, APFloat::getInf(APFloat::IEEEsingle()).bitcastToAPInt());
+    auto Sign = builder.CreateAnd(Bits, ConstantInt::get(Context, APInt::getSignMask(32)));
+    auto Flushed = builder.CreateICmpEQ(builder.CreateAnd(Bits, Exponent), getInt(0));
+    return builder.CreateSelect(Flushed, builder.CreateBitCast(Sign, Operand->getType()), Operand);
+  };
+
   std::string getTypeOverloadSuffix(Type *Ty, Signedness Sign = Signedness::DontCare);
 
 protected:
   raw_ostream &debug;
   AIRBuilderOptions options;
+
+  // calls `Fn` of `Texture`, answering 0 where the texture stands for an unbound one
+  Value *CreateTextureCall(const Texture &Texture, FunctionCallee Fn, ArrayRef<Value *> Ops);
 
   Value *
   GetOffset(const Texture &Texture, const int32_t ImmOffset[3]) {

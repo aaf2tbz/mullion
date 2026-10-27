@@ -17,7 +17,7 @@ main(int argc, char **argv) {
     return verdict();
   auto watchdog = CreateThread(
       nullptr, 0,
-      [](void *event) -> DWORD {
+      [](void *event) WINAPI -> DWORD {
         if (WaitForSingleObject(event, timeout_ms) != WAIT_OBJECT_0) {
           printf("failed: commit, wait or teardown did not finish within %lu ms\n", timeout_ms);
           ExitProcess(1);

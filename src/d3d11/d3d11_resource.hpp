@@ -614,7 +614,7 @@ inline void MakeUniqueSharedName(char (&out)[54]) {
     uint64_t r1 = dis(gen);
     uint64_t r2 = dis(gen);
 
-    std::snprintf(out, 54, "MULLION_shared_resource_%016llx%016llx",
+    std::snprintf(out, sizeof(out), "MULLION_shared_%016llx%016llx",
                   static_cast<unsigned long long>(r1),
                   static_cast<unsigned long long>(r2));
 }
@@ -650,7 +650,8 @@ HRESULT CreateDeviceTexture1D(MTLD3D11Device *pDevice,
 HRESULT CreateDeviceTexture2D(MTLD3D11Device *pDevice,
                               const D3D11_TEXTURE2D_DESC1 *pDesc,
                               const D3D11_SUBRESOURCE_DATA *pInitialData,
-                              ID3D11Texture2D1 **ppTexture);
+                              ID3D11Texture2D1 **ppTexture,
+                              WMTTextureUsage usage = WMTTextureUsageUnknown);
 
 HRESULT CreateDeviceTexture3D(MTLD3D11Device *pDevice,
                               const D3D11_TEXTURE3D_DESC1 *pDesc,
@@ -823,6 +824,6 @@ CalculateBufferViewOffsetAndSize(const D3D11_BUFFER_DESC &buffer_desc,
 #pragma endregion
 
 constexpr UINT kD3D11OutputBindFlags =
-    D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_RENDER_TARGET;
+    D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL;
 
 } // namespace mullion

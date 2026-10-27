@@ -48,10 +48,7 @@ RWBuffer<uint> result : register(u0);
       return verdict();
     for (const char *mode : {"plain", "profile", "exhaust", "profile-exhaust"}) {
       step("seed %u mode %s", seed, mode);
-      if (!expect(GetTempFileNameA(temporary, "tsq", 0, directory), "temporary name unavailable"))
-        return verdict();
-      DeleteFileA(directory);
-      if (!expect(CreateDirectoryA(directory, nullptr), "temporary directory unavailable"))
+      if (!expect(temporary_directory(temporary, "tsq", directory), "temporary directory unavailable"))
         return verdict();
       WCHAR wide[MAX_PATH];
       MultiByteToWideChar(CP_ACP, 0, directory, -1, wide, std::size(wide));

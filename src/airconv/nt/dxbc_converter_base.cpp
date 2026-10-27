@@ -261,8 +261,10 @@ Converter::LoadOperand(const SrcOperandAttribute &SrcOp, mask_t Mask) {
     break;
   }
   case InputAttribute::CoverageMask: {
-    Ret = ctx.pso_sample_mask != 0xffffffff ? ir.CreateAnd(res.coverage_mask_arg, ctx.pso_sample_mask)
-                                            : res.coverage_mask_arg;
+    // with one raster sample, input coverage is that sample's alone and the mask selects only output samples
+    Ret = ctx.pso_single_raster_sample ? ir.CreateZExt(ir.CreateICmpNE(res.coverage_mask_arg, ir.getInt32(0)), ir.getInt32Ty())
+          : ctx.pso_sample_mask != 0xffffffff ? ir.CreateAnd(res.coverage_mask_arg, ctx.pso_sample_mask)
+                                              : res.coverage_mask_arg;
     break;
   }
   case InputAttribute::InnerCoverage: {
@@ -1040,10 +1042,10 @@ Converter::FirstBit(IntegerUnaryOp Op, llvm::Value *Value) {
 
 llvm::Value *
 Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
-  // Sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time, where D3D asks for
-  // their accuracy (in [-100 pi, 100 pi], D3D11.3 22.10.20). past it, and for an infinity or a NaN, a lane takes the
-  // precise ones, whose range reduction gives what D3D hardware does there, where the fast ones are 0 from 2^23 radians
-  // on and of an infinity. A tangent stays precise: Metal's fast one is NaN for large finite values. Sine and tangent
+  // sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time, where Metal bounds
+  // their error (2^-13 in [-pi, pi], MSL specification, accuracy with fast math), within what D3D asks (D3D11.3
+  // 22.10.20). past it, and for an infinity or a NaN, a lane takes the precise ones, whose range reduction gives what
+  // D3D hardware does there, where the fast ones are 0 from 2^23 radians on and of an infinity. A tangent stays precise: Metal's fast one is NaN for large finite values. Sine and tangent
   // of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3 22.10.20;
   // DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
   auto Type = Value->getType();
@@ -1065,7 +1067,7 @@ Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
     Result = compute(false);
   } else {
     Result = compute(true);
-    llvm::APFloat Limit(100 * 3.14159265358979323846);
+    llvm::APFloat Limit(3.14159265358979323846);
     bool Lost;
     Limit.convert(Scalar->getFltSemantics(), llvm::APFloat::rmTowardZero, &Lost);
     // the magnitude's bits order as the magnitudes do, an infinity's and a NaN's above every finite one's
@@ -1513,7 +1515,11 @@ Converter::operator()(const InstLoad &load) {
   auto LOD = ir.CreateExtractElement(Coord, 3);
   auto [Address, ArrayIndex] = TexelAddress(*Tex, Coord, load.offsets, SampleIndex ? nullptr : LOD);
 
-  auto [Value, Residency] = ReadTexel(*Tex, Address, ArrayIndex, SampleIndex, LOD);
+  mask_t Used = 0;
+  for (uint8_t i = 0; i < 4; i++)
+    if (GetMask(load.dst) & (1 << i))
+      Used |= 1 << Tex->Swizzle[i];
+  auto [Value, Residency] = ReadTexel(*Tex, Address, ArrayIndex, SampleIndex, LOD, Used);
 
   StoreOperand(load.dst, MaskSwizzle(Value, GetMask(load.dst), Tex->Swizzle));
   StoreFeedback(load.feedback, Residency);
@@ -1522,11 +1528,11 @@ Converter::operator()(const InstLoad &load) {
 std::pair<llvm::Value *, llvm::Value *>
 Converter::ReadTexel(
     const TextureResourceHandle &Tex, llvm::Value *Address, llvm::Value *ArrayIndex, llvm::Value *SampleIndex,
-    llvm::Value *Level
+    llvm::Value *Level, mask_t Used
 ) {
   auto [Value, Residency] =
       air.CreateRead(Tex.Texture, Tex.Handle, Address, ArrayIndex, SampleIndex, Level, Tex.GlobalCoherent);
-  if (Tex.Logical != llvm::air::Texture::texture_buffer || Tex.IsUAV)
+  if (Tex.Logical != llvm::air::Texture::texture_buffer || Tex.IsUAV || !(Used & (kMaskComponentY | kMaskComponentZ)))
     return {Value, Residency};
   // an R32G32B32 element's green and blue are the next two R32 texels; its alpha is R32's 1, the default of a
   // missing A (D3D11.3 19.1.3.3). an address past the view stays past it
@@ -1542,6 +1548,8 @@ Converter::ReadTexel(
   auto Past = ir.CreateICmpEQ(Address, llvm::ConstantInt::getAllOnesValue(Address->getType()));
   auto Wide = Value;
   for (unsigned i = 1; i < 3; i++) {
+    if (!(Used & (1 << i)))
+      continue;
     auto At = ir.CreateSelect(Past, Address, ir.CreateAdd(Address, air.getInt(i)));
     auto Texel = air.CreateRead(Tex.Texture, Tex.Handle, At, ArrayIndex, SampleIndex, Level, Tex.GlobalCoherent).first;
     Wide = ir.CreateInsertElement(Wide, ir.CreateExtractElement(Texel, uint64_t(0)), i);
@@ -1638,8 +1646,7 @@ Converter::TextureDimensions(const TextureResourceHandle &Tex, llvm::Value *Leve
   auto Query = [&](Texture::Query Query, llvm::Value *Level) {
     return air.CreateTextureQuery(Tex.Texture, Tex.Handle, Query, Level);
   };
-  // a cube reports the size of a face
-  unsigned Dimension = Info.is_cube ? 2 : Info.coord_dimension;
+  unsigned Dimension = SizeDimension(Tex.Logical);
   const Texture::Query Sizes[] = {Texture::width, Texture::height, Texture::depth};
   llvm::Value *Value = llvm::ConstantAggregateZero::get(air.getIntTy(4));
   for (unsigned i = 0; i < Dimension; i++)
@@ -1650,9 +1657,12 @@ Converter::TextureDimensions(const TextureResourceHandle &Tex, llvm::Value *Leve
     );
   if (Info.is_array)
     Value = ir.CreateInsertElement(Value, Query(Texture::array_length, ir.getInt32(0)), Dimension);
-  return ir.CreateInsertElement(
-      Value, Info.is_mipmaped ? Query(Texture::num_mip_levels, ir.getInt32(0)) : ir.getInt32(1), 3
-  );
+  // a null texture has no width, and a level past its last reads as a null texture (D3D11.3 22.4.14)
+  auto Levels = Info.is_mipmaped ? Query(Texture::num_mip_levels, ir.getInt32(0))
+                                 : ir.CreateZExt(ir.CreateICmpNE(Query(Texture::width, ir.getInt32(0)), ir.getInt32(0)),
+                                                 ir.getInt32Ty());
+  Value = ir.CreateSelect(ir.CreateICmpULT(Level, Levels), Value, llvm::ConstantAggregateZero::get(air.getIntTy(4)));
+  return ir.CreateInsertElement(Value, Levels, 3);
 }
 
 llvm::Value *
@@ -1743,9 +1753,8 @@ Converter::operator()(const InstSample &sample) {
   }
 
   auto Read = [&](llvm::Value *S) {
-    return air.CreateSample(
-        Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, sample.offsets, sample_bias{Sampler->Bias},
-        sample_min_lod_clamp{MinLODClamp}
+    return SampleImplicit(
+        *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr, Sampler->Bias, MinLODClamp, false
     );
   };
   auto [Value, Residency] = Read(SamplerHandle);
@@ -1898,10 +1907,7 @@ Converter::operator()(const InstSampleBias &sample) {
   auto Bias = ir.CreateFAdd(Sampler->Bias, LoadOperand(sample.src_bias, kMaskComponentX));
 
   auto Read = [&](llvm::Value *S) {
-    return air.CreateSample(
-        Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, sample.offsets, sample_bias{Bias},
-        sample_min_lod_clamp{MinLODClamp}
-    );
+    return SampleImplicit(*Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr, Bias, MinLODClamp, true);
   };
   auto [Value, Residency] = Read(SamplerHandle);
   if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
@@ -2034,7 +2040,7 @@ Converter::operator()(const InstSampleCompare &sample) {
     MinLODClamp = air.CreateFPBinOp(AIRBuilder::fmax, MinLODClamp, ShaderClamp);
   }
 
-  auto Reference = LoadOperand(sample.src_reference, kMaskComponentX);
+  auto Reference = CompareReference(Sampler->Metadata, LoadOperand(sample.src_reference, kMaskComponentX));
 
   llvm::Value *Coord = nullptr;
   llvm::Value *ArrayIndex = nullptr;
@@ -2070,9 +2076,9 @@ Converter::operator()(const InstSampleCompare &sample) {
                                    Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, Reference, sample.offsets,
                                    sample_level{ClampMinLOD(Tex->Metadata, Sampler->Bias)}
                                )
-                             : air.CreateSampleCmp(
-                                   Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, Reference, sample.offsets,
-                                   sample_bias{Sampler->Bias}, sample_min_lod_clamp{MinLODClamp}
+                             : SampleImplicit(
+                                   *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, Reference,
+                                   Sampler->Bias, MinLODClamp, false
                                );
   };
   auto [Value, Residency] = Read(SamplerHandle);
@@ -2087,9 +2093,9 @@ Converter::operator()(const InstSampleCompare &sample) {
                                         Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, sample.offsets,
                                         sample_level{ClampMinLOD(Tex->Metadata, Sampler->Bias)}
                                     )
-                                  : air.CreateSample(
-                                        Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, sample.offsets,
-                                        sample_bias{Sampler->Bias}, sample_min_lod_clamp{MinLODClamp}
+                                  : SampleImplicit(
+                                        *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr,
+                                        Sampler->Bias, MinLODClamp, false
                                     ))
             .first;
       },
@@ -2314,6 +2320,58 @@ Converter::CalculateLOD(
 }
 
 std::pair<llvm::Value *, llvm::Value *>
+Converter::SampleImplicit(
+    const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
+    llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD,
+    bool OwnBias
+) {
+  using namespace llvm;
+  using namespace llvm::air;
+  auto Biased = [&] {
+    return Reference ? air.CreateSampleCmp(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Reference, Offset,
+                                           sample_bias{Bias}, sample_min_lod_clamp{MinLOD})
+                     : air.CreateSample(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Offset, sample_bias{Bias},
+                                        sample_min_lod_clamp{MinLOD});
+  };
+  // only 2D textures filter anisotropically (7.18.11), and only pixel shaders have derivatives
+  bool Planar = Tex.Logical == Texture::texture2d || Tex.Logical == Texture::texture2d_array ||
+                Tex.Logical == Texture::depth2d || Tex.Logical == Texture::depth2d_array;
+  if (!Planar || ctx.shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
+    return Biased();
+  // the quad's derivatives, before a branch that the quad may not take together
+  auto DDX = air.CreateDerivative(Coord, false), DDY = air.CreateDerivative(Coord, true);
+  auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
+                                 (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
+  auto Anisotropic = ir.CreateICmpUGT(Anisotropy, ir.getInt64(1));
+  auto Scaled = OwnBias ? Anisotropic
+                        : ir.CreateAnd(Anisotropic, ir.CreateFCmpUNE(Bias, ConstantFP::get(air.getFloatTy(), 0)));
+
+  auto Head = ir.GetInsertBlock();
+  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
+  if (auto Branch = Head->getTerminator())
+    Branch->eraseFromParent();
+  auto Gradient = llvm::BasicBlock::Create(ctx.llvm, "sample_scaled_gradients", Head->getParent(), Tail);
+  auto Plain = llvm::BasicBlock::Create(ctx.llvm, "sample_biased", Head->getParent(), Tail);
+  ir.SetInsertPoint(Head);
+  ir.CreateCondBr(Scaled, Gradient, Plain);
+  ir.SetInsertPoint(Gradient);
+  auto ByGradient = air.CreateSampleGrad(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, BiasGradient(DDX, Bias),
+                                         BiasGradient(DDY, Bias), MinLOD, Offset, Reference);
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Plain);
+  auto ByBias = Biased();
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Tail, Tail->begin());
+  auto Value = ir.CreatePHI(ByBias.first->getType(), 2), Residency = ir.CreatePHI(ByBias.second->getType(), 2);
+  Value->addIncoming(ByGradient.first, Gradient);
+  Value->addIncoming(ByBias.first, Plain);
+  Residency->addIncoming(ByGradient.second, Gradient);
+  Residency->addIncoming(ByBias.second, Plain);
+  return {Value, Residency};
+}
+
+std::pair<llvm::Value *, llvm::Value *>
 Converter::SamplingResidency(
     const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
     llvm::Value *ArrayIndex, const int32_t Offset[3], std::pair<llvm::Value *, llvm::Value *> Sample,
@@ -2446,9 +2504,47 @@ Converter::Gather(
     Coord = ir.CreateFAdd(Coord, ir.CreateFDiv(Texels, Size));
     Offset = Constant::getNullValue(OffsetTy);
   }
-  auto [Value, Residency] =
-      Reference ? air.CreateGatherCompare(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Reference, Offset)
-                : air.CreateGather(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Offset, Component);
+  auto Read = [&] {
+    return air.CreateGather(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Offset,
+                            Component ? Component : ir.getInt32(0));
+  };
+  auto Gathered = Reference ? std::pair<llvm::Value *, llvm::Value *>{} : Read();
+  if (Reference) {
+    // Metal orders denormal texels, which go into a comparison as zeros (D3D11.3 22.4.3), so only a zero reference tells
+    // them apart. it is every format's zero texel, so the texels themselves are compared with it
+    Reference = air.getDenormToZero(Reference);
+    auto Head = ir.GetInsertBlock();
+    auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                   : SplitBlock(Head, &*ir.GetInsertPoint());
+    if (auto Branch = Head->getTerminator())
+      Branch->eraseFromParent();
+    auto Exact = llvm::BasicBlock::Create(ctx.llvm, "gather_zero_reference", Head->getParent(), Tail);
+    auto Native = llvm::BasicBlock::Create(ctx.llvm, "gather_compare", Head->getParent(), Tail);
+    ir.SetInsertPoint(Head);
+    ir.CreateCondBr(ir.CreateFCmpOEQ(Reference, ConstantFP::get(air.getFloatTy(), 0)), Exact, Native);
+    ir.SetInsertPoint(Exact);
+    auto [Texels, Status] = Read();
+    llvm::Value *Results = PoisonValue::get(Texels->getType());
+    for (unsigned i = 0; i < cast<FixedVectorType>(Texels->getType())->getNumElements(); i++) {
+      auto Texel = air.getDenormToZero(ir.CreateExtractElement(Texels, i));
+      Results = ir.CreateInsertElement(Results, SamplerCompare(SamplerMetadata, Reference, Texel), i);
+    }
+    // an unbound resource returns 0 (D3D11.3 22.4.3), and has no width
+    auto Width = air.CreateTextureQuery(Tex.Texture, Tex.Handle, llvm::air::Texture::width, ir.getInt32(0));
+    Results = ir.CreateSelect(ir.CreateICmpEQ(Width, ir.getInt32(0)), Constant::getNullValue(Results->getType()), Results);
+    ir.CreateBr(Tail);
+    ir.SetInsertPoint(Native);
+    auto Compared = air.CreateGatherCompare(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Reference, Offset);
+    ir.CreateBr(Tail);
+    ir.SetInsertPoint(Tail, Tail->begin());
+    auto Value = ir.CreatePHI(Texels->getType(), 2), Residency = ir.CreatePHI(Status->getType(), 2);
+    Value->addIncoming(Results, Exact);
+    Value->addIncoming(Compared.first, Native);
+    Residency->addIncoming(Status, Exact);
+    Residency->addIncoming(Compared.second, Native);
+    Gathered = {Value, Residency};
+  }
+  auto [Value, Residency] = Gathered;
   // a comparison gathers the red of depth
   Value = CustomBorder(
       Tex, Sampler, Border, SamplerMetadata, Value,
@@ -2494,6 +2590,25 @@ Converter::SamplerCompare(llvm::Value *SamplerMetadata, llvm::Value *Reference, 
       ir.CreateZExt(ir.CreateICmpEQ(ir.CreateAnd(Function, Outcome), Outcome), air.getIntTy()),
       llvm::air::Signedness::Unsigned
   );
+}
+
+llvm::Value *
+Converter::CompareReference(llvm::Value *SamplerMetadata, llvm::Value *Reference) {
+  // a comparison takes denormal texels and references as zeros (D3D11.3 22.4.3), where Metal orders them. beside the
+  // largest denormal such a texel compares as less or equal, and as greater or equal beside its negation: a function
+  // that passes those outcomes as it passes equal gets D3D's result from that reference. Equal and NotEqual get zero
+  using namespace llvm;
+  auto Largest = APFloat::getSmallestNormalized(APFloat::IEEEsingle());
+  Largest.next(true);
+  auto Flushed = air.getDenormToZero(Reference);
+  auto Function = ir.CreateTrunc(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_COMPARE), ir.getInt32Ty());
+  auto Passes = [&](unsigned Outcome) { return ir.CreateICmpNE(ir.CreateAnd(Function, Outcome), ir.getInt32(0)); };
+  auto Equal = Passes(2);
+  auto Nearest = ir.CreateSelect(
+      ir.CreateICmpEQ(Equal, Passes(4)), ConstantFP::get(ir.getFloatTy(), Largest),
+      ir.CreateSelect(ir.CreateICmpEQ(Equal, Passes(1)), ConstantFP::get(ir.getFloatTy(), neg(Largest)), Flushed)
+  );
+  return ir.CreateSelect(ir.CreateFCmpOEQ(Flushed, ConstantFP::get(ir.getFloatTy(), 0)), Nearest, Reference);
 }
 
 llvm::Value *
@@ -2583,11 +2698,12 @@ Converter::operator()(const InstResourceInfo &resinfo) {
   auto Value = TextureDimensions(*Tex, LoadOperand(resinfo.src_mip_level, kMaskComponentX));
   if (resinfo.modifier != InstResourceInfo::M::uint)
     Value = air.CreateConvertToFloat(Value);
-  // rcp inverts the sizes, not the mip count
-  if (resinfo.modifier == InstResourceInfo::M::rcp)
-    Value = ir.CreateInsertElement(
-        ir.CreateFDiv(llvm::ConstantFP::get(air.getFloatTy(4), 1.0), Value), ir.CreateExtractElement(Value, 3), 3
-    );
+  // rcp inverts the sizes the texture has, not the array size, the mip count or the missing ones (D3D11.3 22.4.14)
+  if (resinfo.modifier == InstResourceInfo::M::rcp) {
+    auto Rcp = ir.CreateFDiv(llvm::ConstantFP::get(air.getFloatTy(4), 1.0), Value);
+    for (unsigned i = 0; i < SizeDimension(Tex->Logical); i++)
+      Value = ir.CreateInsertElement(Value, ir.CreateExtractElement(Rcp, i), i);
+  }
 
   StoreOperand(resinfo.dst, MaskSwizzle(Value, GetMask(resinfo.dst), Tex->Swizzle));
 }
@@ -2628,22 +2744,16 @@ Converter::operator()(const InstSamplePos &sample) {
   llvm::Optional<TextureResourceHandle> Tex =
       sample.src ? LoadTexture(sample.src.value()) : llvm::Optional<TextureResourceHandle>{};
 
-  llvm::Value *SampleCount = nullptr;
-
-  if (!Tex) {
-    if (sample.src.has_value()) {
-      SampleCount = ir.getInt32(0);
-    } else {
-      SampleCount = air.CreateGetNumSamples();
-    }
-  } else {
-    SampleCount = air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::num_samples, ir.getInt32(0));
-  }
-
   llvm::Value *Index = LoadOperand(sample.src_sample_index, kMaskComponentX);
 
   llvm::Value *ValueVec4 = llvm::ConstantAggregateZero::get(air.getFloatTy(2));
-  llvm::Value *Pos = air.CreateSamplePos(SampleCount, Index);
+  llvm::Value *Pos =
+      Tex          ? TextureSamplePos(
+                         *Tex, air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::num_samples, ir.getInt32(0)),
+                         Index
+                     )
+      : sample.src ? air.CreateSamplePos(ir.getInt32(0), Index)
+                   : air.CreateRasterizerSamplePos(Index);
   ValueVec4 = ir.CreateShuffleVector(Pos, ValueVec4, {0, 1, 2, 3});
 
   StoreOperand(sample.dst, MaskSwizzle(ValueVec4, GetMask(sample.dst), sample.read_swizzle));
@@ -2673,18 +2783,20 @@ Converter::LoadBufferWords(
 ) {
   mask_t Mask = GetMask(Dst), Words = MemoryAccessMask(Mask, Buf.Swizzle);
   llvm::Value *Residency = ir.getInt32(0);
-  auto At = [&](unsigned Word) { return ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), Word)); };
+  auto At = [&](unsigned Word, llvm::Value *Index) {
+    return ir.CreateAdd(Index, llvm::ConstantInt::get(Index->getType(), Word));
+  };
   if (auto Comp = ComponentFromScalarMask(Mask, Buf.Swizzle); Comp >= 0) {
-    auto Ptr = CreateGEPInt32WithBoundCheck(Buf, At(Comp));
+    auto Ptr = CreateGEPInt32WithBoundCheck(Buf, At(Comp, Index));
     if (Feedback)
       StoreFeedback(Feedback, BufferResidency(Ptr));
     return StoreOperand(Dst, MaskSwizzle(LoadBufferValue(Buf, ir.getInt32Ty(), Ptr), Mask));
   }
-  auto Last = Feedback ? nullptr : At(llvm::Log2_32(Words));
-  auto ValueVec = LoadBufferUnits(Buf, Last, sizeof(uint32_t), [&](bool Inside) {
+  auto Last = Feedback ? nullptr : At(llvm::Log2_32(Words), Index);
+  auto ValueVec = LoadBufferUnits(Buf, Index, Last, sizeof(uint32_t), [&](llvm::Value *Index, bool Inside) {
     llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
     for (auto [DstComp, _] : EnumerateComponents(Words)) {
-      auto Ptr = CreateGEPInt32WithBoundCheck(Buf, At(DstComp), Inside);
+      auto Ptr = CreateGEPInt32WithBoundCheck(Buf, At(DstComp, Index), Inside);
       if (Feedback)
         Residency = ir.CreateOr(Residency, BufferResidency(Ptr));
       ValueVec = ir.CreateInsertElement(ValueVec, LoadBufferValue(Buf, ir.getInt32Ty(), Ptr, Inside), DstComp);
@@ -2846,7 +2958,7 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
 
   if (Buf) {
     auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
-    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
+    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), IntPtrOffset);
     auto Value = air.CreateAtomicRMW(Op, Ptr, LoadOperand(atomic.src, kMaskComponentX));
     StoreOperand(atomic.dst_original, Value);
     return;
@@ -2873,7 +2985,7 @@ Converter::operator()(const InstAtomicImmCmpExchange &atomic) {
 
   if (Buf) {
     auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
-    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
+    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), IntPtrOffset);
     if (air.DiscardWrites && Ptr->getType()->getPointerAddressSpace() != 3) {
       StoreOperand(atomic.dst, ir.CreateLoad(ir.getInt32Ty(), Ptr));
       return;
@@ -3289,59 +3401,37 @@ Converter::CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Valu
 }
 
 llvm::Value *
-Converter::Either(
-    llvm::Value *Condition, llvm::function_ref<llvm::Value *()> Then, llvm::function_ref<llvm::Value *()> Else
-) {
-  auto Head = ir.GetInsertBlock();
-  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
-                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
-  if (auto Branch = Head->getTerminator())
-    Branch->eraseFromParent();
-  llvm::Value *Values[2];
-  llvm::BasicBlock *Starts[2], *Ends[2];
-  for (int Arm = 0; Arm < 2; Arm++) {
-    ir.SetInsertPoint(Starts[Arm] = llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent(), Tail));
-    Values[Arm] = Arm ? Else() : Then();
-    Ends[Arm] = ir.GetInsertBlock();
-    ir.CreateBr(Tail);
-  }
-  llvm::BranchInst::Create(Starts[0], Starts[1], Condition, Head);
-  ir.SetInsertPoint(Tail, Tail->begin());
-  auto Result = ir.CreatePHI(Values[0]->getType(), 2);
-  for (int Arm = 0; Arm < 2; Arm++)
-    Result->addIncoming(Values[Arm], Ends[Arm]);
-  return Result;
-}
-
-llvm::Value *
 Converter::LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr, bool Inside) {
-  auto Load = [&]() -> llvm::Value * {
+  auto Load = [&](llvm::Value *Ptr) -> llvm::Value * {
     return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(Type, Ptr)
                                  : ir.CreateLoad(Type, Ptr, Ptr->getType()->getPointerAddressSpace() == 3);
   };
   if (!Buffer.Metadata || Inside)
-    return Load();
-  // a null pointer is a bounds result, not a zero-valued load (D3D11.3 22.4.10 and 22.4.12)
-  return Either(ir.CreateIsNotNull(Ptr), Load, [&] { return llvm::Constant::getNullValue(Type); });
+    return Load(Ptr);
+  // a null pointer is a bounds result, not a zero-valued load (D3D11.3 22.4.10 and 22.4.12). the load reads the view's
+  // first unit instead and its value is dropped: a branch round every load splits the shader into blocks whose live
+  // values spill. a null view starts at the device's zero-filled buffer (GetNullBuffer)
+  auto Out = ir.CreateIsNull(Ptr);
+  auto Value = Load(ir.CreateSelect(Out, ir.CreatePointerCast(Buffer.Pointer, Ptr->getType()), Ptr));
+  return ir.CreateSelect(Out, llvm::Constant::getNullValue(Type), Value);
 }
 
-// a load of several units, which Read emits. where the load's last unit, at Last, is in bounds, Read(true): every
-// unit as it is, behind that one branch (a branch costs the GPU more than the units it guards). where it is not, a
-// structured load is past the end as a whole, or by its offset, which leaves it undefined (D3D11.3 22.4.12): zeros.
-// a raw load may cross the end or wrap (22.4.10), so there, and where Last is null, Read(false): each unit by its
-// own bound
+// a load of several units from Base, which Read emits. a structured load whose last unit, at Last, is past the end is
+// past it as a whole, or by its offset, which leaves it undefined (D3D11.3 22.4.12): it reads from the view's start
+// and is zeros, so one compare stands for every unit and no branch splits the shader. a raw load may cross the end or
+// wrap (22.4.10), so it, and a load with no Last, reads each unit by its own bound
 llvm::Value *
 Converter::LoadBufferUnits(
-    BufferResourceHandle &Buffer, llvm::Value *Last, uint32_t UnitBytes, llvm::function_ref<llvm::Value *(bool)> Read
+    BufferResourceHandle &Buffer, llvm::Value *Base, llvm::Value *Last, uint32_t UnitBytes,
+    llvm::function_ref<llvm::Value *(llvm::Value *, bool)> Read
 ) {
-  if (!Buffer.Metadata || !Last)
-    return Read(false);
+  if (!Buffer.Metadata || !Last || !Buffer.StructureStride)
+    return Read(Base, false);
   auto Bytes = DecodeRawBufferByteLength(Buffer.Metadata);
   auto Units = ir.CreateZExtOrTrunc(ir.CreateUDiv(Bytes, llvm::ConstantInt::get(Bytes->getType(), UnitBytes)), Last->getType());
-  llvm::Value *Whole;
-  return Either(ir.CreateICmpULT(Last, Units), [&] { return Whole = Read(true); }, [&] {
-    return Buffer.StructureStride ? llvm::Constant::getNullValue(Whole->getType()) : Read(false);
-  });
+  auto Whole = ir.CreateICmpULT(Last, Units);
+  auto Value = Read(ir.CreateSelect(Whole, Base, llvm::ConstantInt::get(Base->getType(), 0)), true);
+  return ir.CreateSelect(Whole, Value, llvm::Constant::getNullValue(Value->getType()));
 }
 
 llvm::Value *

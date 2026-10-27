@@ -17,6 +17,10 @@
 // Direct3D 10's HardwareLevel is a D3D10_FEATURE_LEVEL1, whose greatest value is D3D10_FEATURE_LEVEL_10_1:
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d10_1/nf-d3d10_1-d3d10createdevice1
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d10_1/ne-d3d10_1-d3d10_feature_level1
+// D3D10 GetCreationFlags returns "A bitfield containing the flags used to create the device."
+// https://learn.microsoft.com/en-us/windows/win32/api/d3d10/nf-d3d10-id3d10device-getcreationflags
+// every combination of the ordinary flags is checked, along with the default multithread protection. Debug
+// layers and the Windows-7-only ALLOW_NULL_FROM_MAP flag have separate prerequisites and are not assumed present.
 #include "d3d11_test.hpp"
 #include <d3d10_1.h>
 #include <algorithm>
@@ -291,6 +295,84 @@ main() {
     expect(bool(device) == (sdk == D3D10_SDK_VERSION), "D3D10 SDK device %p", device.Get());
   }
   auto sentinel10 = reinterpret_cast<ID3D10Device1 *>(factory.Get());
+  const UINT flags10[] = {
+      D3D10_CREATE_DEVICE_SINGLETHREADED, D3D10_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
+      D3D10_CREATE_DEVICE_BGRA_SUPPORT, D3D10_CREATE_DEVICE_PREVENT_ALTERING_LAYER_SETTINGS_FROM_REGISTRY
+  };
+  const D3D10_FEATURE_LEVEL1 levels10[] = {D3D10_FEATURE_LEVEL_10_0, D3D10_FEATURE_LEVEL_10_1};
+  bool bgra_support[std::size(levels10)] = {true, true};
+  for (UINT i = 0; i < std::size(levels10); i++) {
+    ComPtr<ID3D10Device1> control;
+    CHECK(create1(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, levels10[i], D3D10_1_SDK_VERSION, &control));
+    for (auto format :
+         {DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+          DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB}) {
+      UINT support = 0;
+      bgra_support[i] &=
+          SUCCEEDED(control->CheckFormatSupport(format, &support)) && (support & D3D10_FORMAT_SUPPORT_TEXTURE2D);
+    }
+  }
+  for (UINT combination = 0; combination < (1u << std::size(flags10)); combination++) {
+    UINT mask = 0;
+    for (UINT i = 0; i < std::size(flags10); i++)
+      if (combination & (1u << i))
+        mask |= flags10[i];
+    for (UINT i = 0; i < std::size(levels10); i++) {
+      auto level = levels10[i];
+      step("Direct3D 10 level %#x creation flags %#x", level, mask);
+      ComPtr<ID3D10Device1> device;
+      auto hr = create1(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, mask, level, D3D10_1_SDK_VERSION, &device);
+      if ((mask & D3D10_CREATE_DEVICE_BGRA_SUPPORT) && !bgra_support[i]) {
+        expect(FAILED(hr) && !device, "BGRA flag accepted without BGRA support");
+        continue;
+      }
+      if (!expect(hr == S_OK && device, "D3D10 flag creation returned %#lx", hr))
+        return verdict();
+      expect(device->GetCreationFlags() == mask, "D3D10 creation flags differ: %#x", device->GetCreationFlags());
+      ComPtr<ID3D10Multithread> multithread;
+      CHECK(device.As(&multithread));
+      BOOL initial = !(mask & D3D10_CREATE_DEVICE_SINGLETHREADED);
+      expect(multithread->GetMultithreadProtected() == initial, "initial D3D10 multithread protection");
+      expect(
+          multithread->SetMultithreadProtected(!initial) == initial &&
+              multithread->GetMultithreadProtected() == !initial,
+          "changed D3D10 multithread protection"
+      );
+      multithread->Enter();
+      multithread->Enter();
+      multithread->Leave();
+      multithread->Leave();
+      expect(multithread->SetMultithreadProtected(initial) == !initial, "restored D3D10 multithread protection");
+    }
+    ComPtr<ID3D10Device> device;
+    CHECK(create10(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, mask, D3D10_SDK_VERSION, &device));
+    expect(device->GetCreationFlags() == mask, "D3D10CreateDevice creation flags differ");
+  }
+  auto create_swap10 = reinterpret_cast<decltype(&D3D10CreateDeviceAndSwapChain)>(
+      GetProcAddress(api10, "D3D10CreateDeviceAndSwapChain")
+  );
+  if (!expect(create_swap10 != nullptr, "D3D10CreateDeviceAndSwapChain unavailable"))
+    return verdict();
+  for (auto supplied : {static_cast<IDXGIAdapter *>(nullptr), adapter.Get()}) {
+    step("D3D10CreateDeviceAndSwapChain explicit adapter %u", supplied != nullptr);
+    ComPtr<ID3D10Device> device;
+    ComPtr<IDXGISwapChain> swap;
+    desc.OutputWindow = window;
+    desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    CHECK(create_swap10(supplied, D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, D3D10_SDK_VERSION, &desc, &swap, &device));
+    ComPtr<ID3D10Device> swap_device;
+    CHECK(swap->GetDevice(IID_PPV_ARGS(&swap_device)));
+    expect(device == swap_device, "D3D10 swap chain belongs to a different device");
+    ComPtr<ID3D10Texture2D> backbuffer;
+    CHECK(swap->GetBuffer(0, IID_PPV_ARGS(&backbuffer)));
+    D3D10_TEXTURE2D_DESC got;
+    backbuffer->GetDesc(&got);
+    expect(
+        got.Width == desc.BufferDesc.Width && got.Height == desc.BufferDesc.Height &&
+            got.Format == desc.BufferDesc.Format,
+        "D3D10 combined creation backbuffer descriptor"
+    );
+  }
   // Wine d3d10_1.c:162, 214-265 records these output, level, window and format combinations.
   const struct {
     bool device, swap, description;

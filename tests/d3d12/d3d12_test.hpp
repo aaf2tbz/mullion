@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include "../dxbc_hash.hpp"
+#include "../temporary.hpp"
 #include "../trace.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -43,8 +44,8 @@ kept(std::string code, const char *entry) {
 struct Compiler {
   ComPtr<IDxcCompiler3> dxc; // null for DXBC
 
-  // `stage` is "vs", "ps" or "cs", or a whole profile ("cs_6_6") for HLSL only DXC compiles, which then fails for
-  // DXBC; `defines` ("NAME=VALUE") pass test constants into the HLSL, so both sides use one value. `flags` go to DXC
+  // `stage` is "vs", "ps" or "cs", or a whole profile. explicit SM5 profiles also go to FXC; SM6 requires DXC.
+  // `defines` ("NAME=VALUE") pass test constants into the HLSL, so both sides use one value. `flags` go to DXC
   template <size_t N>
   std::string compile(
       const char (&hlsl)[N], const char *entry, const char *stage, std::vector<std::string> defines = {},
@@ -58,7 +59,7 @@ struct Compiler {
     std::string out, profile = stage;
     if (profile.find('_') == std::string::npos)
       profile += dxc ? "_6_0" : "_5_1";
-    else if (!dxc)
+    else if (!dxc && profile.find("_5_") == std::string::npos)
       return out;
     if (!dxc) {
       std::vector<D3D_SHADER_MACRO> macros;

@@ -1,4 +1,5 @@
-# family 7: a GPU without native 64-bit min/max still emits them
+# a GPU without native 64-bit min/max still emits them
+# family 7
 --- a/src/airconv/dxil_converter.cpp
 +++ b/src/airconv/dxil_converter.cpp
 @@ -2169,7 +2169,7 @@

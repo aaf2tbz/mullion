@@ -10,8 +10,10 @@ main() {
   std::vector<Case> cases;
   std::vector<ComPtr<ID3DBlob>> shaders;
   for (UINT width = 1; width <= components; width++)
-    for (UINT padding : {0u, components}) {
-      cases.emplace_back(width + padding, sizeof(UINT) * CHAR_BIT, width, padding, D3D11_RAW_UAV_SRV_BYTE_ALIGNMENT);
+    for (UINT padding : {0u, components})
+      for (bool null : {false, true}) {
+      cases.emplace_back(width + padding, sizeof(UINT) * CHAR_BIT, width, padding, D3D11_RAW_UAV_SRV_BYTE_ALIGNMENT,
+                         null);
       shaders.push_back(compile(hlsl, "cs", "cs", cases.back().defines()));
       if (!shaders.back()) {
         printf("failed: HLSL did not compile\n");
@@ -25,8 +27,8 @@ main() {
                           &context));
   for (size_t variant = 0; variant < cases.size(); variant++) {
     auto &test = cases[variant];
-    step("seed %u, width %u, padding %u, first %u, count %u", test.seed, test.width, test.padding, test.first,
-         test.count);
+    step("seed %u, width %u, padding %u, first %u, count %u%s", test.seed, test.width, test.padding, test.first,
+         test.count, test.null ? ", null views" : "");
     ComPtr<ID3D11ComputeShader> shader;
     CHECK(device->CreateComputeShader(shaders[variant]->GetBufferPointer(), shaders[variant]->GetBufferSize(), nullptr,
                                       &shader));
@@ -68,8 +70,11 @@ main() {
         D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,       sizeof(Result)};
     CHECK(device->CreateBuffer(&result_desc, nullptr, &result));
     CHECK(device->CreateUnorderedAccessView(result.Get(), nullptr, &uavs[4]));
-    ID3D11ShaderResourceView *reads[] = {srvs[0].Get(), srvs[1].Get(), srvs[2].Get()};
-    ID3D11UnorderedAccessView *writes[] = {uavs[0].Get(), uavs[1].Get(), uavs[2].Get(), uavs[3].Get(), uavs[4].Get()};
+    ID3D11ShaderResourceView *reads[] = {test.null ? nullptr : srvs[0].Get(), test.null ? nullptr : srvs[1].Get(),
+                                         srvs[2].Get()};
+    ID3D11UnorderedAccessView *writes[] = {test.null ? nullptr : uavs[0].Get(), test.null ? nullptr : uavs[1].Get(),
+                                           test.null ? nullptr : uavs[2].Get(), test.null ? nullptr : uavs[3].Get(),
+                                           uavs[4].Get()};
     context->CSSetShader(shader.Get(), nullptr, 0);
     context->CSSetShaderResources(0, std::size(reads), reads);
     context->CSSetUnorderedAccessViews(0, std::size(writes), writes, nullptr);

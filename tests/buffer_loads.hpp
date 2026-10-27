@@ -1,6 +1,9 @@
 // D3D11.3 22.4.10: "Out of bounds addressing on u#/t# of any given 32-bit component returns 0 for that component."
 // 22.4.12 gives the same result for an out-of-range structure index; offsets within a structure stay in range here.
-// raw component offsets follow the uint32_t oracle in vkd3d-proton's test_byte_buffer_addressing_wrap.
+// raw component offsets follow the uint32_t oracle in vkd3d-proton's test_byte_buffer_addressing_wrap. a null view
+// holds nothing, so every read of it is out of bounds and 0; D3D12 keeps that for a null descriptor ("there is a
+// defined behavior for accessing an unbound resource [...] honored when accessing a NULL descriptor", Resource Binding
+// spec, NULL Descriptors)
 #pragma once
 #include <algorithm>
 #include <array>
@@ -52,7 +55,7 @@ void save(VALUE value, uint row) {
   shared_values[id] = (WORD)(id + 1);
   GroupMemoryBarrierWithGroupSync();
   uint2 at = addresses[id];
-  uint offset = at.x * WORD_BYTES;
+  uint offset = at.x * RAW_STEP;
   uint row = id * KINDS;
   save(RAW_LOAD(raw_srv, offset), row);
   save(structured_srv[at.y].value, row + 1);
@@ -70,15 +73,17 @@ void save(VALUE value, uint row) {
 )hlsl";
 
 struct Case {
-  UINT seed, bits, width, padding, word_bytes, stride, first, count, raw_first, raw_bytes;
+  UINT seed, bits, width, padding, word_bytes, raw_step, stride, first, count, raw_first, raw_bytes;
+  bool null;
   std::vector<uint8_t> data;
   std::vector<Address> addresses;
   std::vector<Result> expected;
 
-  Case(UINT seed, UINT bits, UINT width, UINT padding, UINT raw_alignment)
-      : seed(seed), bits(bits), width(width), padding(padding) {
+  Case(UINT seed, UINT bits, UINT width, UINT padding, UINT raw_alignment, bool null, UINT raw_unit = 0)
+      : seed(seed), bits(bits), width(width), padding(padding), null(null) {
     std::minstd_rand random(seed);
     word_bytes = bits / CHAR_BIT;
+    raw_step = raw_unit ? raw_unit : word_bytes;
     stride = (width + padding) * word_bytes;
     first = 1 + random() % components;
     count = components + random() % (2 * components + 1);
@@ -90,20 +95,25 @@ struct Case {
                  stride - 1) / stride * stride);
     for (auto &byte : data)
       byte = 1 + random() % UINT8_MAX;
-    const UINT units = raw_bytes / word_bytes, maximum = UINT32_MAX / stride;
+    const UINT units = raw_bytes / raw_step, maximum = UINT32_MAX / stride;
     addresses = {{0, 0},
                  {1, 1},
-                 {units - width, count - 1},
-                 {units - width + 1, count},
+                 {units - width * word_bytes / raw_step, count - 1},
+                 {units - width * word_bytes / raw_step + 1, count},
                  {units - 1, count + 1},
                  {units, maximum - 1},
                  {units + 1, maximum},
-                 {UINT32_MAX / word_bytes - components, maximum + 1},
-                 {UINT32_MAX / word_bytes + (word_bytes > 1), UINT32_MAX}};
+                 {UINT32_MAX / raw_step - components, maximum + 1},
+                 {UINT32_MAX / raw_step + (raw_step > 1), UINT32_MAX}};
     for (UINT i = 0; i < components; i++)
-      addresses.push_back({UINT32_MAX / word_bytes - i, maximum + 1});
+      addresses.push_back({UINT32_MAX / raw_step - i, maximum + 1});
     for (UINT i = 0; i < 2 * components; i++)
       addresses.push_back({random() % (units + components), random() % (count + components)});
+    reference();
+  }
+
+  void reference() {
+    expected.clear();
     for (size_t index = 0; index < addresses.size(); index++) {
       const auto at = addresses[index];
       for (UINT kind = 0; kind < kinds; kind++)
@@ -116,9 +126,9 @@ struct Case {
           } else {
             const bool structured = kind < kinds - 2 && kind % 2;
             const uint64_t offset = structured ? uint64_t(at[1]) * stride + c * word_bytes
-                                               : UINT(at[0] * word_bytes +
+                                               : UINT(at[0] * raw_step +
                                                       (c + (kind == kinds - 1 ? components : 0)) * word_bytes);
-            if (!structured || at[1] < count)
+            if (!null && (!structured || at[1] < count))
               for (UINT b = 0; b < word_bytes; b++) {
                 const uint64_t byte_offset = structured ? offset + b : UINT(offset + b);
                 if (!structured && byte_offset >= raw_bytes)
@@ -141,6 +151,7 @@ struct Case {
             "WIDTH=" + std::to_string(width),
             "PADDING=" + std::to_string(padding),
             "WORD_BYTES=" + std::to_string(word_bytes),
+            "RAW_STEP=" + std::to_string(raw_step),
             "CASES=" + std::to_string(addresses.size()),
             "COMPONENTS=" + std::to_string(components),
             "KINDS=" + std::to_string(kinds)};
@@ -151,9 +162,9 @@ struct Case {
       Result got;
       memcpy(&got, static_cast<const uint8_t *>(bytes) + i * sizeof(got), sizeof(got));
       expect(got == expected[i],
-             "seed %u, %u-bit width %u padding %u, address %zu, kind %zu, component %zu: "
+             "seed %u, %u-bit width %u padding %u%s, address %zu, kind %zu, component %zu: "
              "%08x:%08x, expected %08x:%08x",
-             seed, bits, width, padding, i / (kinds * width), i / width % kinds, i % width, got[1], got[0],
+             seed, bits, width, padding, null ? " null" : "", i / (kinds * width), i / width % kinds, i % width, got[1], got[0],
              expected[i][1], expected[i][0]);
     }
   }

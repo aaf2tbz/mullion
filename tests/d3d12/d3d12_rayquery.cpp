@@ -34,6 +34,11 @@
 // description" (DXR functional spec, "Additional SRV type"). that section requires a null resource parameter;
 // Windows also accepts a resource there (vkd3d-proton test_rayquery_root_table), and its contents do not select the
 // structure. the same rays are checked with a null, matching and unrelated resource, and with a null Location.
+// query reuse: "reset the query regardless of its current state"; after Proceed returns FALSE, further calls
+// "will continue to return FALSE and do nothing" (DXR specification, TraceRayInline control flow and Proceed).
+// repeat commits: "subsequent calls simply have no effect" for a triangle; procedural commits may repeat in the
+// updated inclusive interval. transform 4x3 forms are "transposed -- use whichever is convenient."
+// https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-intrinsics
 #include "d3d12_rays.hpp"
 
 static const char hlsl[] = R"hlsl(
@@ -43,23 +48,37 @@ cbuffer Case : register(b0) { uint flags; uint mask; float tmin; float tmax; uin
 struct Result {
   uint status, instance, id, geometry, primitive, front, contribution, flags;
   float t; float2 bary; float object_x, to_world_x, to_object_x, tmin, world_z;
+  uint lifecycle; float transforms[48];
 };
 RWStructuredBuffer<Result> results : register(u0);
 // the boxes of the procedural geometry: x and y bounds and the near face's z
 static const float boxes[BOXES][5] = { BOX_LIST };
 
+#define INITIALIZE(q)                                                                                                  \
+  if (from_table) q.TraceRayInline(table_scene, flags, mask, ray); else q.TraceRayInline(scene, flags, mask, ray);
+
 #define TRACE(q)                                                                                                       \
-  if (from_table) q.TraceRayInline(table_scene, flags, mask, ray); else q.TraceRayInline(scene, flags, mask, ray);    \
+  INITIALIZE(q)                                                                                                        \
+  q.Abort();                                                                                                           \
+  r.lifecycle |= uint(q.Proceed());                                                                                    \
+  r.lifecycle |= uint(q.Proceed()) << 1;                                                                               \
+  INITIALIZE(q)                                                                                                        \
   for (uint steps = 0; steps < MAX_STEPS && q.Proceed(); steps++) {                                                   \
     if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {                                                         \
-      if ((q.CandidatePrimitiveIndex() + q.CandidateInstanceID()) % 2 == 0) q.CommitNonOpaqueTriangleHit();           \
+      if ((q.CandidatePrimitiveIndex() + q.CandidateInstanceID()) % 2 == 0) {                                          \
+        q.CommitNonOpaqueTriangleHit();                                                                                \
+        if (!(flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH)) q.CommitNonOpaqueTriangleHit();                       \
+      }                                                                                                                \
     } else {                                                                                                          \
       float3 o = q.CandidateObjectRayOrigin();                                                                        \
       float b[5] = boxes[q.CandidatePrimitiveIndex()];                                                                \
       float t = (b[4] - o.z) / q.CandidateObjectRayDirection().z;                                                     \
       bool inside = o.x > b[0] && o.x < b[1] && o.y > b[2] && o.y < b[3];                                             \
       float limit = q.CommittedStatus() == COMMITTED_NOTHING ? tmax : q.CommittedRayT();                              \
-      if (inside && t >= q.RayTMin() && t <= limit) q.CommitProceduralPrimitiveHit(t);                                \
+      if (inside && t >= q.RayTMin() && t <= limit) {                                                                  \
+        q.CommitProceduralPrimitiveHit(t);                                                                             \
+        if (!(flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH)) q.CommitProceduralPrimitiveHit(t);                    \
+      }                                                                                                                \
     }                                                                                                                 \
   }                                                                                                                   \
   r.status = q.CommittedStatus();                                                                                     \
@@ -76,11 +95,32 @@ static const float boxes[BOXES][5] = { BOX_LIST };
     r.object_x = q.CommittedObjectRayOrigin().x;                                                                      \
     r.to_world_x = q.CommittedObjectToWorld3x4()[0][3];                                                               \
     r.to_object_x = q.CommittedWorldToObject3x4()[0][3];                                                              \
+    float3x4 to_world = q.CommittedObjectToWorld3x4(), to_object = q.CommittedWorldToObject3x4();                      \
+    float4x3 to_world_t = q.CommittedObjectToWorld4x3(), to_object_t = q.CommittedWorldToObject4x3();                  \
+    for (uint row = 0; row < 3; row++) for (uint col = 0; col < 4; col++) {                                            \
+      r.transforms[row * 4 + col] = to_world[row][col];                                                                \
+      r.transforms[12 + row * 4 + col] = to_object[row][col];                                                          \
+      r.transforms[24 + col * 3 + row] = to_world_t[col][row];                                                         \
+      r.transforms[36 + col * 3 + row] = to_object_t[col][row];                                                        \
+    }                                                                                                                 \
   }                                                                                                                   \
   if (r.status == COMMITTED_TRIANGLE_HIT) {                                                                           \
     r.front = q.CommittedTriangleFrontFace();                                                                         \
     r.bary = q.CommittedTriangleBarycentrics();                                                                       \
-  }
+  }                                                                                                                   \
+  r.lifecycle |= uint(q.Proceed()) << 2;                                                                               \
+  r.lifecycle |= uint(q.Proceed()) << 3;                                                                               \
+  RayDesc reset_ray = ray;                                                                                             \
+  reset_ray.TMin = 0;                                                                                                  \
+  reset_ray.Origin += float3(STEP, 2 * STEP, 3 * STEP);                                                                \
+  if (from_table) q.TraceRayInline(table_scene, RAY_FLAG_FORCE_OPAQUE, 0, reset_ray);                                  \
+  else q.TraceRayInline(scene, RAY_FLAG_FORCE_OPAQUE, 0, reset_ray);                                                   \
+  r.lifecycle |= uint(q.Proceed()) << 4;                                                                               \
+  r.lifecycle |= uint(q.Proceed()) << 5;                                                                               \
+  r.lifecycle |= uint(q.CommittedStatus() != COMMITTED_NOTHING) << 6;                                                  \
+  r.lifecycle |= uint(q.RayFlags() != (RAY_FLAG_FORCE_OPAQUE | (own_flags ? OWN_FLAGS : 0))) << 7;                     \
+  r.lifecycle |= uint(any(q.WorldRayOrigin() != reset_ray.Origin)) << 8;                                               \
+  r.lifecycle |= uint(q.RayTMin() != reset_ray.TMin) << 9;
 
 Result shoot(uint2 id) {
   RayDesc ray;
@@ -139,6 +179,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 struct Result {
   UINT status, instance, id, geometry, primitive, front, contribution, flags;
   float t, bary[2], object_x, to_world_x, to_object_x, tmin, world_z;
+  UINT lifecycle;
+  float transforms[48];
 };
 
 // the half float of a value that has one exactly
@@ -365,6 +407,27 @@ main(int argc, char **argv) {
                               std::equal(&got.t, &got.world_z + 1, &want.t, [](float x, float y) {
                                 return std::abs(x - y) < 1e-3f;
                               });
+        same &= expect(got.lifecycle == 0, "%s case %u ray %u lifecycle bits %#x", what, c, i, got.lifecycle);
+        if (got.status) {
+          if (expect(got.instance < scene.instances.size(), "committed instance index")) {
+            auto &instance = scene.instances[got.instance];
+            for (UINT form = 0; form < 4; form++)
+              for (UINT row = 0; row < 3; row++)
+                for (UINT col = 0; col < 4; col++) {
+                  const float value = col == 3 ? instance.translation[row] * (form % 2 ? -1 : 1)
+                                               : float(row == col);
+                  const UINT element = form * 12 + (form < 2 ? row * 4 + col : col * 3 + row);
+                  same &= expect(got.transforms[element] == value,
+                                 "%s case %u ray %u transform %u row %u col %u: %g expected %g",
+                                 what, c, i, form, row, col, got.transforms[element], value);
+                }
+          } else {
+            same = false;
+          }
+        } else {
+          for (float value : got.transforms)
+            same &= expect(value == 0, "miss leaves transform output zero");
+        }
         if (!same && failures++ < 12)
           printf(
               "%s, case %u, ray %u,%u: status %u instance %u id %u geometry %u primitive %u front %u contribution %u "

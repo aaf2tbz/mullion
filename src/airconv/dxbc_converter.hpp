@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -199,10 +200,13 @@ struct io_binding_map {
   llvm::Value *thread_id_in_group_arg = nullptr;
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
   llvm::Value *coverage_mask_arg = nullptr;
-  // a coarse shading pixel shader's rate (D3D12_SHADING_RATE), its SV_ShadingRate
-  llvm::Value *shading_rate = nullptr;
+  // the samples a pixel shader's output keeps: those of its clip test (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
+  // in the depth bounds (depth_bounds)
+  llvm::Value *kept_samples = nullptr;
   // a conservative rasterizer's SV_InnerCoverage, 0 or 1; null without one
   llvm::Value *inner_coverage = nullptr;
+  // a coarse shading pixel shader's rate (D3D12_SHADING_RATE), its SV_ShadingRate
+  llvm::Value *shading_rate = nullptr;
 
   llvm::Value *domain = nullptr;
   llvm::Value *patch_id = nullptr;
@@ -244,7 +248,7 @@ struct io_binding_map {
   // its registers, where the window coordinates are in the vertex data, and each vertex (0) and primitive (1) varying's
   // pixel shader register and whether it is an integer
   struct ConservativeMesh {
-    uint32_t fans;
+    uint32_t triangles;
     llvm::Value *slice, *viewports;
     uint32_t flat_inputs, noperspective_inputs;
     uint32_t at;
@@ -273,6 +277,7 @@ struct context {
   io_binding_map &resource;
   air::AirType &types; // hmmm
   uint32_t pso_sample_mask;
+  bool pso_single_raster_sample = false;
   microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type;
   SM50_SHADER_METAL_VERSION metal_version;
   uint32_t simd_width = 0; // the device's SIMD-group width, which vertex functions have no input for; 0 when unknown
@@ -319,7 +324,7 @@ IREffect init_input_reg_with_interpolation(
 );
 
 std::function<IRValue(pvalue)>
-pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element, std::array<int, 4> channels = {0, 1, 2, 3});
 
 std::function<IRValue(pvalue)>
 pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element);
@@ -368,6 +373,11 @@ inline std::string
 varying_name(uint32_t reg, uint32_t component) {
   return "reg" + std::to_string(reg) + "_" + std::to_string(component);
 }
+// a clip distance a pipeline's pixel shader tests itself (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
+inline std::string
+clip_varying_name(uint32_t index) {
+  return "clip" + std::to_string(index);
+}
 constexpr air::MSLScalerOrVectorType
 varying_type(RegisterComponentType type) {
   return type == RegisterComponentType::Float ? air::MSLScalerOrVectorType(air::msl_float) : air::msl_uint;
@@ -391,9 +401,13 @@ struct SignatureContext {
   io_binding_map &resource;
   SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout;
   bool dual_source_blending;
+  // the shader blends target 0 itself, so its second source o1 leaves through no output
+  bool shader_blends_dual_source;
   bool disable_depth_output;
   bool skip_vertex_output;
   uint32_t pull_mode_reg_mask;
+  // centroid inputs are interpolated in the shader (llvm::air::AIRBuilder::CentroidCoverage)
+  bool pull_centroids;
   uint32_t unorm_output_reg_mask;
   // it is considered optional (as a hint)
   air::MTLPixelFormat pixel_formats[8];
@@ -407,15 +421,30 @@ struct SignatureContext {
       resource(resource),
       ia_layout(nullptr),
       dual_source_blending(false),
+      shader_blends_dual_source(false),
       disable_depth_output(false),
       skip_vertex_output(false),
       pull_mode_reg_mask(0),
+      pull_centroids(false),
       unorm_output_reg_mask(0) {
     memset(pixel_formats, 0, sizeof(pixel_formats));
   };
 };
 
 RegisterComponentType component_type_from_pixel_format(air::MTLPixelFormat format);
+
+// the input a stage that writes rasterized positions scales them with (llvm::air::AIRBuilder::RasterScale)
+inline uint32_t
+DefineRasterScale(air::FunctionSignatureBuilder &signature) {
+  return signature.DefineInput(air::ArgumentBindingBuffer{
+      .location_index = SM50_BINDING_INDEX_RASTER_SCALE,
+      .array_size = 1,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::msl_float,
+      .arg_name = "raster_scale",
+  });
+}
 
 struct MeshOutputContext {
   llvm::Value *vertex_id;
@@ -535,10 +564,11 @@ public:
   uint32_t gs_max_vertex_output = 0;
   uint32_t gs_instance_count = 1;
   uint32_t ps_has_coverage_output = 0;
-  // a pixel shader that runs per pixel or sample at any shading rate (MTL_PIXEL_SHADER_REFLECTION's FineShading)
-  bool ps_fine_shading = false;
+  uint32_t ps_has_coverage_input = 0;
   // the pixel shader's input registers it takes flat, and those it interpolates without perspective
   uint32_t ps_flat_input_mask = 0, ps_noperspective_input_mask = 0;
+  // a pixel shader that runs per pixel or sample at any shading rate (MTL_PIXEL_SHADER_REFLECTION's FineShading)
+  bool ps_fine_shading = false;
   std::string dxil; // bitcode of a DXIL shader, empty for DXBC
   // a DXIL library's ray tracing shaders, by their functions' names
   struct RayShader {
@@ -765,24 +795,30 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
 }
 
 
-// conservative rasterization (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), dxbc_converter_gs.cpp
-struct ConservativeFan {
-  using Weights = pvalue[9][3];
-  Weights over_w, linear;
-  pvalue position[9], rcp_w[9];          // each point's, and the plane's 1/w there
-  pvalue window[3][2];                   // the corners in the window
-  pvalue in_front, degenerate, expanded; // all corners before the eye; no area there; grown
+// conservative rasterization (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), dxbc_converter_gs.cpp: the
+// triangle Metal rasterizes for one of the pipeline's
+struct ConservativeTriangle {
+  using Weights = pvalue[3][3];
+  Weights over_w, linear;                      // each point's weights of the corners
+  pvalue position[3], rcp_w[3];                // each point's, and the plane's 1/w there
+  pvalue sum[3];                               // each point's sum of its linear weights, which blends divide by
+  pvalue window[SM50_CONSERVATIVE_CORNERS][2]; // the polygon the pixel shader tests pixels against
+  pvalue culled;                               // nothing of it is drawn
 };
 
-// conservative_fan's comment, at its definition
-ConservativeFan conservative_fan(
+// conservative_triangle's comment, at its definition
+ConservativeTriangle conservative_triangle(
     llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, air::AirType &types, pvalue const (&clip)[3],
     pvalue viewports, pvalue viewport_index
 );
-// the output registers (`output`, int4s) of the fan's point `u`, from the corners' (`corner`): blended as the pixel
-// shader interpolates them (over w, or in the window), the position the fan's, flat and integer ones the first corner's
+// the varyings of point `u` the pixel shader tests and divides by (SM50_CONSERVATIVE_VARYINGS, SM50_CONSERVATIVE_RCP_W),
+// from mesh vertex data `at` on
+void conservative_varyings(llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at);
+// the output registers (`output`, int4s) of the triangle's point `u`, from the corners' (`corner`): blended as the
+// pixel shader interpolates them (over w, or in the window), the position the triangle's, flat and integer ones the
+// first corner's
 void conservative_point(
-    llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeFan &fan, uint32_t u, const SM50ShaderInternal &stage,
+    llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeTriangle &triangle, uint32_t u, const SM50ShaderInternal &stage,
     uint32_t position_reg, uint32_t flat_inputs, uint32_t noperspective_inputs,
     const std::function<pvalue(uint32_t corner, uint32_t reg)> &corner, pvalue output
 );

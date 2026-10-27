@@ -59,18 +59,23 @@ public:
       if (counting && !pDesc->SOLayout)
         break;
       // the counting pass draws nothing
-      ShaderVariantStreamOutput so{pDesc->SOLayout, counting, pDesc->InputPrimitive, pDesc->PassThrough && !counting};
+      ShaderVariantStreamOutput so{
+          pDesc->SOLayout, counting, pDesc->InputPrimitive, pDesc->PassThrough && !counting, pDesc->QuadLines && !counting
+      };
       VertexShader[counting] = pDesc->VertexShader->get_shader(ShaderVariantGeometryVertex{
           pDesc->InputLayout, pDesc->GeometryShader, pDesc->IndexBufferFormat, pDesc->GSStripTopology, so});
       GeometryShader[counting] =
-          owner->get_shader(ShaderVariantGeometry{pDesc->VertexShader, pDesc->GSStripTopology, so});
+          owner->get_shader(ShaderVariantGeometry{
+          pDesc->VertexShader, pDesc->GSStripTopology, so, pDesc->PipelineStatistics, pDesc->ClipDistances != 0});
     }
 
     if (pDesc->PixelShader) {
       PixelShader = pDesc->PixelShader->get_pixel_shader(ShaderVariantPixel{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
-          unorm_output_reg_mask, pDesc->PipelineStatistics}, {rtv_formats, num_rtvs});
+          unorm_output_reg_mask, pDesc->PipelineStatistics, pDesc->BlendState->IsAlphaToCoverage(),
+          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->ClipDistances},
+          {rtv_formats, num_rtvs}, pDesc->BlendState);
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;
@@ -79,7 +84,7 @@ public:
   }
 
   void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline, bool statistics) final {
-    if (statistics && description->PixelShader && !description->PipelineStatistics) {
+    if (statistics && (description->PixelShader || description->GeometryShader) && !description->PipelineStatistics) {
       auto desc = *description;
       desc.PipelineStatistics = true;
       MTLCompiledGeometryPipeline *pipeline;
@@ -153,6 +158,9 @@ public:
     if (pBlendState) {
       pBlendState->SetupMetalPipelineDescriptor((WMTRenderPipelineBlendInfo *)&info, num_rtvs, ps_valid_render_targets);
     }
+    // explicit shader coverage disables A2C (D3D11.3 17.18)
+    if (description->PixelShader && description->PixelShader->reflection().PixelShader.HasCoverageOutput)
+      info.alpha_to_coverage_enabled = false;
 
     info.raster_sample_count = SampleCount;
 

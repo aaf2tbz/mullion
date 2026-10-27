@@ -109,6 +109,7 @@ AIRBuilderResult unpack_fvec4_from_addr(
     break;
   case MTLAttributeFormat::UChar4Normalized:
   case MTLAttributeFormat::UChar4Normalized_BGRA:
+  case MTLAttributeFormat::UChar4Normalized_BGRX:
     op = "unorm4x8.v4f32";
     src_type = types._int;
     align = 1;
@@ -195,6 +196,11 @@ AIRBuilderResult unpack_fvec4_from_addr(
   if (format == MTLAttributeFormat::UChar4Normalized_BGRA) {
     ret = builder.CreateShuffleVector(ret, {2, 1, 0, 3});
   }
+  // X is no component, so alpha takes its default (D3D11.3 19.1.3.3)
+  if (format == MTLAttributeFormat::UChar4Normalized_BGRX) {
+    ret = builder.CreateShuffleVector(ret, {2, 1, 0, -1});
+    ret = builder.CreateInsertElement(ret, co_yield get_float(1), (int)3);
+  }
   if (dst_type == types._float) {
     ret = builder.CreateInsertElement(
       llvm::PoisonValue::get(types._float4), ret, (int)0
@@ -277,6 +283,15 @@ AIRBuilderResult pull_vec4_from_addr_checked(
     );
     value = builder.CreateZExt(value, types._int4);
     break;
+  case MTLAttributeFormat::UInt1010102: {
+    auto packed = builder.CreateVectorSplat(4, co_yield load_from_device_buffer(types._int, base_addr, byte_offset, 0, 4));
+    auto field = [&](uint32_t c) { return builder.getInt32(c); };
+    value = builder.CreateAnd(
+        builder.CreateLShr(packed, llvm::ConstantVector::get({field(0), field(10), field(20), field(30)})),
+        llvm::ConstantVector::get({field(0x3ff), field(0x3ff), field(0x3ff), field(0x3)})
+    );
+    break;
+  }
   case MTLAttributeFormat::Short:
     value = co_yield load_from_device_buffer(
       types._short, base_addr, byte_offset, 0, 2
@@ -428,6 +443,7 @@ AIRBuilderResult pull_vec4_from_addr_checked(
   case MTLAttributeFormat::UChar2Normalized:
   case MTLAttributeFormat::UChar4Normalized:
   case MTLAttributeFormat::UChar4Normalized_BGRA:
+  case MTLAttributeFormat::UChar4Normalized_BGRX:
   case MTLAttributeFormat::CharNormalized:
   case MTLAttributeFormat::Char2Normalized:
   case MTLAttributeFormat::Char4Normalized:

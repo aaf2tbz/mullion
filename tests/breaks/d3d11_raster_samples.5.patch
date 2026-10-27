@@ -1,0 +1,12 @@
+# Metal's viewports stay the application's, so Metal cuts triangles past 1.5 of a viewport
+--- a/src/mullion/mullion_command.hpp
++++ b/src/mullion/mullion_command.hpp
+@@ -80,7 +80,7 @@
+     for (auto [origin, size] : {std::pair{v.originX, v.width}, std::pair{v.originY, v.height}})
+       if (size > 0)
+         reach = std::min({reach, (origin - bound_min) / (size / 2) + 1, (bound_max - origin) / (size / 2) - 1});
+-  double factor = std::isfinite(reach) && reach >= 1 ? std::exp2(std::floor(std::log2(reach))) : 1;
++  double factor = 1;
+   for (auto &v : viewports) {
+     v.originX -= (factor - 1) * v.width / 2, v.originY -= (factor - 1) * v.height / 2;
+     v.width *= factor, v.height *= factor;

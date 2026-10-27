@@ -26,6 +26,7 @@
 #include "wsi_platform.hpp"
 #include <cstdint>
 #include <cfloat>
+#include <cmath>
 
 namespace mullion {
 
@@ -364,9 +365,21 @@ void
 ArgumentEncodingContext::encodeShaderResources(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t offset
 ) {
+
   auto BindingCount = reflection->NumArguments;
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
-
+  // an unbound texture's stand-in, of the type the argument names (InternalCommandLibrary::UnboundTexture)
+  auto unbound = [&](const MTL_SM50_SHADER_ARGUMENT &arg, bool write) {
+    auto stand_in = lib.UnboundTexture(
+        WMTTextureType((arg.Flags >> MTL_SM50_SHADER_ARGUMENT_TEXTURE_TYPE_SHIFT) & 0xf),
+        SM50_SAMPLE_TYPE((arg.Flags >> MTL_SM50_SHADER_ARGUMENT_SAMPLE_TYPE_SHIFT) & 0x3), write
+    );
+    makeResident<stage, kind>(stand_in.texture, GetResidencyMask<kind>(stage, true, write));
+    if (stand_in.backing)
+      makeResident<stage, kind>(stand_in.backing, GetResidencyMask<kind>(stage, true, write));
+    encoded_buffer[arg.StructurePtrOffset] = stand_in.id;
+    encoded_buffer[arg.StructurePtrOffset + 1] = SM50_TEXTURE_METADATA_UNBOUND;
+  };
   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
 
   for (unsigned i = 0; i < BindingCount; i++) {
@@ -400,8 +413,10 @@ ArgumentEncodingContext::encodeShaderResources(
           encoded_buffer[arg.StructurePtrOffset + 1] = srv.slice.byteLength;
           makeResident<stage, kind>(srv.buffer.ptr());
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
+          // a load from a slot without a buffer reads the zeros of a slot without a constant buffer, and drops them
+          encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
           encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
         }
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (srv.buffer.ptr()) {
@@ -418,19 +433,22 @@ ArgumentEncodingContext::encodeShaderResources(
           // none, and a fetch gives what no texture gives (D3D11.3 5.8.5)
           TextureViewKey key(viewIdChecked);
           float clamp = srv.texture->minLOD - key.mip_start;
-          encoded_buffer[arg.StructurePtrOffset] =
-              clamp > key.mip_end - key.mip_start - 1
-                  ? 0
-                  : access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
-          encoded_buffer[arg.StructurePtrOffset + 1] =
-              TextureMetadata(srv.texture->arrayLength(viewIdChecked), std::max(0.0f, clamp));
-          if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE)
+          if (clamp > key.mip_end - key.mip_start - 1) {
+            unbound(arg, false);
+          } else {
+            encoded_buffer[arg.StructurePtrOffset] =
+                access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
             encoded_buffer[arg.StructurePtrOffset + 1] =
-                TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0) | (srv.texture->sampleCount() == 1);
-          makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
+                TextureMetadata(srv.texture->arrayLength(viewIdChecked), std::max(0.0f, clamp));
+            if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLE)
+              encoded_buffer[arg.StructurePtrOffset + 1] =
+                  TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0) |
+                  (srv.texture->sampleCount() == 1 ? SM50_TEXTURE_MULTISAMPLE_METADATA_SINGLE : 0) |
+                  (srv.texture->centered ? SM50_TEXTURE_MULTISAMPLE_METADATA_CENTERED : 0);
+            makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
+          }
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
-          encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          unbound(arg, false);
         }
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
@@ -441,7 +459,11 @@ ArgumentEncodingContext::encodeShaderResources(
     case SM50BindingType::UAV: {
       auto &uav = UAVBindingSet[arg.SM50BindingSlot];
       bool read = (arg.Flags >> 10) & 1, write = (arg.Flags >> 10) & 2;
+      // a counter-only UAV still has a read-only buffer pointer in the argument table.
+      read |= !write;
       int access_flags =  ((arg.Flags >> 10) & 3) | ResourceAccess::UAV;
+      if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER)
+        access_flags |= ResourceAccess::ReadWrite;
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (uav.buffer.ptr()) {
@@ -450,8 +472,10 @@ ArgumentEncodingContext::encodeShaderResources(
           encoded_buffer[arg.StructurePtrOffset + 1] = uav.slice.byteLength;
           makeResident<stage, kind>(uav.buffer.ptr(), read, write);
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
+          // its size of 0 drops every store and atomic, so the zeros stay
+          encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
           encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
         }
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (uav.buffer.ptr()) {
@@ -469,8 +493,7 @@ ArgumentEncodingContext::encodeShaderResources(
               uav.w_range ? uav.w_range : TextureMetadata(uav.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read, write);
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
-          encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          unbound(arg, true);
         }
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
@@ -602,6 +625,11 @@ ArgumentEncodingContext::clearDepthStencil(
     Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
 ) {
   assert(!encoder_current);
+  if (texture->pixelFormat(viewId) == WMTPixelFormatDepth16Unorm) {
+    auto code = std::lround(std::fmin(std::fmax(double(depth), 0.0), 1.0) * UINT16_MAX);
+    // a Metal clear may truncate; an upper float keeps the rounded D16 code (D3D11.3 3.2.3.6).
+    depth = std::nextafter(float(double(code) / UINT16_MAX), 1.0f);
+  }
   auto encoder_info = allocate<ClearEncoderData>();
   encoder_info->type = EncoderType::Clear;
   encoder_info->id = nextEncoderId();
@@ -610,8 +638,9 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->clear_dsv = flag & DepthStencilPlanarFlags(texture->pixelFormat());
   encoder_info->depth_stencil = {depth, stencil};
   encoder_info->array_length = arrayLength;
-  encoder_info->width = texture->width();
-  encoder_info->height = texture->height();
+  // the pass is as large as the view's level
+  encoder_info->width = texture->width(viewId);
+  encoder_info->height = texture->height(viewId);
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
@@ -641,7 +670,7 @@ ArgumentEncodingContext::resolveTexture(
 
 void
 ArgumentEncodingContext::present(
-    Rc<Texture> &texture, Rc<Presenter> &presenter, double after, Presenter::PresentState state
+    Rc<Texture> &texture, TextureViewKey view, Rc<Presenter> &presenter, double after, Presenter::PresentState state
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<PresentData>();
@@ -654,12 +683,14 @@ ArgumentEncodingContext::present(
   encoder_info->state = std::move(state);
 
   encoder_current = encoder_info;
-  encoder_info->backbuffer = access(texture, texture->fullView, ResourceAccess::Read).texture;
+  encoder_info->backbuffer = access(texture, view, ResourceAccess::Read).texture;
   endPass();
 }
 
 void
-ArgumentEncodingContext::upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler) {
+ArgumentEncodingContext::upscale(
+    Rc<Texture> &texture, TextureViewKey view, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler
+) {
   assert(!encoder_current);
   auto encoder_info = allocate<SpatialUpscaleData>();
   encoder_info->type = EncoderType::SpatialUpscale;
@@ -669,7 +700,7 @@ ArgumentEncodingContext::upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc
   encoder_info->scaler = scaler;
 
   encoder_current = encoder_info;
-  encoder_info->backbuffer = access(texture, texture->fullView, ResourceAccess::Read).texture;
+  encoder_info->backbuffer = access(texture, view, ResourceAccess::Read).texture;
   encoder_info->upscaled = access(upscaled, upscaled->fullView, ResourceAccess::Write).texture;
   endPass();
 }
@@ -905,6 +936,13 @@ void ArgumentEncodingContext::countPipelineStatistics(uint64_t vertices, uint64_
   countPipelineStatistics(draw);
 }
 
+static_assert(offsetof(PipelineStatisticsResult, pixels) == SM50_STATISTIC_PIXELS * sizeof(uint64_t) &&
+              offsetof(PipelineStatisticsResult, gs_invocations) == SM50_STATISTIC_GS_INVOCATIONS * sizeof(uint64_t) &&
+              offsetof(PipelineStatisticsResult, gs_primitives) == SM50_STATISTIC_GS_PRIMITIVES * sizeof(uint64_t) &&
+              offsetof(PipelineStatisticsResult, rasterized) == SM50_STATISTIC_RASTERIZED * sizeof(uint64_t) &&
+              offsetof(PipelineStatisticsResult, gs_inputs) == SM50_STATISTIC_GS_INPUTS * sizeof(uint64_t) &&
+              sizeof(PipelineStatisticsResult) == SM50_STATISTIC_COUNT * sizeof(uint64_t));
+
 void ArgumentEncodingContext::countPipelineStatistics(PipelineStatisticsDraw draw) {
   if (pipeline_queries_.empty())
     return;
@@ -924,6 +962,7 @@ void ArgumentEncodingContext::countPipelineStatistics(PipelineStatisticsDraw dra
     query->statistics.emplace_back(statistics_page_, statistics_offset_);
   if (draw.first && draw.index_stride && ibuf_) {
     auto [indices, offset] = access<PipelineStage::Vertex>(ibuf_, 0, ibuf_->length(), ResourceAccess::Read);
+    makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(ibuf_.ptr());
     draw.start -= offset / draw.index_stride;
     draw.indices = indices->gpuAddress() + offset;
     draw.index_bytes = ibuf_->length();
@@ -1072,16 +1111,20 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   }
 
   if (encoder_count > 1) {
-    unsigned j, i;
+    unsigned j, i, k;
     for (j = encoder_count - 2; j != ~0u; j--) {
       // TODO(fences): we don't actively move encoders other than clear and render
       if (encoders[j]->type != EncoderType::Clear && encoders[j]->type != EncoderType::Render)
         continue;
-      for (i = j + 1; i < encoder_count; i++) {
+      for (k = j, i = j + 1; i < encoder_count; i++) {
         if (encoders[i]->type == EncoderType::Null)
           continue;
-        if (checkEncoderRelation(encoders[j], encoders[i]) == MULLION_ENCODER_LIST_OP_SYNCHRONIZE)
+        if (checkEncoderRelation(encoders[k], encoders[i]) == MULLION_ENCODER_LIST_OP_SYNCHRONIZE)
           break;
+        // a resolve folded into the render pass runs where the resolve was, after the encoders it waits for, which
+        // the render pass moved past
+        if (encoders[i]->type == EncoderType::Null)
+          std::swap(encoders[k], encoders[i]), k = i;
       }
     }
   }
@@ -1094,8 +1137,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   QueryReadbacks readbacks{};
 
   auto count = vro_state_.reset();
-  if (count || std::any_of(pending_queries_.begin(), pending_queries_.end(), [](auto &query) {
-        return !query->statistics.empty();
+  if (count || std::any_of(pending_queries_.begin(), pending_queries_.end(), [=](auto &query) {
+        return !query->statistics.empty() || !query->dispatch_statistics.empty() || query->queryEndAt() == seqId;
       })) {
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
         device_, seqId, count, pending_queries_, std::move(visibility_result_offsets_)
@@ -1108,8 +1151,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
 
   unsigned metal_encoder_count = 0;
   WMTSampleBufferAttachmentInfo timestamp_sample{};
+  diag::DebugGroups groups;
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
+    if (diag::events)
+      groups.Enter(cmdbuf, current->event_path ? current->event_path : "");
     diag::ProfileBuffer *profiled = nullptr;
     WMTSampleBufferAttachmentInfo samples{};
     if constexpr (Profile)
@@ -1199,6 +1245,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           stencil_info.clear_stencil = stencil_data.clear_stencil;
         }
         render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
+        render_pass_info.center_samples = data->center_samples;
         render_pass_info.render_target_array_length = data->render_target_array_length;
         render_pass_info.render_target_width = data->render_target_width;
         render_pass_info.render_target_height = data->render_target_height;
@@ -1309,7 +1356,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         // indirect draws with stream output share the encoder's scratch area (encodeStreamOutputTargets)
         if (data->so_scratch) {
           encoder.useResource(data->so_scratch, WMTResourceUsageRead | WMTResourceUsageWrite, WMTRenderStageVertex);
-          encoder.useResource(so_scratch_overflow_, WMTResourceUsageWrite, WMTRenderStageVertex);
+          encoder.useResource(so_scratch_overflow_, WMTResourceUsageRead | WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         for (unsigned i = 0; i<task_count; i++) {
           auto & task = data->gs_arg_marshal_tasks[i];
@@ -1602,6 +1649,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         profiled->passes.back().encoding = diag::Now() - profiled->passes.back().encoding;
     encoder_index--;
   }
+  if (diag::events)
+    groups.Enter(cmdbuf, {});
   encoder_head.next = nullptr;
   encoder_last = &encoder_head;
   encoder_count_ = 0;
@@ -1972,16 +2021,7 @@ ArgumentEncodingContext::isResolveSignatureMatched(RenderEncoderData *render, Re
 template <>
 WMT::Reference<WMT::ComputePipelineState>
 SimpleCommandContext<ArgumentEncodingContext>::getComputePipeline(std::string name) {
-  auto lib = ctx.lib.getLibrary();
-  auto func = lib.newFunction(name.c_str());
-  if (!func)
-    return {};
-  WMT::Reference<WMT::Error> err;
-  auto pso = ctx.device_.newComputePipelineState(func, err);
-  if (err) {
-    ERR("Failed to create compute PSO: ", err.description().getUTF8String());
-  }
-  return pso;
+  return ctx.lib.ComputePipeline(name);
 }
 
 template <>
@@ -2180,6 +2220,17 @@ SimpleCommandContext<ArgumentEncodingContext>::setStencilReference(uint8_t stenc
 }
 
 template <>
+void
+SimpleCommandContext<ArgumentEncodingContext>::setFragmentTexture(
+    uint32_t index, const Rc<Texture> &texture, uint64_t viewId
+) {
+  auto &settex = ctx.encodeRenderCommand<wmtcmd_render_settexture>();
+  settex.type = WMTRenderCommandSetFragmentTexture;
+  settex.texture = ctx.access<PipelineStage::Pixel>(texture, viewId, ResourceAccess::Read).texture;
+  settex.index = index;
+}
+
+template <>
 void *
 SimpleCommandContext<ArgumentEncodingContext>::setFragmentBytes(uint32_t index, uint32_t length) {
   auto &setmeta = ctx.encodeRenderCommand<wmtcmd_render_setbytes>();
@@ -2204,6 +2255,51 @@ SimpleCommandContext<ArgumentEncodingContext>::draw(
   draw.vertex_count = vertex_count;
   draw.base_instance = base_instance;
   draw.instance_count = instance_count;
+}
+
+void
+ArgumentEncodingContext::countComputePipelineStatistics(
+    WMTSize groups, WMT::Buffer arguments, uint64_t arguments_offset
+) {
+  if (pipeline_queries_.empty())
+    return;
+  if (!statistics_page_ || statistics_offset_ + sizeof(PipelineStatisticsDispatch) > statistics_page_->length()) {
+    statistics_page_ = new Buffer(MULLION_PAGE_SIZE, device_);
+    Flags<BufferAllocationFlag> flags;
+#ifdef __i386__
+    flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
+    statistics_page_->rename(statistics_page_->allocate(flags));
+    statistics_offset_ = 0;
+  }
+  auto allocation = statistics_page_->current();
+  retainAllocation(allocation);
+  auto encoder = static_cast<ComputeEncoderData *>(encoder_current);
+  auto size = encoder->threadgroup_size;
+  auto count = reinterpret_cast<PipelineStatisticsDispatch *>(
+      static_cast<char *>(allocation->mappedMemory(0)) + statistics_offset_);
+  auto threads = uint64_t(size.width) * size.height * size.depth;
+  *count = {threads * groups.width * groups.height * groups.depth, threads};
+  for (auto &query : pipeline_queries_)
+    query->dispatch_statistics.emplace_back(statistics_page_, statistics_offset_);
+  auto offset = statistics_offset_;
+  statistics_offset_ += sizeof(PipelineStatisticsDispatch);
+  if (!arguments)
+    return;
+  SimpleCommandContext<ArgumentEncodingContext> ctx{*this};
+  if (!dispatch_statistics_pso_)
+    dispatch_statistics_pso_ = ctx.getComputePipeline("pipeline_statistics_dispatch");
+  if (!dispatch_statistics_pso_)
+    abort();
+  ctx.setComputePSO(dispatch_statistics_pso_, {1, 1, 1});
+  ctx.setComputeBuffer(kCustomBufferArgumentIndex0, allocation->buffer(), offset);
+  ctx.setComputeBuffer(kCustomBufferArgumentIndex1, arguments, arguments_offset);
+  ctx.dispatch({1, 1, 1});
+  // the arguments may be overwritten by the application dispatch (D3D11.3 20.4.7).
+  auto &barrier = encodeComputeCommand<wmtcmd_compute_memory_barrier>();
+  barrier.type = WMTComputeCommandMemoryBarrier;
+  barrier.scope = WMTBarrierScopeBuffers;
+  ctx.setComputePSO(encoder->last_pso, size);
 }
 
 } // namespace mullion

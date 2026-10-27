@@ -48,6 +48,7 @@ constexpr auto D3D_ROOT_SIGNATURE_VERSION_1_2 = (D3D_ROOT_SIGNATURE_VERSION)3;
 constexpr auto D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE = (D3D12_BARRIER_LAYOUT)31;
 constexpr UINT D3D12_FEATURE_PREDICATION = 50;
 constexpr UINT D3D12_FEATURE_HARDWARE_COPY = 52;
+constexpr UINT D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT = 54;
 constexpr UINT D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE = 56;
 constexpr UINT D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED = 57;
 constexpr UINT D3D12_FEATURE_SHADER_CACHE_ABI_SUPPORT = 61;
@@ -90,7 +91,7 @@ template <typename T>
 static HRESULT
 NotSupported(void *pFeatureData, UINT DataSize) {
   if (DataSize != sizeof(T))
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   *reinterpret_cast<T *>(pFeatureData) = {};
   return S_OK;
 }
@@ -100,7 +101,7 @@ template <typename T>
 static HRESULT
 NotSupportedOnNode(void *pFeatureData, UINT DataSize) {
   if (DataSize != sizeof(T) || reinterpret_cast<T *>(pFeatureData)->NodeIndex)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   *reinterpret_cast<T *>(pFeatureData) = {};
   return S_OK;
 }
@@ -174,7 +175,7 @@ public:
   SignalEventAtFence(ID3D12Fence *pFence, UINT64 FenceValue, WMT::SharedEvent Event, UINT64 Value) final {
     if (!pFence || !Owns(pFence))
       return E_INVALIDARG;
-    static_cast<MTLD3D12Fence *>(pFence)->Expect(FenceValue, [event = WMT::Reference<WMT::SharedEvent>(Event), Value]() mutable {
+    static_cast<MTLD3D12Fence *>(pFence)->completion->Expect(FenceValue, [event = WMT::Reference<WMT::SharedEvent>(Event), Value]() mutable {
       event.signalValue(Value);
     });
     return S_OK;
@@ -197,6 +198,8 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   WMT::Reference<WMT::Buffer> atomic_locks_;
   uint64_t atomic_locks_address_ = 0;
   uint32_t *atomic_locks_given_up_ = nullptr;
+  WMT::Reference<WMT::Buffer> null_buffer_;
+  uint64_t null_buffer_address_ = 0;
   WMTSparsePageSize sparse_page_size_ = {};
 
   Com<IMTLDXGIAdapter> adapter_;
@@ -233,13 +236,47 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
 
   InternalCommandLibrary command_library;
   FormatCapabilityInspector format_inspector_;
+  std::once_flag sharing_;
+  D3DKMT_HANDLE local_kmt_ = 0;
+  std::unique_ptr<EventListener> event_listener_;
+
+  void
+  Share() {
+    std::call_once(sharing_, [this] {
+      D3DKMT_CREATEDEVICE create = {};
+      create.hAdapter = adapter_->GetLocalD3DKMT();
+      if (create.hAdapter && !D3DKMTCreateDevice(&create))
+        local_kmt_ = create.hDevice;
+      else
+        WARN("Failed to create D3DKMT device");
+      event_listener_ = std::make_unique<EventListener>();
+    });
+  }
 
 public:
   MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter) : adapter_(adapter), command_library(adapter_->GetMTLDevice()) {
     mesh_bytes_per_draw = MeshBytesPerDraw(adapter_->GetMTLDevice());
   }
 
-  ~MTLD3D12DeviceImpl() {}
+  ~MTLD3D12DeviceImpl() {
+    if (local_kmt_) {
+      D3DKMT_DESTROYDEVICE destroy = {};
+      destroy.hDevice = local_kmt_;
+      D3DKMTDestroyDevice(&destroy);
+    }
+  }
+
+  D3DKMT_HANDLE
+  GetLocalD3DKMT() override {
+    Share();
+    return local_kmt_;
+  }
+
+  EventListener &
+  GetEventListener() override {
+    Share();
+    return *event_listener_;
+  }
 
   HRESULT
   Initialize() {
@@ -304,6 +341,14 @@ public:
     atomic_locks_given_up_ = words + locks + 1;
     atomic_locks_address_ = locks_info.gpu_address + sizeof(AccelerationStructureHeader);
     RegisterResidency(atomic_locks_);
+    WMTBufferInfo null_info{D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 4 * sizeof(uint32_t), WMTResourceStorageModeShared};
+    if (!(null_buffer_ = GetMTLDevice().newBuffer(null_info))) {
+      ERR("Failed to create the target of null buffer views");
+      return E_FAIL;
+    }
+    std::memset(null_info.memory.get(), 0, null_info.length);
+    null_buffer_address_ = null_info.gpu_address;
+    RegisterResidency(null_buffer_);
 
     // the structure of nothing has no instances: their count is the zero its header has for their address, and the
     // buffer Metal wants them in is one it then reads nothing of. it is built here, on a queue of its own
@@ -335,6 +380,16 @@ public:
   uint64_t
   GetAtomicLocks() {
     return atomic_locks_address_;
+  }
+
+  uint64_t
+  GetNullBuffer() {
+    return null_buffer_address_;
+  }
+
+  obj_handle_t
+  GetNullBufferHandle() {
+    return null_buffer_.handle;
   }
 
   void
@@ -393,7 +448,7 @@ public:
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
-      return E_POINTER;
+      return FAIL(E_POINTER);
 
     *ppvObject = nullptr;
 
@@ -446,7 +501,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   GetEnabledExperimentalFeatures(GUID *guids, UINT count) {
     if (count < UINT(experimental_shader_models_) || (experimental_shader_models_ && !guids))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (experimental_shader_models_)
       guids[0] = D3D12ExperimentalShaderModels;
     return S_OK;
@@ -473,7 +528,7 @@ public:
   CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue) {
     InitReturnPtr(ppCommandQueue);
     if (FAILED(removed_))
-      return DXGI_ERROR_DEVICE_REMOVED;
+      return FAIL(DXGI_ERROR_DEVICE_REMOVED);
     if (pDesc->Flags)
       WARN("CreateCommandQueue: flags ignored: ", pDesc->Flags);
     return mullion::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
@@ -500,7 +555,7 @@ public:
       ID3D12PipelineState *pInitialPipelineState, REFIID riid, void **ppCommandList
   ) {
     if (!pCommandAllocator)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto allocator = static_cast<MTLD3D12CommandAllocator *>(pCommandAllocator);
     return allocator->CreateCommandList(NodeMask, Type, pInitialPipelineState, riid, ppCommandList);
   };
@@ -511,10 +566,10 @@ public:
     switch (UINT(Feature)) {
     case D3D12_FEATURE_ARCHITECTURE: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_ARCHITECTURE *>(pFeatureData);
       if (out->NodeIndex > 0)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       out->CacheCoherentUMA = FALSE;
       out->TileBasedRenderer = TRUE;
       out->UMA = !advertise_numa_;
@@ -522,10 +577,10 @@ public:
     }
     case D3D12_FEATURE_ARCHITECTURE1: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_ARCHITECTURE1 *>(pFeatureData);
       if (out->NodeIndex > 0)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       out->CacheCoherentUMA = FALSE;
       out->TileBasedRenderer = TRUE;
       out->UMA = !advertise_numa_;
@@ -534,17 +589,17 @@ public:
     }
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *>(pFeatureData);
 
       out->NumQualityLevels = 0;
       if (!out->SampleCount || out->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT)
-        return E_FAIL;
+        return FAIL(E_FAIL);
 
       MTL_DXGI_FORMAT_DESC format_desc;
       MTLQueryDXGIFormat(metal, out->Format, format_desc);
       if (!format_desc.PlanarCount && !IsSamplerFeedback(out->Format))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       // a multisampled texture is a multisampled target: what the format's support says
       uint32_t support1 = 0, support2 = 0;
       MTLQueryDXGIFormatSupport(
@@ -557,21 +612,21 @@ public:
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE *>(pFeatureData);
       /* the highest version both know: newer ones (1.2) come down to 1.1, as the runtime answers */
       if (out->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1 ||
           out->HighestVersion > sdk::D3D_ROOT_SIGNATURE_VERSION_1_2)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       out->HighestVersion = std::min(out->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_1);
       return S_OK;
     }
     case D3D12_FEATURE_FEATURE_LEVELS: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS *>(pFeatureData);
       if (!out->NumFeatureLevels)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       // the highest level the options make up, as D3D12 defines the levels: 11_1 with logic ops, 12_0 with tiled
       // resources tier 2, binding tier 2 and typed UAV loads, 12_1 with ROVs and conservative rasterization tier 1,
       // 12_2 (Direct3D feature level 12_2) with shader model 6.5, ray tracing tier 1.1, variable rate shading tier 2,
@@ -614,20 +669,20 @@ public:
     }
     case D3D12_FEATURE_FORMAT_INFO:  {
        if (DataSize != sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_FORMAT_INFO *>(pFeatureData);
       MTL_DXGI_FORMAT_DESC format_desc;
       MTLQueryDXGIFormat(metal, out->Format, format_desc);
       auto planes = IsSamplerFeedback(out->Format) ? 1 : format_desc.PlanarCount;
       if (!planes)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
 
       out->PlaneCount = planes;
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT *>(pFeatureData);
       out->MaxGPUVirtualAddressBitsPerProcess = 48;
       out->MaxGPUVirtualAddressBitsPerResource = 48;
@@ -635,14 +690,14 @@ public:
     }
     case D3D12_FEATURE_SHADER_MODEL: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
       out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_7);
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS *>(pFeatureData);
       out->DoublePrecisionFloatShaderOps = FALSE;
 #ifdef MULLION_NO_PRIVATE_API
@@ -671,7 +726,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS16: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16 *>(pFeatureData);
       out->GPUUploadHeapSupported = FALSE;    // TODO(d3d12): gpu upload heap
       out->DynamicDepthBiasSupported = FALSE; // TODO(d3d12): ID3D12GraphicsCommandList9::RSSetDepthBias
@@ -679,7 +734,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS2: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(pFeatureData);
       // Metal's on Apple10, the pixel shader's elsewhere (d3d12_command_list.cpp, DepthBoundsSamples)
       out->DepthBoundsTestSupported = TRUE;
@@ -688,7 +743,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(pFeatureData);
       out->CastingFullyTypedFormatSupported = TRUE;
       out->BarycentricsSupported = FALSE;
@@ -699,7 +754,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(pFeatureData);
       out->WaveOps = TRUE;
       out->WaveLaneCountMin = simd_width_;
@@ -713,7 +768,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS12: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(pFeatureData);
       out->RelaxedFormatCastingSupported = FALSE;
       // ID3D12Device10's layouts and ID3D12GraphicsCommandList7::Barrier
@@ -723,7 +778,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS4: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4 *>(pFeatureData);
       out->MSAA64KBAlignedTextureSupported = TRUE;
       out->Native16BitShaderOpsSupported = TRUE;
@@ -733,7 +788,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS5: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(pFeatureData);
       out->SRVOnlyTiledResourceTier3 = FALSE;
       out->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
@@ -742,7 +797,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS7: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
       out->MeshShaderTier = D3D12_MESH_SHADER_TIER_1;
       // 1.0 would need the first mip and slice of a paired texture's view in the shader
@@ -751,7 +806,7 @@ public:
     }
     case D3D12_FEATURE_SHADER_CACHE: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_CACHE *>(pFeatureData);
       out->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO | D3D12_SHADER_CACHE_SUPPORT_LIBRARY |
                           D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE |
@@ -761,17 +816,17 @@ public:
     case sdk::D3D12_FEATURE_PREDICATION:
     case sdk::D3D12_FEATURE_HARDWARE_COPY:
       // these reserved queries return E_NOTIMPL on Windows (vkd3d-proton, test_misc_agility_sdk_feature_checks)
-      return E_NOTIMPL;
+      return FAIL(E_NOTIMPL);
     case sdk::D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE:
       return NotSupported<sdk::D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE>(pFeatureData, DataSize);
     case sdk::D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED:
       return NotSupported<sdk::D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED>(pFeatureData, DataSize);
     case sdk::D3D12_FEATURE_SHADER_CACHE_ABI_SUPPORT:
       // no shader-cache ABI is a failure, not an unknown query (vkd3d-proton, test_misc_agility_sdk_feature_checks)
-      return DataSize == sizeof(sdk::D3D12_FEATURE_DATA_SHADERCACHE_ABI_SUPPORT) ? E_FAIL : E_INVALIDARG;
+      return DataSize == sizeof(sdk::D3D12_FEATURE_DATA_SHADERCACHE_ABI_SUPPORT) ? FAIL(E_FAIL) : FAIL(E_INVALIDARG);
     case sdk::D3D12_FEATURE_D3D12_OPTIONS22: {
       if (DataSize != sizeof(sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS22))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       D3D12_FEATURE_DATA_D3D12_OPTIONS7 mesh;
       CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mesh, sizeof(mesh));
       auto *out = reinterpret_cast<sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS22 *>(pFeatureData);
@@ -783,7 +838,7 @@ public:
     }
     case sdk::D3D12_FEATURE_BARRIER_LAYOUT: {
       if (DataSize != sizeof(sdk::D3D12_FEATURE_DATA_BARRIER_LAYOUT))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<sdk::D3D12_FEATURE_DATA_BARRIER_LAYOUT *>(pFeatureData);
       // queue compatibility is defined by DirectX-Specs, Enhanced Barriers, Command Queue Layout Compatibility
       switch (out->Layout) {
@@ -843,7 +898,7 @@ public:
     }
     case D3D12_FEATURE_FORMAT_SUPPORT: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT *>(pFeatureData);
       if (out->Format == DXGI_FORMAT_UNKNOWN) {
         out->Support1 = D3D12_FORMAT_SUPPORT1_BUFFER;
@@ -855,17 +910,20 @@ public:
         out->Support2 = D3D12_FORMAT_SUPPORT2_SAMPLER_FEEDBACK;
         return S_OK;
       }
-      // D3D12_FORMAT_SUPPORT1 and 2 share D3D11's bit values
-      return MTLQueryDXGIFormatSupport(
+      // D3D12_FORMAT_SUPPORT1 and 2 share D3D11's bit values, but for D3D11's mip generation, CPU access and sharing
+      HRESULT hr = MTLQueryDXGIFormatSupport(
           GetMTLDevice(), out->Format, [this](WMTPixelFormat f) { return GetMTLPixelFormatCapability(f); },
           *reinterpret_cast<uint32_t *>(&out->Support1), *reinterpret_cast<uint32_t *>(&out->Support2)
       );
+      out->Support1 &= ~D3D12_FORMAT_SUPPORT1(D3D11_FORMAT_SUPPORT_MIP_AUTOGEN | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE);
+      out->Support2 &= ~D3D12_FORMAT_SUPPORT2(D3D11_FORMAT_SUPPORT2_SHAREABLE);
+      return hr;
     }
     // 64-bit atomics on typed resources, groupshared memory and descriptor heap resources, which the shader compiler
     // builds from locks as it does on root buffers
     case D3D12_FEATURE_D3D12_OPTIONS9: {
       if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS9>(pFeatureData, DataSize) != S_OK)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
       out->AtomicInt64OnTypedResourceSupported = TRUE;
       out->AtomicInt64OnGroupSharedSupported = TRUE;
@@ -873,7 +931,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
       if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS11>(pFeatureData, DataSize) != S_OK)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData)->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
       return S_OK;
     }
@@ -900,7 +958,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS14: {
       if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS14>(pFeatureData, DataSize) != S_OK)
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14 *>(pFeatureData);
       out->IndependentFrontAndBackStencilRefMaskSupported = TRUE;
       return S_OK;
@@ -908,8 +966,15 @@ public:
     /* capabilities with no complete path yet: D3D12 defines an all-zero answer as unsupported, or tier 0, in each */
     case D3D12_FEATURE_D3D12_OPTIONS8:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS8>(pFeatureData, DataSize);
-    case D3D12_FEATURE_D3D12_OPTIONS13:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS13>(pFeatureData, DataSize);
+    case D3D12_FEATURE_D3D12_OPTIONS13: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
+        return FAIL(E_INVALIDARG);
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13 *>(pFeatureData);
+      *out = {};
+      // the blend factor's alpha is Metal's blend color alpha (WMTBlendFactorBlendAlpha)
+      out->AlphaBlendFactorSupported = TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS15:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS15>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS17:
@@ -931,7 +996,7 @@ public:
       return NotSupportedOnNode<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT>(pFeatureData, DataSize);
     // D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT (Agility SDK 1.716): resources keep their 64 KiB placement alignment. Unity
     // 6.3 asks for it with the Agility SDK runtime and falls back to D3D11 when the query fails (PEAK, 2026-10-24)
-    case D3D12_FEATURE(54): {
+    case sdk::D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT: {
       if (DataSize != sizeof(UINT))
         return E_INVALIDARG;
       *reinterpret_cast<UINT *>(pFeatureData) = 0; // D3D12_TIGHT_ALIGNMENT_TIER_NOT_SUPPORTED
@@ -939,10 +1004,10 @@ public:
     }
     case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES))
-        return E_INVALIDARG;
+        return FAIL(E_INVALIDARG);
       auto *in = reinterpret_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES *>(pFeatureData);
       /* there are no types, so the count asked for must be 0 */
-      return in->NodeIndex || in->Count ? E_INVALIDARG : S_OK;
+      return in->NodeIndex || in->Count ? FAIL(E_INVALIDARG) : S_OK;
     }
     default:
       break;
@@ -1181,7 +1246,7 @@ public:
     default:
       break;
     }
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1200,7 +1265,7 @@ public:
   ) {
     InitReturnPtr(ppResource);
     if (!pHeap)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto d3d12heap = static_cast<MTLD3D12Heap *>(pHeap);
     auto heap_desc = d3d12heap->GetDesc();
     HRESULT hr = S_OK;
@@ -1217,7 +1282,7 @@ public:
     GetResourceAllocationInfo(&info, 0, 1, pDesc);
     if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
         info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -1228,7 +1293,7 @@ public:
     default:
       break;
     }
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1247,7 +1312,7 @@ public:
     if (HRESULT hr = ValidateResourceStates(InitialState, &heap); FAILED(hr))
       return hr;
     if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && OptimizedClearValue)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
                ? CreateReservedBuffer(this, pDesc, riid, resource)
                : CreateReservedTexture(this, pDesc, InitialState, riid, resource);
@@ -1257,17 +1322,33 @@ public:
   CreateSharedHandle(
       ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle
   ) {
-    return E_NOTIMPL;
+    InitReturnPtr(handle);
+    Com<ID3D12Fence> fence;
+    if (!object || !handle)
+      return E_INVALIDARG;
+    // only fences are shared so far, not resources and heaps
+    if (FAILED(object->QueryInterface(IID_PPV_ARGS(&fence))))
+      return E_NOTIMPL;
+    // a fence made with D3D12_FENCE_FLAG_SHARED, whose Access "is GENERIC_ALL" (ID3D12Device::CreateSharedHandle)
+    auto allocation = static_cast<MTLD3D12Fence *>(fence.ptr())->SharedAllocation();
+    if (!allocation || access != GENERIC_ALL)
+      return E_INVALIDARG;
+    return shareHandle(allocation, attributes, access, name, handle);
   };
 
   HRESULT STDMETHODCALLTYPE
   OpenSharedHandle(HANDLE handle, REFIID riid, void **object) {
-    return E_NOTIMPL;
+    InitReturnPtr(object);
+    D3DKMT_HANDLE allocation;
+    auto event = openSharedEvent(GetMTLDevice(), GetLocalD3DKMT(), handle, allocation);
+    return OpenFence(this, std::move(event), allocation, riid, object);
   };
 
   HRESULT STDMETHODCALLTYPE
   OpenSharedHandleByName(const WCHAR *name, DWORD access, HANDLE *handle) {
-    return E_NOTIMPL;
+    InitReturnPtr(handle);
+    // "Currently the only value this parameter accepts is GENERIC_ALL" (OpenSharedHandleByName, Access)
+    return name && handle && access == GENERIC_ALL ? openHandleByName(name, access, handle) : E_INVALIDARG;
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1293,8 +1374,19 @@ public:
 
   void
   LoseDevice(HRESULT Reason) {
-    HRESULT present = S_OK;
-    removed_.compare_exchange_strong(present, Reason);
+    decltype(fences.values) pending;
+    {
+      std::lock_guard lock(fences.mutex);
+      HRESULT present = S_OK;
+      if (!removed_.compare_exchange_strong(present, Reason))
+        return;
+      pending.swap(fences.values);
+    }
+    FLIGHT("device %p is removed: %#llx", this, uint64_t(uint32_t(Reason)));
+    WMTFlightDump("a removed device");
+    // RemoveDevice signals all fences to UINT64_MAX; late queue signals must not take them back.
+    for (auto &fence : pending)
+      fence->Reach(UINT64_MAX, true);
   }
 
   void STDMETHODCALLTYPE GetCopyableFootprints(
@@ -1429,7 +1521,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetStablePowerState(WINBOOL Enable) {
-    return E_NOTIMPL;
+    return FAIL(E_NOTIMPL);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1470,9 +1562,11 @@ public:
       HANDLE hEvent
   ) {
     if (!FenceCount || (Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     auto set = std::make_shared<std::atomic<bool>>();
-    auto done = [=] {
+    auto done = [=, began = diag::profile ? diag::Now() : 0, thread = GetCurrentThreadId()] {
+      if (began)
+        diag::Waited("fence", began, thread);
       if (hEvent)
         SetEvent(hEvent);
       *set = true;
@@ -1481,7 +1575,7 @@ public:
     // each fence counts down as it has its value. the count is one when any of them is enough
     auto left = std::make_shared<std::atomic<UINT>>(Flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY ? 1 : FenceCount);
     for (UINT i = 0; i < FenceCount; i++)
-      static_cast<MTLD3D12Fence *>(pFences[i])->Expect(pValues[i], [=] {
+      static_cast<MTLD3D12Fence *>(pFences[i])->completion->Expect(pValues[i], [=] {
         if (left->fetch_sub(1) == 1)
           done();
       });
@@ -1510,7 +1604,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   OpenExistingHeapFromFileMapping(HANDLE hFileMapping, REFIID riid, void **ppHeap) {
-    return hFileMapping ? OpenHeap(this, nullptr, hFileMapping, riid, ppHeap) : E_INVALIDARG;
+    return hFileMapping ? OpenHeap(this, nullptr, hFileMapping, riid, ppHeap) : FAIL(E_INVALIDARG);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1519,7 +1613,7 @@ public:
       UINT64 FenceValue
   ) {
     // every object is resident while it exists
-    return pFence ? pFence->Signal(FenceValue) : E_INVALIDARG;
+    return pFence ? pFence->Signal(FenceValue) : FAIL(E_INVALIDARG);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1527,13 +1621,13 @@ public:
       UINT NodeMask, D3D12_COMMAND_LIST_TYPE Type, D3D12_COMMAND_LIST_FLAGS Flags, REFIID riid, void **ppCommandList
   ) {
     if (NodeMask > 1 || Flags != D3D12_COMMAND_LIST_FLAG_NONE)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreateClosedCommandList(this, Type, riid, ppCommandList);
   }
 
   HRESULT STDMETHODCALLTYPE
   CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC *pDesc, REFIID riid, void **ppSession) {
-    return E_NOTIMPL;
+    return FAIL(E_NOTIMPL);
   }
 
   /* protected sessions are not supported (CreateProtectedResourceSession fails), so none can be passed */
@@ -1545,7 +1639,7 @@ public:
   ) {
     InitReturnPtr(ppResource);
     if (pSession)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreateCommittedResource(pHeapProps, HeapFlags, pDesc, InitialState, OptimizedClearValue, riid, ppResource);
   }
 
@@ -1553,7 +1647,7 @@ public:
   CreateHeap1(const D3D12_HEAP_DESC *pDesc, ID3D12ProtectedResourceSession *pSession, REFIID riid, void **ppHeap) {
     InitReturnPtr(ppHeap);
     if (pSession)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreateHeap(pDesc, riid, ppHeap);
   }
 
@@ -1565,7 +1659,7 @@ public:
   ) {
     InitReturnPtr(ppResource);
     if (pSession)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreateReservedResource(pDesc, InitialState, OptimizedClearValue, riid, ppResource);
   }
 
@@ -1573,16 +1667,18 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateLifetimeTracker(ID3D12LifetimeOwner *pOwner, REFIID riid, void **ppvTracker) {
     InitReturnPtr(ppvTracker);
-    return E_NOTIMPL;
+    return FAIL(E_NOTIMPL);
   }
 
   void STDMETHODCALLTYPE
-  RemoveDevice() {}
+  RemoveDevice() {
+    LoseDevice(DXGI_ERROR_DEVICE_REMOVED);
+  }
 
   HRESULT STDMETHODCALLTYPE
   EnumerateMetaCommands(UINT *pNumMetaCommands, D3D12_META_COMMAND_DESC *pDescs) {
     if (!pNumMetaCommands)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     *pNumMetaCommands = 0;
     return S_OK;
   }
@@ -1592,7 +1688,7 @@ public:
       REFGUID CommandId, D3D12_META_COMMAND_PARAMETER_STAGE Stage, UINT *pTotalStructureSizeInBytes,
       UINT *pParameterCount, D3D12_META_COMMAND_PARAMETER_DESC *pParameterDescs
   ) {
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1601,7 +1697,7 @@ public:
       REFIID riid, void **ppMetaCommand
   ) {
     InitReturnPtr(ppMetaCommand);
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1617,7 +1713,7 @@ public:
     // the sizes are Metal's: the structure's memory holds its header and stands for a Metal structure of that
     // size, and the scratch memory is what Metal builds in
     bool top = pDesc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-    std::vector<WMTAccelerationStructureGeometry> geometries(top ? 0 : pDesc->NumDescs);
+    std::vector<WMTAccelerationStructureGeometry> geometries(top ? 0 : std::max(pDesc->NumDescs, 1u));
     auto info = AccelerationStructureInfo(this, *pDesc, geometries.data(), false);
     GetMTLDevice().accelerationStructureSizes(info);
     bool updates = pDesc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
@@ -1668,7 +1764,7 @@ public:
       const D3D12_PROTECTED_RESOURCE_SESSION_DESC1 *pDesc, REFIID riid, void **ppSession
   ) {
     InitReturnPtr(ppSession);
-    return E_NOTIMPL;
+    return FAIL(E_NOTIMPL);
   }
 
   /* the resource to create: a sampler feedback map is one R32_UINT texel per mip region of its paired texture's first
@@ -1700,7 +1796,7 @@ public:
 
     InitReturnPtr(ppResource);
     if (!ResourceDesc(pDesc, desc))
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     if (!IsSamplerFeedback(pDesc->Format) || !ppResource)
       return create(&desc, riid, ppResource);
     Com<ID3D12Resource> map;
@@ -1780,7 +1876,7 @@ public:
   ) {
     InitReturnPtr(ppResource);
     if (NumCastableFormats)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreateCommittedResource2(
         pHeapProps, HeapFlags, pDesc, LayoutState(InitialLayout), OptimizedClearValue, pSession, riid, ppResource
     );
@@ -1794,7 +1890,7 @@ public:
   ) {
     InitReturnPtr(ppResource);
     if (NumCastableFormats)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreatePlacedResource1(
         pHeap, HeapOffset, pDesc, LayoutState(InitialLayout), OptimizedClearValue, riid, ppResource
     );
@@ -1808,7 +1904,7 @@ public:
   ) {
     InitReturnPtr(ppResource);
     if (NumCastableFormats)
-      return E_INVALIDARG;
+      return FAIL(E_INVALIDARG);
     return CreateReservedResource1(pDesc, LayoutState(InitialLayout), OptimizedClearValue, pSession, riid, ppResource);
   }
 
@@ -1853,12 +1949,12 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC *pDesc, REFIID riid, void **ppvSession) {
     InitReturnPtr(ppvSession);
-    return E_NOTIMPL;
+    return FAIL(E_NOTIMPL);
   }
 
   HRESULT STDMETHODCALLTYPE
   ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS Kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS Control) {
-    return E_NOTIMPL;
+    return FAIL(E_NOTIMPL);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1884,6 +1980,9 @@ public:
       has_msaa_resource |= desc->SampleDesc.Count > 1;
 
       if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        if (FAILED(ValidateResourceDescs(desc, &heap)))
+          goto invalid;
         if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
           DEBUG("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.\n");
           goto invalid;
@@ -2190,17 +2289,21 @@ public:
 
   virtual FormatCapability
   GetMTLPixelFormatCapability(WMTPixelFormat Format) final {
-    Format = ORIGINAL_FORMAT(Format);
-    if (!format_inspector_.textureCapabilities.contains(Format))
+    auto original = WMTPixelFormat(ORIGINAL_FORMAT(Format));
+    if (!format_inspector_.textureCapabilities.contains(original))
       return FormatCapability(0);
-    return format_inspector_.textureCapabilities.at(Format);
+    auto capability = format_inspector_.textureCapabilities.at(original);
+    // blending takes the stored channels as they are: rotated ones would blend red with alpha's factors
+    if (RenderTargetChannels(Format) != RenderTargetChannels(original))
+      capability = capability & ~FormatCapability::Blend;
+    return capability;
   };
 };
 
 HRESULT
 PipelineStateStream::Parse(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc) {
   if (!pDesc || !pDesc->pPipelineStateSubobjectStream)
-    return E_INVALIDARG;
+    return FAIL(E_INVALIDARG);
   const char *stream_start = reinterpret_cast<const char *>(pDesc->pPipelineStateSubobjectStream);
   const char *stream_end = stream_start + pDesc->SizeInBytes;
 

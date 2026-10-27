@@ -280,8 +280,9 @@ main(int argc, char **argv) {
   };
   for (auto &c : cases)
     if (c.ms.empty() || c.ps.empty()) {
-      printf("skipped: mesh shaders are shader model 6.5\n");
-      return 77;
+      // DXC compiles it, so its empty code is a failure; FXC stops at shader model 5.1
+      printf(compiler.dxc ? "failed: HLSL did not compile\n" : "skipped: mesh shaders are shader model 6.5\n");
+      return compiler.dxc ? 1 : 77;
     }
   std::string line_shaders[3];
   for (UINT mode = 0; mode < std::size(line_shaders); mode++) {

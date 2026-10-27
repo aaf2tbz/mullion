@@ -7,6 +7,9 @@
 // with zero support bits, not E_INVALIDARG; the latter rejects a feature data size mismatch.
 // D16_UNORM depth/stencil and integer shader loads are required by D3D11.3 19.1.4.
 // NV12: "Hardware support required" (Microsoft Learn, Format support for Direct3D Feature Level 11.0 through 12.1).
+// FORMAT_SUPPORT.Support1/2 is "A combination of D3D12_FORMAT_SUPPORT1-typed values" (Microsoft Learn,
+// D3D12_FEATURE_DATA_FORMAT_SUPPORT); reserved positions cannot inherit D3D11-only capabilities.
+// absent dimension caps reject storage: "2D texture resources supported." (Learn, D3D12_FORMAT_SUPPORT1).
 #include "d3d12_test.hpp"
 #include "../depth_formats.hpp"
 #include <limits>
@@ -15,6 +18,7 @@
 namespace reference {
 constexpr auto DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE = (DXGI_FORMAT)189;
 constexpr auto DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE = (DXGI_FORMAT)190;
+constexpr auto DXGI_FORMAT_A4B4G4R4_UNORM = (DXGI_FORMAT)191;
 constexpr auto D3D_ROOT_SIGNATURE_VERSION_1_2 = (D3D_ROOT_SIGNATURE_VERSION)3;
 constexpr auto D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE = (D3D12_BARRIER_LAYOUT)31;
 constexpr UINT D3D12_FEATURE_PREDICATION = 50;
@@ -53,18 +57,43 @@ main(int argc, char **argv) {
   printf("variant: %s; inputs: exhaustive\n", argc > 1 ? argv[1] : "api");
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-  const struct { DXGI_FORMAT format; const char *name; } formats[] = {DXGI_FORMATS};
+  const struct { DXGI_FORMAT format; const char *name; } formats[] = {
+      DXGI_FORMATS,
+      {reference::DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE, "DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE"},
+      {reference::DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE, "DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE"},
+      {reference::DXGI_FORMAT_A4B4G4R4_UNORM, "DXGI_FORMAT_A4B4G4R4_UNORM"}};
   for (auto [format, name] : formats) {
     step("format %#x: support and plane layout", format);
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format, D3D12_FORMAT_SUPPORT1(~0u), D3D12_FORMAT_SUPPORT2(~0u)};
     HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
     expect(hr == S_OK || (hr == E_FAIL && !support.Support1 && !support.Support2),
            "support hr %08lx, bits %#x, %#x", hr, support.Support1, support.Support2);
+    expect(!(UINT(support.Support1) & ~UINT(D3D12_FORMAT_SUPPORT1_ALLOWED)),
+           "support1 contains bits absent from D3D12_FORMAT_SUPPORT1: %#x", support.Support1);
+    expect(!(UINT(support.Support2) & ~UINT(D3D12_FORMAT_SUPPORT2_ALLOWED)),
+           "support2 contains bits absent from D3D12_FORMAT_SUPPORT2: %#x", support.Support2);
+    const struct { D3D12_RESOURCE_DIMENSION dimension; D3D12_FORMAT_SUPPORT1 cap; } dimensions[] = {
+        {D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_FORMAT_SUPPORT1_TEXTURE1D},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_FORMAT_SUPPORT1_TEXTURE2D},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_FORMAT_SUPPORT1_TEXTURE3D}};
+    for (auto [dimension, cap] : dimensions)
+      if (!(support.Support1 & cap)) {
+        constexpr UINT extent = 4; // a complete BC block and even video dimensions
+        D3D12_RESOURCE_DESC desc{dimension, 0, extent, dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1u : extent,
+                                 UINT16(dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? extent : 1), 1, format, {1, 0}};
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        ComPtr<ID3D12Resource> texture;
+        expect(FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                       D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture))) && !texture,
+               "unsupported dimension %u format created storage", dimension);
+      }
     if (format == DXGI_FORMAT_UNKNOWN)
       expect(hr == S_OK && support.Support1 == D3D12_FORMAT_SUPPORT1_BUFFER && !support.Support2,
              "UNKNOWN is not a buffer-only format");
     std::string type = name;
     if ((type.ends_with("_UINT") || type.ends_with("_SINT")) && !type.starts_with("DXGI_FORMAT_D")) {
+      expect(!(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER),
+             "integer format reports shader gather4");
       expect(!(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE), "integer format reports shader sampling");
       expect(hr == S_OK && (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
              "integer format has no shader loads");

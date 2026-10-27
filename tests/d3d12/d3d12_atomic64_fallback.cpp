@@ -165,7 +165,8 @@ main(int argc, char **argv) {
                              std::string::npos;
         const bool maximum = converted.find(i ? "air.atomic_max_explicit_" : "air.atomic.global.max.u.i64") !=
                              std::string::npos;
-        const bool locks = converted.find("air.atomic.global.xchg.i32") != std::string::npos;
+        // a lock is released by adding one to its word, the shaders' only 32-bit atomic (dxil_converter.cpp)
+        const bool locks = converted.find("air.atomic.global.add.u.i32") != std::string::npos;
         expect((minimum && maximum && !locks) || (!minimum && !maximum && locks),
                "AIR must contain both native min/max or the lock release: min=%u max=%u locks=%u", minimum, maximum,
                locks);

@@ -115,7 +115,7 @@ static int check_queue(ID3D11InfoQueue *queue) {
     expect(bytes == sizeof(D3D11_INFO_QUEUE_FILTER), "empty filter has data: %zu", bytes);
     D3D11_INFO_QUEUE_FILTER empty{};
     CHECK(get(&empty, &bytes));
-    for (SIZE_T short_size : {SIZE_T(0), sizeof(empty) - 1}) {
+    for (SIZE_T short_size : {SIZE_T(0), SIZE_T(sizeof(empty) - 1)}) {
       auto supplied = short_size;
       expect(FAILED(get(&empty, &supplied)) && supplied == sizeof(empty), "short filter output was accepted");
     }

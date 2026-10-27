@@ -8,6 +8,8 @@
 // - a clamp "past the least detailed mip in the view (e.g. 5.1)" leaves the view no levels: "the out of bounds
 //   behavior applies", 0, to samples and loads (5.8.5).
 // - the clamp set is the clamp got, and 0 again shows every level.
+// 5.8.2: "the command is queued means it does not affect the behavior of anything ahead of it in the queue."
+// deferred clamp changes bracket separate dispatches; their recording cannot change the immediate dispatch.
 // each level of the texture holds its number plus one, and a compute shader samples and loads the level asked for.
 #include "d3d11_test.hpp"
 #include <algorithm>
@@ -29,15 +31,14 @@ RWStructuredBuffer<float2> read : register(u0);
 
 int
 main() {
+  auto code = compile(hlsl, "cs", "cs");
+  if (!code)
+    return 1;
   ComPtr<ID3D11Device> device;
-  ComPtr<ID3D11DeviceContext> context;
+  ComPtr<ID3D11DeviceContext> context, deferred;
   const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
   CHECK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr, &context));
-  auto code = compile(hlsl, "cs", "cs");
-  if (!code) {
-    printf("failed: HLSL did not compile\n");
-    return 1;
-  }
+  CHECK(device->CreateDeferredContext(0, &deferred));
   ComPtr<ID3D11ComputeShader> cs;
   CHECK(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &cs));
 
@@ -91,6 +92,8 @@ main() {
       context->UpdateSubresource(ask.Get(), 0, nullptr, asked, 0, 0);
       context->Dispatch(1, 1, 1);
       auto got = read(device.Get(), context.Get(), out.Get());
+      if (!expect(got.size() == out_desc.ByteWidth / sizeof(UINT), "readback size"))
+        return verdict();
       for (UINT v = 0; v < std::size(shown); v++) {
         // a view's level is the resource's after its first. a view whose last level the clamp is past has none;
         // else a sample fetches no level before the clamp and none after the view's last, and a load reads the level
@@ -110,6 +113,54 @@ main() {
       }
     }
   }
-  printf("%s: %u wrong of %u samples\n", wrong ? "failed" : "passed", wrong, cases);
-  return wrong != 0;
+  step("deferred MinLOD changes retain dispatch order across resource rebinding");
+  ComPtr<ID3D11Buffer> captures[2];
+  ComPtr<ID3D11UnorderedAccessView> capture_views[2];
+  for (UINT i = 0; i < std::size(captures); i++) {
+    CHECK(device->CreateBuffer(&out_desc, nullptr, &captures[i]));
+    CHECK(device->CreateUnorderedAccessView(captures[i].Get(), nullptr, &capture_views[i]));
+  }
+  auto bind = [&](ID3D11DeviceContext *to, ID3D11UnorderedAccessView *output) {
+    to->ClearState();
+    to->CSSetShader(cs.Get(), nullptr, 0);
+    to->CSSetShaderResources(0, std::size(shown), views);
+    to->CSSetSamplers(0, 1, sampler.GetAddressOf());
+    to->CSSetConstantBuffers(0, 1, ask.GetAddressOf());
+    to->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+  };
+  const float asked[4] = {};
+  context->UpdateSubresource(ask.Get(), 0, nullptr, asked, 0, 0);
+  context->SetResourceMinLOD(texture.Get(), 0);
+  std::vector<UINT> immediate_capture;
+  for (UINT i = 0; i < std::size(captures); i++) {
+    bind(deferred.Get(), capture_views[i].Get());
+    deferred->SetResourceMinLOD(texture.Get(), i ? 0 : 2);
+    deferred->Dispatch(1, 1, 1);
+    if (i == 0) {
+      bind(context.Get(), uav.Get());
+      context->Dispatch(1, 1, 1);
+      immediate_capture = read(device.Get(), context.Get(), out.Get());
+    }
+  }
+  ComPtr<ID3D11CommandList> commands;
+  CHECK(deferred->FinishCommandList(FALSE, &commands));
+  context->ExecuteCommandList(commands.Get(), FALSE);
+  for (UINT capture = 0; capture <= std::size(captures); capture++) {
+    auto got = capture == std::size(captures) ? immediate_capture : read(device.Get(), context.Get(), captures[capture].Get());
+    if (!expect(got.size() == out_desc.ByteWidth / sizeof(UINT), "capture readback size"))
+      return verdict();
+    const float clamp = capture == 0 ? 2 : 0;
+    for (UINT v = 0; v < std::size(shown); v++) {
+      const float begin = shown[v][0], last = begin + shown[v][1] - 1;
+      const float want[] = {clamp > last ? 0 : held(std::max(begin, clamp)), begin < clamp ? 0 : held(begin)};
+      for (UINT r = 0; r < std::size(want); r++) {
+        float value;
+        memcpy(&value, &got[2 * v + r], sizeof(value));
+        expect(std::fabs(value - want[r]) <= 1.0f / 128, "capture %u view %u component %u: %g, want %g",
+               capture, v, r, value, want[r]);
+      }
+    }
+  }
+  expect(!wrong, "%u wrong of %u immediate samples", wrong, cases);
+  return verdict();
 }

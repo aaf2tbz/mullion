@@ -245,8 +245,9 @@ main(int argc, char **argv) {
        cs_grad = compiler.compile(hlsl, "cs_grad", "cs_6_5", defines), vs = compiler.compile(hlsl, "vs", "vs_6_5", defines),
        ps = compiler.compile(hlsl, "ps", "ps_6_5", defines);
   if (cs_level.empty() || cs_far.empty() || cs_grad.empty() || vs.empty() || ps.empty()) {
-    printf("skipped: sampler feedback is shader model 6.5\n");
-    return 77;
+    // DXC compiles it, so its empty code is a failure; FXC stops at shader model 5.1
+    printf(compiler.dxc ? "failed: HLSL did not compile\n" : "skipped: sampler feedback is shader model 6.5\n");
+    return compiler.dxc ? 1 : 77;
   }
   ComPtr<ID3D12Device8> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));

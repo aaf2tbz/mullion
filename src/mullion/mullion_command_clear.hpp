@@ -43,6 +43,9 @@ public:
 
   void
   begin(const std::array<float, 4> &color, Texture *texture, TextureViewKey view) {
+    auto format = texture->pixelFormat(view);
+    if (IsIntegerFormat(format))
+      return begin(clearColor(color, format), texture, view);
 
     clearing_texture_ = texture;
     clearing_view_ = view;
@@ -126,6 +129,9 @@ public:
 
   void
   begin(const std::array<float, 4> &color, Buffer *buffer, BufferViewKey view) {
+    auto format = buffer->pixelFormat(view);
+    if (IsIntegerFormat(format))
+      return begin(clearColor(color, format), buffer, view);
 
     clearing_buffer_ = buffer;
     clearing_view_ = view;
@@ -152,6 +158,7 @@ public:
     if (view_format != uint_format) {
       BufferViewDescriptor view;
       view.format = uint_format;
+      view.write = true;
       clearing_view_ = buffer->createView(view);
     }
 
@@ -338,6 +345,15 @@ public:
     return packed;
   };
 
+  static std::array<uint32_t, 4>
+  clearColor(const std::array<float, 4> &color, WMTPixelFormat format) {
+    // ClearView clamps integer inputs, then rounds toward zero (D3D11.3 5.2.3.3).
+    WMTClearColor converted{color[0], color[1], color[2], color[3]};
+    SanitizeRTVClearColor(format, converted);
+    return {uint32_t(int64_t(converted.r)), uint32_t(int64_t(converted.g)),
+            uint32_t(int64_t(converted.b)), uint32_t(int64_t(converted.a))};
+  }
+
 private:
   WMT::Device device_;
   SimpleCommandContext<Context> ctx_;
@@ -435,7 +451,10 @@ public:
       pipeline_info.raster_sample_count = texture->sampleCount();
       pipeline_info.vertex_function = vs_clear_;
       if (dsv_flag) {
-        pipeline_info.fragment_function = !resolve ? fs_clear_depth_ : dsv_flag & 1 ? fs_resolve_depth_ : fs_resolve_stencil_;
+        if (resolve)
+          pipeline_info.fragment_function = dsv_flag & 1 ? fs_resolve_depth_ : fs_resolve_stencil_;
+        else if (dsv_flag & 1)
+          pipeline_info.fragment_function = fs_clear_depth_;
         pipeline_info.depth_pixel_format = dsv_flag & 1 ? format : WMTPixelFormatInvalid;
         pipeline_info.stencil_pixel_format = dsv_flag & 2 ? format : WMTPixelFormatInvalid;
       } else if (IsIntegerFormat(format)) {

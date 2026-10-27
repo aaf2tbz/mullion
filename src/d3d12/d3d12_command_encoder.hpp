@@ -63,6 +63,8 @@ struct EncoderData {
   EncoderData *next = nullptr;
   uint64_t id;
   Stamp *stamps = nullptr;
+  // the path of the application's events the pass began in, each name ended by diag::kEventEnd (diag::events)
+  const char *event_path = nullptr;
   PassOverlap overlap = PassOverlap::Ordered;
 };
 
@@ -106,6 +108,7 @@ struct RenderEncoderData : EncoderData {
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;
   uint8_t default_raster_sample_count;
+  uint8_t center_samples = 0;
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;
@@ -120,11 +123,14 @@ struct RenderEncoderData : EncoderData {
     const struct IndirectRenderCommandData *call;
     Most *next;
   } *most;
+  // where the resolvers of the pass's indirect commands leave those they left out: for a geometry command its object
+  // threadgroups, for stream output (`scratch`) the scratch bytes it needed
   struct Omitted {
     WMT::Buffer buffer;
     uint64_t offset;
     uint64_t words;
     Omitted *next;
+    bool scratch = false;
   } *omitted = nullptr;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
@@ -147,6 +153,8 @@ struct BlitEncoderData : EncoderData {
 struct ComputeEncoderData : EncoderData {
   wmtcmd_compute_nop cmd_head;
   wmtcmd_base *cmd_tail;
+  // it dispatches rays, whose kernel reads the sparse buffer table even when there is none
+  bool rays = false;
 };
 
 // bindings recorded once; the queue submits each part before making the next
