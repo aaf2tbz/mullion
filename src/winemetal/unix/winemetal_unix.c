@@ -4286,6 +4286,8 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
   MTLSize threadgroup;
   struct WMTSampleBufferAttachmentInfo samples;
   bool render;
+  // a compute encoder that updates a fence of its own overlaps other passes: its end leaves the buffer's fence
+  bool overlaps;
 }
 @end
 
@@ -4337,7 +4339,9 @@ API_AVAILABLE(macos(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
   MullionMetal4Encoder *state = compute;
   if (!state)
     return;
-  [state->encoder updateFence:fence afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+  if (!state->overlaps)
+    [state->encoder updateFence:fence
+             afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
   [state->encoder endEncoding];
   compute = nil;
   stamp_heap = 0;
@@ -5382,7 +5386,9 @@ API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const str
     }
     case WMTComputeCommandUpdateFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageDispatch];
+      [encoder updateFence:(id<MTLFence>)body->fence
+          afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+      state->overlaps = true;
       break;
     }
     case WMTComputeCommandSetVisibleFunctionTable: {

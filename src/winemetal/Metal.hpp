@@ -953,6 +953,14 @@ public:
     cmd.next.set(nullptr);
     encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&cmd));
   }
+  // after every stage of the work encoded before it. the encoder is then no ordering point: its end leaves the
+  // buffer's fence as it was
+  void
+  updateFence(Fence fence) {
+    wmtcmd_compute_fence_op cmd{.type = WMTComputeCommandUpdateFence, .fence = fence.handle};
+    cmd.next.set(nullptr);
+    encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&cmd));
+  }
 
   template <size_t N>
   void

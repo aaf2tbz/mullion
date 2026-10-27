@@ -150,25 +150,27 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   PassSync
   NextSync(const EncoderData *pass) {
     PassSync sync;
+    // a Metal 4 pass of compute or blit work that waits for every pass before it, as WaitAll's encoders do, is a
+    // segment of the buffer's one compute encoder, which barriers order and whose end updates fence_ (closeCompute).
+    // one that joins a group is an encoder of its own, as on Metal 3
+    bool segment = Metal4 && pass->type != EncoderType::Render && pass->type != EncoderType::Clear &&
+                   pass->type != EncoderType::Resolve;
     if (!PassesOverlap()) {
       sync.waits[sync.wait_count++] = fence_;
-      sync.update = fence_;
+      if (!segment)
+        sync.update = fence_;
       return sync;
     }
     if (!Encodes(pass)) {
       order_next_ |= pass->overlap == PassOverlap::Ordered;
       return sync;
     }
-    // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder, which barriers order
-    // and whose end updates fence_ (closeCompute): it waits for every pass before it, as WaitAll's encoders do
-    if constexpr (Metal4)
-      if (pass->type != EncoderType::Render && pass->type != EncoderType::Clear && pass->type != EncoderType::Resolve) {
-        order_next_ = false;
-        WaitAll([&](WMT::Fence fence) { sync.waits[sync.wait_count++] = fence; });
-        return sync;
-      }
-    sync.waits[sync.wait_count++] = fence_;
     auto overlap = std::exchange(order_next_, false) ? PassOverlap::Ordered : pass->overlap;
+    if (segment && (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses)) {
+      WaitAll([&](WMT::Fence fence) { sync.waits[sync.wait_count++] = fence; });
+      return sync;
+    }
+    sync.waits[sync.wait_count++] = fence_;
     if (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses) {
       overlap = PassOverlap::Ordered;
       previous_count_ = group_count_;
@@ -1221,15 +1223,15 @@ public:
           break;
         }
         auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
-        // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder (NextSync)
+        // a Metal 4 pass of compute or blit work with no fence of its own is a segment of the buffer's one compute
+        // encoder (NextSync), and so is a render pass's work before it
         auto end = [&](auto &encoder) {
-          if constexpr (Metal4) {
-            encoder.endSegment();
-          } else {
-            if (sync.update.handle)
-              encoder.updateFence(sync.update);
-            encoder.endEncoding();
-          }
+          if constexpr (Metal4)
+            if (!sync.update.handle || current->type == EncoderType::Render || current->type == EncoderType::Clear)
+              return encoder.endSegment();
+          if (sync.update.handle)
+            encoder.updateFence(sync.update);
+          encoder.endEncoding();
         };
         switch (current->type) {
         case EncoderType::Null:
