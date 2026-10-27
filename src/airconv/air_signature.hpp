@@ -663,6 +663,9 @@ public:
   uint32_t DefineMeshVertexOutput(const MeshVertexOutput &output);
   uint32_t DefineMeshPrimitiveOutput(const MeshPrimitiveOutput &output);
   void UseEarlyFragmentTests() { early_fragment_tests = true; }
+  // the inputs defined so far, by argument index, and the outputs
+  const std::vector<FunctionInput> &Inputs() const { return inputs; }
+  const std::vector<FunctionOutput> &Outputs() const { return outputs; }
   bool EarlyFragmentTests() const { return early_fragment_tests; }
   void UseLateFragmentTests() { early_fragment_tests = false; }
   void UseMaxWorkgroupSize(uint32_t size) { max_work_group_size = size; }

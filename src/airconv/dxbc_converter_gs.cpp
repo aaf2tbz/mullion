@@ -10,8 +10,12 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace mullion::dxbc {
@@ -127,6 +131,230 @@ stream_output_input(air::FunctionSignatureBuilder &signature, llvm::LLVMContext 
   });
 }
 
+// conservative rasterization of a triangle with corners at `clip`, through the viewport `viewport_index` of
+// `viewports` (SM50_CONSERVATIVE_VIEWPORTS). the rasterizer takes the triangle as clipped, to the depth range when the
+// pipeline clips depth (D3D11.3 15.5) and to before the eye when not: a polygon in the window of at most
+// SM50_CONSERVATIVE_CORNERS corners, snapped to a 256th of a pixel, which the pixel shader tests pixels' squares
+// against. Metal rasterizes one triangle around it, a little more than a pixel larger, so every sample of a pixel the
+// polygon touches is inside and the pixel's shader runs once: the triangle's edges moved out, or where those meet far
+// out (a sharp corner, a corner behind the eye) or there is no area, half of a box twice the polygon's. its points have
+// a w of 1, so what Metal interpolates over them is linear in the window: an input over w and the plane's 1/w
+// (SM50_CONSERVATIVE_RCP_W), from the corners' homogeneous barycentrics there, which hold behind the eye too. a polygon
+// of no area takes the first corner's inputs and faces back ("degenerate triangles must be considered back facing",
+// D3D12 conservative rasterization)
+ConservativeTriangle
+conservative_triangle(
+    llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, air::AirType &types, pvalue const (&clip)[3],
+    pvalue viewports, pvalue viewport_index
+) {
+  using llvm::air::AIRBuilder;
+  ConservativeTriangle out;
+  auto f = [&](double v) { return air.getFloat(v); };
+  auto at = [&](pvalue v, uint32_t i) { return builder.CreateExtractElement(v, i); };
+  auto add = [&](pvalue a, pvalue b) { return builder.CreateFAdd(a, b); };
+  auto sub = [&](pvalue a, pvalue b) { return builder.CreateFSub(a, b); };
+  auto mul = [&](pvalue a, pvalue b) { return builder.CreateFMul(a, b); };
+  auto div = [&](pvalue a, pvalue b) { return builder.CreateFDiv(a, b); };
+  auto min = [&](pvalue a, pvalue b) { return air.CreateFPBinOp(AIRBuilder::fmin, a, b, false); };
+  auto max = [&](pvalue a, pvalue b) { return air.CreateFPBinOp(AIRBuilder::fmax, a, b, false); };
+  auto abs = [&](pvalue a) { return air.CreateFPUnOp(AIRBuilder::fabs, a, false); };
+  auto viewport = builder.CreateLoad(types._float4, builder.CreateGEP(types._float4, viewports, {viewport_index}));
+  auto state = builder.CreateLoad(
+      types._float4,
+      builder.CreateGEP(types._float4, viewports, {builder.getInt32(offsetof(SM50_CONSERVATIVE_VIEWPORTS, state) / sizeof(float[4]))})
+  );
+  auto clips_depth = builder.CreateFCmpONE(at(state, 0), f(0)), counterclockwise = builder.CreateFCmpONE(at(state, 1), f(0));
+  // a corner this near the eye is behind it
+  const double eye = 1e-6;
+  // the planes the triangle is clipped to, z >= 0 and z <= w, or w above 0 (nothing for the second): Sutherland and
+  // Hodgman's, each corner kept in order where it is inside and a corner made where an edge crosses, gathered into one
+  // more than it had, the last repeated in those left (a repeated corner makes an edge of no length)
+  std::vector<pvalue> polygon(std::begin(clip), std::end(clip));
+  out.culled = builder.getFalse();
+  for (uint32_t i = 0; i < 2; i++) {
+    auto distance = [&](pvalue v) {
+      return i ? builder.CreateSelect(clips_depth, sub(at(v, 3), at(v, 2)), f(1))
+               : builder.CreateSelect(clips_depth, at(v, 2), sub(at(v, 3), f(eye)));
+    };
+    std::vector<pvalue> made, kept;
+    for (size_t k = 0; k < polygon.size(); k++) {
+      auto a = polygon[k], b = polygon[(k + 1) % polygon.size()];
+      auto da = distance(a), db = distance(b);
+      auto in_a = builder.CreateFCmpOGE(da, f(0)), in_b = builder.CreateFCmpOGE(db, f(0));
+      made.push_back(a), kept.push_back(in_a);
+      auto t = builder.CreateVectorSplat(4, div(da, sub(da, db)));
+      made.push_back(builder.CreateFAdd(a, builder.CreateFMul(t, builder.CreateFSub(b, a))));
+      kept.push_back(builder.CreateXor(in_a, in_b));
+    }
+    std::vector<pvalue> gathered(polygon.size() + 1, made[0]);
+    pvalue count = builder.getInt32(0);
+    for (size_t j = 0; j < made.size(); j++) {
+      for (uint32_t s = 0; s < gathered.size(); s++)
+        gathered[s] = builder.CreateSelect(
+            builder.CreateAnd(kept[j], builder.CreateICmpULE(count, builder.getInt32(s))), made[j], gathered[s]
+        );
+      count = builder.CreateAdd(count, builder.CreateZExt(kept[j], builder.getInt32Ty()));
+    }
+    polygon = std::move(gathered);
+    // nothing left by one plane is nothing, whatever the next keeps of the filler
+    out.culled = builder.CreateOr(out.culled, builder.CreateICmpEQ(count, builder.getInt32(0)));
+  }
+  // the window, where pixels are squares a unit wide, and back
+  auto window = [&](pvalue x, pvalue y) -> std::array<pvalue, 2> {
+    return {add(at(viewport, 0), mul(add(x, f(1)), mul(at(viewport, 2), f(0.5)))),
+            add(at(viewport, 1), mul(sub(f(1), y), mul(at(viewport, 3), f(0.5))))};
+  };
+  auto ndc = [&](pvalue x, pvalue y) -> std::array<pvalue, 2> {
+    return {sub(div(sub(x, at(viewport, 0)), mul(at(viewport, 2), f(0.5))), f(1)),
+            sub(f(1), div(sub(y, at(viewport, 1)), mul(at(viewport, 3), f(0.5))))};
+  };
+  // twice the signed area, positive turning clockwise in the window
+  auto area = [&](auto &points, size_t n) {
+    pvalue sum = f(0);
+    for (size_t k = 0; k < n; k++)
+      sum = add(sum, sub(mul(points[k][0], points[(k + 1) % n][1]), mul(points[(k + 1) % n][0], points[k][1])));
+    return sum;
+  };
+  // snapped as a rasterizer snaps them, to a 256th of a pixel: a polygon of no area after that is degenerate
+  pvalue first_depth = nullptr;
+  for (uint32_t k = 0; k < SM50_CONSERVATIVE_CORNERS; k++) {
+    auto w = max(at(polygon[k], 3), f(eye));
+    auto [x, y] = window(div(at(polygon[k], 0), w), div(at(polygon[k], 1), w));
+    out.window[k][0] = x, out.window[k][1] = y;
+    for (auto &c : out.window[k])
+      c = div(air.CreateFPUnOp(AIRBuilder::rint, mul(c, f(256)), false), f(256));
+    if (!k)
+      first_depth = div(at(polygon[k], 2), w);
+  }
+  auto polygon_area = area(out.window, SM50_CONSERVATIVE_CORNERS);
+  // the corners' homogeneous barycentrics at a point of the window: the inverse of the matrix of their x, y and w,
+  // rows the cross products of its columns (Olano and Greer). they sum to the plane's 1/w there, and weigh the corners'
+  // inputs over w; times each corner's w, its barycentrics in the window
+  pvalue column[3][3];
+  for (uint32_t j = 0; j < 3; j++)
+    column[j][0] = at(clip[j], 0), column[j][1] = at(clip[j], 1), column[j][2] = at(clip[j], 3);
+  pvalue row[3][3];
+  for (uint32_t j = 0; j < 3; j++) {
+    auto &a = column[(j + 1) % 3], &b = column[(j + 2) % 3];
+    for (uint32_t c = 0; c < 3; c++)
+      row[j][c] = sub(mul(a[(c + 1) % 3], b[(c + 2) % 3]), mul(a[(c + 2) % 3], b[(c + 1) % 3]));
+  }
+  auto det = add(add(mul(column[0][0], row[0][0]), mul(column[0][1], row[0][1])), mul(column[0][2], row[0][2]));
+  auto degenerate = builder.CreateOr(builder.CreateFCmpOEQ(polygon_area, f(0)), builder.CreateFCmpOEQ(det, f(0)));
+  // the triangle's edges moved out by the square, where its corners are before the eye
+  const double grow = 1 + 1.0 / 64;
+  std::array<pvalue, 2> corner[3];
+  pvalue before = builder.getTrue();
+  for (uint32_t k = 0; k < 3; k++) {
+    before = builder.CreateAnd(before, builder.CreateFCmpOGT(at(clip[k], 3), f(eye)));
+    corner[k] = window(div(at(clip[k], 0), at(clip[k], 3)), div(at(clip[k], 1), at(clip[k], 3)));
+  }
+  auto inward = builder.CreateSelect(builder.CreateFCmpOGT(polygon_area, f(0)), f(1), f(-1));
+  pvalue nx[3], ny[3], c[3];
+  for (uint32_t i = 0; i < 3; i++) {
+    auto &a = corner[i], &b = corner[(i + 1) % 3];
+    nx[i] = mul(sub(a[1], b[1]), inward), ny[i] = mul(sub(b[0], a[0]), inward);
+    c[i] = sub(add(mul(nx[i], a[0]), mul(ny[i], a[1])), mul(add(abs(nx[i]), abs(ny[i])), f(grow)));
+  }
+  std::array<pvalue, 2> moved[3];
+  for (uint32_t k = 0; k < 3; k++) {
+    uint32_t a = (k + 2) % 3, b = k; // the edges into and out of corner k
+    auto d = sub(mul(nx[a], ny[b]), mul(ny[a], nx[b]));
+    moved[k] = {div(sub(mul(c[a], ny[b]), mul(c[b], ny[a])), d), div(sub(mul(nx[a], c[b]), mul(nx[b], c[a])), d)};
+  }
+  // the box around the polygon, as much larger, and the half of the box twice its size that has it
+  pvalue low[2], high[2];
+  for (uint32_t axis = 0; axis < 2; axis++) {
+    low[axis] = high[axis] = out.window[0][axis];
+    for (uint32_t k = 1; k < SM50_CONSERVATIVE_CORNERS; k++)
+      low[axis] = min(low[axis], out.window[k][axis]), high[axis] = max(high[axis], out.window[k][axis]);
+    low[axis] = sub(low[axis], f(grow)), high[axis] = add(high[axis], f(grow));
+  }
+  auto width = sub(high[0], low[0]), height = sub(high[1], low[1]);
+  std::array<pvalue, 2> box[3] = {
+      {low[0], low[1]}, {add(low[0], mul(width, f(2))), low[1]}, {low[0], add(low[1], mul(height, f(2)))}
+  };
+  auto use_moved = builder.CreateAnd(
+      builder.CreateAnd(before, builder.CreateNot(degenerate)),
+      builder.CreateFCmpOLE(abs(area(moved, 3)), mul(mul(width, height), f(4)))
+  );
+  // the box's half turns clockwise; it turns as the polygon does, or back where it is degenerate
+  auto clockwise = builder.CreateSelect(degenerate, counterclockwise, builder.CreateFCmpOGT(polygon_area, f(0)));
+  for (uint32_t u = 0; u < 3; u++) {
+    uint32_t mirrored = u ? 3 - u : 0;
+    pvalue point[2];
+    for (uint32_t axis = 0; axis < 2; axis++)
+      point[axis] = builder.CreateSelect(
+          use_moved, moved[u][axis], builder.CreateSelect(clockwise, box[u][axis], box[mirrored][axis])
+      );
+    auto [x, y] = ndc(point[0], point[1]);
+    pvalue weight[3], rcp_w = f(0), z = f(0);
+    for (uint32_t j = 0; j < 3; j++) {
+      weight[j] = div(add(add(mul(row[j][0], x), mul(row[j][1], y)), row[j][2]), det);
+      rcp_w = add(rcp_w, weight[j]);
+      z = add(z, mul(weight[j], at(clip[j], 2)));
+    }
+    for (uint32_t j = 0; j < 3; j++) {
+      auto first = f(j == 0 ? 1.0 : 0.0);
+      out.over_w[u][j] = builder.CreateSelect(degenerate, first, weight[j]);
+      out.linear[u][j] = builder.CreateSelect(degenerate, first, mul(weight[j], at(clip[j], 3)));
+    }
+    out.rcp_w[u] = builder.CreateSelect(degenerate, f(1), rcp_w);
+    pvalue position = llvm::UndefValue::get(types._float4);
+    position = builder.CreateInsertElement(position, x, uint64_t(0));
+    position = builder.CreateInsertElement(position, y, uint64_t(1));
+    position = builder.CreateInsertElement(position, builder.CreateSelect(degenerate, first_depth, z), uint64_t(2));
+    out.position[u] = builder.CreateInsertElement(position, f(1), uint64_t(3));
+  }
+  return out;
+}
+
+void
+conservative_varyings(llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at) {
+  auto &builder = air.builder;
+  for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+    air.CreateSetMeshVertexData(vertex, builder.getInt32(at + i), triangle.window[i / 2][i % 2]);
+  for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
+    air.CreateSetMeshVertexData(vertex, builder.getInt32(at + SM50_CONSERVATIVE_VARYINGS + i), triangle.rcp_w[u]);
+}
+
+void
+conservative_point(
+    llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeTriangle &triangle, uint32_t u, const SM50ShaderInternal &stage,
+    uint32_t position_reg, uint32_t flat_inputs, uint32_t noperspective_inputs,
+    const std::function<pvalue(uint32_t corner, uint32_t reg)> &corner, pvalue output
+) {
+  auto registers_type = llvm::ArrayType::get(types._int4, stage.max_output_register);
+  auto real = [&](pvalue bits) { return builder.CreateBitCast(bits, types._float); };
+  for (uint32_t reg = 0; reg < stage.max_output_register; reg++) {
+    auto component_types = stage.register_types(reg, RegisterComponentType::Float);
+    pvalue corners[3];
+    for (uint32_t k = 0; k < 3; k++)
+      corners[k] = corner(k, reg);
+    pvalue value = llvm::UndefValue::get(types._int4);
+    for (uint32_t c = 0; c < 4; c++) {
+      auto at = [&](uint32_t k) { return builder.CreateExtractElement(corners[k], uint64_t(c)); };
+      // a flat register is the first corner's
+      bool flat = reg != position_reg &&
+                  (component_types[c] != RegisterComponentType::Float || (flat_inputs >> reg & 1));
+      pvalue component = at(0);
+      if (reg == position_reg) {
+        component = builder.CreateBitCast(builder.CreateExtractElement(triangle.position[u], uint64_t(c)), types._int);
+      } else if (!flat) {
+        auto &parts = noperspective_inputs >> reg & 1 ? triangle.linear : triangle.over_w;
+        pvalue sum = nullptr;
+        for (uint32_t k = 0; k < 3; k++) {
+          auto part = builder.CreateFMul(parts[u][k], real(at(k)));
+          sum = sum ? builder.CreateFAdd(sum, part) : part;
+        }
+        component = builder.CreateBitCast(sum, types._int);
+      }
+      value = builder.CreateInsertElement(value, component, c);
+    }
+    builder.CreateStore(value, builder.CreateGEP(registers_type, output, {builder.getInt32(0), builder.getInt32(reg)}));
+  }
+}
+
 llvm::Error
 convert_dxbc_geometry_shader(
     SM50ShaderInternal *pShaderInternal, const char *name, SM50ShaderInternal *pVertexStage, llvm::LLVMContext &context,
@@ -231,8 +459,22 @@ convert_dxbc_geometry_shader(
       .size = pHullStage ? (uint32_t)module.getDataLayout().getTypeAllocSize(tessellation_payload)
                          : SM50_GEOMETRY_PAYLOAD_SIZE
   });
+  // conservative rasterization of the triangles the shader emits: each one Metal triangle of its own
+  // (conservative_triangle), which the pipeline asks for only where they fit (MTL_GEOMETRY_SHADER_REFLECTION). after
+  // a tessellator the pipeline's say comes with the tessellator's arguments
+  SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
+  if (pHullStage)
+    args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess);
+  uint32_t flat_inputs = pso_tess ? pso_tess->flat_inputs : pso_data ? pso_data->flat_inputs : 0;
+  uint32_t noperspective_inputs = pso_tess ? pso_tess->noperspective_inputs : pso_data ? pso_data->noperspective_inputs : 0;
+  bool conservative = (pso_tess ? pso_tess->conservative : pso_data && pso_data->conservative) &&
+                      topology == air::MeshOutputTopology::Triangle &&
+                      max_vertex_out >= 3;
+  uint32_t triangles = conservative ? max_vertex_out - 2 : 0;
   // it's intended to declare a bit more max primitive count
-  auto mesh_idx = func_signature.DefineInput(air::InputMesh{(uint32_t)max_vertex_out, (uint32_t)max_vertex_out, topology});
+  auto mesh_idx = func_signature.DefineInput(air::InputMesh{
+      conservative ? 3 * triangles : (uint32_t)max_vertex_out, conservative ? triangles : (uint32_t)max_vertex_out, topology
+  });
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
   // a tessellated draw's mesh threadgroups have the domain stage's threads, of which the first does the work
   uint32_t thread_idx = pHullStage ? func_signature.DefineInput(air::InputThreadPositionInThreadgroup{}) : ~0u;
@@ -265,10 +507,29 @@ convert_dxbc_geometry_shader(
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
   if (topology == air::MeshOutputTopology::Point)
     func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
-  // Metal culls by primitive, where Direct3D discards one whose vertices are all behind a cull distance (15.4.2)
-  bool culls = pShaderInternal->cull_distance_scalars.size();
+  // Metal culls by primitive, where Direct3D discards one whose vertices are all behind a cull distance (15.4.2), and
+  // a conservative rasterizer one that its clipping leaves nothing of
+  bool culls = pShaderInternal->cull_distance_scalars.size() || conservative;
   if (culls)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
+  // and the viewports, and the window coordinates the pixel shader tests against
+  uint32_t viewports_idx = 0, conservative_at = pShaderInternal->num_mesh_vertex_data;
+  if (conservative) {
+    viewports_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_VIEWPORTS,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::msl_float4,
+        .arg_name = "viewports",
+        .raster_order_group = {}
+    });
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
+      func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+          .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = conservative_at + i
+      });
+  }
 
   auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
@@ -521,6 +782,109 @@ convert_dxbc_geometry_shader(
     };
     mesh_cut = []() -> IREffect {
       // there is nothing to cut!
+      co_return {};
+    };
+  }
+
+  // conservative: the strip's last three vertices' output registers, and the triangles emitted
+  llvm::Value *emitted = nullptr, *ring = nullptr;
+  auto registers_type = llvm::ArrayType::get(types._int4, std::max(max_output_register, 1u));
+  auto ring_type = llvm::ArrayType::get(registers_type, 3);
+  uint32_t position_reg = ~0u, viewport_reg = ~0u, viewport_component = 0;
+  if (conservative) {
+    {
+      llvm::IRBuilder<>::InsertPointGuard guard(builder);
+      builder.SetInsertPoint(&*function->getEntryBlock().getFirstInsertionPt());
+      ring = builder.CreateAlloca(ring_type);
+      emitted = builder.CreateAlloca(types._int);
+    }
+    builder.CreateStore(zero_const, emitted);
+    for (auto &element : pShaderInternal->output_signature) {
+      if (element.systemValue() == D3D10_SB_NAME_POSITION)
+        position_reg = element.reg();
+      if (element.systemValue() == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
+        viewport_reg = element.reg(), viewport_component = std::countr_zero(element.mask());
+    }
+    auto output_at = [&](uint32_t reg) {
+      return builder.CreateGEP(registers_type, resource_map.output.ptr_int4, {zero_const, builder.getInt32(reg)});
+    };
+    auto ring_at = [&](pvalue slot, uint32_t reg) {
+      return builder.CreateGEP(ring_type, ring, {zero_const, slot, builder.getInt32(reg)});
+    };
+    auto real = [&](pvalue bits) { return builder.CreateBitCast(bits, types._float); };
+    mesh_emit = [&, ring_at, output_at, real]() -> IREffect {
+      auto written = builder.CreateLoad(types._int, next_write_vertex);
+      builder.CreateStore(builder.CreateAdd(written, one_const), next_write_vertex);
+      for (uint32_t reg = 0; reg < max_output_register; reg++)
+        builder.CreateStore(
+            builder.CreateLoad(types._int4, output_at(reg)), ring_at(builder.CreateURem(written, builder.getInt32(3)), reg)
+        );
+      if (position_reg == ~0u)
+        co_return {};
+      // the triangle this vertex completes, odd ones as (n, n + 2, n + 1), keeping winding
+      auto head = builder.GetInsertBlock();
+      auto complete = llvm::BasicBlock::Create(context, "conservative_triangle", function);
+      auto after = llvm::BasicBlock::Create(context, "conservative_after", function);
+      if (builder.GetInsertPoint() != head->end()) {
+        auto rest = llvm::SplitBlock(head, &*builder.GetInsertPoint());
+        head->getTerminator()->eraseFromParent();
+        builder.SetInsertPoint(after);
+        builder.CreateBr(rest);
+        builder.SetInsertPoint(head);
+      }
+      builder.CreateCondBr(builder.CreateICmpUGE(written, two_const), complete, after);
+      builder.SetInsertPoint(complete);
+      auto first = builder.CreateSub(written, two_const);
+      auto odd = builder.CreateAnd(first, one_const);
+      pvalue slot[3] = {
+          builder.CreateURem(first, builder.getInt32(3)),
+          builder.CreateURem(builder.CreateAdd(builder.CreateAdd(first, one_const), odd), builder.getInt32(3)),
+          builder.CreateURem(builder.CreateSub(builder.CreateAdd(first, two_const), odd), builder.getInt32(3)),
+      };
+      pvalue clip[3];
+      for (uint32_t k = 0; k < 3; k++)
+        clip[k] = builder.CreateBitCast(builder.CreateLoad(types._int4, ring_at(slot[k], position_reg)), types._float4);
+      pvalue viewport_index = zero_const;
+      if (viewport_reg != ~0u)
+        viewport_index = builder.CreateExtractElement(
+            builder.CreateLoad(types._int4, ring_at(slot[0], viewport_reg)), uint64_t(viewport_component)
+        );
+      viewport_index = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport_index, builder.getInt32(15), false);
+      auto triangle = conservative_triangle(builder, air, types, clip, function->getArg(viewports_idx), viewport_index);
+      auto primitive = builder.CreateLoad(types._int, emitted);
+      builder.CreateStore(builder.CreateAdd(primitive, one_const), emitted);
+      auto vertex_base = builder.CreateMul(primitive, builder.getInt32(3));
+      for (uint32_t u = 0; u < 3; u++) {
+        conservative_point(
+            builder, types, triangle, u, *pShaderInternal, position_reg, flat_inputs, noperspective_inputs,
+            [&](uint32_t k, uint32_t reg) { return builder.CreateLoad(types._int4, ring_at(slot[k], reg)); },
+            resource_map.output.ptr_int4
+        );
+        auto vertex = builder.CreateAdd(vertex_base, builder.getInt32(u));
+        MeshOutputContext gs_out_ctx{vertex, primitive};
+        for (auto &h : gs_output_handlers)
+          co_yield h(gs_out_ctx);
+        emit_clip_distances(vertex);
+        conservative_varyings(air, triangle, u, vertex, conservative_at);
+        air.CreateSetMeshIndex(builder.CreateAdd(vertex_base, builder.getInt32(u)), vertex);
+      }
+      // culled by a distance all three corners are behind, or by clipping
+      pvalue culled = triangle.culled;
+      for (auto &distance : pShaderInternal->cull_distance_scalars) {
+        pvalue behind = builder.getTrue();
+        for (uint32_t k = 0; k < 3; k++) {
+          auto value = builder.CreateExtractElement(builder.CreateLoad(types._int4, ring_at(slot[k], distance.reg)), uint64_t(distance.component));
+          behind = builder.CreateAnd(behind, builder.CreateFCmpULT(real(value), llvm::ConstantFP::get(types._float, 0)));
+        }
+        culled = builder.CreateOr(culled, behind);
+      }
+      air.CreateSetMeshPrimitiveCulled(primitive, culled);
+      builder.CreateBr(after);
+      builder.SetInsertPoint(after, after->getFirstInsertionPt());
+      co_return {};
+    };
+    mesh_cut = [&]() -> IREffect {
+      builder.CreateStore(zero_const, next_write_vertex);
       co_return {};
     };
   }
@@ -979,8 +1343,9 @@ convert_dxbc_geometry_shader(
     return err;
   }
   // a point is a primitive as it is emitted; a strip's are counted where it ends
-  auto rasterized =
-      builder.CreateLoad(types._int, topology == air::MeshOutputTopology::Point ? next_write_vertex : primitive_count);
+  auto rasterized = builder.CreateLoad(
+      types._int, conservative ? emitted : topology == air::MeshOutputTopology::Point ? next_write_vertex : primitive_count
+  );
   air.CreateSetMeshPrimitiveCount(rasterized);
   if (statistics) {
     auto counted = llvm::BasicBlock::Create(context, "counted", function), count = llvm::BasicBlock::Create(context, "count", function, counted);
@@ -1177,8 +1542,9 @@ convert_pass_through_geometry_shader(
   air::FunctionSignatureBuilder func_signature;
   uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = SM50_GEOMETRY_PAYLOAD_SIZE});
   // a quadrilateral line is a rectangle 1.4 pixels wide, two triangles whose corners take their end's attributes
-  // (D3D11.3 3.4.5): what Metal's own lines are not
-  bool quads = pso_data->quad_lines && own.count == 2;
+  // (D3D11.3 3.4.5): what Metal's own lines are not. conservative rasterization of triangles: each the triangle
+  // conservative_triangle makes of it
+  bool quads = pso_data->quad_lines && own.count == 2, conservative = pso_data->conservative && own.count == 3;
   uint32_t corners = quads ? 4 : own.count, primitives = quads ? 2 : 1;
   func_signature.DefineInput(air::InputMesh{
       corners, primitives,
@@ -1231,11 +1597,29 @@ convert_pass_through_geometry_shader(
     });
   if (!clip_varyings && pVertexStage->clip_distance_scalars.size())
     func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = pVertexStage->clip_distance_scalars.size()});
-  if (pVertexStage->cull_distance_scalars.size())
+  if (pVertexStage->cull_distance_scalars.size() || conservative)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
   if (own.count == 1)
     func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
+  // and the viewports, and the window coordinates the pixel shader tests against
+  uint32_t viewports_idx = 0, conservative_at = varyings.size();
+  if (conservative) {
+    viewports_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_VIEWPORTS,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::msl_float4,
+        .arg_name = "viewports",
+        .raster_order_group = {}
+    });
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
+      func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+          .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = conservative_at + i
+      });
+  }
 
   auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
@@ -1289,29 +1673,32 @@ convert_pass_through_geometry_shader(
         return component(0, element.reg(), std::countr_zero(element.mask()));
     return nullptr;
   };
-  auto position = [&](uint32_t corner) -> pvalue {
-    for (auto &element : pVertexStage->output_signature)
-      if (element.systemValue() == D3D10_SB_NAME_POSITION) {
-        pvalue position = llvm::UndefValue::get(types._float4);
-        for (uint32_t c = 0; c < 4; c++)
-          position = builder.CreateInsertElement(position, real(component(corner, element.reg(), c)), c);
-        return position;
-      }
-    return nullptr;
+  // the viewport it chooses, an out-of-range index meaning viewport 0
+  auto viewport = [&] {
+    pvalue index = chosen(D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX);
+    return index ? builder.CreateSelect(builder.CreateICmpULT(index, builder.getInt32(SM50_VIEWPORTS)), index, zero) : zero;
   };
+  pvalue clip[3] = {};
+  for (uint32_t corner = 0; corner < own.count; corner++)
+    for (auto &element : pVertexStage->output_signature) {
+      if (element.systemValue() != D3D10_SB_NAME_POSITION)
+        continue;
+      clip[corner] = llvm::UndefValue::get(types._float4);
+      for (uint32_t c = 0; c < 4; c++)
+        clip[corner] = builder.CreateInsertElement(clip[corner], real(component(corner, element.reg(), c)), c);
+    }
   // the rectangle's half width in x and y of normalized device coordinates. on the screen the line points along
   // d = (xb wa - xa wb, yb wa - ya wb), whichever side of w = 0 either end is, as d/dt (x/w) = d/w^2 along it; its
-  // normal in pixels of the viewport (width and height in the raster scale buffer, an out-of-range index meaning
-  // viewport 0) is then 0.7 (H dy, W dx) / |(W dx, H dy)| / (W/2, -H/2). a line of no length has no rectangle, and
-  // its NaN corners are discarded
+  // normal in pixels of the viewport (width and height in the raster scale buffer) is then
+  // 0.7 (H dy, W dx) / |(W dx, H dy)| / (W/2, -H/2). a line of no length has no rectangle, and its NaN corners are
+  // discarded
   pvalue half_width = nullptr;
-  if (quads) {
-    auto a = position(0), b = position(1);
+  if (quads && clip[0]) {
+    auto a = clip[0], b = clip[1];
     auto at = [&](pvalue v, uint32_t i) { return builder.CreateExtractElement(v, i); };
-    pvalue viewport = chosen(D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX);
-    viewport = viewport ? builder.CreateSelect(builder.CreateICmpULT(viewport, builder.getInt32(SM50_VIEWPORTS)), viewport, zero) : zero;
+    auto chosen_viewport = viewport();
     auto size = [&](uint32_t i) {
-      auto index = builder.CreateAdd(builder.CreateShl(viewport, 1), builder.getInt32(1 + i));
+      auto index = builder.CreateAdd(builder.CreateShl(chosen_viewport, 1), builder.getInt32(1 + i));
       return builder.CreateLoad(types._float, builder.CreateGEP(types._float, function->getArg(raster_scale), index));
     };
     auto w = size(0), h = size(1);
@@ -1327,29 +1714,68 @@ convert_pass_through_geometry_shader(
         builder.CreateFNeg(builder.CreateFDiv(builder.CreateFMul(scale, sx), h)), 1
     );
   }
+  // what of each of the primitive's corners each of a triangle's vertices has: its own corner's, or for a conservative
+  // rasterizer's triangle what conservative_triangle finds there
+  pvalue over_w[3][3], window_linear[3][3], grown[3] = {};
+  for (uint32_t u = 0; u < own.count; u++)
+    for (uint32_t k = 0; k < 3; k++)
+      over_w[u][k] = window_linear[u][k] = air.getFloat(u == k ? 1.0 : 0.0);
+  std::optional<ConservativeTriangle> triangle;
+  if (conservative && clip[0]) {
+    triangle = conservative_triangle(builder, air, types, clip, function->getArg(viewports_idx), viewport());
+    for (uint32_t u = 0; u < own.count; u++) {
+      for (uint32_t k = 0; k < 3; k++)
+        over_w[u][k] = triangle->over_w[u][k], window_linear[u][k] = triangle->linear[u][k];
+      grown[u] = triangle->position[u];
+    }
+  }
+  // vertex j's value of what the corners have, `bits` reads them
+  auto blend = [&](pvalue(&parts)[3][3], uint32_t j, auto &&bits) {
+    pvalue value = nullptr;
+    for (uint32_t k = 0; k < 3; k++) {
+      auto part = builder.CreateFMul(parts[j][k], real(bits(k)));
+      value = value ? builder.CreateFAdd(value, part) : part;
+    }
+    return value;
+  };
   // a quadrilateral's corners are its ends' to either side, the first end's two then the second's
-  for (uint32_t index = 0; index < corners; index++) {
-    auto vertex = builder.getInt32(index);
-    uint32_t corner = quads ? index / 2 : index;
-    if (auto p = position(corner)) {
-      if (quads) {
-        auto offset = builder.CreateFMul(half_width, builder.CreateVectorSplat(4, builder.CreateExtractElement(p, 3)));
-        p = index % 2 ? builder.CreateFSub(p, offset) : builder.CreateFAdd(p, offset);
+  for (uint32_t u = 0; u < corners; u++) {
+    auto vertex = builder.getInt32(u);
+    uint32_t corner = quads ? u / 2 : u;
+    if (clip[corner]) {
+      pvalue position = triangle ? grown[u] : clip[corner];
+      if (half_width) {
+        auto offset = builder.CreateFMul(half_width, builder.CreateVectorSplat(4, builder.CreateExtractElement(position, 3)));
+        position = u % 2 ? builder.CreateFSub(position, offset) : builder.CreateFAdd(position, offset);
       }
-      air.CreateSetMeshPosition(vertex, p);
+      air.CreateSetMeshPosition(vertex, position);
     }
     for (auto &v : varyings) {
-      auto value = component(corner, v.reg, v.component);
       bool integer = pVertexStage->register_types(v.reg, RegisterComponentType::Float)[v.component] != RegisterComponentType::Float;
+      bool flat = integer || (pso_data->flat_inputs >> v.reg & 1);
+      // a flat varying is the first corner's
+      auto value = component(triangle && flat ? 0 : corner, v.reg, v.component);
+      if (triangle && !flat) {
+        bool screen = pso_data->noperspective_inputs >> v.reg & 1;
+        air.CreateSetMeshVertexData(
+            vertex, builder.getInt32(v.index),
+            blend(screen ? window_linear : over_w, u, [&](uint32_t k) { return component(k, v.reg, v.component); })
+        );
+        continue;
+      }
       air.CreateSetMeshVertexData(vertex, builder.getInt32(v.index), integer ? value : real(value));
     }
     for (auto distance : llvm::enumerate(pVertexStage->clip_distance_scalars)) {
-      auto value = real(component(corner, distance.value().reg, distance.value().component));
+      auto &d = distance.value();
+      auto value = triangle ? blend(over_w, u, [&](uint32_t k) { return component(k, d.reg, d.component); })
+                            : real(component(corner, d.reg, d.component));
       if (clip_varyings)
         air.CreateSetMeshVertexData(vertex, varyings.size() + distance.index(), value);
       else
         air.CreateSetMeshClipDistance(vertex, builder.getInt32(distance.index()), value);
     }
+    if (triangle)
+      conservative_varyings(air, *triangle, u, vertex, conservative_at);
     if (own.count == 1)
       air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
   }
@@ -1365,7 +1791,7 @@ convert_pass_through_geometry_shader(
       air.CreateSetMeshViewportArrayIndex(builder.getInt32(i), viewport);
   }
   // culled by a distance that every vertex is behind: negative, or NaN
-  pvalue culled = builder.getFalse();
+  pvalue culled = triangle ? triangle->culled : builder.getFalse();
   for (auto &distance : pVertexStage->cull_distance_scalars) {
     pvalue behind = builder.getTrue();
     for (uint32_t corner = 0; corner < own.count; corner++)
@@ -1374,8 +1800,9 @@ convert_pass_through_geometry_shader(
       );
     culled = builder.CreateOr(culled, behind);
   }
-  for (uint32_t i = 0; pVertexStage->cull_distance_scalars.size() && i < primitives; i++)
-    air.CreateSetMeshPrimitiveCulled(builder.getInt32(i), culled);
+  if (pVertexStage->cull_distance_scalars.size() || conservative)
+    for (uint32_t i = 0; i < primitives; i++)
+      air.CreateSetMeshPrimitiveCulled(builder.getInt32(i), culled);
   builder.CreateStore(builder.getInt32(primitives), count);
   builder.CreateBr(done);
 

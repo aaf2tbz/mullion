@@ -203,6 +203,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     std::copy(variant.blend.begin(), variant.blend.end(), data.blend);
     data.depth_bounds = false;
     data.late_tests = false;
+    data.conservative = false;
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;

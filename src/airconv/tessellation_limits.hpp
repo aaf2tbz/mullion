@@ -1,6 +1,7 @@
 // what a tessellation pipeline's stages are sized for: how air_tessellation.metal cuts a patch of the largest factor
 #pragma once
 #include "DXBCParser/d3d12tokenizedprogramformat.hpp"
+#include "airconv_public.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -115,12 +116,25 @@ struct tess_pieces {
   uint32_t count, primitives;
 };
 
+// conservative rasterization (`conservative`) always shares a workload of triangles: each primitive is one triangle
+// of three vertices of its own, each with the conservative rasterizer's floats (SM50_CONSERVATIVE_VARYINGS,
+// SM50_CONSERVATIVE_RCP_W), and its corners' registers wait in threadgroup memory, 16 KB of it, for the triangles;
+// `primitives` 0 where not even one fits
+constexpr uint32_t conservative_stash_limit = 16384;
+
 inline tess_pieces
 tessellation_pieces(
     uint32_t factor, microsoft::D3D11_SB_TESSELLATOR_DOMAIN domain,
-    microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE primitive, uint32_t vertex_size
+    microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE primitive, uint32_t vertex_size, bool conservative = false
 ) {
   uint32_t corners = get_primitive_vertices(primitive), vertices = get_max_workload_vertices(factor, domain);
+  if (conservative && corners == 3) {
+    uint32_t grown = vertex_size + (SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * sizeof(float);
+    uint32_t triangles = std::min({256u / 3, 512u, conservative_stash_limit / (3 * std::max(vertex_size, 1u))});
+    while (triangles && mesh_size(3 * triangles, grown, triangles) > mesh_size_limit)
+      triangles--;
+    return {triangles ? (vertices + triangles - 1) / triangles : 0, triangles};
+  }
   // a point has its size too
   vertex_size += corners == 1 ? sizeof(float) : 0;
   if (mesh_size(vertices, vertex_size, vertices) <= mesh_size_limit)

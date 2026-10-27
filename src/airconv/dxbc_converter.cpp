@@ -513,6 +513,56 @@ blend_output(
   ir.CreateStore(result, at(ctx.types._float4, reg));
 }
 
+// whether a conservative rasterizer leaves out the pixel at `position`: its square, a unit wide, has no point in the
+// polygon with these window coordinates (SM50_CONSERVATIVE_VARYINGS). the separating axis test: the axes, then each
+// edge's normal; a repeated corner's edge of no length separates nothing. and whether the square is inside the polygon,
+// every edge having all of it (SV_InnerCoverage), which a polygon of no area has of no square: its edges go both ways
+static std::pair<llvm::Value *, llvm::Value *>
+conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Value *position, llvm::Value *const *window) {
+  using llvm::air::AIRBuilder;
+  auto f = [&](double v) { return air.getFloat(v); };
+  auto abs = [&](llvm::Value *v) { return air.CreateFPUnOp(AIRBuilder::fabs, v, false); };
+  auto min = [&](llvm::Value *l, llvm::Value *r) { return air.CreateFPBinOp(AIRBuilder::fmin, l, r, false); };
+  auto max = [&](llvm::Value *l, llvm::Value *r) { return air.CreateFPBinOp(AIRBuilder::fmax, l, r, false); };
+  // the pixel's center; a 256th of a pixel more than half a pixel around it, the uncertainty tier 2 has room for
+  const double half = 0.5 + 1.0 / 256;
+  const uint32_t n = SM50_CONSERVATIVE_CORNERS;
+  llvm::Value *center[2];
+  for (uint32_t axis = 0; axis < 2; axis++)
+    center[axis] = builder.CreateFAdd(
+        air.CreateFPUnOp(AIRBuilder::floor, builder.CreateExtractElement(position, axis), false), f(0.5)
+    );
+  auto x = [&](uint32_t k) { return window[2 * (k % n)]; };
+  auto y = [&](uint32_t k) { return window[2 * (k % n) + 1]; };
+  llvm::Value *outside = builder.getFalse();
+  for (uint32_t axis = 0; axis < 2; axis++) {
+    auto low = window[axis], high = window[axis];
+    for (uint32_t k = 1; k < n; k++)
+      low = min(low, window[2 * k + axis]), high = max(high, window[2 * k + axis]);
+    outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(center[axis], f(half)), low));
+    outside = builder.CreateOr(outside, builder.CreateFCmpOGT(builder.CreateFSub(center[axis], f(half)), high));
+  }
+  llvm::Value *area = f(0);
+  for (uint32_t k = 0; k < n; k++)
+    area = builder.CreateFAdd(
+        area, builder.CreateFSub(builder.CreateFMul(x(k), y(k + 1)), builder.CreateFMul(x(k + 1), y(k)))
+    );
+  auto inward = builder.CreateSelect(builder.CreateFCmpOGT(area, f(0)), f(1), f(-1));
+  llvm::Value *inside = builder.CreateFCmpONE(area, f(0));
+  for (uint32_t i = 0; i < n; i++) {
+    auto a = builder.CreateFMul(builder.CreateFSub(y(i), y(i + 1)), inward);
+    auto b = builder.CreateFMul(builder.CreateFSub(x(i + 1), x(i)), inward);
+    // the edge's value at the center, against its most at any point of the square
+    auto value = builder.CreateFAdd(
+        builder.CreateFMul(a, builder.CreateFSub(center[0], x(i))), builder.CreateFMul(b, builder.CreateFSub(center[1], y(i)))
+    );
+    auto reach = builder.CreateFMul(builder.CreateFAdd(abs(a), abs(b)), f(half));
+    outside = builder.CreateOr(outside, builder.CreateFCmpOLT(builder.CreateFAdd(value, reach), f(0)));
+    inside = builder.CreateAnd(inside, builder.CreateFCmpOGE(builder.CreateFSub(value, reach), f(0)));
+  }
+  return {outside, inside};
+}
+
 llvm::Error convert_dxbc_pixel_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   llvm::LLVMContext &context, llvm::Module &module,
@@ -685,6 +735,76 @@ llvm::Error convert_dxbc_pixel_shader(
     });
   }
 
+  // conservative rasterization: the pixel's position, and the triangle the mesh stage passes on; the inputs it
+  // interpolates over w, with that 1/w at each place they are interpolated (SM50_CONSERVATIVE_RCP_W), and the coverage,
+  // of every sample (or this one, when the shader runs per sample)
+  uint32_t conservative_position = ~0u, conservative_window[SM50_CONSERVATIVE_VARYINGS],
+           conservative_rcp_w[SM50_CONSERVATIVE_RCP_W], conservative_coverage = ~0u, conservative_sample = ~0u;
+  std::vector<std::pair<uint32_t, uint32_t>> conservative_over_w; // an input, and where it is interpolated
+  if (pso_data && pso_data->conservative) {
+    auto &inputs = func_signature.Inputs();
+    for (uint32_t i = 0; i < inputs.size(); i++) {
+      if (auto in = std::get_if<air::InputFragmentStageIn>(&inputs[i])) {
+        using air::Interpolation;
+        uint32_t at = in->pull_mode                                              ? 3
+                      : in->interpolation == Interpolation::center_perspective   ? 0
+                      : in->interpolation == Interpolation::centroid_perspective ? 1
+                      : in->interpolation == Interpolation::sample_perspective   ? 2
+                                                                                 : ~0u;
+        bool perspective = in->interpolation == Interpolation::center_perspective ||
+                           in->interpolation == Interpolation::centroid_perspective ||
+                           in->interpolation == Interpolation::sample_perspective;
+        if (~at && perspective)
+          conservative_over_w.push_back({i, at});
+      }
+      if (std::holds_alternative<air::InputInputCoverage>(inputs[i]))
+        conservative_coverage = i;
+      // the shader's own, not the one its counted runs take (`coverage` is defined with that one)
+      if (std::holds_alternative<air::InputSampleIndex>(inputs[i]) && !(i == sample && coverage != ~0u))
+        conservative_sample = i;
+    }
+    const air::Interpolation rcp_w_at[SM50_CONSERVATIVE_RCP_W] = {
+        air::Interpolation::center_no_perspective, air::Interpolation::centroid_no_perspective,
+        air::Interpolation::sample_no_perspective, air::Interpolation::center_perspective
+    };
+    // only the 1/w the inputs need, the center's for the position: an input at the sample runs the shader once a
+    // sample (MSL's sample_no_perspective), where D3D runs it once a pixel
+    bool needed[SM50_CONSERVATIVE_RCP_W] = {true};
+    for (auto [index, at] : conservative_over_w)
+      needed[at] = true;
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
+      if (needed[i])
+        conservative_rcp_w[i] = func_signature.DefineInput(air::InputFragmentStageIn{
+            .user = "mullion_conservative" + std::to_string(SM50_CONSERVATIVE_VARYINGS + i),
+            .type = air::msl_float,
+            .interpolation = rcp_w_at[i],
+            .pull_mode = i == 3
+        });
+    conservative_position =
+        func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+      conservative_window[i] = func_signature.DefineInput(air::InputFragmentStageIn{
+          .user = "mullion_conservative" + std::to_string(i),
+          .type = air::msl_float,
+          .interpolation = air::Interpolation::flat,
+          .pull_mode = false
+      });
+    // the depth, clamped to the viewport's range (D3D11.3 17.10): Metal clamps what a function that may discard
+    // interpolates past it wrongly, and what one writes as it should (probe-depth-clamp.m)
+    bool writes_depth = std::ranges::any_of(func_signature.Outputs(), [](auto &output) {
+      return std::holds_alternative<air::OutputDepth>(output);
+    });
+    if (!writes_depth && !pso_disable_depth_output && !func_signature.EarlyFragmentTests()) {
+      auto at = func_signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
+      epilogue >> [=](pvalue value) {
+        return make_irvalue([=](struct context ctx) {
+          auto position = ctx.function->getArg(conservative_position);
+          return ctx.builder.CreateInsertValue(value, ctx.builder.CreateExtractElement(position, uint64_t(2)), {at});
+        });
+      };
+    }
+  }
+
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -731,6 +851,56 @@ llvm::Error convert_dxbc_pixel_shader(
 
   setup_metal_version(module, metal_version);
   air.CenteredSamples = pso_data && pso_data->centered_samples;
+
+  std::vector<std::pair<llvm::Argument *, llvm::Value *>> conservative_inputs;
+  llvm::SmallPtrSet<llvm::Instruction *, 32> conservative_own;
+  if (conservative_position != ~0u) {
+    pvalue window[SM50_CONSERVATIVE_VARYINGS];
+    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+      window[i] = function->getArg(conservative_window[i]);
+    auto position = function->getArg(conservative_position);
+    // what reads the inputs gets them divided by the 1/w Metal interpolates with them, and the position's w over it
+    auto rcp_w = [&](uint32_t at) { return function->getArg(conservative_rcp_w[at]); };
+    for (auto [index, at] : conservative_over_w) {
+      auto input = function->getArg(index);
+      if (at == 3)
+        continue; // at each evaluation instead
+      auto vector = llvm::dyn_cast<llvm::FixedVectorType>(input->getType());
+      conservative_inputs.push_back(
+          {input, builder.CreateFDiv(
+                      input, vector ? builder.CreateVectorSplat(vector->getNumElements(), rcp_w(at)) : rcp_w(at)
+                  )}
+      );
+    }
+    conservative_inputs.push_back(
+        {position,
+         builder.CreateInsertElement(
+             position, builder.CreateFMul(builder.CreateExtractElement(position, uint64_t(3)), rcp_w(0)), uint64_t(3)
+         )}
+    );
+    // a covered pixel has all its samples (D3D11.3 15.17.5), where Metal gives a shader that writes memory, which it
+    // runs once a sample, that sample's alone
+    if (~conservative_coverage) {
+      auto all =
+          builder.CreateSub(builder.CreateShl(builder.getInt32(1), air.CreateGetNumSamples()), builder.getInt32(1));
+      conservative_inputs.push_back(
+          {function->getArg(conservative_coverage),
+           ~conservative_sample ? builder.CreateShl(builder.getInt32(1), function->getArg(conservative_sample)) : all}
+      );
+    }
+    auto [culled, inside] = conservative_overlap(builder, air, position, window);
+    resource_map.inner_coverage = builder.CreateZExt(inside, builder.getInt32Ty());
+    auto discard = llvm::BasicBlock::Create(context, "conservative_discard", function, epilogue_bb);
+    auto live = llvm::BasicBlock::Create(context, "conservative_live", function, epilogue_bb);
+    builder.CreateCondBr(culled, discard, live);
+    builder.SetInsertPoint(discard);
+    air.CreateDiscard();
+    builder.CreateBr(live);
+    builder.SetInsertPoint(live);
+    for (auto &block : *function)
+      for (auto &instruction : block)
+        conservative_own.insert(&instruction);
+  }
 
   // the covered samples whose distances are all at least 0, which NaN never is
   llvm::Value *kept = nullptr;
@@ -903,6 +1073,29 @@ llvm::Error convert_dxbc_pixel_shader(
     builder.CreateRetVoid();
   } else {
     builder.CreateRet(value);
+  }
+  // the shader reads the conservative rasterizer's inputs, and divides what it evaluates of one over w by 1/w's there
+  for (auto [input, value] : conservative_inputs)
+    input->replaceUsesWithIf(value, [&](llvm::Use &use) {
+      auto user = llvm::dyn_cast<llvm::Instruction>(use.getUser());
+      return user && !conservative_own.contains(user);
+    });
+  for (auto [index, at] : conservative_over_w) {
+    if (at != 3)
+      continue;
+    std::vector<llvm::CallInst *> evaluations;
+    for (auto user : function->getArg(index)->users())
+      if (auto call = llvm::dyn_cast<llvm::CallInst>(user);
+          call && call->getCalledFunction() && call->getCalledFunction()->getName().startswith("air.interpolate_"))
+        evaluations.push_back(call);
+    for (auto call : evaluations) {
+      auto rcp_w = llvm::cast<llvm::CallInst>(call->clone());
+      rcp_w->setArgOperand(0, function->getArg(conservative_rcp_w[3]));
+      rcp_w->insertAfter(call);
+      builder.SetInsertPoint(rcp_w->getNextNode());
+      auto divided = builder.CreateFDiv(call, rcp_w);
+      call->replaceUsesWithIf(divided, [&](llvm::Use &use) { return use.getUser() != divided; });
+    }
   }
   // the registers' allocas made after the clip and depth bounds tests split the entry block go back to it, where SROA
   // promotes them
@@ -1720,6 +1913,29 @@ AIRCONV_API int SM50Initialize(
     }
     pRefl->GroupsWorkTogether = sm50_shader->groups_work_together;
     pRefl->DeviceAtomics64 = sm50_shader->device_atomics64;
+    // a mesh shader's conservative triangles: its outputs wait in threadgroup memory, 16 KB of it, for a mesh of its
+    // triangles, three vertices each of its components and the conservative rasterizer's, each primitive its own
+    // and four words. a group too large for one mesh runs once for each, which one that writes resources cannot
+    pRefl->MeshMaxPrimitives = sm50_shader->mesh_max_primitives;
+    pRefl->MeshConservativeTriangles = 0;
+    if (sm50_shader->shader_type == microsoft::D3D12_SB_MESH_SHADER && !sm50_shader->mesh_lines) {
+      uint32_t components[2] = {};
+      for (uint32_t primitive = 0; primitive < 2; primitive++)
+        for (auto &e : sm50_shader->mesh_outputs[primitive])
+          components[primitive] += e.rows * e.cols;
+      uint32_t staged = sm50_shader->mesh_max_vertices * (components[0] + 1) * 4 +
+                        sm50_shader->mesh_max_primitives * (components[1] * 4 + 8);
+      uint32_t vertex_size = (components[0] + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4;
+      uint32_t triangles = staged <= mullion::dxbc::conservative_stash_limit
+                               ? std::min({256u / 3, 512u, std::max(sm50_shader->mesh_max_primitives, 1u)})
+                               : 0;
+      while (triangles && mullion::dxbc::mesh_size(3 * triangles, vertex_size, triangles * (4 + components[1])) >
+                              mullion::dxbc::mesh_size_limit)
+        triangles--;
+      if (sm50_shader->writes_resources && triangles < std::max(sm50_shader->mesh_max_primitives, 1u))
+        triangles = 0;
+      pRefl->MeshConservativeTriangles = triangles;
+    }
     if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER) {
       auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
       if (threads_per_patch > 32) {
@@ -1776,11 +1992,22 @@ AIRCONV_API int SM50Initialize(
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
+      // a grown triangle's vertex: the position, the varyings and the conservative rasterizer's, and clip distances;
+      // the triangle carries what Metal's primitives may, counted as four words. Metal has 256 vertices and 512
+      // primitives
+      uint32_t triangles = sm50_shader->gs_max_vertex_output >= 3 ? sm50_shader->gs_max_vertex_output - 2 : 0;
+      uint32_t vertex_size = sizeof(float[4]) +
+                             (sm50_shader->num_mesh_vertex_data + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4 +
+                             sm50_shader->clip_distance_scalars.size() * sizeof(float);
+      pRefl->GeometryShader.ConservativeFits =
+          sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && triangles &&
+          3 * triangles <= 256 && triangles <= 512 &&
+          mullion::dxbc::mesh_size(3 * triangles, vertex_size, triangles * 4) <= mullion::dxbc::mesh_size_limit;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
-      pRefl->PixelShader = {
-          sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0, sm50_shader->ps_has_coverage_input
-      };
+      pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0,
+                            sm50_shader->ps_has_coverage_input, sm50_shader->ps_flat_input_mask,
+                            sm50_shader->ps_noperspective_input_mask};
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;

@@ -397,8 +397,9 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds,
-             late] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
-      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds, late);
+             late, conservative] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds, late,
+           conservative);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -411,8 +412,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
-      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
-      hash(strip, cut, index, primitive, pass, statistics, clips, quads);
+      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads, conservative, flat, noperspective] =
+          *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
+      hash(strip, cut, index, primitive, pass, statistics, clips, quads, conservative, flat, noperspective);
       break;
     }
     case SM50_SHADER_GS_PASS_THROUGH: {
@@ -421,8 +423,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
-      auto &[next, type, factor, size, groups, geometry] = *(SM50_SHADER_PSO_TESSELLATOR_DATA *)arg;
-      hash(factor, size, groups, bool(geometry));
+      auto &[next, type, factor, size, groups, geometry, conservative, flat, noperspective] =
+          *(SM50_SHADER_PSO_TESSELLATOR_DATA *)arg;
+      hash(factor, size, groups, bool(geometry), conservative, flat, noperspective);
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:
@@ -444,8 +447,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
-      auto &[next, type, pixel] = *(SM50_SHADER_MESH_SHADER_DATA *)arg;
-      hash(bool(pixel));
+      auto &[next, type, pixel, conservative, amplified, triangles, slices, flat, noperspective] =
+          *(SM50_SHADER_MESH_SHADER_DATA *)arg;
+      hash(bool(pixel), conservative, amplified, triangles, slices, flat, noperspective);
       break;
     }
     default:
@@ -612,6 +616,9 @@ protected:
     uint32_t primitive; // D3D10_SB_PRIMITIVE of the topology type
     bool clip_distance_varyings;
     bool quad_lines;
+    // conservative rasterization, and how the pixel shader interpolates its inputs
+    bool conservative;
+    uint32_t flat_inputs, noperspective_inputs;
   };
   std::shared_ptr<GeometryInputs> topology_inputs_;
   // whether a pipeline's geometry shader can count pipeline statistics
@@ -651,6 +658,9 @@ protected:
     pso_gs.pipeline_statistics = statistics;
     pso_gs.clip_distance_varyings = in.clip_distance_varyings;
     pso_gs.quad_lines = in.quad_lines && pass_through && !counting;
+    pso_gs.conservative = in.conservative && !counting && (!in.gs.empty() || pass_through);
+    pso_gs.flat_inputs = in.flat_inputs;
+    pso_gs.noperspective_inputs = in.noperspective_inputs;
     so = in.so;
     so.counting = counting;
     so.elements = in.so_elements.data();
@@ -739,34 +749,86 @@ protected:
     return variant;
   }
 
-  // a fragment function of no outputs that discards the pixels of no sample in the depth bounds, and keeps the samples
-  // that are, as a pixel shader with SM50_SHADER_PSO_PIXEL_SHADER_DATA's depth_bounds does
+  // an object function for a conservative mesh shader without an amplification shader: each of its threadgroups, one
+  // thread for each of the D3D grid's groups, launches the group's `slices` mesh threadgroups and gives them its ID as
+  // the payload (SM50_SHADER_MESH_SHADER_DATA)
   WMT::Reference<WMT::Function>
-  DepthBoundsFragment() {
-    static const char source[] = R"(#include <metal_stdlib>
+  ConservativeObject(uint32_t slices) {
+    auto source = std::string(R"(#include <metal_stdlib>
 using namespace metal;
-struct Kept {
-  uint samples [[sample_mask]];
+struct Group {
+  uint3 id;
 };
-fragment Kept depth_bounds_fragment(float4 position [[position]], constant uint2 &bounds [[buffer(12)]],
-                                    device const uchar *samples [[buffer(13)]]) {
-  Kept kept{~0u};
-  if (!bounds.x)
-    return kept;
-  kept.samples = samples[uint(position.y) * bounds.y + uint(position.x)];
-  if (!kept.samples)
-    discard_fragment();
-  return kept;
+[[object]] void conservative_object(uint3 group [[threadgroup_position_in_grid]], object_data Group &payload [[payload]],
+                                    mesh_grid_properties grid) {
+  payload.id = group;
+  grid.set_threadgroups_per_grid(uint3()") + std::to_string(slices) + R"(, 1, 1));
 }
 )";
-    static_assert(SM50_BINDING_INDEX_DEPTH_BOUNDS == 12 && SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES == 13);
     WMT::Reference<WMT::Error> err;
-    auto library = device_->GetMTLDevice().newLibraryWithSource(std::string_view(source, sizeof(source) - 1), err);
+    auto library = device_->GetMTLDevice().newLibraryWithSource(source, err);
     if (!library) {
-      ERR("Failed to compile the depth bounds test's fragment function: ", err.description().getUTF8String());
+      ERR("Failed to compile the conservative rasterizer's object function: ", err.description().getUTF8String());
       return {};
     }
-    return library.newFunction("depth_bounds_fragment");
+    return library.newFunction("conservative_object");
+  }
+
+  // a fragment function for a pipeline without a pixel shader that does what a pixel shader would: discards the pixels
+  // whose squares miss the polygon the mesh stage passes on in SM50_CONSERVATIVE_VARYINGS, as airconv's conservative
+  // pixel shaders do, writing their depth; and of no sample in the depth bounds of a GPU without the test, keeping the
+  // samples that are, as SM50_SHADER_PSO_PIXEL_SHADER_DATA's depth_bounds does
+  WMT::Reference<WMT::Function>
+  TestFragment(bool conservative, bool bounds) {
+    auto corners = std::to_string(SM50_CONSERVATIVE_CORNERS);
+    std::string source = "#include <metal_stdlib>\nusing namespace metal;\nstruct In {\n  float4 position [[position]];\n";
+    for (uint32_t i = 0; conservative && i < SM50_CONSERVATIVE_VARYINGS; i++)
+      source += "  float v" + std::to_string(i) + " [[user(mullion_conservative" + std::to_string(i) + "), flat]];\n";
+    source += "};\nstruct Out {\n";
+    source += conservative ? "  float z [[depth(any)]];\n" : "";
+    source += bounds ? "  uint samples [[sample_mask]];\n" : "";
+    source += "};\nfragment Out test_fragment(In in [[stage_in]]";
+    if (bounds)
+      source += ", constant uint2 &bounds [[buffer(" + std::to_string(SM50_BINDING_INDEX_DEPTH_BOUNDS) +
+                ")]], device const uchar *samples [[buffer(" + std::to_string(SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES) + ")]]";
+    source += ") {\n  Out out;\n";
+    if (conservative) {
+      source += "  float2 v[] = {";
+      for (uint32_t k = 0; k < SM50_CONSERVATIVE_CORNERS; k++)
+        source += "{in.v" + std::to_string(2 * k) + ", in.v" + std::to_string(2 * k + 1) + "}, ";
+      source += R"(};
+  const float half_pixel = 0.5 + 1.0 / 256;
+  float2 center = floor(in.position.xy) + 0.5, low = v[0], high = v[0];
+  float area = 0;
+  for (int k = 0; k < )" + corners + R"(; k++) {
+    float2 a = v[k], b = v[(k + 1) % )" + corners + R"(];
+    low = min(low, a), high = max(high, a), area += a.x * b.y - b.x * a.y;
+  }
+  bool outside = any(center + half_pixel < low) || any(center - half_pixel > high);
+  float inward = area > 0 ? 1 : -1;
+  for (int k = 0; k < )" + corners + R"(; k++) {
+    float2 a = v[k], b = v[(k + 1) % )" + corners + R"(];
+    float2 n = float2(a.y - b.y, b.x - a.x) * inward;
+    outside |= dot(n, center - a) + (abs(n.x) + abs(n.y)) * half_pixel < 0;
+  }
+  if (outside)
+    discard_fragment();
+  out.z = in.position.z;
+)";
+    }
+    if (bounds)
+      source += R"(  out.samples = bounds.x ? samples[uint(in.position.y) * bounds.y + uint(in.position.x)] : ~0u;
+  if (!out.samples)
+    discard_fragment();
+)";
+    source += "  return out;\n}\n";
+    WMT::Reference<WMT::Error> err;
+    auto library = device_->GetMTLDevice().newLibraryWithSource(source, err);
+    if (!library) {
+      ERR("Failed to compile the fragment function of a pipeline without a pixel shader: ", err.description().getUTF8String());
+      return {};
+    }
+    return library.newFunction("test_fragment");
   }
 
 public:
@@ -1143,11 +1205,47 @@ public:
     // without a geometry shader streams out of the object stage
     vertex_registers = mesh_shader ? 0 : ref_vs.NumOutputElement;
     bool plain = !mesh_shader && !tessellation && !pDesc->GS.pShaderBytecode;
+    // conservative rasterization dilates a vertex shader's triangles in the mesh stage, which passes them on
+    // (D3D12_CONSERVATIVE_RASTERIZATION_TIER_1); it does not apply to points and lines (D3D11.3 15.17)
+    bool requested = pDesc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+    conservative = requested && (!plain || pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    // a geometry shader's triangles are grown where it emits them, when they fit a mesh; a domain shader's
+    // triangles in pieces of their workloads, when one of its triangles fits one; after a mesh shader, or where they
+    // do not fit, those triangles rasterize as usual for now
+    bool geometry_grows = !mesh_shader && pDesc->GS.pShaderBytecode && ref_gs.GeometryShader.ConservativeFits;
+    // a mesh shader's triangles in slices of its groups' (SM50_SHADER_MESH_SHADER_DATA), when its outputs fit, in one
+    // slice where the shader writes resources
+    bool mesh_grows = mesh_shader && ref_ms.MeshConservativeTriangles;
+    auto tessellated = microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(tessellation ? ref_hs.Tessellator.OutputPrimitive : 0);
+    bool domain_grows = tessellation && !pDesc->GS.pShaderBytecode &&
+                        (tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
+                         tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW) &&
+                        dxbc::tessellation_pieces(
+                            1, microsoft::D3D11_SB_TESSELLATOR_DOMAIN(ref_hs.Tessellator.Domain), tessellated,
+                            ref_ds.PostTessellator.MeshVertexSize, true
+                        ).primitives;
+    // points and lines rasterize as usual, a geometry shader's or a tessellator's too
+    bool triangles = mesh_shader                ? true
+                     : pDesc->GS.pShaderBytecode ? ref_gs.GeometryShader.ConservativeFits
+                     : tessellation          ? tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
+                                         tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW
+                                             : true;
+    if (conservative && !plain && !triangles)
+      conservative = false;
+    if (conservative && !plain && !geometry_grows && !domain_grows && !mesh_grows) {
+      static std::once_flag warned;
+      std::call_once(warned, [] {
+        WARN("CreatePipelineState: conservative rasterization of primitives too large to grow, or after a mesh shader "
+             "that writes resources, is not implemented yet; those pipelines rasterize as usual");
+      });
+      conservative = false;
+    }
     // and passes lines on as quadrilaterals (D3D11.3 15.14.1, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
     bool quad_lines =
         plain && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE && pDesc->RasterizerState.MultisampleEnable;
     bool pass_through = plain && pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
-                        (ref_vs.CullDistances || (stream_output && so_data.rasterized_stream == 0) || quad_lines);
+                        (ref_vs.CullDistances || (stream_output && so_data.rasterized_stream == 0) || quad_lines ||
+                         conservative);
     geometry_shader |= pass_through;
     mesh_instances = sm50_shader_t(shader_gs) ? gs_instances : pass_through;
     adjacency = plain && (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
@@ -1159,8 +1257,10 @@ public:
       return hr;
     // a pixel shader whose runs are seen tests the last pre-raster stage's clip distances itself (D3D11.3 15.4.1),
     // where Metal would cut the primitive and run a pixel on the cut once for each piece. a geometry shader after
-    // tessellation still clips in Metal
+    // tessellation still clips in Metal, and so does a conservative rasterizer's grown triangle, whose varyings are
+    // linear in the window
     uint32_t clips = pDesc->PS.pShaderBytecode && !mesh_shader && !(tessellation && pDesc->GS.pShaderBytecode) &&
+                             !conservative &&
                              (ref_ps.UAVSlotMask || ref_ps.PixelShader.HasCoverageInput)
                          ? (pDesc->GS.pShaderBytecode ? ref_gs : tessellation ? ref_ds : ref_vs).ClipDistances
                          : 0;
@@ -1236,6 +1336,7 @@ public:
           data_ps.single_raster_sample || pDesc->SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN;
       data_ps.depth_bounds = depth_bounds_emulated;
       data_ps.late_tests = false;
+      data_ps.conservative = conservative;
 
       std::array<WMTPixelFormat, std::size(data_ps.pixel_formats)> formats{};
       for (unsigned i = 0; i < pDesc->NumRenderTargets; i++)
@@ -1273,8 +1374,8 @@ public:
           };
     }
 
-    // without a pixel shader, one that only tests the depth bounds of a GPU without the test
-    if (depth_bounds_emulated && !ps_func && !(ps_func = DepthBoundsFragment()))
+    // without a pixel shader, one that only does the tests a pixel shader would
+    if ((conservative || depth_bounds_emulated) && !ps_func && !(ps_func = TestFragment(conservative, depth_bounds_emulated)))
       return E_FAIL;
 
     auto geometry_inputs = [&] {
@@ -1294,6 +1395,9 @@ public:
       in->quad_lines = quad_lines;
       in->strip_cut = pDesc->IBStripCutValue;
       in->primitive = pDesc->PrimitiveTopologyType;
+      in->conservative = conservative;
+      in->flat_inputs = ps_func ? ref_ps.PixelShader.FlatInputs : 0;
+      in->noperspective_inputs = ps_func ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
       WMT::InitializeMeshRenderPipelineInfo(in->info);
       bool dual_source = false;
       SM50_SHADER_BLEND blend[8] = {};
@@ -1310,11 +1414,25 @@ public:
       };
       // the mesh shader names its outputs as the pixel shader's inputs
       SM50_SHADER_MESH_SHADER_DATA link{&common, SM50_SHADER_MESH_SHADER, pDesc->PS.pShaderBytecode};
+      if (conservative) {
+        link.conservative = true;
+        link.amplified = AS.pShaderBytecode;
+        link.triangles = ref_ms.MeshConservativeTriangles;
+        link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.triangles - 1) / link.triangles;
+        link.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
+        link.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
+      }
+      // the amplification shader asks for a conservative mesh shader's slices
+      SM50_SHADER_MESH_SHADER_DATA amplified = link;
+      amplified.pixel_shader_bytecode = nullptr;
       WMT::Reference<WMT::Function> as_func, ms_func = compile(shader_ms, MS, &link, "ms_main", pDesc->PS);
-      if (!ms_func || (AS.pShaderBytecode && !(as_func = compile(shader_as, AS, &common, "as_main")))) {
+      if (!ms_func ||
+          (AS.pShaderBytecode && !(as_func = compile(shader_as, AS, conservative ? (void *)&amplified : &common, "as_main")))) {
         DumpShaders({AS, MS});
         return FAIL(E_INVALIDARG);
       }
+      if (conservative && !AS.pShaderBytecode && !(as_func = ConservativeObject(link.slices)))
+        return E_FAIL;
       mesh_info.object_function = as_func.handle;
       mesh_info.mesh_function = ms_func.handle;
       mesh_info.fragment_function = ps_func.handle;
@@ -1368,6 +1486,9 @@ public:
       pso_tess.max_potential_tess_factor = D3D12_TESSELLATOR_MAX_TESSELLATION_FACTOR;
       pso_tess.mesh_vertex_size = ref_ds.PostTessellator.MeshVertexSize;
       pso_tess.geometry = shader_gs;
+      pso_tess.conservative = conservative;
+      pso_tess.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
+      pso_tess.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
       pso_tess.next = &clip_data;
       mesh_info.fragment_function = ps_func.handle;
       mesh_info.rasterization_enabled = true;
@@ -1390,7 +1511,7 @@ public:
                                           : dxbc::tessellation_pieces(
                                                 factor, domain,
                                                 microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(ref_hs.Tessellator.OutputPrimitive),
-                                                pso_tess.mesh_vertex_size
+                                                pso_tess.mesh_vertex_size, pso_tess.conservative
                                             ).count,
                                  geometry ? ref_gs.GeometryShader.InstanceCount : 1, pso_tess.max_mesh_threadgroups
         ).parts;
