@@ -192,23 +192,79 @@ def footprint(group):
 # short of it, and the lock that picks that one
 RUNNING = set()
 PRESSED = threading.Lock()
+# the most memory each test took when it last ran on this machine, by what it runs as (measured)
+PEAKS = Path.home() / "Library" / "Caches" / "Mullion" / "test-peaks.json"
+# the tests running now and the memory each may take, None for one never measured; `lone` counts the tests never
+# measured that wait to run alone, before which no other starts
+ADMITTED = threading.Condition()
+ADMITTED.reserved, ADMITTED.lone = {}, 0
+
+
+def available():
+    """the memory the kernel counts free (memory_pressure(1) gives its percentage) above the share at which it leaves
+    the normal pressure level"""
+    level, threshold, total = map(int, subprocess.run(
+        ["sysctl", "-n", "kern.memorystatus_level", "kern.vm_pressure_level_transition_threshold", "hw.memsize"],
+        capture_output=True, text=True).stdout.split())
+    return total * (level - threshold) // 100
+
+
+def measured(command, env):
+    """what a test runs as in PEAKS: its program, its arguments and the settings that change what memory it takes"""
+    return " ".join([*(Path(part).name for part in command),
+                     *(f"{name}={env[name]}" for name in ("MULLION_GPU_FAMILY", "MULLION_D3D12_METAL4", "MTL_DEBUG_LAYER")
+                       if name in env)])
+
+
+def peaks():
+    try:
+        return json.loads(PEAKS.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def admitted(peak):
+    """whether a test that took `peak` may start beside the tests running: the free memory holds it and what those may
+    still grow by to their own peaks, with the machine at the normal pressure level after. a test never measured starts
+    alone, and nothing starts beside it or before it; one alone starts whatever it took"""
+    reserved = ADMITTED.reserved
+    if peak is None:
+        return not reserved
+    if ADMITTED.lone or None in reserved.values():
+        return False
+    return not reserved or available() >= peak + sum(max(0, taken - footprint(group)) for group, taken in reserved.items())
 
 
 def finish(command, env, seconds, log):
-    """runs the command with its output in the log: its exit status, or None when it outlived its time. nothing
-    starts on a machine short of memory (the kernel's pressure level, 1 when normal): a GPU test there can take the
-    machine down with it, and so can tests that grow together after they started. the test waits for the memory, up
-    to PATIENCE seconds, and not while it has the machine's lock; once the machine is short of it, the running test
-    that holds the most ends, and fails with that said"""
-    for waited in range(0, PATIENCE + 1, 10):
+    """runs the command with its output in the log: its exit status, or None when it outlived its time. a GPU test on
+    a machine short of memory can take the machine down with it, and so can tests that grow together after they
+    started: a test starts only where the free memory holds the most it took when it last ran here (PEAKS) beside
+    what the tests running may still grow by, and one never measured runs alone. nothing starts at a pressure level
+    above normal (the kernel's, 1 when normal), and the test waits for that up to PATIENCE seconds, not while it has
+    the machine's lock; once the machine is short of memory all the same, the running test that holds the most ends,
+    and fails with that said"""
+    key = measured(command, env)
+    peak = peaks().get(key)
+    with ADMITTED:
+        ADMITTED.lone += peak is None
+    pressed = 0
+    while True:
         with alone():
-            if pressure() == 1:
-                with open(log, "wb") as out:
+            with ADMITTED:
+                calm = pressure() == 1
+                start = calm and admitted(peak)
+                if start:
+                    ADMITTED.lone -= peak is None
+                    out = open(log, "wb")
                     end = time.monotonic() + seconds
                     process = subprocess.Popen(
                         command, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
                     )
+                    ADMITTED.reserved[process.pid] = peak
+            if start:
+                with out:
                     RUNNING.add(process.pid)
+                    taken = 0
                     # the test and what it started, which nothing else is in the session of, do not outlive their time
                     # or this runner: a test left behind would use the GPU without the lock
                     try:
@@ -218,6 +274,7 @@ def finish(command, env, seconds, log):
                             try:
                                 return process.wait(1)
                             except subprocess.TimeoutExpired:
+                                taken = max(taken, footprint(process.pid))
                                 level = pressure()
                                 if level > 1:
                                     with PRESSED:
@@ -238,8 +295,22 @@ def finish(command, env, seconds, log):
                         if process.poll() is None:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
-        time.sleep(10)
-    sys.exit(f"memory pressure level {pressure()} for {PATIENCE} s: no test started")
+                        with ADMITTED:
+                            del ADMITTED.reserved[process.pid]
+                            # a test of a second or less is not sampled, and its memory is held as little as that
+                            known = peaks()
+                            known[key] = max(known.get(key, 0), taken)
+                            PEAKS.parent.mkdir(parents=True, exist_ok=True)
+                            PEAKS.with_suffix(f".{os.getpid()}").write_text(json.dumps(known, indent=0, sort_keys=True))
+                            PEAKS.with_suffix(f".{os.getpid()}").replace(PEAKS)
+                            ADMITTED.notify_all()
+        pressed += 10 * (not calm)
+        if pressed > PATIENCE:
+            with ADMITTED:
+                ADMITTED.lone -= peak is None
+            sys.exit(f"memory pressure level {pressure()} for {PATIENCE} s: no test started")
+        with ADMITTED:
+            ADMITTED.wait(10)
 
 
 def compiler(builds):
