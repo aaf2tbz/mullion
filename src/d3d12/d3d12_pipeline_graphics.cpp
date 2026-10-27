@@ -30,6 +30,7 @@
 #include "util_env.hpp"
 #include <span>
 #include <fstream>
+#include <mutex>
 #include <array>
 #include <unordered_set>
 #include <variant>
@@ -238,12 +239,21 @@ MTLD3D12PipelineState::DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> 
   static const auto dir = env::getEnvVar("MULLION_SHADER_DUMP_PATH");
   if (dir.empty())
     return;
+  // a shader shared by many pipelines is written once
+  static std::mutex mutex;
+  static std::unordered_set<std::string> written;
   for (auto &Shader : Shaders) {
     if (!Shader.pShaderBytecode)
       continue;
-    auto path = dir + "\\" + Sha1HashState::compute(Shader.pShaderBytecode, Shader.BytecodeLength).string() + ".dxbc";
+    auto hash = Sha1HashState::compute(Shader.pShaderBytecode, Shader.BytecodeLength).string();
+    {
+      std::lock_guard lock(mutex);
+      if (!written.insert(hash).second)
+        continue;
+    }
+    auto path = dir + "\\" + hash + ".dxbc";
     std::ofstream(path, std::ios::binary).write((const char *)Shader.pShaderBytecode, Shader.BytecodeLength);
-    ERR("Dumped shader ", path);
+    DEBUG("Dumped shader ", path);
   }
 }
 
@@ -252,7 +262,8 @@ MTLD3D12PipelineState::Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders
   for (auto &Shader : Shaders)
     if (Shader.pShaderBytecode)
       name += Sha1HashState::compute(Shader.pShaderBytecode, Shader.BytecodeLength).string() + " ";
-  if (Logger::logLevel() == LogLevel::Trace)
+  static const bool dump_all = env::getEnvVar("MULLION_SHADER_DUMP_ALL") == "1";
+  if (dump_all || Logger::logLevel() == LogLevel::Trace)
     DumpShaders(Shaders);
 }
 

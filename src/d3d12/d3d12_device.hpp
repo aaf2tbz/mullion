@@ -280,6 +280,9 @@ class MTLD3D12Heap : public ID3D12Heap {
 public:
   WMT::Reference<WMT::Heap> heap;
   std::shared_ptr<void> memory;
+  // a heap of textures alone that the CPU never reaches is private, as its textures then are (Metal places only
+  // resources of the heap's storage mode)
+  bool private_storage = false;
 };
 
 struct Reached {
@@ -432,8 +435,9 @@ public:
   // writes shaders that failed to compile to MULLION_SHADER_DUMP_PATH, when set, as <sha1>.dxbc for airconv's CLI
   static void DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
 
-  // the SHA-1 of each of its shaders, which is what logs call the pipeline. with MULLION_LOG_LEVEL=trace every shader
-  // is also written as DumpShaders writes them, so that a pass a log names can be looked at
+  // the SHA-1 of each of its shaders, which is what logs call the pipeline. with MULLION_LOG_LEVEL=trace or
+  // MULLION_SHADER_DUMP_ALL=1 every shader is also written as DumpShaders writes them, so that a pass a log or a
+  // profile names can be looked at
   std::string name;
   void Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders);
 };
@@ -600,7 +604,9 @@ public:
 
   virtual HRESULT UnregisterResidencyAndVA(BufferAllocation *allocation) = 0;
 
-  virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
+  // pEnd, when given, is where the addresses that find the same buffer end: its end, or the next buffer's start
+  virtual BufferAllocation *
+  LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pEnd = nullptr) = 0;
 
   virtual void UpdateSparseBufferMappings(
       BufferAllocation *buffer, const std::vector<WMTSparseBufferMapping> &ranges

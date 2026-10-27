@@ -597,6 +597,10 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::getComputePipeline(std::stri
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startComputePass() {
+  if (ctx.share_compute_ && ctx.encoder_current && ctx.encoder_current->type == EncoderType::Compute) {
+    ctx.OrderDispatches();
+    return;
+  }
   ctx.InvalidateCurrentPass();
   auto compute = ctx.AllocatePass<ComputeEncoderData>();
   compute->type = EncoderType::Compute;
@@ -608,6 +612,10 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startComputePass() {
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::endPass() {
+  if (ctx.share_compute_ && ctx.encoder_current && ctx.encoder_current->type == EncoderType::Compute) {
+    ctx.OrderDispatches();
+    return;
+  }
   ctx.InvalidateCurrentPass();
 }
 

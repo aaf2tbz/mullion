@@ -306,7 +306,7 @@ public:
       Flags<TextureAllocationFlag> flags = {};
       // a committed texture the CPU never reaches is private: Metal keeps its contents compressed from the start, where
       // a shared texture is so only once the GPU writes it (a placed texture has its heap's storage mode)
-      if (!pHeap && !pTexture && !IsCpuVisibleHeap(pHeapProps))
+      if ((!pHeap && !pTexture && !IsCpuVisibleHeap(pHeapProps)) || (pHeap && pHeap->private_storage))
         flags.set(TextureAllocationFlag::CpuInvisible);
       if (Reserved) {
         if (planes > 1)
