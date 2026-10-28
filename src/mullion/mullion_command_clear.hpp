@@ -21,6 +21,7 @@
 #include "mullion_command_constants.hpp"
 #include "mullion_command_context.hpp"
 #include "mullion_format.hpp"
+#include <bit>
 
 namespace mullion {
 
@@ -38,6 +39,9 @@ public:
     CREATE_COMPUTE_PIPELINE(cs_clear_texture2d_array_float);
     CREATE_COMPUTE_PIPELINE(cs_clear_texture3d_uint);
     CREATE_COMPUTE_PIPELINE(cs_clear_texture3d_float);
+    CREATE_COMPUTE_PIPELINE(cs_clear_texture2d_half);
+    CREATE_COMPUTE_PIPELINE(cs_clear_texture2d_array_half);
+    CREATE_COMPUTE_PIPELINE(cs_clear_texture3d_half);
 #undef CREATE_COMPUTE_PIPELINE
   }
 
@@ -82,18 +86,27 @@ public:
 
   void
   begin(const std::array<uint32_t, 4> &color, Texture *texture, TextureViewKey view) {
-
-    clearing_texture_ = texture;
-    clearing_view_ = view;
-    ctx_.startComputePass();
-
     auto view_format = texture->pixelFormat(view);
     auto uint_format = MTLGetUnsignedIntegerFormat(view_format);
     if (view_format == WMTPixelFormatRG11B10Float || view_format == WMTPixelFormatRGB9E5Float) {
       uint_format = WMTPixelFormatR32Uint;
     }
+    // a texture made without Metal's format view has no integer view (d3d12_texture.cpp, PopulateWMTTextureInfo)
+    auto write = view_format == uint_format || (texture->usage() & WMTTextureUsagePixelFormatView)
+                     ? UIntClearWrite::IntegerView : GetUIntClearWrite(view_format);
+    if (write == UIntClearWrite::Unorm || write == UIntClearWrite::Float) {
+      auto ones = clearColor(std::array<uint32_t, 4>{~0u, ~0u, ~0u, ~0u}, view_format);
+      std::array<float, 4> values;
+      for (unsigned i = 0; i < 4; i++)
+        values[i] = write == UIntClearWrite::Float ? std::bit_cast<float>(color[i]) : float(color[i] & ones[i]) / ones[i];
+      return begin(values, texture, view);
+    }
 
-    if (view_format != uint_format) {
+    clearing_texture_ = texture;
+    clearing_view_ = view;
+    ctx_.startComputePass();
+
+    if (write == UIntClearWrite::IntegerView && view_format != uint_format) {
       clearing_view_ = texture->checkViewUseFormat(clearing_view_, uint_format);
     }
 
@@ -121,10 +134,16 @@ public:
       break;
     }
 
-    ctx_.setComputePSO(
-        is_3d ? cs_clear_texture3d_uint_ : (is_array ? cs_clear_texture2d_array_uint_ : cs_clear_texture2d_uint_),
-        {32, 1, 1}
-    );
+    if (write == UIntClearWrite::Half)
+      ctx_.setComputePSO(
+          is_3d ? cs_clear_texture3d_half_ : (is_array ? cs_clear_texture2d_array_half_ : cs_clear_texture2d_half_),
+          {32, 1, 1}
+      );
+    else
+      ctx_.setComputePSO(
+          is_3d ? cs_clear_texture3d_uint_ : (is_array ? cs_clear_texture2d_array_uint_ : cs_clear_texture2d_uint_),
+          {32, 1, 1}
+      );
   }
 
   void
@@ -363,6 +382,9 @@ private:
   WMT::Reference<WMT::ComputePipelineState> cs_clear_tbuffer_float_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_uint_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_half_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_half_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_texture3d_half_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_uint_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_float_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture3d_uint_;

@@ -150,13 +150,21 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
 
   WMTTextureUsage Usage = ORIGINAL_FORMAT(InfoOut.pixel_format) == WMTPixelFormatDepth32Float_Stencil8
                               ? WMTTextureUsagePixelFormatView : WMTTextureUsageUnknown;
-  if ((Format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_EMULATED_RGB32)) ||
-      CastsAcrossLayouts(Device->GetMTLDevice(), Desc.Format, true))
+  // a view in another layout needs Metal's format view, which takes the texture's lossless compression: only a format
+  // D3D12 lets a view cast across layouts gets one (its typeless family, or Relaxed Format Casting's), and never a
+  // depth texture, which every view reads as itself
+  if ((Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) ||
+      (!DepthStencilPlanarFlags(WMTPixelFormat(ORIGINAL_FORMAT(InfoOut.pixel_format))) &&
+       CastsAcrossLayouts(Device->GetMTLDevice(), Desc.Format, !(Format.Flag & MTL_DXGI_FORMAT_TYPELESS))))
     Usage |= WMTTextureUsagePixelFormatView;
   if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
-    Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
+    Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    // and so does a uint clear of a format whose values cannot hold all its bit patterns (GetUIntClearWrite)
+    auto pixel = WMTPixelFormat(ORIGINAL_FORMAT(InfoOut.pixel_format));
+    if (GetUIntClearWrite(pixel) == UIntClearWrite::IntegerView && MTLGetUnsignedIntegerFormat(pixel) != pixel)
+      Usage |= WMTTextureUsagePixelFormatView;
     // Metal runs a shader's atomic functions only on a texture made for them
     if (any_bit_set(Device->GetMTLPixelFormatCapability(InfoOut.pixel_format) & FormatCapability::Atomic))
       Usage |= WMTTextureUsageShaderAtomic;
