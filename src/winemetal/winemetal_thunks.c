@@ -101,6 +101,8 @@ flight_ticks(void) {
 #endif
 }
 static const void *flight_exception_site;
+// the registers of a thread whose exception dumps, four to a record (x86_64 and ARM64EC)
+static const void *flight_registers_site[4];
 
 WINEMETAL_API const void *
 WMTFlightSite(const char *format) {
@@ -201,32 +203,85 @@ WMTFlightDump(const char *reason) {
   ReleaseSRWLockExclusive(&flight_dump_lock);
 }
 
-// "exception in <module>+<offset>", for the dump's heading: the records give only an address, and a module the
-// loader relocated could be any of them
+// the dump's heading: what fits of `text` after what it has. a heading has no commas (it ends at the first)
 static void
-flight_exception_reason(char *reason, size_t size, const void *address) {
-  HMODULE module;
-  char path[MAX_PATH], offset[20] = "+0x";
-  strcpy(reason, "exception");
-  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          address, &module))
-    return;
-  DWORD length = GetModuleFileNameA(module, path, sizeof(path));
-  if (!length || length >= sizeof(path))
-    return;
-  const char *name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
-  uint64_t value = (uintptr_t)address - (uintptr_t)module;
-  char digits[17];
+reason_append(char *reason, size_t size, const char *text) {
+  size_t used = strlen(reason), more = strlen(text);
+  if (used + more < size)
+    memcpy(reason + used, text, more + 1);
+}
+
+static void
+reason_hex(char *reason, size_t size, uint64_t value) {
+  char text[19] = "0x", digits[16];
   int count = 0;
   do
     digits[count++] = "0123456789abcdef"[value & 15];
   while ((value >>= 4) && count < 16);
   for (int i = 0; i < count; i++)
-    offset[3 + i] = digits[count - 1 - i];
-  offset[3 + count] = 0;
-  if (strlen("exception in ") + strlen(name) + strlen(offset) >= size)
+    text[2 + i] = digits[count - 1 - i];
+  text[2 + count] = 0;
+  reason_append(reason, size, text);
+}
+
+// "<module>+<offset>" of an address in a loaded module; FALSE when no module holds it
+static BOOL
+reason_module(char *reason, size_t size, const void *address) {
+  HMODULE module;
+  char path[MAX_PATH];
+  // the first 64 KB never hold code, and a null address would name the executable
+  if ((uintptr_t)address < 0x10000)
+    return FALSE;
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          address, &module))
+    return FALSE;
+  DWORD length = GetModuleFileNameA(module, path, sizeof(path));
+  if (!length || length >= sizeof(path))
+    return FALSE;
+  reason_append(reason, size, strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path);
+  reason_append(reason, size, "+");
+  reason_hex(reason, size, (uintptr_t)address - (uintptr_t)module);
+  return TRUE;
+}
+
+// the dump's heading: "exception in <module>+<offset>", as the records give only an address and a module the loader
+// relocated could be any of them. code no module holds (a JIT's, an unpacker's) is named by its memory, and by the
+// modules of the return addresses on its stack, which say who called into it
+static void
+flight_exception_reason(char *reason, size_t size, const void *address, const CONTEXT *context) {
+  MEMORY_BASIC_INFORMATION memory;
+  strcpy(reason, "exception in ");
+  if (reason_module(reason, size, address))
     return;
-  strcat(strcat(strcpy(reason, "exception in "), name), offset);
+  if (!VirtualQuery(address, &memory, sizeof(memory))) {
+    strcpy(reason, "exception");
+    return;
+  }
+  reason_append(reason, size, "memory ");
+  reason_hex(reason, size, (uintptr_t)memory.AllocationBase);
+  reason_append(reason, size, "+");
+  reason_hex(reason, size, (uintptr_t)address - (uintptr_t)memory.AllocationBase);
+  reason_append(reason, size, " type ");
+  reason_hex(reason, size, memory.Type);
+  reason_append(reason, size, " protect ");
+  reason_hex(reason, size, memory.Protect);
+#if defined(__x86_64__) || defined(__arm64ec__)
+  MEMORY_BASIC_INFORMATION stack;
+  if (!VirtualQuery((const void *)context->Rsp, &stack, sizeof(stack)) || stack.State != MEM_COMMIT)
+    return;
+  const uint64_t *at = (const uint64_t *)(context->Rsp & ~7ull);
+  const uint64_t *end = (const uint64_t *)((uintptr_t)stack.BaseAddress + stack.RegionSize);
+  if (end - at > 8192)
+    end = at + 8192;
+  for (int found = 0; at < end && found < 8; at++) {
+    size_t used = strlen(reason);
+    reason_append(reason, size, " from ");
+    if (reason_module(reason, size, (const void *)(uintptr_t)*at))
+      found++;
+    else
+      reason[used] = 0;
+  }
+#endif
 }
 
 // the exceptions that end a process unless it catches them: the first dumps the records before its handlers run
@@ -249,8 +304,16 @@ flight_exception(EXCEPTION_POINTERS *pointers) {
   case EXCEPTION_INT_DIVIDE_BY_ZERO:
   case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
     if (!InterlockedExchange(&dumped, 1)) {
-      char reason[MAX_PATH + 32];
-      flight_exception_reason(reason, sizeof(reason), record->ExceptionAddress);
+#if defined(__x86_64__) || defined(__arm64ec__)
+      // the faulting thread's registers: what pointer it held when it faulted
+      const CONTEXT *context = pointers->ContextRecord;
+      WMTFlightRecord(flight_registers_site[0], context->Rip, context->Rsp, context->Rbp, context->Rax);
+      WMTFlightRecord(flight_registers_site[1], context->Rbx, context->Rcx, context->Rdx, context->Rsi);
+      WMTFlightRecord(flight_registers_site[2], context->Rdi, context->R8, context->R9, context->R10);
+      WMTFlightRecord(flight_registers_site[3], context->R11, context->R12, context->R13, context->R14);
+#endif
+      char reason[1024];
+      flight_exception_reason(reason, sizeof(reason), record->ExceptionAddress, pointers->ContextRecord);
       WMTFlightDump(reason);
     }
   }
@@ -268,6 +331,10 @@ wmt_flight_main(DWORD reason, BOOL exiting) {
     flight_started = flight_ticks();
     flight_started_qpc = started.QuadPart;
     flight_exception_site = WMTFlightSite("exception %#llx at %#llx, information %#llx %#llx");
+    flight_registers_site[0] = WMTFlightSite("registers rip %#llx rsp %#llx rbp %#llx rax %#llx");
+    flight_registers_site[1] = WMTFlightSite("registers rbx %#llx rcx %#llx rdx %#llx rsi %#llx");
+    flight_registers_site[2] = WMTFlightSite("registers rdi %#llx r8 %#llx r9 %#llx r10 %#llx");
+    flight_registers_site[3] = WMTFlightSite("registers r11 %#llx r12 %#llx r13 %#llx r14 %#llx");
     AddVectoredExceptionHandler(1, flight_exception);
     break;
   case DLL_THREAD_DETACH: {
