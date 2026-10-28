@@ -347,13 +347,14 @@ public:
     return at ? ptr_add(cpu_heap_, *at) : nullptr;
   }
 
+  // what logs call a pass: one count for every kind, as a profile's target names its pass by it
+  static inline std::atomic<uint64_t> passes_;
+
   template <typename T>
   T *
   AllocatePass() {
     auto p = (new (AllocateCPUHeap(sizeof(T), alignof(T))) T());
-    // what logs call the pass
-    static std::atomic<uint64_t> passes;
-    p->id = ++passes;
+    p->id = ++passes_;
     p->event_path = event;
     encoder_current = p;
     return p;
