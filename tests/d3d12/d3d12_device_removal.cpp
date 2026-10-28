@@ -7,9 +7,12 @@
 // https://github.com/HansKristian-Work/vkd3d-proton/blob/master/tests/d3d12_sync.c
 // Present returns DXGI_ERROR_DEVICE_REMOVED after removal, including DXGI_PRESENT_TEST.
 // https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-present
+// Work submitted to a removed device does not run: after a GPU hang the application keeps submitting until it sees the
+// removal, and every command buffer that reached the GPU could hang it again.
 #include "d3d12_test.hpp"
 #include <dxgi1_4.h>
 #include <limits>
+#include <cstring>
 #include <thread>
 
 int main(int, char **) {
@@ -48,6 +51,23 @@ int main(int, char **) {
     ComPtr<ID3D12Fence> discarded;
     CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&discarded)));
   }
+  step("record a copy to submit after removal");
+  const UINT64 size = 256;
+  auto upload = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto readback = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> copy;
+  if (!expect(upload && readback, "copy buffers"))
+    return verdict();
+  void *bytes;
+  CHECK(upload->Map(0, nullptr, &bytes));
+  memset(bytes, 0x5a, size);
+  upload->Unmap(0, nullptr);
+  CHECK(forget(readback.Get()));
+  CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+  CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&copy)));
+  copy->CopyBufferRegion(readback.Get(), 0, upload.Get(), 0, size);
+  CHECK(copy->Close());
   HRESULT created = E_FAIL;
   std::thread creation([&] { created = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&raced)); });
   device->RemoveDevice();
@@ -81,6 +101,20 @@ int main(int, char **) {
       static_cast<ID3D12Fence *>(after)->Release();
     for (UINT flags : {0u, UINT(DXGI_PRESENT_TEST)})
       expect(chain->Present(0, flags) == DXGI_ERROR_DEVICE_REMOVED, "removed Present(%u) succeeded", flags);
+    step("work submitted after removal does not run");
+    ID3D12CommandList *lists[] = {copy.Get()};
+    presenting->ExecuteCommandLists(1, lists);
+    presenting->Signal(fence.Get(), removed);
+    Sleep(200);
+    if (expect(SUCCEEDED(readback->Map(0, nullptr, &bytes)), "Map of a readback buffer after removal")) {
+      bool untouched = true;
+      for (UINT64 i = 0; i < size; i++)
+        untouched &= static_cast<uint8_t *>(bytes)[i] == 0xff;
+      expect(untouched, "a copy submitted after removal ran");
+      readback->Unmap(0, nullptr);
+    }
+    HRESULT reset = allocator->Reset();
+    expect(reset == S_OK || reset == DXGI_ERROR_DEVICE_REMOVED, "Reset of the allocator of dropped work: %08lx", reset);
     step("removed device rejects further queues and keeps its reason");
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
@@ -91,6 +125,8 @@ int main(int, char **) {
   }
   if (SUCCEEDED(reason))
     CHECK(fence->Signal(removed));
+  copy.Reset();
+  allocator.Reset();
   fence.Reset();
   other.Reset();
   raced.Reset();

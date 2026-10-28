@@ -231,6 +231,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     Run(MetalCommandBuffer buffer, uint64_t *committed) {
       if (cancelled)
         return;
+      // a removed device runs nothing more (D3D12: work submitted to one is dropped): after a GPU hang or fault the
+      // application goes on submitting until it sees the removal, and each command buffer can hang the GPU again,
+      // which stalls the whole system's graphics. one never committed is retired as a cancelled one is
+      if (device && FAILED(device->GetDeviceRemovedReason())) {
+        FLIGHT("command buffer %#llx is dropped: the device is removed", buffer.handle);
+        return;
+      }
       if constexpr (Metal4)
         if (!buffer)
           return;
@@ -445,6 +452,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       Trace("tile mappings: waits for the work before");
       if (!scope.Settle())
+        return;
+      // nothing more reaches the GPU of a removed device (Gate::Run)
+      if (FAILED(device_->GetDeviceRemovedReason()))
         return;
       // the heaps it maps from must be resident by now, as for a command buffer
       device_->CommitResidency();
