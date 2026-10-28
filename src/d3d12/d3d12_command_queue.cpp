@@ -17,6 +17,7 @@
  */
 
 #include <deque>
+#include <functional>
 #include <algorithm>
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
@@ -253,6 +254,101 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
   mullion::thread held_thread_;
   std::atomic<DWORD> held_thread_id_{0};
+
+  // a submission's runs of passes that need nothing but a command buffer (EncodePass) are encoded by several threads
+  // at once, the queue's own among them, each into a command buffer of its own, and committed in the queue's order:
+  // Metal's encoding of draws is what a frame of many waits for. MULLION_D3D12_ENCODE_THREADS=1 encodes on one.
+  // Metal 3 only: a Metal 4 queue's command buffers are its own (MTL4CommandBuffer_new)
+  static constexpr unsigned kMaxEncodeThreads = 8;
+  // commands: a run of fewer is encoded on one thread, and a thread is given no fewer
+  // (MULLION_D3D12_PARALLEL_COMMANDS, for tests: both are that number)
+  static inline const uint64_t kParallelCommands = [] {
+    auto set = env::getEnvVar("MULLION_D3D12_PARALLEL_COMMANDS");
+    uint64_t count = 2048;
+    std::from_chars(set.data(), set.data() + set.size(), count);
+    return count;
+  }();
+  static inline const uint64_t kChunkCommands = std::min<uint64_t>(kParallelCommands, 512);
+  mullion::mutex encode_mutex_;
+  mullion::condition_variable encode_changed_, encoded_;
+  std::deque<std::function<void()>> encode_jobs_;
+  bool encode_stop_ = false;
+  std::vector<mullion::thread> encode_threads_;
+
+  static unsigned
+  EncodeThreads() {
+    static const unsigned threads = [] {
+      auto set = env::getEnvVar("MULLION_D3D12_ENCODE_THREADS");
+      unsigned count = 0;
+      if (std::from_chars(set.data(), set.data() + set.size(), count).ec != std::errc{} || !count)
+        count = std::clamp(mullion::thread::hardware_concurrency() / 2, 1u, 4u);
+      return std::min(count, kMaxEncodeThreads);
+    }();
+    return threads;
+  }
+
+  void
+  EncodeWorker() {
+    env::setThreadName("mullion-encode-thread");
+    std::unique_lock<mullion::mutex> lock(encode_mutex_);
+    for (;;) {
+      encode_changed_.wait(lock, [&] { return encode_stop_ || !encode_jobs_.empty(); });
+      if (encode_stop_)
+        return;
+      auto job = std::move(encode_jobs_.front());
+      encode_jobs_.pop_front();
+      lock.unlock();
+      job();
+      job = {};
+      lock.lock();
+    }
+  }
+
+  // a pass EncodePass encodes with nothing of the queue's: no timestamps, no resolver words read back, no wait
+  static bool
+  Parallel(const EncoderData *pass) {
+    if (pass->stamps)
+      return false;
+    switch (pass->type) {
+    case EncoderType::Null:
+    case EncoderType::Clear:
+    case EncoderType::Blit:
+    case EncoderType::Compute:
+    case EncoderType::Resolve:
+      return true;
+    case EncoderType::Render:
+      return !static_cast<const RenderEncoderData *>(pass)->omitted;
+    case EncoderType::ComputeParts:
+      return !static_cast<const ComputePartsEncoderData *>(pass)->indirect;
+    default:
+      return false;
+    }
+  }
+
+  // how many commands a pass has: what encoding it costs
+  static uint64_t
+  Commands(const EncoderData *pass) {
+    auto count = [](const void *head) {
+      uint64_t n = 0;
+      for (auto cmd = static_cast<const wmtcmd_base *>(head); cmd; cmd = static_cast<const wmtcmd_base *>(cmd->next.ptr))
+        n++;
+      return n;
+    };
+    switch (pass->type) {
+    case EncoderType::Clear:
+    case EncoderType::Render: {
+      auto data = static_cast<const RenderEncoderData *>(pass);
+      return count(&data->cmd_head) + count(&data->before_head);
+    }
+    case EncoderType::Blit:
+      return count(&static_cast<const BlitEncoderData *>(pass)->cmd_head);
+    case EncoderType::Compute:
+    case EncoderType::ComputeParts:
+      return count(&static_cast<const ComputeEncoderData *>(pass)->cmd_head);
+    default:
+      return 1;
+    }
+  }
 
   // what the queue does and where it waits, with MULLION_LOG_LEVEL=trace: the last lines of a hang name it
   template <typename... Args>
@@ -689,9 +785,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     };
 
     // a slot is the scope's from here to its retirement: it is waited for and counted under the lock, so two
-    // submitters never pass one free slot, and counted before the completion thread hears of it
+    // submitters never pass one free slot, and counted before the completion thread hears of it. `encoded` is a
+    // command buffer of the queue's encoded already (Metal 3), which the slot then has
     void
-    Start() {
+    Start(WMT::Reference<MetalCommandBuffer> encoded = {}) {
       queue->inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
       queue->inflight_cmdbuf_count_.fetch_add(1, std::memory_order_relaxed);
       auto seq = queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
@@ -706,7 +803,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         if (!inflight->cmdbuf)
           queue->device_->LoseDevice();
       } else {
-        inflight->cmdbuf = queue->queue_.commandBuffer();
+        inflight->cmdbuf = encoded ? std::move(encoded) : queue->queue_.commandBuffer();
       }
       if (queue->profile_) {
         auto &buffer = queue->profile_->buffers[seq % kCommandQueueSize];
@@ -801,6 +898,14 @@ public:
       }
       held_thread_.join();
     }
+    // the held work's encoding has ended with it
+    {
+      std::lock_guard<mullion::mutex> lock(encode_mutex_);
+      encode_stop_ = true;
+      encode_changed_.notify_all();
+    }
+    for (auto &thread : encode_threads_)
+      thread.join();
     std::lock_guard<mullion::mutex> lock(mutex_commit_);
     // the marker first: the completion thread reads it as soon as the sequence moves
     inflight_cmdbuf_stop_.store(inflight_cmdbuf_seq_.load());
@@ -835,7 +940,8 @@ public:
         return E_OUTOFMEMORY;
       timestamp_frequency_ = MTLDevice_queryTimestampFrequency(metal_device);
     } else {
-      queue_ = metal_device.newCommandQueue(kCommandQueueSize);
+      // the slots' command buffers, and those encoded ahead of them on the encoding threads
+      queue_ = metal_device.newCommandQueue(kCommandQueueSize + kMaxEncodeThreads);
     }
     if (!queue_)
       return FAIL(E_FAIL);
@@ -1222,165 +1328,18 @@ public:
         default:
           break;
         }
-        auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
-        // a Metal 4 pass of compute or blit work with no fence of its own is a segment of the buffer's one compute
-        // encoder (NextSync), and so is a render pass's work before it
-        auto end = [&](auto &encoder) {
-          if constexpr (Metal4)
-            if (!sync.update.handle || current->type == EncoderType::Render || current->type == EncoderType::Clear)
-              return encoder.endSegment();
-          if (sync.update.handle)
-            encoder.updateFence(sync.update);
-          encoder.endEncoding();
-        };
         switch (current->type) {
         case EncoderType::Null:
           break;
         case EncoderType::Clear:
-        case EncoderType::Render: {
-          auto data = static_cast<RenderEncoderData *>(current);
-          WMTRenderPassInfo render_pass_info;
-          WMT::InitializeRenderPassInfo(render_pass_info);
-          {
-            for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
-              auto &color_data = data->colors[i];
-              if (!color_data.attachment)
-                continue;
-              auto &color_info = render_pass_info.colors[i];
-              color_info.texture = color_data.attachment.texture();
-              color_info.load_action = color_data.load_action;
-              color_info.store_action = color_data.store_action;
-              color_info.level = color_data.level;
-              color_info.slice = color_data.slice;
-              color_info.depth_plane = color_data.depth_plane;
-              color_info.clear_color = color_data.clear_color;
-              color_info.resolve_texture = color_data.resolve_attachment.texture();
-              color_info.resolve_level = color_data.resolve_level;
-              color_info.resolve_slice = color_data.resolve_slice;
-              color_info.resolve_depth_plane = color_data.resolve_depth_plane;
-            }
-            if (data->depth.attachment) {
-              auto &depth_info = render_pass_info.depth;
-              auto &depth_data = data->depth;
-              depth_info.texture = depth_data.attachment.texture();
-              depth_info.load_action = depth_data.load_action;
-              depth_info.store_action = depth_data.store_action;
-              depth_info.level = depth_data.level;
-              depth_info.slice = depth_data.slice;
-              depth_info.depth_plane = depth_data.depth_plane;
-              depth_info.clear_depth = depth_data.clear_depth;
-            }
-            if (data->stencil.attachment) {
-              auto &stencil_info = render_pass_info.stencil;
-              auto &stencil_data = data->stencil;
-              stencil_info.texture = stencil_data.attachment.texture();
-              stencil_info.load_action = stencil_data.load_action;
-              stencil_info.store_action = stencil_data.store_action;
-              stencil_info.level = stencil_data.level;
-              stencil_info.slice = stencil_data.slice;
-              stencil_info.depth_plane = stencil_data.depth_plane;
-              stencil_info.clear_stencil = stencil_data.clear_stencil;
-            }
-            render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
-            render_pass_info.programmed_samples = data->programmed_samples;
-            std::ranges::copy(data->sample_positions, render_pass_info.sample_positions);
-            render_pass_info.render_target_array_length = data->render_target_array_length;
-            render_pass_info.render_target_width = data->render_target_width;
-            render_pass_info.render_target_height = data->render_target_height;
-            render_pass_info.visibility_buffer = data->visibility_buffer;
-          }
-          if (data->before_head.next.get()) {
-            if (diag::trace_encoders)
-              scope.inflight->physical[WMTMetal4Compute]++;
-            auto before = cmdbuf.computeCommandEncoder(true);
-            wait(before);
-            before.encodeCommands(&data->before_head);
-            end(before);
-            if (data->omitted) {
-              size_t count = 0;
-              for (auto omitted = data->omitted; omitted; omitted = omitted->next)
-                count += omitted->words;
-              WMTBufferInfo info{count * sizeof(uint32_t), WMTResourceStorageModeShared};
-              auto buffer = device_->GetMTLDevice().newBuffer(info);
-              if (!buffer) {
-                device_->LoseDevice();
-                return;
-              }
-              // a replay may overwrite the resolver's words before the completion thread runs
-              if (diag::trace_encoders)
-                scope.inflight->physical[WMTMetal4Blit]++;
-              auto copy = cmdbuf.blitCommandEncoder();
-              if constexpr (!Metal4)
-                if (sync.update.handle)
-                  copy.waitForFence(sync.update);
-              size_t offset = 0;
-              for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
-                copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset * sizeof(uint32_t), omitted->words * sizeof(uint32_t));
-                scope.inflight->omitted.emplace_back(
-                    buffer, std::span(static_cast<const uint32_t *>(info.memory.get()) + offset, omitted->words),
-                    omitted->scratch
-                );
-                offset += omitted->words;
-              }
-              end(copy);
-            }
-          }
-          if (diag::trace_encoders)
-            scope.inflight->physical[WMTMetal4Render]++;
-          auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
-                                                  : cmdbuf.renderCommandEncoder(render_pass_info);
-          if (record_totals_ && current->type == EncoderType::Render) {
-            auto label = "render " + device_->PassName(current, !profile_);
-            SnapshotGPURecords(records, current, label, scope.inflight->records);
-            encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
-            for (auto most = data->most; most; most = most->next)
-              scope.inflight->most.emplace_back(label, most);
-          }
-          if (current->type == EncoderType::Clear)
-            encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
-          // the object and mesh stages read what earlier passes wrote as the vertex stage does. a pass that draws to what
-          // one of its group drew to waits for that one's pixels before its own. the waits go to Metal in one call
-          std::array<wmtcmd_render_fence_op, std::tuple_size_v<decltype(sync.waits)> + 1 +
-                                                 std::tuple_size_v<decltype(sync.pixels)>>
-              waits;
-          unsigned waited = 0;
-          auto wait_for = [&](WMT::Fence fence, WMTRenderStages stages) {
-            auto &op = waits[waited] = {WMTRenderCommandWaitForFence, {}, {}, fence.handle, stages};
-            if (waited++)
-              waits[waited - 2].next.set(&op);
-          };
-          for (unsigned i = 0; i < sync.wait_count; i++)
-            wait_for(sync.waits[i], WMTRenderStagePreRaster);
-          if (data->before_head.next.get() && sync.update.handle)
-            wait_for(sync.update, WMTRenderStagePreRaster);
-          for (unsigned i = 0; i < sync.pixel_count; i++)
-            wait_for(sync.pixels[i], WMTRenderStageFragment);
-          if (waited)
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(waits.data()));
-          if (sparse_mappings) {
-            scope.inflight->sparse_mappings = sparse_mappings;
-            encoder.setVertexBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
-            encoder.setFragmentBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
-            encoder.setObjectBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
-            encoder.setMeshBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
-          }
-          encoder.encodeCommands(&data->cmd_head);
-          if (sync.update.handle)
-            encoder.updateFence(sync.update, WMTRenderStageFragment);
-          encoder.endEncoding();
+        case EncoderType::Render:
+        case EncoderType::Blit:
+        case EncoderType::Compute:
+        case EncoderType::ComputeParts:
+        case EncoderType::Resolve:
+          if (!EncodePass(cmdbuf, current, attachment, sparse_mappings, *scope.inflight, records, sync))
+            return;
           break;
-        }
-        case EncoderType::Blit: {
-          auto data = static_cast<BlitEncoderData *>(current);
-          if (diag::trace_encoders)
-            scope.inflight->physical[WMTMetal4Blit]++;
-          auto encoder = attachment.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1)
-                                                  : cmdbuf.blitCommandEncoder();
-          wait(encoder);
-          encoder.encodeCommands(&data->cmd_head);
-          end(encoder);
-          break;
-        }
         case EncoderType::AccelerationStructure: {
           // which structures are built is the device's, and another queue's builds change it
           gate_->closed.wait(true);
@@ -1409,77 +1368,6 @@ public:
             encoder.endSegment();
           else
             encoder.endEncoding();
-          break;
-        }
-        case EncoderType::Compute: {
-          auto data = static_cast<ComputeEncoderData *>(current);
-          if (diag::trace_encoders)
-            scope.inflight->physical[WMTMetal4Compute]++;
-          bool concurrent = DispatchesOverlap(reinterpret_cast<const wmtcmd_base *>(&data->cmd_head));
-          auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, concurrent)
-                                                  : cmdbuf.computeCommandEncoder(concurrent);
-          if (record_totals_) {
-            auto label = "compute " + device_->PassName(current, !profile_);
-            SnapshotGPURecords(records, current, label, scope.inflight->records);
-            encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
-          }
-          wait(encoder);
-          if (sparse_mappings || data->rays) {
-            scope.inflight->sparse_mappings = sparse_mappings;
-            wmtcmd_compute_setbuffer binding{};
-            binding.type = WMTComputeCommandSetBuffer;
-            binding.buffer = sparse_mappings ? sparse_mappings.handle : device_->GetNullBufferHandle();
-            binding.index = kSparseBufferArgumentIndex;
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
-          }
-          encoder.encodeCommands(&data->cmd_head);
-          end(encoder);
-          break;
-        }
-        case EncoderType::ComputeParts: {
-          auto data = static_cast<ComputePartsEncoderData *>(current);
-          auto size = data->indirect ? WMTSize{data->indirect->ThreadGroupCountX, data->indirect->ThreadGroupCountY,
-                                             data->indirect->ThreadGroupCountZ} : data->size;
-          const std::array<uint64_t, 3> extent{size.width, size.height, size.depth};
-          auto pipeline = reinterpret_cast<const wmtcmd_compute_setpso *>(data->cmd_head.next.ptr);
-          assert(pipeline->type == WMTComputeCommandSetPSO);
-          if (diag::trace_encoders)
-            scope.inflight->physical[WMTMetal4Compute]++;
-          auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true)
-                                                  : cmdbuf.computeCommandEncoder(true);
-          wait(encoder);
-          if (sparse_mappings) {
-            scope.inflight->sparse_mappings = sparse_mappings;
-            wmtcmd_compute_setbuffer binding{};
-            binding.type = WMTComputeCommandSetBuffer;
-            binding.buffer = sparse_mappings;
-            binding.index = kSparseBufferArgumentIndex;
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
-          }
-          encoder.encodeCommands(&data->cmd_head);
-          auto parts = [&](auto &parts, std::array<uint64_t, 3> origin, std::array<uint64_t, 3> size) -> void {
-            if (size[0] * size[1] * size[2] > data->at_once) {
-              auto axis = std::max_element(size.begin(), size.end()) - size.begin();
-              auto half = size;
-              half[axis] /= 2;
-              parts(parts, origin, half);
-              origin[axis] += half[axis];
-              size[axis] -= half[axis];
-              return parts(parts, origin, size);
-            }
-            wmtcmd_compute_dispatch_part part{};
-            part.type = WMTComputeCommandDispatchPart;
-            part.origin = {origin[0], origin[1], origin[2]};
-            part.size = {size[0], size[1], size[2]};
-            part.threadgroup_size = pipeline->threadgroup_size;
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&part));
-            wmtcmd_compute_memory_barrier barrier{};
-            barrier.type = WMTComputeCommandMemoryBarrier;
-            barrier.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&barrier));
-          };
-          parts(parts, {}, extent);
-          end(encoder);
           break;
         }
         case EncoderType::ResolveTimestamps: {
@@ -1582,29 +1470,6 @@ public:
             unresolved_.push_back({data->destination, structure, structure->inputs, desc.Inputs, std::move(instances)});
           break;
         }
-        case EncoderType::Resolve: {
-          auto data = static_cast<ResolveEncoderData *>(current);
-
-          WMTRenderPassInfo info;
-          WMT::InitializeRenderPassInfo(info);
-          info.colors[0].texture = data->src.texture();
-          info.colors[0].load_action = WMTLoadActionLoad;
-          info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
-          info.colors[0].resolve_texture = data->dst.texture();
-
-          if (diag::trace_encoders)
-            scope.inflight->physical[WMTMetal4Render]++;
-          auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(info, attachment)
-                                                  : cmdbuf.renderCommandEncoder(info);
-          for (unsigned i = 0; i < sync.wait_count; i++)
-            encoder.waitForFence(sync.waits[i], WMTRenderStageFragment);
-          encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
-          if (sync.update.handle)
-            encoder.updateFence(sync.update, WMTRenderStageFragment);
-          encoder.endEncoding();
-
-          break;
-        }
         }
         if (profiled) {
           profiled->encoding = diag::Now() - profiled->encoding;
@@ -1637,9 +1502,376 @@ public:
         }
       }
     };
-    for (size_t i = 0; i < recorded.size(); i++)
-      encode(encode, recorded[i], keeps.allocators[i].ptr());
+    // lists whose every pass encodes on any thread, as many as follow each other: their passes, and what they cost.
+    // not with what keeps state of a slot's own (profiles, GPU records, debug groups, encoder counts)
+    std::vector<std::pair<EncoderData *, uint64_t>> passes;
+    bool parallel = !Metal4 && EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
+                    !diag::trace_encoders;
+    for (size_t i = 0; i < recorded.size();) {
+      size_t j = i;
+      uint64_t commands = 0;
+      passes.clear();
+      for (; parallel && unresolved_.empty() && j < recorded.size(); j++) {
+        auto first = passes.size();
+        auto pass = recorded[j];
+        for (; pass && Parallel(pass); pass = pass->next)
+          commands += passes.emplace_back(pass, Commands(pass)).second;
+        if (pass) {
+          for (auto k = first; k < passes.size(); k++)
+            commands -= passes[k].second;
+          passes.resize(first);
+          break;
+        }
+      }
+      if constexpr (!Metal4) {
+        if (commands >= kParallelCommands && passes.size() > 1) {
+          if (!EncodeParallel(scope, passes, commands, sparse_mappings))
+            return;
+          cmdbuf = scope.inflight->cmdbuf;
+          i = j;
+          continue;
+        }
+      }
+      for (j = std::max(j, i + 1); i < j; i++)
+        encode(encode, recorded[i], keeps.allocators[i].ptr());
+    }
   };
+
+  // encodes a pass of draws, copies, dispatches or a resolve into `cmdbuf`: it needs nothing of the queue's but its
+  // fences (`sync`), so the encoding threads run it too (EncodeParallel). false when the device is lost
+  bool
+  EncodePass(
+      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo attachment,
+      WMT::Buffer sparse_mappings, InflightCommandBuffer &inflight, const GPUListRecords *records, const PassSync &sync
+  ) {
+    auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
+    // a Metal 4 pass of compute or blit work with no fence of its own is a segment of the buffer's one compute
+    // encoder (NextSync), and so is a render pass's work before it
+    auto end = [&](auto &encoder) {
+      if constexpr (Metal4)
+        if (!sync.update.handle || current->type == EncoderType::Render || current->type == EncoderType::Clear)
+          return encoder.endSegment();
+      if (sync.update.handle)
+        encoder.updateFence(sync.update);
+      encoder.endEncoding();
+    };
+    switch (current->type) {
+    case EncoderType::Clear:
+    case EncoderType::Render: {
+      auto data = static_cast<RenderEncoderData *>(current);
+      WMTRenderPassInfo render_pass_info;
+      WMT::InitializeRenderPassInfo(render_pass_info);
+      {
+        for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
+          auto &color_data = data->colors[i];
+          if (!color_data.attachment)
+            continue;
+          auto &color_info = render_pass_info.colors[i];
+          color_info.texture = color_data.attachment.texture();
+          color_info.load_action = color_data.load_action;
+          color_info.store_action = color_data.store_action;
+          color_info.level = color_data.level;
+          color_info.slice = color_data.slice;
+          color_info.depth_plane = color_data.depth_plane;
+          color_info.clear_color = color_data.clear_color;
+          color_info.resolve_texture = color_data.resolve_attachment.texture();
+          color_info.resolve_level = color_data.resolve_level;
+          color_info.resolve_slice = color_data.resolve_slice;
+          color_info.resolve_depth_plane = color_data.resolve_depth_plane;
+        }
+        if (data->depth.attachment) {
+          auto &depth_info = render_pass_info.depth;
+          auto &depth_data = data->depth;
+          depth_info.texture = depth_data.attachment.texture();
+          depth_info.load_action = depth_data.load_action;
+          depth_info.store_action = depth_data.store_action;
+          depth_info.level = depth_data.level;
+          depth_info.slice = depth_data.slice;
+          depth_info.depth_plane = depth_data.depth_plane;
+          depth_info.clear_depth = depth_data.clear_depth;
+        }
+        if (data->stencil.attachment) {
+          auto &stencil_info = render_pass_info.stencil;
+          auto &stencil_data = data->stencil;
+          stencil_info.texture = stencil_data.attachment.texture();
+          stencil_info.load_action = stencil_data.load_action;
+          stencil_info.store_action = stencil_data.store_action;
+          stencil_info.level = stencil_data.level;
+          stencil_info.slice = stencil_data.slice;
+          stencil_info.depth_plane = stencil_data.depth_plane;
+          stencil_info.clear_stencil = stencil_data.clear_stencil;
+        }
+        render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
+        render_pass_info.programmed_samples = data->programmed_samples;
+        std::ranges::copy(data->sample_positions, render_pass_info.sample_positions);
+        render_pass_info.render_target_array_length = data->render_target_array_length;
+        render_pass_info.render_target_width = data->render_target_width;
+        render_pass_info.render_target_height = data->render_target_height;
+        render_pass_info.visibility_buffer = data->visibility_buffer;
+      }
+      if (data->before_head.next.get()) {
+        if (diag::trace_encoders)
+          inflight.physical[WMTMetal4Compute]++;
+        auto before = cmdbuf.computeCommandEncoder(true);
+        wait(before);
+        before.encodeCommands(&data->before_head);
+        end(before);
+        if (data->omitted) {
+          size_t count = 0;
+          for (auto omitted = data->omitted; omitted; omitted = omitted->next)
+            count += omitted->words;
+          WMTBufferInfo info{count * sizeof(uint32_t), WMTResourceStorageModeShared};
+          auto buffer = device_->GetMTLDevice().newBuffer(info);
+          if (!buffer) {
+            device_->LoseDevice();
+            return false;
+          }
+          // a replay may overwrite the resolver's words before the completion thread runs
+          if (diag::trace_encoders)
+            inflight.physical[WMTMetal4Blit]++;
+          auto copy = cmdbuf.blitCommandEncoder();
+          if constexpr (!Metal4)
+            if (sync.update.handle)
+              copy.waitForFence(sync.update);
+          size_t offset = 0;
+          for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
+            copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset * sizeof(uint32_t), omitted->words * sizeof(uint32_t));
+            inflight.omitted.emplace_back(
+                buffer, std::span(static_cast<const uint32_t *>(info.memory.get()) + offset, omitted->words),
+                omitted->scratch
+            );
+            offset += omitted->words;
+          }
+          end(copy);
+        }
+      }
+      if (diag::trace_encoders)
+        inflight.physical[WMTMetal4Render]++;
+      auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
+                                              : cmdbuf.renderCommandEncoder(render_pass_info);
+      if (record_totals_ && current->type == EncoderType::Render) {
+        auto label = "render " + device_->PassName(current, !profile_);
+        SnapshotGPURecords(records, current, label, inflight.records);
+        encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
+        for (auto most = data->most; most; most = most->next)
+          inflight.most.emplace_back(label, most);
+      }
+      if (current->type == EncoderType::Clear)
+        encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
+      // the object and mesh stages read what earlier passes wrote as the vertex stage does. a pass that draws to what
+      // one of its group drew to waits for that one's pixels before its own. the waits go to Metal in one call
+      std::array<wmtcmd_render_fence_op, std::tuple_size_v<decltype(sync.waits)> + 1 +
+                                             std::tuple_size_v<decltype(sync.pixels)>>
+          waits;
+      unsigned waited = 0;
+      auto wait_for = [&](WMT::Fence fence, WMTRenderStages stages) {
+        auto &op = waits[waited] = {WMTRenderCommandWaitForFence, {}, {}, fence.handle, stages};
+        if (waited++)
+          waits[waited - 2].next.set(&op);
+      };
+      for (unsigned i = 0; i < sync.wait_count; i++)
+        wait_for(sync.waits[i], WMTRenderStagePreRaster);
+      if (data->before_head.next.get() && sync.update.handle)
+        wait_for(sync.update, WMTRenderStagePreRaster);
+      for (unsigned i = 0; i < sync.pixel_count; i++)
+        wait_for(sync.pixels[i], WMTRenderStageFragment);
+      if (waited)
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(waits.data()));
+      if (sparse_mappings) {
+        inflight.sparse_mappings = sparse_mappings;
+        encoder.setVertexBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+        encoder.setFragmentBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+        encoder.setObjectBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+        encoder.setMeshBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
+      }
+      encoder.encodeCommands(&data->cmd_head);
+      if (sync.update.handle)
+        encoder.updateFence(sync.update, WMTRenderStageFragment);
+      encoder.endEncoding();
+      break;
+    }
+    case EncoderType::Blit: {
+      auto data = static_cast<BlitEncoderData *>(current);
+      if (diag::trace_encoders)
+        inflight.physical[WMTMetal4Blit]++;
+      auto encoder = attachment.sample_buffer ? cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1)
+                                              : cmdbuf.blitCommandEncoder();
+      wait(encoder);
+      encoder.encodeCommands(&data->cmd_head);
+      end(encoder);
+      break;
+    }
+    case EncoderType::Compute: {
+      auto data = static_cast<ComputeEncoderData *>(current);
+      if (diag::trace_encoders)
+        inflight.physical[WMTMetal4Compute]++;
+      bool concurrent = DispatchesOverlap(reinterpret_cast<const wmtcmd_base *>(&data->cmd_head));
+      auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, concurrent)
+                                              : cmdbuf.computeCommandEncoder(concurrent);
+      if (record_totals_) {
+        auto label = "compute " + device_->PassName(current, !profile_);
+        SnapshotGPURecords(records, current, label, inflight.records);
+        encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
+      }
+      wait(encoder);
+      if (sparse_mappings || data->rays) {
+        inflight.sparse_mappings = sparse_mappings;
+        wmtcmd_compute_setbuffer binding{};
+        binding.type = WMTComputeCommandSetBuffer;
+        binding.buffer = sparse_mappings ? sparse_mappings.handle : device_->GetNullBufferHandle();
+        binding.index = kSparseBufferArgumentIndex;
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
+      }
+      encoder.encodeCommands(&data->cmd_head);
+      end(encoder);
+      break;
+    }
+    case EncoderType::ComputeParts: {
+      auto data = static_cast<ComputePartsEncoderData *>(current);
+      auto size = data->indirect ? WMTSize{data->indirect->ThreadGroupCountX, data->indirect->ThreadGroupCountY,
+                                         data->indirect->ThreadGroupCountZ} : data->size;
+      const std::array<uint64_t, 3> extent{size.width, size.height, size.depth};
+      auto pipeline = reinterpret_cast<const wmtcmd_compute_setpso *>(data->cmd_head.next.ptr);
+      assert(pipeline->type == WMTComputeCommandSetPSO);
+      if (diag::trace_encoders)
+        inflight.physical[WMTMetal4Compute]++;
+      auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, true)
+                                              : cmdbuf.computeCommandEncoder(true);
+      wait(encoder);
+      if (sparse_mappings) {
+        inflight.sparse_mappings = sparse_mappings;
+        wmtcmd_compute_setbuffer binding{};
+        binding.type = WMTComputeCommandSetBuffer;
+        binding.buffer = sparse_mappings;
+        binding.index = kSparseBufferArgumentIndex;
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&binding));
+      }
+      encoder.encodeCommands(&data->cmd_head);
+      auto parts = [&](auto &parts, std::array<uint64_t, 3> origin, std::array<uint64_t, 3> size) -> void {
+        if (size[0] * size[1] * size[2] > data->at_once) {
+          auto axis = std::max_element(size.begin(), size.end()) - size.begin();
+          auto half = size;
+          half[axis] /= 2;
+          parts(parts, origin, half);
+          origin[axis] += half[axis];
+          size[axis] -= half[axis];
+          return parts(parts, origin, size);
+        }
+        wmtcmd_compute_dispatch_part part{};
+        part.type = WMTComputeCommandDispatchPart;
+        part.origin = {origin[0], origin[1], origin[2]};
+        part.size = {size[0], size[1], size[2]};
+        part.threadgroup_size = pipeline->threadgroup_size;
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&part));
+        wmtcmd_compute_memory_barrier barrier{};
+        barrier.type = WMTComputeCommandMemoryBarrier;
+        barrier.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&barrier));
+      };
+      parts(parts, {}, extent);
+      end(encoder);
+      break;
+    }
+    case EncoderType::Resolve: {
+      auto data = static_cast<ResolveEncoderData *>(current);
+
+      WMTRenderPassInfo info;
+      WMT::InitializeRenderPassInfo(info);
+      info.colors[0].texture = data->src.texture();
+      info.colors[0].load_action = WMTLoadActionLoad;
+      info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
+      info.colors[0].resolve_texture = data->dst.texture();
+
+      if (diag::trace_encoders)
+        inflight.physical[WMTMetal4Render]++;
+      auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(info, attachment)
+                                              : cmdbuf.renderCommandEncoder(info);
+      for (unsigned i = 0; i < sync.wait_count; i++)
+        encoder.waitForFence(sync.waits[i], WMTRenderStageFragment);
+      encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
+      if (sync.update.handle)
+        encoder.updateFence(sync.update, WMTRenderStageFragment);
+      encoder.endEncoding();
+
+      break;
+    }
+    default:
+      break;
+    }
+    return true;
+  }
+
+  // encodes passes on the encoding threads, in parts of about the same cost: the first part follows what the scope's
+  // command buffer has, and the scope ends with the last part's. false when the device is lost
+  bool
+  EncodeParallel(
+      CommittingScope &scope, const std::vector<std::pair<EncoderData *, uint64_t>> &passes, uint64_t commands,
+      WMT::Buffer sparse_mappings
+  ) {
+    auto parts = unsigned(std::min<uint64_t>({EncodeThreads(), commands / std::max<uint64_t>(kChunkCommands, 1), passes.size()}));
+    if (encode_threads_.size() + 1 < parts) {
+      std::lock_guard<mullion::mutex> lock(encode_mutex_);
+      while (encode_threads_.size() + 1 < parts)
+        encode_threads_.emplace_back([this] { EncodeWorker(); });
+    }
+    // where each part begins, and the end
+    std::vector<size_t> bounds{0};
+    uint64_t sum = 0;
+    for (size_t i = 0; i + 1 < passes.size() && bounds.size() < parts; i++)
+      if ((sum += passes[i].second) * parts >= commands * bounds.size())
+        bounds.push_back(i + 1);
+    bounds.push_back(passes.size());
+    parts = bounds.size() - 1;
+    // the passes' waits and updates are the queue's, in their order
+    std::vector<PassSync> syncs;
+    syncs.reserve(passes.size());
+    for (auto &[pass, _] : passes)
+      syncs.push_back(NextSync(pass));
+    std::vector<WMT::Reference<MetalCommandBuffer>> buffers(parts);
+    buffers[0] = scope.inflight->cmdbuf;
+    for (unsigned k = 1; k < parts; k++)
+      buffers[k] = queue_.commandBuffer();
+    // the parts the encoding threads have yet to finish, under the lock
+    unsigned left = parts - 1;
+    std::atomic<bool> lost = false;
+    auto part = [&](unsigned k) {
+      InflightCommandBuffer unused;
+      for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++)
+        if (!EncodePass(buffers[k], passes[i].first, {}, sparse_mappings, unused, nullptr, syncs[i]))
+          lost = true;
+    };
+    {
+      std::lock_guard<mullion::mutex> lock(encode_mutex_);
+      for (unsigned k = 1; k < parts; k++)
+        encode_jobs_.emplace_back([&, k] {
+          {
+            // the encoders this thread makes are released with the pool, before the queue's thread hears of it
+            auto pool = WMT::MakeAutoreleasePool();
+            part(k);
+          }
+          std::lock_guard<mullion::mutex> lock(encode_mutex_);
+          if (!--left)
+            encoded_.notify_all();
+        });
+      encode_changed_.notify_all();
+    }
+    part(0);
+    {
+      std::unique_lock<mullion::mutex> lock(encode_mutex_);
+      encoded_.wait(lock, [&] { return !left; });
+    }
+    for (unsigned k = 0; k < parts; k++) {
+      for (auto i = bounds[k]; i < bounds[k + 1]; i++)
+        scope.inflight->encoders[size_t(passes[i].first->type)]++;
+      if (sparse_mappings)
+        scope.inflight->sparse_mappings = sparse_mappings;
+      if (k + 1 < parts) {
+        scope.End();
+        scope.Start(std::move(buffers[k + 1]));
+      }
+    }
+    return !lost;
+  }
 
   // the build that gives back the structure serialized at `Source` (CopyRaytracingAccelerationStructure,
   // DESERIALIZE): a serialized structure is its inputs. `read` gives GPU memory
