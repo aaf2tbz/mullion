@@ -238,7 +238,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         *committed = diag::Now();
       if (device)
         device->CommitResidency();
-      FLIGHT("command buffer %#llx commits", buffer.handle);
+      FLIGHT_HEAVY(Gpu, "command buffer %#llx commits", buffer.handle);
       buffer.commit();
     }
   };
@@ -411,6 +411,21 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   };
   std::vector<Unresolved> unresolved_;
 
+  // the process's queues, for MULLION_TRACE_RESOURCE: what each has on the GPU when a tile mapping is made
+  static inline mullion::mutex queues_mutex_;
+  static inline std::vector<MTLD3D12CommandQueueImpl *> queues_;
+
+  std::string
+  QueuesInFlight() {
+    std::lock_guard<mullion::mutex> lock(queues_mutex_);
+    std::string text;
+    for (auto queue : queues_)
+      if (queue->device_ == device_)
+        text += str::format(text.empty() ? "" : ", ", queue == this ? "this " : "", queue, " ",
+                            queue->inflight_cmdbuf_count_.load(), " in flight");
+    return text;
+  }
+
   // tile mappings: a Metal 4 queue makes them, once the work before has run and before the work after is committed
   // (Metal 4's mappings hold for the classic queue's work ordered after them)
   WMT::Reference<WMT::MTL4CommandQueue> mapping_queue_;
@@ -433,6 +448,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         return;
       // the heaps it maps from must be resident by now, as for a command buffer
       device_->CommitResidency();
+      TRACE_IN(Resource, "queue ", this, ": tile mapping ", mapping_value_ + 1, " made; queues: ", QueuesInFlight());
       update(mapping_queue_);
       mapping_queue_.signalEvent(mapped_->sharedEvent(), ++mapping_value_);
       Trace("tile mappings: waits for mapping ", mapping_value_);
@@ -558,9 +574,19 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   mullion::thread inflight_cmdbuf_wait_thread_;
 
   // a command buffer that does not complete stops the queue with no error from Metal: a thread reports the one the
-  // completion thread has waited on for kStuckSeconds, with what Metal says of it and what is in it. a warning: one
+  // completion thread has waited on for StuckTime(), with what Metal says of it and what is in it. a warning: one
   // list of very many draws takes as long
-  static constexpr auto kStuckSeconds = std::chrono::seconds(10);
+  static std::chrono::milliseconds
+  StuckTime() {
+    // MULLION_TRACE_GPU reports a command buffer sooner: after MULLION_TRACE_GPU_HANG_MS, 2 s unless it says
+    static const auto time = [] {
+      if (!trace::On(trace::Gpu))
+        return std::chrono::milliseconds(10'000);
+      auto given = env::getEnvVar("MULLION_TRACE_GPU_HANG_MS");
+      return std::chrono::milliseconds(given.empty() ? 2000 : std::max(1, std::atoi(given.c_str())));
+    }();
+    return time;
+  }
   mullion::mutex watch_mutex_;
   mullion::condition_variable watch_changed_;
   uint64_t watched_seq_ = 0;
@@ -574,17 +600,17 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     while (!watch_stop_) {
       auto seq = watched_seq_;
       // the same one still, after the time: it is reported once, and the thread sleeps until another is waited on
-      if (watch_changed_.wait_for(lock, kStuckSeconds, [&] { return watch_stop_ || watched_seq_ != seq; }) || !seq)
+      if (watch_changed_.wait_for(lock, StuckTime(), [&] { return watch_stop_ || watched_seq_ != seq; }) || !seq)
         continue;
       auto &inflight = inflight_cmdbuf_pool_[seq % kCommandQueueSize];
       std::string encoders;
       for (auto count : inflight.encoders)
         encoders += std::to_string(count) + " ";
-      WARN("command buffer ", seq, " of queue ", this, " has not completed for ", kStuckSeconds.count(),
-          " s; Metal's status of it is ", uint64_t(inflight.cmdbuf.status()), " (2 committed, 3 scheduled); encoders by kind: ",
+      WARN("command buffer ", seq, " of queue ", this, " has not completed for ", StuckTime().count(),
+          " ms; Metal's status of it is ", uint64_t(inflight.cmdbuf.status()), " (2 committed, 3 scheduled); encoders by kind: ",
           encoders, inflight.presents ? "and a present" : "");
-      FLIGHT("queue %p: command buffer %llu has not completed in %lld s, status %llu", this, seq,
-             int64_t(kStuckSeconds.count()), uint64_t(inflight.cmdbuf.status()));
+      FLIGHT_IN(Gpu, "queue %p: command buffer %llu has not completed in %lld ms, status %llu", this, seq,
+             int64_t(StuckTime().count()), uint64_t(inflight.cmdbuf.status()));
       WMTFlightDump("a stuck command buffer");
       watch_changed_.wait(lock, [&] { return watch_stop_ || watched_seq_ != seq; });
     }
@@ -633,21 +659,30 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       auto completed = profile_ ? diag::Now() : 0;
       Watched(0);
       Trace("command buffer ", internal_seq, " completed");
-      FLIGHT("queue %p: command buffer %llu completes, status %llu", this, internal_seq,
+      FLIGHT_HEAVY(Gpu, "queue %p: command buffer %llu completes, status %llu", this, internal_seq,
              uint64_t(inflight.cmdbuf.status()));
       device_->CheckAtomicLocks();
       if (record_totals_)
         CompareGPURecords(inflight.records, record_totals_);
       if (inflight.cmdbuf.status() == WMTCommandBufferStatusError) {
-        // the first says why; Metal fails what follows a fault of the process's too
-        if (SUCCEEDED(device_->GetDeviceRemovedReason())) {
-          ERR("Device error: ", inflight.cmdbuf.error().description().getUTF8String());
+        // the first says why; Metal fails what follows a fault of the process's too. MULLION_TRACE_GPU has them all:
+        // one Metal calls an innocent victim of a GPU recovery leaves the one at fault to another command buffer
+        bool first = SUCCEEDED(device_->GetDeviceRemovedReason());
+        if (first || trace::On(trace::Gpu)) {
+          auto report = [&](const std::string &line) {
+            if (first)
+              ERR(line);
+            else
+              TRACE_IN(Gpu, line);
+          };
+          report(str::format(first ? "Device error: " : "", "queue ", this, ", command buffer ", internal_seq,
+                             first ? ": " : " fails too: ", inflight.cmdbuf.error().description().getUTF8String()));
           for (auto &[label, most] : inflight.most)
-            ERR("indirect commands of ", label, ": ", most->words[5], " commands of at most ", most->call->max_count,
-                most->call->max_count_buffer ? " with a count buffer" : "", ", arguments at ",
-                (void *)most->call->argument_buffer, "; the most instances ", most->words[0], ", vertices or indices ",
-                most->words[1], ", start ", most->words[2], ", base vertex ", most->words[3], ", start instance ",
-                most->words[4]);
+            report(str::format("indirect commands of ", label, ": ", most->words[5], " commands of at most ",
+                               most->call->max_count, most->call->max_count_buffer ? " with a count buffer" : "",
+                               ", arguments at ", (void *)most->call->argument_buffer, "; the most instances ",
+                               most->words[0], ", vertices or indices ", most->words[1], ", start ", most->words[2],
+                               ", base vertex ", most->words[3], ", start instance ", most->words[4]));
         }
         device_->LoseDevice();
       }
@@ -826,7 +861,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           ended, queue->profile_
                      ? &queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].committed
                      : nullptr);
-      FLIGHT("queue %p: command buffer %llu is %#llx", queue, queue->inflight_cmdbuf_seq_.load(), ended.handle);
+      FLIGHT_HEAVY(Gpu, "queue %p: command buffer %llu is %#llx", queue, queue->inflight_cmdbuf_seq_.load(), ended.handle);
       inflight = nullptr;
       queue->inflight_cmdbuf_seq_.fetch_add(1, std::memory_order_release);
       queue->inflight_cmdbuf_seq_.notify_one();
@@ -874,9 +909,16 @@ public:
   MTLD3D12CommandQueueImpl(MTLD3D12Device *pDevice) :
       MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice),
       inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }),
-      watch_thread_([this] { Watch(); }) {}
+      watch_thread_([this] { Watch(); }) {
+    std::lock_guard<mullion::mutex> lock(queues_mutex_);
+    queues_.push_back(this);
+  }
 
   ~MTLD3D12CommandQueueImpl() {
+    {
+      std::lock_guard<mullion::mutex> lock(queues_mutex_);
+      std::erase(queues_, this);
+    }
     if (held_thread_.joinable()) {
       {
         std::unique_lock<mullion::mutex> lock(held_mutex_);
@@ -998,6 +1040,30 @@ public:
       const D3D12_TILE_RANGE_FLAGS *range_flags, const UINT *heap_range_offsets, const UINT *range_tile_counts,
       D3D12_TILE_MAPPING_FLAGS flags
   ) {
+    if (trace::On(trace::Resource)) {
+      // where the regions start, and their sizes in tiles: up to 8 of them, every one with heavy
+      std::string regions;
+      for (UINT region = 0; region < region_count && (region < 8 || trace::Heavy(trace::Resource)); region++)
+        regions += str::format(region ? ", " : " (", region_start_coordinates ? region_start_coordinates[region].X : 0u,
+                               ",", region_start_coordinates ? region_start_coordinates[region].Y : 0u, ",",
+                               region_start_coordinates ? region_start_coordinates[region].Z : 0u, " subresource ",
+                               region_start_coordinates ? region_start_coordinates[region].Subresource : 0u, ": ",
+                               region_sizes ? region_sizes[region].NumTiles : 0u, " tiles");
+      std::string ranges;
+      for (UINT range = 0; range < range_count && range < 8; range++)
+        ranges += str::format(range ? ", " : " (", "flags ", range_flags ? uint32_t(range_flags[range]) : 0u,
+                              " heap tile ", heap_range_offsets ? heap_range_offsets[range] : 0u, ": ",
+                              range_tile_counts ? range_tile_counts[range] : 0u, " tiles");
+      TRACE_IN(Resource, "queue ", this, ": UpdateTileMappings of ", resource, ", ", region_count, " regions",
+               regions.empty() ? "" : regions + (region_count > 8 && !trace::Heavy(trace::Resource) ? ", ...)" : ")"),
+               ", ", range_count, " ranges", ranges.empty() ? "" : ranges + (range_count > 8 ? ", ...)" : ")"),
+               ", heap ", heap, ", flags ", uint32_t(flags));
+    }
+    if (trace::Heavy(trace::Resource))
+      for (UINT range = 0; range < range_count; range++)
+        TRACE_IN(Resource, "  range ", range, ": flags ", range_flags ? uint32_t(range_flags[range]) : 0u, ", heap tile ",
+                 heap_range_offsets ? heap_range_offsets[range] : 0u, ", tiles ",
+                 range_tile_counts ? range_tile_counts[range] : 0u);
     // D3D12's regions and heap ranges, walked tile by tile together, become Metal operations over runs of tiles along
     // x with consecutive heap tiles. Metal applies them in order, so a tile named twice keeps the last mapping
     Tiling tiling(resource);
@@ -1068,6 +1134,8 @@ public:
       ID3D12Resource *src_resource, const D3D12_TILED_RESOURCE_COORDINATE *src_region_start_coordinate,
       const D3D12_TILE_REGION_SIZE *region_size, D3D12_TILE_MAPPING_FLAGS flags
   ) {
+    TRACE_IN(Resource, "queue ", this, ": CopyTileMappings from ", src_resource, " to ", dst_resource, ", ",
+             region_size ? region_size->NumTiles : 0u, " tiles, flags ", uint32_t(flags));
     Tiling source(src_resource), destination(dst_resource);
     if (source.texture != destination.texture) {
       ERR("CopyTileMappings: Metal copies mappings between buffers or between textures only");
@@ -1131,7 +1199,7 @@ public:
         allocators[i]->pending++;
     }
     Trace("ExecuteCommandLists of ", Count);
-    FLIGHT("queue %p: ExecuteCommandLists of %llu", this, uint64_t(Count));
+    FLIGHT_HEAVY(Sync, "queue %p: ExecuteCommandLists of %llu", this, uint64_t(Count));
     auto work = [this, recorded = std::move(recorded), allocators = std::move(allocators)]() mutable {
       auto began = profile_ ? diag::Now() : 0;
       Commit(recorded, std::move(allocators));
@@ -1646,12 +1714,16 @@ public:
         inflight.physical[WMTMetal4Render]++;
       auto encoder = attachment.sample_buffer ? cmdbuf.renderCommandEncoder(render_pass_info, attachment)
                                               : cmdbuf.renderCommandEncoder(render_pass_info);
-      if (record_totals_ && current->type == EncoderType::Render) {
+      if ((record_totals_ || trace::Heavy(trace::Pass)) && current->type == EncoderType::Render) {
         auto label = "render " + device_->PassName(current, !profile_);
-        SnapshotGPURecords(records, current, label, inflight.records);
+        if (trace::Heavy(trace::Pass))
+          TRACE_IN(Pass, "queue ", this, ": ", label);
+        if (record_totals_) {
+          SnapshotGPURecords(records, current, label, inflight.records);
+          for (auto most = data->most; most; most = most->next)
+            inflight.most.emplace_back(label, most);
+        }
         encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
-        for (auto most = data->most; most; most = most->next)
-          inflight.most.emplace_back(label, most);
       }
       if (current->type == EncoderType::Clear)
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
@@ -1694,9 +1766,12 @@ public:
       bool concurrent = DispatchesOverlap(reinterpret_cast<const wmtcmd_base *>(&data->cmd_head));
       auto encoder = attachment.sample_buffer ? cmdbuf.computeCommandEncoder(attachment, concurrent)
                                               : cmdbuf.computeCommandEncoder(concurrent);
-      if (record_totals_) {
+      if (record_totals_ || trace::Heavy(trace::Pass)) {
         auto label = "compute " + device_->PassName(current, !profile_);
-        SnapshotGPURecords(records, current, label, inflight.records);
+        if (trace::Heavy(trace::Pass))
+          TRACE_IN(Pass, "queue ", this, ": ", label);
+        if (record_totals_)
+          SnapshotGPURecords(records, current, label, inflight.records);
         encoder.setLabel(WMT::String::string(label.c_str(), WMTUTF8StringEncoding));
       }
       wait(encoder);
@@ -1944,12 +2019,12 @@ public:
       std::lock_guard<mullion::mutex> lock(mutex_commit_);
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
-        FLIGHT("fence %p reaches %llu", fence.ptr(), Value);
+        FLIGHT_HEAVY(Sync, "fence %p reaches %llu", fence.ptr(), Value);
         fence->Signaled(Value);
       });
     };
     Trace("Signal of fence ", pFence, " to ", Value);
-    FLIGHT("queue %p: Signal of fence %p to %llu", this, pFence, Value);
+    FLIGHT_HEAVY(Sync, "queue %p: Signal of fence %p to %llu", this, pFence, Value);
     if (!Hold(work))
       work();
     return S_OK;
@@ -1976,7 +2051,10 @@ public:
         StartCommitting();
     };
     Trace("Wait for fence ", pFence, " at ", Value, gate->closed ? ", which holds the queue" : ", which it has had");
-    FLIGHT("queue %p: Wait for fence %p at %llu, holding %llu", this, pFence, Value, uint64_t(bool(gate->closed)));
+    FLIGHT_HEAVY(Sync, "queue %p: Wait for fence %p at %llu, holding %llu", this, pFence, Value, uint64_t(bool(gate->closed)));
+    // MULLION_TRACE_SYNC: only the Waits that hold the queue's work back, which a hang waits on; heavy has every one
+    if (gate->closed && !trace::Heavy(trace::Sync))
+      TRACE_IN(Sync, "queue ", this, ": Wait for fence ", pFence, " at ", Value, " holds the queue's work");
     if (gate->closed && !Hold(work))
       Hold(work, true);
     return S_OK;
@@ -2129,7 +2207,7 @@ public:
       const std::vector<PresentCopy> &copies
   ) {
     Trace("Present");
-    FLIGHT("queue %p: Present %llu", this, number);
+    FLIGHT_HEAVY(Present, "queue %p: Present %llu", this, number);
     auto scope = StartCommitting();
     auto &cmdbuf = scope.inflight->cmdbuf;
     if constexpr (Metal4)

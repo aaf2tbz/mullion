@@ -6,6 +6,7 @@
 #include "dxgi_options.hpp"
 #include "util_string.hpp"
 #include "log/log.hpp"
+#include "log/trace.hpp"
 #include "wsi_monitor.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
@@ -277,6 +278,10 @@ public:
     pVideoMemoryInfo->Budget = local ? device_.recommendedMaxWorkingSetSize() : 0;
     pVideoMemoryInfo->CurrentUsage = local ? device_.currentAllocatedSize() : 0;
     pVideoMemoryInfo->AvailableForReservation = pVideoMemoryInfo->Budget / 2;
+    // MULLION_TRACE_MEMORY=heavy: every query; a game polls it each frame
+    if (trace::Heavy(trace::Memory) && local)
+      TRACE_IN(Memory, "QueryVideoMemoryInfo: usage ", pVideoMemoryInfo->CurrentUsage >> 20, " MB of a budget of ",
+               pVideoMemoryInfo->Budget >> 20, " MB");
     pVideoMemoryInfo->CurrentReservation =
         mem_reserved_[uint32_t(MemorySegmentGroup)];
     return S_OK;
