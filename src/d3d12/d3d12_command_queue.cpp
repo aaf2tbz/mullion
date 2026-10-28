@@ -258,7 +258,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // a submission's runs of passes that need nothing but a command buffer (EncodePass) are encoded by several threads
   // at once, the queue's own among them, each into a command buffer of its own, and committed in the queue's order:
   // Metal's encoding of draws is what a frame of many waits for. MULLION_D3D12_ENCODE_THREADS=1 encodes on one.
-  // Metal 3 only: a Metal 4 queue's command buffers are its own (MTL4CommandBuffer_new)
   static constexpr unsigned kMaxEncodeThreads = 8;
   // commands: a run of fewer is encoded on one thread, and a thread is given no fewer
   // (MULLION_D3D12_PARALLEL_COMMANDS, for tests: both are that number)
@@ -795,11 +794,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
       pool = WMT::MakeAutoreleasePool();
       if constexpr (Metal4) {
-        inflight->cmdbuf = WMT::Reference<MetalCommandBuffer>(MTL4CommandBuffer_new(
-            queue->queue_, queue->fence_, queue->completion_event_, seq, queue->device_->GetGlobalResidencySet(),
-            {kCustomBufferArgumentIndex0 + 1, D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
-             D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT}
-        ));
+        inflight->cmdbuf = encoded ? std::move(encoded) : queue->NewCommandBuffer(seq);
         if (!inflight->cmdbuf)
           queue->device_->LoseDevice();
       } else {
@@ -864,6 +859,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   CommittingScope
   StartCommitting() {
     return CommittingScope(this);
+  }
+
+  // a Metal 4 command buffer for the slot of sequence number `seq`, whose commit signals that number
+  WMT::Reference<MetalCommandBuffer>
+  NewCommandBuffer(uint64_t seq) {
+    return WMT::Reference<MetalCommandBuffer>(MTL4CommandBuffer_new(
+        queue_, fence_, completion_event_, seq, device_->GetGlobalResidencySet(),
+        {kCustomBufferArgumentIndex0 + 1, D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+         D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT}
+    ));
   }
 
 public:
@@ -1505,7 +1510,7 @@ public:
     // lists whose every pass encodes on any thread, as many as follow each other: their passes, and what they cost.
     // not with what keeps state of a slot's own (profiles, GPU records, debug groups, encoder counts)
     std::vector<std::pair<EncoderData *, uint64_t>> passes;
-    bool parallel = !Metal4 && EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
+    bool parallel = EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
                     !diag::trace_encoders;
     for (size_t i = 0; i < recorded.size();) {
       size_t j = i;
@@ -1523,14 +1528,12 @@ public:
           break;
         }
       }
-      if constexpr (!Metal4) {
-        if (commands >= kParallelCommands && passes.size() > 1) {
-          if (!EncodeParallel(scope, passes, commands, sparse_mappings))
-            return;
-          cmdbuf = scope.inflight->cmdbuf;
-          i = j;
-          continue;
-        }
+      if (commands >= kParallelCommands && passes.size() > 1) {
+        if (!EncodeParallel(scope, passes, commands, sparse_mappings))
+          return;
+        cmdbuf = scope.inflight->cmdbuf;
+        i = j;
+        continue;
       }
       for (j = std::max(j, i + 1); i < j; i++)
         encode(encode, recorded[i], keeps.allocators[i].ptr());
@@ -1829,8 +1832,17 @@ public:
       syncs.push_back(NextSync(pass));
     std::vector<WMT::Reference<MetalCommandBuffer>> buffers(parts);
     buffers[0] = scope.inflight->cmdbuf;
-    for (unsigned k = 1; k < parts; k++)
-      buffers[k] = queue_.commandBuffer();
+    // a part's command buffer is the slot's after the one before, which commits it next
+    for (unsigned k = 1; k < parts; k++) {
+      if constexpr (Metal4)
+        buffers[k] = NewCommandBuffer(inflight_cmdbuf_seq_.load(std::memory_order_relaxed) + k);
+      else
+        buffers[k] = queue_.commandBuffer();
+      if (!buffers[k]) {
+        device_->LoseDevice();
+        return false;
+      }
+    }
     // the parts the encoding threads have yet to finish, under the lock
     unsigned left = parts - 1;
     std::atomic<bool> lost = false;
