@@ -2254,10 +2254,11 @@ convert_dxil(
     Value *ret = nullptr;
     auto a = [&](unsigned i) { return arg(call, i); };
     // Metal's SIMD-group functions take every active lane, a helper's too: where D3D leaves helpers out, they skip
-    // the operation, and get zero for its undefined result
+    // the operation, and get zero for its undefined result. WaveReadLaneFirst they take part in (below)
     llvm::BasicBlock *skipped = nullptr;
     if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves &&
-        ((op >= WaveIsFirstLane && op <= WavePrefixOp && op != WaveGetLaneIndex && op != WaveGetLaneCount) ||
+        ((op >= WaveIsFirstLane && op <= WavePrefixOp && op != WaveGetLaneIndex && op != WaveGetLaneCount &&
+          op != WaveReadLaneFirst) ||
          op == WaveAllBitCount || op == WavePrefixBitCount || (op >= WaveMatch && op <= WaveMultiPrefixBitCount))) {
       skipped = ir.GetInsertBlock();
       auto join = SplitBlock(skipped, call);
@@ -2406,7 +2407,21 @@ convert_dxil(
       ret = move("simd_shuffle", a(1), {i16(a(2))});
       break;
     case WaveReadLaneFirst:
-      ret = move("simd_broadcast_first", a(1), {});
+      if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves) {
+        // the first lane that is not a helper, as D3D has it, and its value for every lane, the helpers' too: in a
+        // loop that runs until a lane's value is the first lane's (a "waterfall" over the wave's distinct values), a
+        // helper given zero, or a first lane that is a helper, never matches, and the loop never ends (Dragon's
+        // Dogma 2's PS_Culltest hung the GPU). a loop only helpers are still in takes the first of them
+        auto ctz = ctx.module.getOrInsertFunction(
+            "air.ctz.i64", FunctionType::get(ir.getInt64Ty(), {ir.getInt64Ty(), ir.getInt1Ty()}, false)
+        );
+        auto helper = simd("simd_is_helper_thread", ir.getInt1Ty(), {});
+        auto real = simd("simd_ballot", ir.getInt64Ty(), {ir.CreateNot(helper)}, ir.getInt64Ty());
+        auto active = simd("simd_ballot", ir.getInt64Ty(), {ir.getTrue()}, ir.getInt64Ty());
+        auto lanes = ir.CreateSelect(ir.CreateICmpNE(real, ir.getInt64(0)), real, active);
+        ret = move("simd_shuffle", a(1), {i16(ir.CreateCall(ctz, {lanes, ir.getFalse()}))});
+      } else
+        ret = move("simd_broadcast_first", a(1), {});
       break;
     case QuadReadLaneAt:
       ret = move("quad_shuffle", a(1), {i16(a(2))});
