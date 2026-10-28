@@ -1592,6 +1592,13 @@ _MTLDevice_supports32BitMSAA(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_supportsShaderBarycentricCoordinates(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle supportsShaderBarycentricCoordinates];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_maxArgumentBufferSamplerCount(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLDevice>)params->handle maxArgumentBufferSamplerCount];
@@ -2304,6 +2311,7 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool conservative;
   bool coarse_shading;
   uint32_t shading_rate_varying;
+  bool quad_lines;
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -2328,6 +2336,7 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA32 {
   bool pipeline_statistics;
   bool clip_distance_varyings;
   bool quad_lines;
+  bool barycentrics;
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
@@ -2409,6 +2418,7 @@ sm50_compilation_argument32_convert(
       data->conservative = src->conservative;
       data->coarse_shading = src->coarse_shading;
       data->shading_rate_varying = src->shading_rate_varying;
+      data->quad_lines = src->quad_lines;
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -2451,6 +2461,7 @@ sm50_compilation_argument32_convert(
       data->pipeline_statistics = src->pipeline_statistics;
       data->clip_distance_varyings = src->clip_distance_varyings;
       data->quad_lines = src->quad_lines;
+      data->barycentrics = src->barycentrics;
       data->conservative = src->conservative;
       data->flat_inputs = src->flat_inputs;
       data->noperspective_inputs = src->noperspective_inputs;
@@ -5916,6 +5927,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_queryTimestampFrequency,
     &_MTL4CommandBuffer_present,
     &_MTL4CommandBuffer_waitForEvent,
+    &_MTLDevice_supportsShaderBarycentricCoordinates,
 };
 
 #ifndef MULLION_NATIVE
@@ -6112,6 +6124,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_queryTimestampFrequency,
     &_MTL4CommandBuffer_present,
     &_MTL4CommandBuffer_waitForEvent,
+    &_MTLDevice_supportsShaderBarycentricCoordinates,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

@@ -316,9 +316,20 @@ public:
 
   Value *CreateInterpolateAtCentroid(Value *Interpoant, bool Perspective);
 
+  // the sample D3D takes a centroid at among `Coverage`'s samples in `Mask` (D3D11.3 3.5.5): whether it is the center,
+  // and else which one
+  std::pair<Value *, Value *> CreateCentroidSample(Value *Coverage, Value *Mask);
+
+  // where D3D takes a centroid, as an offset from the pixel's center, of the pixel's covered samples (or
+  // CentroidCoverage's, where it is set)
+  Value *CreateCentroidOffset(Value *Coverage);
+
   Value *CreateInterpolateAtSample(Value *Interpoant, Value *SampleIndex, bool Perspective);
 
   Value *CreateInterpolateAtOffset(Value *Interpoant, Value *Offset, bool Perspective);
+
+  // a vertex_value input's value of type `Ty` (a float, or an unsigned integer) at the primitive's vertex `Index`
+  Value *CreateGetVertexValue(Value *VertexValue, Type *Ty, Value *Index);
 
   /* Object Shader */
 

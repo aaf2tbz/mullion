@@ -748,7 +748,9 @@ public:
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(pFeatureData);
       out->CastingFullyTypedFormatSupported = TRUE;
-      out->BarycentricsSupported = FALSE;
+      // Metal 4's shading language reads barycentrics and inputs at each vertex (SM50_SHADER_METAL_400)
+      out->BarycentricsSupported = GetMTLDevice().supportsFamily(WMTGPUFamilyMetal4) &&
+                                   GetMTLDevice().supportsShaderBarycentricCoordinates();
       out->CopyQueueTimestampQueriesSupported = FALSE;
       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
       // a list's own copies, after the work before them whatever the marker mode (WriteImmediate); bundles record none

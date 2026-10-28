@@ -264,6 +264,16 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
     module.setTargetTriple("air64-apple-macosx15.0.0");
     break;
   }
+  case SM50_SHADER_METAL_400: {
+    airVersion->addOperand(
+        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)})
+    );
+    airLangVersion->addOperand(MDTuple::get(
+        context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(0), createUnsignedInteger(0)}
+    ));
+    module.setTargetTriple("air64_v28-apple-macosx26.0.0");
+    break;
+  }
   default: {
     airVersion->addOperand(
         MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(6), createUnsignedInteger(0)})
@@ -600,6 +610,9 @@ llvm::Error convert_dxbc_pixel_shader(
     metal_version = sm50_common->metal_version;
     shader_flags = sm50_common->flags;
   }
+  // barycentrics and inputs read at each vertex are Metal 4's
+  if (shader_info->use_barycentrics || shader_info->vertex_value_reg_mask)
+    metal_version = SM50_SHADER_METAL_400;
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
@@ -623,6 +636,7 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output || early_tests;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
+    sig_ctx.barycentric_rows = pso_data && pso_data->quad_lines;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
@@ -2025,6 +2039,7 @@ AIRCONV_API int SM50Initialize(
                             sm50_shader->ps_noperspective_input_mask};
       // EvaluateAttribute* evaluates where the shader chooses, which coarse shading does not move
       pRefl->PixelShader.FineShading = sm50_shader->ps_fine_shading || sm50_shader->shader_info.pull_mode_reg_mask;
+      pRefl->PixelShader.Barycentrics = sm50_shader->shader_info.use_barycentrics;
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;

@@ -408,9 +408,9 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds,
-             late, conservative, coarse, rate] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+             late, conservative, coarse, rate, quads] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
       hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds, late,
-           conservative, coarse, rate);
+           conservative, coarse, rate, quads);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -423,9 +423,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
-      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads, conservative, flat, noperspective] =
-          *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
-      hash(strip, cut, index, primitive, pass, statistics, clips, quads, conservative, flat, noperspective);
+      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads, barycentrics, conservative, flat,
+             noperspective] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
+      hash(strip, cut, index, primitive, pass, statistics, clips, quads, barycentrics, conservative, flat, noperspective);
       break;
     }
     case SM50_SHADER_GS_PASS_THROUGH: {
@@ -627,7 +627,7 @@ protected:
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut;
     uint32_t primitive; // D3D10_SB_PRIMITIVE of the topology type
     bool clip_distance_varyings;
-    bool quad_lines;
+    bool quad_lines, barycentrics;
     // conservative rasterization, and how the pixel shader interpolates its inputs
     bool conservative;
     uint32_t flat_inputs, noperspective_inputs;
@@ -670,6 +670,7 @@ protected:
     pso_gs.pipeline_statistics = statistics;
     pso_gs.clip_distance_varyings = in.clip_distance_varyings;
     pso_gs.quad_lines = in.quad_lines && pass_through && !counting;
+    pso_gs.barycentrics = in.barycentrics && pso_gs.quad_lines;
     pso_gs.conservative = in.conservative && !counting && (!in.gs.empty() || pass_through);
     pso_gs.flat_inputs = in.flat_inputs;
     pso_gs.noperspective_inputs = in.noperspective_inputs;
@@ -1252,6 +1253,15 @@ public:
       });
       conservative = false;
     }
+    // a grown triangle's barycentrics are not the primitive's
+    if (conservative && ref_ps.PixelShader.Barycentrics) {
+      static std::once_flag warned;
+      std::call_once(warned, [] {
+        WARN("CreatePipelineState: conservative rasterization with a pixel shader that reads barycentrics is not "
+             "implemented yet; those pipelines rasterize as usual");
+      });
+      conservative = false;
+    }
     // and passes lines on as quadrilaterals (D3D11.3 15.14.1, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
     bool quad_lines =
         plain && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE && pDesc->RasterizerState.MultisampleEnable;
@@ -1349,6 +1359,7 @@ public:
       data_ps.depth_bounds = depth_bounds_emulated;
       data_ps.late_tests = false;
       data_ps.conservative = conservative;
+      data_ps.quad_lines = quad_lines && ref_ps.PixelShader.Barycentrics;
       data_ps.coarse_shading = false;
       // the primitive's shading rate, from the stage before the rasterizer: a domain or mesh shader has none
       data_ps.shading_rate_varying = sm50_shader_t(shader_gs)      ? ref_gs.ShadingRateOutput
@@ -1412,6 +1423,7 @@ public:
       in->ps = ps_func;
       in->clip_distance_varyings = clips;
       in->quad_lines = quad_lines;
+      in->barycentrics = ps_func && ref_ps.PixelShader.Barycentrics;
       in->strip_cut = pDesc->IBStripCutValue;
       in->primitive = pDesc->PrimitiveTopologyType;
       in->conservative = conservative;

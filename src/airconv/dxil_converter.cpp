@@ -165,6 +165,7 @@ enum Op : uint32_t {
   LegacyF16ToF32 = 131,
   WaveAllBitCount = 135,
   WavePrefixBitCount = 136,
+  AttributeAtVertex = 137,
   ViewID = 138,
   RawBufferLoad = 139,
   RawBufferStore = 140,
@@ -237,6 +238,7 @@ enum Semantic : uint32_t {
   DepthLessEqual,
   DepthGreaterEqual,
   StencilRef,
+  SemanticBarycentrics = 28,
   SemanticShadingRate = 29,
   SemanticCullPrimitive = 30,
 };
@@ -910,7 +912,7 @@ read_dxil(
       {Coverage, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK},
       {InnerCoverage, D3D11_SB_OPERAND_TYPE_INNER_COVERAGE},
   };
-  std::set<uint32_t> used_ops;
+  std::set<uint32_t> used_ops, evaluated_barycentrics;
   for (auto &F : M) {
     if (!F.getName().startswith("dx.op."))
       continue;
@@ -918,12 +920,23 @@ read_dxil(
       auto call = cast<CallInst>(user);
       auto op = opcode(call);
       used_ops.insert(op);
+      if (op != EvalSnapped && op != EvalSampleIndex && op != EvalCentroid && op != AttributeAtVertex)
+        continue;
+      auto id = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+      auto &e = entry.input[id];
+      if (e.semantic == SemanticBarycentrics) {
+        evaluated_barycentrics.insert(id);
+        continue;
+      }
+      // the rows it reads: all of the element's for a dynamic row
+      uint32_t rows = uint32_t((1ull << e.rows) - 1) << e.row;
+      if (auto row = dyn_cast<ConstantInt>(call->getArgOperand(2)))
+        rows = 1u << (e.row + row->getZExtValue());
+      if (op == AttributeAtVertex)
+        info.vertex_value_reg_mask |= rows;
       // evaluated attributes are interpolated in the shader, as DXBC's eval instructions mark them
-      if ((op == EvalSnapped || op == EvalSampleIndex || op == EvalCentroid) &&
-          isa<ConstantInt>(call->getArgOperand(2)))
-        info.pull_mode_reg_mask |= 1u
-                                   << (entry.input[cast<ConstantInt>(call->getArgOperand(1))->getZExtValue()].row +
-                                       cast<ConstantInt>(call->getArgOperand(2))->getZExtValue());
+      else if (isa<ConstantInt>(call->getArgOperand(2)))
+        info.pull_mode_reg_mask |= rows;
     }
   }
 
@@ -1001,6 +1014,9 @@ read_dxil(
   auto rows = [&](auto &elements, auto &parser, auto opcode_of, D3D10_SB_OPERAND_TYPE type, uint32_t phase = ~0u) {
     for (unsigned id = 0; id < elements.size(); id++) {
       auto &e = elements[id];
+      // barycentrics have no register (define_barycentrics)
+      if (e.semantic == SemanticBarycentrics)
+        continue;
       for (uint32_t row = e.row; row < e.row + e.rows; row++) {
         uint32_t mask = ((1u << e.cols) - 1) << e.col;
         auto name = system_value(parser, row, mask);
@@ -1061,6 +1077,13 @@ read_dxil(
     auto [opcode, type, row, name, id, interpolation, phase] = key;
     declare(opcode, type, row, mask, name, interpolation, phase);
   }
+  // after the position's declaration, whose interpolation stays its own where barycentrics take the position too
+  if (pixel)
+    for (unsigned id = 0; id < entry.input.size(); id++)
+      if (entry.input[id].semantic == SemanticBarycentrics)
+        define_barycentrics(
+            shader, id, D3D10_SB_INTERPOLATION_MODE(entry.input[id].interpolation), evaluated_barycentrics.contains(id)
+        );
   // groupshared 64-bit atomics hash their locks with the threadgroup's position (`locked`); those on resources share
   // their locks among threadgroups
   for (auto &F : M)
@@ -2321,6 +2344,10 @@ convert_dxil(
                    : op == LoadOutputControlPoint ? ctx.resource.output
                                                   : ctx.resource.patch_constant_output;
       auto &elements = op == LoadInput ? entry.input : op == LoadOutputControlPoint ? entry.output : entry.patch;
+      if (op == LoadInput && elements[constant(a(1))].semantic == SemanticBarycentrics) {
+        ret = ir.CreateExtractElement(ctx.resource.barycentrics[constant(a(1))].value, a(3));
+        break;
+      }
       auto ptr = element_ptr(file, elements[constant(a(1))], call, op == LoadPatchConstant ? nullptr : a(4));
       ret = narrow(ir.CreateLoad(ir.getInt32Ty(), ptr), ty);
       break;
@@ -3315,6 +3342,21 @@ convert_dxil(
     case EvalCentroid:
     case EvalSampleIndex:
     case EvalSnapped: {
+      if (entry.input[constant(a(1))].semantic == SemanticBarycentrics) {
+        auto &b = ctx.resource.barycentrics[constant(a(1))];
+        // eval_snapped's offset is in 1/16 pixel steps, [-8, 7]
+        auto snapped = [&] {
+          auto steps = ir.CreateAnd(ir.CreateAdd(vec(call, 4, 2, air.getIntTy(2)), air.getInt2(8, 8)), air.getInt2(0b1111, 0b1111));
+          return ir.CreateFSub(
+              ir.CreateFMul(air.CreateConvertToFloat(steps), air.getFloat2(1.0f / 16.0f, 1.0f / 16.0f)), air.getFloat2(0.5f, 0.5f)
+          );
+        };
+        auto offset = op == EvalCentroid      ? b.centroid
+                      : op == EvalSampleIndex ? air.CreateRasterizerSamplePos(a(4))
+                                              : snapped();
+        ret = ir.CreateExtractElement(b.At(ir, offset), a(3));
+        break;
+      }
       auto itp = interpolant(call);
       if (!itp)
         return make_error<UnsupportedFeature>(
@@ -3555,6 +3597,27 @@ convert_dxil(
         auto byte = ir.CreateTrunc(ir.CreateLShr(a(2), 8 * i), ir.getInt8Ty());
         ret = ir.CreateInsertValue(ret, constant(a(1)) ? ir.CreateSExt(byte, elem) : ir.CreateZExt(byte, elem), {i});
       }
+      break;
+    }
+    case AttributeAtVertex: {
+      if (ty->getPrimitiveSizeInBits() > 32)
+        return make_error<UnsupportedFeature>("DXIL 64-bit inputs are not lowered yet");
+      auto &e = entry.input[constant(a(1))];
+      auto at = [&](uint32_t row) -> Value * {
+        auto &values = ctx.resource.vertex_value_map[e.row + row];
+        auto c = e.col + constant(a(3));
+        auto value = air.CreateGetVertexValue(
+            ctx.function->getArg(values.component[c]), values.integers >> c & 1 ? ir.getInt32Ty() : ir.getFloatTy(),
+            ir.CreateZExt(a(4), ir.getInt32Ty())
+        );
+        return ir.CreateBitCast(value, ir.getInt32Ty());
+      };
+      // a dynamic row picks among the element's
+      bool dynamic = !isa<ConstantInt>(a(2));
+      Value *value = at(dynamic ? 0 : constant(a(2)));
+      for (uint32_t row = 1; dynamic && row < e.rows; row++)
+        value = ir.CreateSelect(ir.CreateICmpEQ(a(2), ir.getInt32(row)), at(row), value);
+      ret = narrow(value, ty);
       break;
     }
     case ViewID:

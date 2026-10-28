@@ -290,6 +290,74 @@ void handle_signature_vs(
   }
 };
 
+void define_barycentrics(
+  SM50ShaderInternal *sm50_shader, uint32_t element, D3D10_SB_INTERPOLATION_MODE mode, bool evaluated
+) {
+  auto interpolation = to_air_interpolation(mode);
+  bool perspective = interpolation == Interpolation::center_perspective ||
+                     interpolation == Interpolation::centroid_perspective ||
+                     interpolation == Interpolation::sample_perspective;
+  bool sample = interpolation == Interpolation::sample_perspective || interpolation == Interpolation::sample_no_perspective;
+  bool centroid =
+      interpolation == Interpolation::centroid_perspective || interpolation == Interpolation::centroid_no_perspective;
+  sm50_shader->shader_info.use_barycentrics = true;
+  sm50_shader->ps_fine_shading |= sample || evaluated;
+  sm50_shader->signature_handlers.push_back([=](SignatureContext &ctx) {
+    bool rows = ctx.barycentric_rows, stepped = sample || centroid || evaluated;
+    std::array<uint32_t, 3> coords{rows ? ~0u : ctx.func_signature.DefineInput(InputBarycentricCoord{.perspective = perspective})};
+    for (uint32_t k = 0; rows && k < 3; k++)
+      coords[k] = ctx.func_signature.DefineInput(InputFragmentStageIn{
+          .user = "mullion_barycentrics" + std::to_string((perspective ? 0 : 3) + k),
+          .type = msl_float,
+          .interpolation = Interpolation::center_no_perspective,
+          .pull_mode = false
+      });
+    auto position = stepped && perspective && !rows ? ctx.func_signature.DefineInput(InputPosition{Interpolation::center_no_perspective}) : ~0u;
+    auto sample_index = sample ? ctx.func_signature.DefineInput(InputSampleIndex{}) : ~0u;
+    auto coverage = centroid || evaluated ? ctx.func_signature.DefineInput(InputInputCoverage{}) : ~0u;
+    ctx.prologue << make_effect([=](struct context ctx) {
+      auto &ir = ctx.builder;
+      auto &b = ctx.resource.barycentrics[element];
+      b.perspective = perspective;
+      if (rows) {
+        // already linear in the window, times 1/w where perspective
+        b.center = llvm::ConstantAggregateZero::get(llvm::FixedVectorType::get(ir.getFloatTy(), 3));
+        for (uint32_t k = 0; k < 3; k++)
+          b.center = ir.CreateInsertElement(b.center, ctx.function->getArg(coords[k]), k);
+        b.value = b.At(ir, nullptr);
+      } else {
+        b.value = b.center = ctx.function->getArg(coords[0]);
+      }
+      if (!stepped)
+        return std::monostate{};
+      if (perspective && !rows) {
+        // Metal's position is where its own interpolation takes it, with 1/w there in w: 1/w is affine on the screen
+        // too, so a step back along its derivatives gives the center's
+        auto mtl_position = ctx.function->getArg(position);
+        auto w = ir.CreateExtractElement(mtl_position, 3);
+        auto xy = ir.CreateShuffleVector(mtl_position, {0, 1});
+        auto off = ir.CreateFSub(ir.CreateFSub(xy, ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::floor, xy)), ctx.air.getFloat2(0.5f, 0.5f));
+        auto at_center = ir.CreateFSub(
+            w, ir.CreateFAdd(
+                   ir.CreateFMul(ctx.air.CreateDerivative(w, false), ir.CreateExtractElement(off, uint64_t(0))),
+                   ir.CreateFMul(ctx.air.CreateDerivative(w, true), ir.CreateExtractElement(off, 1))
+               )
+        );
+        b.center = ir.CreateFMul(b.center, ir.CreateVectorSplat(3, at_center));
+      }
+      b.ddx = ctx.air.CreateDerivative(b.center, false);
+      b.ddy = ctx.air.CreateDerivative(b.center, true);
+      if (~coverage)
+        b.centroid = ctx.air.CreateCentroidOffset(ctx.function->getArg(coverage));
+      if (sample)
+        b.value = b.At(ir, ctx.air.CreateRasterizerSamplePos(ctx.function->getArg(sample_index)));
+      else if (centroid)
+        b.value = b.At(ir, b.centroid);
+      return std::monostate{};
+    });
+  });
+}
+
 void handle_signature_ps(
   CSignatureParser &inputParser, const CSignatureParser &outputParser,
   D3D10ShaderBinary::CInstruction &Inst, SM50ShaderInternal *sm50_shader,
@@ -313,12 +381,21 @@ void handle_signature_ps(
                       interpolation == air::Interpolation::centroid_no_perspective;
       bool pull_mode = (bool(ctx.pull_mode_reg_mask & (1 << reg)) || (ctx.pull_centroids && centroid)) &&
                        interpolation != air::Interpolation::flat;
+      bool vertex_value = sm50_shader->shader_info.vertex_value_reg_mask >> reg & 1;
       for (unsigned c = 0; c < 4; c++) {
         if (!(mask >> c & 1))
           continue;
         auto assigned_index = ctx.func_signature.DefineInput(InputFragmentStageIn{
-          .user = varying_name(reg, c), .type = varying_type(type), .interpolation = interpolation, .pull_mode = pull_mode
+          .user = varying_name(reg, c), .type = varying_type(type), .interpolation = interpolation, .pull_mode = pull_mode,
+          .vertex_value = vertex_value
         });
+        if (vertex_value) {
+          auto &values = ctx.resource.vertex_value_map[reg];
+          values.component[c] = assigned_index;
+          values.integers |= (type != RegisterComponentType::Float) << c;
+          ctx.prologue << init_input_reg_at_vertex(assigned_index, reg, 1 << c, type != RegisterComponentType::Float);
+          continue;
+        }
         if (!pull_mode) {
           ctx.prologue << init_input_reg(assigned_index, reg, 1 << c);
           continue;

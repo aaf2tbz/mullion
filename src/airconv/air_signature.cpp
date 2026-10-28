@@ -493,6 +493,9 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
               [&](const InputRenderTarget s) {
                 return s.index == std::get<InputRenderTarget>(element.value()).index;
               },
+              [&](const InputBarycentricCoord s) {
+                return s.perspective == std::get<InputBarycentricCoord>(element.value()).perspective;
+              },
               [](auto) { return true; }
             },
             input
@@ -690,14 +693,31 @@ auto FunctionSignatureBuilder::CreateFunction(
         [&](const InputFragmentStageIn &frag_in) -> llvm::Type * {
           metadata_field.string("air.fragment_input")
             ->string(std::string("user(") + frag_in.user + ")");
-          insert_inteterpolation(metadata_field, frag_in.interpolation, frag_in.pull_mode);
+          if (frag_in.vertex_value)
+            metadata_field.string("air.vertex_value");
+          else
+            insert_inteterpolation(metadata_field, frag_in.interpolation, frag_in.pull_mode);
           metadata_field.string("air.arg_type_name")
             ->string(get_name(frag_in.type))
             ->string("air.arg_name")
             ->string(frag_in.user);
+          if (frag_in.vertex_value)
+            return getOrCreateStructType("struct._vertex_value_t", context)->getPointerTo(1);
           if (frag_in.pull_mode)
             return getOrCreateStructType("struct._interpolant_t", context)->getPointerTo(1);
           return get_llvm_type(frag_in.type, context);
+        },
+        [&](const InputBarycentricCoord &barycentric) -> llvm::Type * {
+          metadata_field.string("air.barycentric_coord");
+          insert_inteterpolation(
+              metadata_field,
+              barycentric.perspective ? Interpolation::center_perspective : Interpolation::center_no_perspective, false
+          );
+          metadata_field.string("air.arg_type_name")
+            ->string("float3")
+            ->string("air.arg_name")
+            ->string(barycentric.perspective ? "barycentric_coord" : "barycentric_coord_no_perspective");
+          return llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 3);
         },
         [&](const ArgumentBindingBuffer &buffer) {
           return build_argument_binding_buffer(

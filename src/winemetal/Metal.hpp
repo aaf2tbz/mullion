@@ -1378,6 +1378,11 @@ public:
     return MTLDevice_supports32BitMSAA(handle);
   }
 
+  bool
+  supportsShaderBarycentricCoordinates() {
+    return MTLDevice_supportsShaderBarycentricCoordinates(handle);
+  }
+
   uint64_t
   maxArgumentBufferSamplerCount() {
     return MTLDevice_maxArgumentBufferSamplerCount(handle);

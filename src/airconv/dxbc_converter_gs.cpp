@@ -1605,6 +1605,13 @@ convert_pass_through_geometry_shader(
     });
   if (!clip_varyings && pVertexStage->clip_distance_scalars.size())
     func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = pVertexStage->clip_distance_scalars.size()});
+  // the pixel shader's barycentrics are the line's, not its quadrilateral's triangles'
+  bool rows = quads && pso_data->barycentrics;
+  uint32_t rows_at = varyings.size() + (clip_varyings ? pVertexStage->clip_distance_scalars.size() : 0);
+  for (uint32_t i = 0; rows && i < SM50_BARYCENTRIC_ROWS; i++)
+    func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+        .user = "mullion_barycentrics" + std::to_string(i), .type = air::msl_float, .index = rows_at + i
+    });
   if (pVertexStage->cull_distance_scalars.size() || conservative)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
@@ -1784,6 +1791,11 @@ convert_pass_through_geometry_shader(
     }
     if (triangle)
       conservative_varyings(air, *triangle, u, vertex, conservative_at);
+    for (uint32_t i = 0; rows && clip[corner] && i < SM50_BARYCENTRIC_ROWS; i++) {
+      auto rcp_w = builder.CreateFDiv(air.getFloat(1), builder.CreateExtractElement(clip[corner], 3));
+      auto weight = i % 3 != corner ? air.getFloat(0) : i < 3 ? rcp_w : air.getFloat(1);
+      air.CreateSetMeshVertexData(vertex, builder.getInt32(rows_at + i), weight);
+    }
     if (own.count == 1)
       air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
   }
