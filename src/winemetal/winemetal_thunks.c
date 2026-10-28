@@ -201,6 +201,34 @@ WMTFlightDump(const char *reason) {
   ReleaseSRWLockExclusive(&flight_dump_lock);
 }
 
+// "exception in <module>+<offset>", for the dump's heading: the records give only an address, and a module the
+// loader relocated could be any of them
+static void
+flight_exception_reason(char *reason, size_t size, const void *address) {
+  HMODULE module;
+  char path[MAX_PATH], offset[20] = "+0x";
+  strcpy(reason, "exception");
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          address, &module))
+    return;
+  DWORD length = GetModuleFileNameA(module, path, sizeof(path));
+  if (!length || length >= sizeof(path))
+    return;
+  const char *name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+  uint64_t value = (uintptr_t)address - (uintptr_t)module;
+  char digits[17];
+  int count = 0;
+  do
+    digits[count++] = "0123456789abcdef"[value & 15];
+  while ((value >>= 4) && count < 16);
+  for (int i = 0; i < count; i++)
+    offset[3 + i] = digits[count - 1 - i];
+  offset[3 + count] = 0;
+  if (strlen("exception in ") + strlen(name) + strlen(offset) >= size)
+    return;
+  strcat(strcat(strcpy(reason, "exception in "), name), offset);
+}
+
 // the exceptions that end a process unless it catches them: the first dumps the records before its handlers run
 static LONG CALLBACK
 flight_exception(EXCEPTION_POINTERS *pointers) {
@@ -220,8 +248,11 @@ flight_exception(EXCEPTION_POINTERS *pointers) {
   case EXCEPTION_STACK_OVERFLOW:
   case EXCEPTION_INT_DIVIDE_BY_ZERO:
   case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-    if (!InterlockedExchange(&dumped, 1))
-      WMTFlightDump("exception");
+    if (!InterlockedExchange(&dumped, 1)) {
+      char reason[MAX_PATH + 32];
+      flight_exception_reason(reason, sizeof(reason), record->ExceptionAddress);
+      WMTFlightDump(reason);
+    }
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }
