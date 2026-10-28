@@ -857,6 +857,11 @@ UINT DecomposeSubresource(
     UINT *pPlaneSlice = NULL
 );
 
+namespace sdk {
+// GPU upload heaps (DirectX-Specs, D3D12 GPU Upload Heaps), which the toolchain's d3d12.h lacks
+constexpr auto D3D12_HEAP_TYPE_GPU_UPLOAD = D3D12_HEAP_TYPE(5);
+} // namespace sdk
+
 bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
 
 // whether these bytes are a container (of a shader, a library or a root signature) that is what its hash says, or

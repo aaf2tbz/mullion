@@ -728,7 +728,7 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16 *>(pFeatureData);
-      out->GPUUploadHeapSupported = FALSE;    // TODO(d3d12): gpu upload heap
+      out->GPUUploadHeapSupported = TRUE;
       out->DynamicDepthBiasSupported = FALSE; // TODO(d3d12): ID3D12GraphicsCommandList9::RSSetDepthBias
       return S_OK;
     }
@@ -1204,7 +1204,9 @@ public:
       __ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
       __ret->MemoryPoolPreference = advertise_numa_ ? D3D12_MEMORY_POOL_L1 : D3D12_MEMORY_POOL_L0;
       break;
+    // a GPU upload heap's are an upload heap's on a UMA adapter (D3D12 GPU Upload Heaps)
     case D3D12_HEAP_TYPE_UPLOAD:
+    case sdk::D3D12_HEAP_TYPE_GPU_UPLOAD:
       __ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
       __ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
       break;
