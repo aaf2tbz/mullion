@@ -729,7 +729,7 @@ public:
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16 *>(pFeatureData);
       out->GPUUploadHeapSupported = TRUE;
-      out->DynamicDepthBiasSupported = FALSE; // TODO(d3d12): ID3D12GraphicsCommandList9::RSSetDepthBias
+      out->DynamicDepthBiasSupported = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS2: {

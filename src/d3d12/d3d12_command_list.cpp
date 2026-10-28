@@ -226,6 +226,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   FLOAT blend_factor_[4];
   UINT8 stencil_ref_;
   UINT8 back_stencil_ref_;
+  // RSSetDepthBias's bias, clamp and slope scale, until a pipeline state is set again
+  std::optional<std::array<FLOAT, 3>> depth_bias_;
   // OMSetDepthBounds' range, NaN as 0; the pass has a range set when depth_bounds_set_
   FLOAT depth_bounds_[2];
   bool depth_bounds_set_ = false;
@@ -716,6 +718,7 @@ public:
     blend_factor_[2] = 1.0f;
     blend_factor_[3] = 1.0f;
     stencil_ref_ = back_stencil_ref_ = 0;
+    depth_bias_.reset();
     depth_bounds_[0] = 0.0f;
     depth_bounds_[1] = 1.0f;
     shading_rate_ = D3D12_SHADING_RATE_1X1;
@@ -790,7 +793,8 @@ public:
         riid == __uuidof(ID3D12GraphicsCommandList1) || riid == __uuidof(ID3D12GraphicsCommandList2) ||
         riid == __uuidof(ID3D12GraphicsCommandList3) || riid == __uuidof(ID3D12GraphicsCommandList4) ||
         riid == __uuidof(ID3D12GraphicsCommandList5) || riid == __uuidof(ID3D12GraphicsCommandList6) ||
-        riid == __uuidof(ID3D12GraphicsCommandList7) || riid == __uuidof(ID3D12GraphicsCommandList8)) {
+        riid == __uuidof(ID3D12GraphicsCommandList7) || riid == __uuidof(ID3D12GraphicsCommandList8) ||
+        riid == __uuidof(ID3D12GraphicsCommandList9)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -1165,9 +1169,9 @@ public:
       // a conservative rasterizer clips depth itself, and its grown triangles' depth goes past the polygon's
       cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
-      cmd_setrs.depth_bias = pso_graphics_->depth_bias;
-      cmd_setrs.depth_bias_clamp = pso_graphics_->depth_bias_clamp;
-      cmd_setrs.scole_scale = pso_graphics_->scole_scale;
+      std::tie(cmd_setrs.depth_bias, cmd_setrs.depth_bias_clamp, cmd_setrs.scole_scale) = depth_bias_.value_or(
+        std::array{pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale}
+      );
       cmd_setrs.winding = pso_graphics_->winding;
 
       dirty_state_.clr(DirtyState::GraphicsPipelineState);
@@ -2570,9 +2574,29 @@ public:
   }
 
   void STDMETHODCALLTYPE
+  RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) {
+    if (Bundled() && Record([=](auto *l) { l->RSSetDepthBias(DepthBias, DepthBiasClamp, SlopeScaledDepthBias); }))
+      return;
+    depth_bias_ = {DepthBias, DepthBiasClamp, SlopeScaledDepthBias};
+    dirty_state_.set(DirtyState::GraphicsPipelineState);
+  }
+
+  void STDMETHODCALLTYPE
+  IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) {
+    // geometry shader pipelines build the cut in, so OPTIONS15 reports no DynamicIndexBufferStripCutSupported
+    ERR("IASetIndexBufferStripCutValue: dynamic strip cut is not supported");
+    recording_error_ = E_INVALIDARG;
+  }
+
+  void STDMETHODCALLTYPE
   SetPipelineState(ID3D12PipelineState *pPSO) {
     if (Bundled() && Record([pso = Com<ID3D12PipelineState>(pPSO)](auto *l) { l->SetPipelineState(pso.ptr()); }))
       return;
+    // setting a pipeline state again takes its depth bias back, the same one included
+    if (depth_bias_) {
+      depth_bias_.reset();
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+    }
     if (!pPSO) {
       pso_graphics_ = nullptr;
       pso_compute_ = nullptr;

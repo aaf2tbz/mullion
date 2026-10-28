@@ -87,6 +87,17 @@ struct D3D12_DEPTH_STENCIL_DESC2 {
 };
 #endif
 
+#ifndef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+#define __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+/** ID3D12GraphicsCommandList9 as the D3D12 headers declare it: dynamic depth bias and index buffer strip cut. */
+MIDL_INTERFACE("34ed2808-ffe6-4c2b-b11a-cabd2b0c59e1")
+ID3D12GraphicsCommandList9 : public ID3D12GraphicsCommandList8 {
+  virtual void STDMETHODCALLTYPE RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) = 0;
+  virtual void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) = 0;
+};
+__CRT_UUID_DECL(ID3D12GraphicsCommandList9, 0x34ed2808, 0xffe6, 0x4c2b, 0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1)
+#endif
+
 namespace mullion {
 
 bool ExperimentalShaderModelsEnabled();
@@ -114,7 +125,7 @@ constexpr uint64_t kGPUTimestampFrequency = 1'000'000'000;
 class MTLD3D12CommandAllocator;
 class MTLD3D12Device;
 
-class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList8 {
+class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList9 {
 public:
   EncoderData *entry;
   size_t encoder_count;
