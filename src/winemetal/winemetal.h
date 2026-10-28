@@ -2088,7 +2088,8 @@ WINEMETAL_API void WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *p
 enum WMTMetalVersion : uint32_t {
   WMTMetal310 = 310,
   WMTMetal320 = 320,
-  WMTMetalVersionMax = WMTMetal320,
+  WMTMetal400 = 400,
+  WMTMetalVersionMax = WMTMetal400,
 };
 
 WINEMETAL_API obj_handle_t MTLDevice_newBinaryArchive(obj_handle_t device, const char *url, obj_handle_t *err_out);
