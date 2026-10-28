@@ -749,7 +749,10 @@ public:
       out->BarycentricsSupported = FALSE;
       out->CopyQueueTimestampQueriesSupported = FALSE;
       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
-      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+      // a list's own copies, after the work before them whatever the marker mode (WriteImmediate); bundles record none
+      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
+                                              D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
+                                              D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
