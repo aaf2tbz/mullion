@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 82
+#define AIRCONV_VERSION 83
 
 #ifdef __cplusplus
 #include <string>
@@ -316,6 +316,7 @@ struct SM50_SHADER_MESH_SHADER_DATA {
   uint32_t slices;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
+  bool barycentrics;
 };
 
 /* a DXIL library compiles one function at a time: its ray tracing shader `name`, as a visible function of a ray
@@ -663,7 +664,8 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
   /* the lines passed on are quadrilaterals (D3D11.3 3.4.5): two counterclockwise triangles, which the pipeline
      draws with no culling, no depth bias, solid fill and counterclockwise front faces, as lines are drawn */
   bool quad_lines;
-  /* the pixel shader reads barycentrics, which quadrilaterals pass on as SM50_BARYCENTRIC_ROWS */
+  /* the pixel shader reads barycentrics, which quadrilaterals and conservative triangles pass on as
+     SM50_BARYCENTRIC_ROWS */
   bool barycentrics;
   /* passing triangles through, conservative rasterization: each is one Metal triangle around it, its attributes
      extrapolated as the pixel shader interpolates them (MTL_PIXEL_SHADER_REFLECTION's FlatInputs,
@@ -692,6 +694,7 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA {
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
+  bool barycentrics;
 };
 
 /* the libraries whose functions a library's shader may call: those of its state object */

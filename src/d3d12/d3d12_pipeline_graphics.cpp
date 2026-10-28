@@ -434,9 +434,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
-      auto &[next, type, factor, size, groups, geometry, conservative, flat, noperspective] =
+      auto &[next, type, factor, size, groups, geometry, conservative, flat, noperspective, barycentrics] =
           *(SM50_SHADER_PSO_TESSELLATOR_DATA *)arg;
-      hash(factor, size, groups, bool(geometry), conservative, flat, noperspective);
+      hash(factor, size, groups, bool(geometry), conservative, flat, noperspective, barycentrics);
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:
@@ -458,9 +458,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
-      auto &[next, type, pixel, conservative, amplified, triangles, slices, flat, noperspective] =
+      auto &[next, type, pixel, conservative, amplified, triangles, slices, flat, noperspective, barycentrics] =
           *(SM50_SHADER_MESH_SHADER_DATA *)arg;
-      hash(bool(pixel), conservative, amplified, triangles, slices, flat, noperspective);
+      hash(bool(pixel), conservative, amplified, triangles, slices, flat, noperspective, barycentrics);
       break;
     }
     default:
@@ -670,8 +670,8 @@ protected:
     pso_gs.pipeline_statistics = statistics;
     pso_gs.clip_distance_varyings = in.clip_distance_varyings;
     pso_gs.quad_lines = in.quad_lines && pass_through && !counting;
-    pso_gs.barycentrics = in.barycentrics && pso_gs.quad_lines;
     pso_gs.conservative = in.conservative && !counting && (!in.gs.empty() || pass_through);
+    pso_gs.barycentrics = in.barycentrics && (pso_gs.quad_lines || pso_gs.conservative);
     pso_gs.flat_inputs = in.flat_inputs;
     pso_gs.noperspective_inputs = in.noperspective_inputs;
     so = in.so;
@@ -1253,15 +1253,6 @@ public:
       });
       conservative = false;
     }
-    // a grown triangle's barycentrics are not the primitive's
-    if (conservative && ref_ps.PixelShader.Barycentrics) {
-      static std::once_flag warned;
-      std::call_once(warned, [] {
-        WARN("CreatePipelineState: conservative rasterization with a pixel shader that reads barycentrics is not "
-             "implemented yet; those pipelines rasterize as usual");
-      });
-      conservative = false;
-    }
     // and passes lines on as quadrilaterals (D3D11.3 15.14.1, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
     bool quad_lines =
         plain && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE && pDesc->RasterizerState.MultisampleEnable;
@@ -1452,6 +1443,7 @@ public:
         link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.triangles - 1) / link.triangles;
         link.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
         link.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
+        link.barycentrics = pixel_shader && ref_ps.PixelShader.Barycentrics;
       }
       // the amplification shader asks for a conservative mesh shader's slices
       SM50_SHADER_MESH_SHADER_DATA amplified = link;
@@ -1520,6 +1512,7 @@ public:
       pso_tess.conservative = conservative;
       pso_tess.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
       pso_tess.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
+      pso_tess.barycentrics = conservative && pixel_shader && ref_ps.PixelShader.Barycentrics;
       pso_tess.next = &clip_data;
       mesh_info.fragment_function = ps_func.handle;
       mesh_info.rasterization_enabled = true;

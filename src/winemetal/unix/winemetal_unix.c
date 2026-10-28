@@ -2362,6 +2362,7 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA32 {
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
+  bool barycentrics;
 };
 
 struct SM50_SHADER_ROOT_SIGNATURE_DATA32 {
@@ -2517,6 +2518,7 @@ sm50_compilation_argument32_convert(
       data->conservative = src->conservative;
       data->flat_inputs = src->flat_inputs;
       data->noperspective_inputs = src->noperspective_inputs;
+      data->barycentrics = src->barycentrics;
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:

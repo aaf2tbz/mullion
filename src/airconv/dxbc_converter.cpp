@@ -636,7 +636,7 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output || early_tests;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
-    sig_ctx.barycentric_rows = pso_data && pso_data->quad_lines;
+    sig_ctx.barycentric_rows = pso_data && (pso_data->quad_lines || pso_data->conservative);
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
@@ -1954,7 +1954,7 @@ AIRCONV_API int SM50Initialize(
           components[primitive] += e.rows * e.cols;
       uint32_t staged = sm50_shader->mesh_max_vertices * (components[0] + 1) * 4 +
                         sm50_shader->mesh_max_primitives * (components[1] * 4 + 8);
-      uint32_t vertex_size = (components[0] + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4;
+      uint32_t vertex_size = (components[0] + mullion::dxbc::conservative_floats) * 4;
       uint32_t triangles = staged <= mullion::dxbc::conservative_stash_limit
                                ? std::min({256u / 3, 512u, std::max(sm50_shader->mesh_max_primitives, 1u)})
                                : 0;
@@ -2026,7 +2026,7 @@ AIRCONV_API int SM50Initialize(
       // primitives
       uint32_t triangles = sm50_shader->gs_max_vertex_output >= 3 ? sm50_shader->gs_max_vertex_output - 2 : 0;
       uint32_t vertex_size = sizeof(float[4]) +
-                             (sm50_shader->num_mesh_vertex_data + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4 +
+                             (sm50_shader->num_mesh_vertex_data + mullion::dxbc::conservative_floats) * 4 +
                              sm50_shader->clip_distance_scalars.size() * sizeof(float);
       pRefl->GeometryShader.ConservativeFits =
           sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && triangles &&

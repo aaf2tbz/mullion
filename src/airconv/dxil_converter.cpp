@@ -3944,11 +3944,11 @@ convert_dxil(
       for (uint32_t u = 0; u < 3; u++) {
         auto vertex = ir.CreateAdd(vertex_base, ir.getInt32(u));
         air.CreateSetMeshPosition(vertex, triangle.position[u]);
-        // a flat varying is the first corner's
+        // a flat varying is its own corner's, as conservative_point's
         for (uint32_t i = 0; i < cm->registers[0].size(); i++) {
           auto reg = cm->registers[0][i];
           bool integer = cm->integers[0][i], flat = integer || (cm->flat_inputs >> reg & 1);
-          Value *value = flat ? word(conservative_vertices, corner[0], i)
+          Value *value = flat ? word(conservative_vertices, corner[u], i)
                               : blend(cm->noperspective_inputs >> reg & 1 ? triangle.linear : triangle.over_w, u, i);
           if (flat && !integer)
             value = real(value);
@@ -3956,7 +3956,7 @@ convert_dxil(
         }
         for (uint32_t i = 0; i < clip_count; i++)
           air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(triangle.over_w, u, position_at + 4 + i));
-        conservative_varyings(air, triangle, u, vertex, cm->at);
+        conservative_varyings(air, triangle, u, vertex, cm->at, cm->barycentrics);
         air.CreateSetMeshIndex(ir.CreateAdd(vertex_base, ir.getInt32(u)), ir.CreateTrunc(vertex, i8));
       }
       // a primitive is culled when one distance puts all its vertices out, when the shader culls it itself, or when
@@ -4132,6 +4132,7 @@ convert_dxil_mesh_stage(
     resource_map.conservative_mesh->triangles = link->triangles;
     resource_map.conservative_mesh->flat_inputs = link->flat_inputs;
     resource_map.conservative_mesh->noperspective_inputs = link->noperspective_inputs;
+    resource_map.conservative_mesh->barycentrics = link->barycentrics;
   }
   resource_map.mesh_slices = slices;
 
@@ -4222,10 +4223,7 @@ convert_dxil_mesh_stage(
     if (conservative) {
       auto &cm = *resource_map.conservative_mesh;
       cm.at = cm.registers[0].size();
-      for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
-        func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-            .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = cm.at + i
-        });
+      define_conservative_varyings(func_signature, cm.at, cm.barycentrics);
     }
   } else {
     func_signature.DefineInput(air::InputMeshGridProperties{});

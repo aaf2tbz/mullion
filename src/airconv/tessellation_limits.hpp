@@ -118,9 +118,11 @@ struct tess_pieces {
 
 // conservative rasterization (`conservative`) always shares a workload of triangles: each primitive is one triangle
 // of three vertices of its own, each with the conservative rasterizer's floats (SM50_CONSERVATIVE_VARYINGS,
-// SM50_CONSERVATIVE_RCP_W), and its corners' registers wait in threadgroup memory, 16 KB of it, for the triangles;
-// `primitives` 0 where not even one fits
+// SM50_CONSERVATIVE_RCP_W, and the SM50_BARYCENTRIC_ROWS a pixel shader may read, which the pipeline knows later),
+// and its corners' registers wait in threadgroup memory, 16 KB of it, for the triangles; `primitives` 0 where not even
+// one fits
 constexpr uint32_t conservative_stash_limit = 16384;
+constexpr uint32_t conservative_floats = SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W + SM50_BARYCENTRIC_ROWS;
 
 inline tess_pieces
 tessellation_pieces(
@@ -129,7 +131,7 @@ tessellation_pieces(
 ) {
   uint32_t corners = get_primitive_vertices(primitive), vertices = get_max_workload_vertices(factor, domain);
   if (conservative && corners == 3) {
-    uint32_t grown = vertex_size + (SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * sizeof(float);
+    uint32_t grown = vertex_size + conservative_floats * sizeof(float);
     uint32_t triangles = std::min({256u / 3, 512u, conservative_stash_limit / (3 * std::max(vertex_size, 1u))});
     while (triangles && mesh_size(3 * triangles, grown, triangles) > mesh_size_limit)
       triangles--;
