@@ -984,8 +984,13 @@ public:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS15>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS17:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS17>(pFeatureData, DataSize);
-    case D3D12_FEATURE_D3D12_OPTIONS18:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS18>(pFeatureData, DataSize);
+    case D3D12_FEATURE_D3D12_OPTIONS18: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18))
+        return FAIL(E_INVALIDARG);
+      // tier 0: BeginRenderPass binds and clears its surfaces as the runtime does for drivers without render passes
+      reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS18 *>(pFeatureData)->RenderPassesValid = TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_EXISTING_HEAPS:
       return NotSupported<D3D12_FEATURE_DATA_EXISTING_HEAPS>(pFeatureData, DataSize);
     case D3D12_FEATURE_CROSS_NODE:

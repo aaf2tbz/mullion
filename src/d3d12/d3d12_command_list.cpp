@@ -4190,11 +4190,23 @@ public:
         for (auto &sub : std::span(end.Resolve.pSubresourceParameters, end.Resolve.SubresourceCount))
           pass_resolves_.push_back({end.Resolve, sub});
     };
+    // the surfaces bound for raster (Render Passes, "Surfaces That BeginRenderPass Binds For Raster")
+    auto bound = [](const D3D12_RENDER_PASS_BEGINNING_ACCESS &begin, bool read_only) {
+      UINT type = begin.Type;
+      return type == sdk::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_SRV
+                 ? read_only
+                 : type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS &&
+                       type != sdk::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_UAV;
+    };
     for (UINT i = 0; i < NumRenderTargets; i++) {
-      targets[i] = pRenderTargets[i].cpuDescriptor;
+      targets[i] = bound(pRenderTargets[i].BeginningAccess, false) ? pRenderTargets[i].cpuDescriptor
+                                                                    : D3D12_CPU_DESCRIPTOR_HANDLE{};
       resolve(pRenderTargets[i].EndingAccess);
     }
-    OMSetRenderTargets(NumRenderTargets, targets, FALSE, pDepthStencil ? &pDepthStencil->cpuDescriptor : nullptr);
+    bool depth_stencil = pDepthStencil &&
+                         (bound(pDepthStencil->DepthBeginningAccess, Flags & D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_DEPTH) ||
+                          bound(pDepthStencil->StencilBeginningAccess, Flags & D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_STENCIL));
+    OMSetRenderTargets(NumRenderTargets, targets, FALSE, depth_stencil ? &pDepthStencil->cpuDescriptor : nullptr);
     for (UINT i = 0; i < NumRenderTargets; i++)
       if (pRenderTargets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
         ClearRenderTargetView(targets[i], pRenderTargets[i].BeginningAccess.Clear.ClearValue.Color, 0, nullptr);

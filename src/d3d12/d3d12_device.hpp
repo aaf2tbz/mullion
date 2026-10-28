@@ -871,6 +871,10 @@ UINT DecomposeSubresource(
 namespace sdk {
 // GPU upload heaps (DirectX-Specs, D3D12 GPU Upload Heaps), which the toolchain's d3d12.h lacks
 constexpr auto D3D12_HEAP_TYPE_GPU_UPLOAD = D3D12_HEAP_TYPE(5);
+// render passes' local accesses (DirectX-Specs, Render Passes), which the toolchain's d3d12.h lacks too, past the
+// range of its D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE
+constexpr UINT D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_SRV = 5;
+constexpr UINT D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_UAV = 6;
 } // namespace sdk
 
 bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
