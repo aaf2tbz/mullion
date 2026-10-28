@@ -226,6 +226,9 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   FLOAT blend_factor_[4];
   UINT8 stencil_ref_;
   UINT8 back_stencil_ref_;
+  // SetSamplePositions' pattern, of programmed_samples_ samples a pixel
+  uint8_t programmed_samples_;
+  decltype(RenderEncoderData::sample_positions) sample_positions_;
   // RSSetDepthBias's bias, clamp and slope scale, until a pipeline state is set again
   std::optional<std::array<FLOAT, 3>> depth_bias_;
   // OMSetDepthBounds' range, NaN as 0; the pass has a range set when depth_bounds_set_
@@ -718,6 +721,7 @@ public:
     blend_factor_[2] = 1.0f;
     blend_factor_[3] = 1.0f;
     stencil_ref_ = back_stencil_ref_ = 0;
+    programmed_samples_ = 0;
     depth_bias_.reset();
     depth_bounds_[0] = 0.0f;
     depth_bounds_[1] = 1.0f;
@@ -1065,7 +1069,7 @@ public:
 
       unsigned render_target_width = 16384, render_target_height = 16384, render_target_array_length = 0;
 
-      unsigned effective_rtvs = 0;
+      unsigned effective_rtvs = 0, samples = 0;
       render_serial_ = barrier_serial_;
       targets_pass_ = render;
       targets_.fill(nullptr);
@@ -1077,7 +1081,8 @@ public:
           continue;
         effective_rtvs++;
         if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
-          render->center_samples = AttachmentDesc.Texture->sampleCount();
+          render->programmed_samples = AttachmentDesc.Texture->sampleCount();
+        samples = AttachmentDesc.Texture->sampleCount();
         targets_[i] = AttachmentDesc.Texture;
         auto &rt = render->colors[i];
         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
@@ -1092,7 +1097,8 @@ public:
         auto &AttachmentDesc = dsv;
         effective_rtvs++;
         if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
-          render->center_samples = AttachmentDesc.Texture->sampleCount();
+          render->programmed_samples = AttachmentDesc.Texture->sampleCount();
+        samples = AttachmentDesc.Texture->sampleCount();
         targets_.back() = AttachmentDesc.Texture;
         auto dsv_planar_flags =
             DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View)) & pso_graphics_->dsv_mask;
@@ -1121,6 +1127,11 @@ public:
       render->render_target_width = render_target_width;
       render->render_target_height = render_target_height;
       render->render_target_array_length = render_target_array_length;
+      // SetSamplePositions' pattern is for targets of its sample count; with others what the draws sample is undefined
+      if (programmed_samples_ && programmed_samples_ == samples) {
+        render->programmed_samples = programmed_samples_;
+        render->sample_positions = sample_positions_;
+      }
       if (effective_rtvs == 0) {
         render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
       }
@@ -3914,7 +3925,21 @@ public:
 
   void STDMETHODCALLTYPE
   SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION *pSamplePositions) {
-    IMPLEMENT_ME
+    // one pattern for every pixel (tier 1), or none to take the standard one back; other calls are dropped
+    bool reset = !NumSamplesPerPixel && !NumPixels;
+    if (!reset && (NumPixels != 1 || !std::has_single_bit(NumSamplesPerPixel) ||
+                   NumSamplesPerPixel > sample_positions_.size()))
+      return;
+    auto positions = std::span(pSamplePositions, reset ? 0 : NumSamplesPerPixel);
+    if (programmed_samples_ == positions.size() &&
+        std::ranges::equal(positions, std::span(sample_positions_).first(positions.size()), [](auto &a, auto &b) {
+          return a.X == b.x && a.Y == b.y;
+        }))
+      return;
+    programmed_samples_ = positions.size();
+    std::ranges::transform(positions, sample_positions_.begin(), [](auto &p) { return WMTSamplePosition{p.X, p.Y}; });
+    // a render pass has one pattern
+    allocator_->InvalidateCurrentPass();
   }
 
   // ResolveSubresourceRegion's sampler feedback modes, between a map and an R8_UINT texture or, for a MinMip map

@@ -108,7 +108,9 @@ struct RenderEncoderData : EncoderData {
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;
   uint8_t default_raster_sample_count;
-  uint8_t center_samples = 0;
+  // the pass's sample pattern (WMTRenderPassInfo)
+  uint8_t programmed_samples = 0;
+  std::array<WMTSamplePosition, std::size(WMTRenderPassInfo{}.sample_positions)> sample_positions{};
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;

@@ -738,7 +738,9 @@ public:
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(pFeatureData);
       // Metal's on Apple10, the pixel shader's elsewhere (d3d12_command_list.cpp, DepthBoundsSamples)
       out->DepthBoundsTestSupported = TRUE;
-      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      // every Apple GPU family places samples where a render pass says (Metal feature set tables), one pattern for
+      // all pixels
+      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {

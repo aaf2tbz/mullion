@@ -1282,7 +1282,8 @@ public:
               stencil_info.clear_stencil = stencil_data.clear_stencil;
             }
             render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
-            render_pass_info.center_samples = data->center_samples;
+            render_pass_info.programmed_samples = data->programmed_samples;
+            std::ranges::copy(data->sample_positions, render_pass_info.sample_positions);
             render_pass_info.render_target_array_length = data->render_target_array_length;
             render_pass_info.render_target_width = data->render_target_width;
             render_pass_info.render_target_height = data->render_target_height;

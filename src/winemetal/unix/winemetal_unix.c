@@ -481,16 +481,19 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
-// a render pass whose samples all lie at the pixel center (WMTRenderPassInfo). one sample lies there already, and
-// Metal takes custom positions only for more
+// a render pass's own sample positions (WMTRenderPassInfo). one sample lies at the center already, and Metal takes
+// custom positions only for more, from the pixel's top left corner
 static void
-center_samples(id descriptor, unsigned count) {
+sample_positions(id descriptor, const struct WMTRenderPassInfo *info) {
+  unsigned count = info->programmed_samples;
   if (count <= 1)
     return;
-  MTLSamplePosition center[count];
+  MTLSamplePosition positions[count];
   for (unsigned i = 0; i < count; i++)
-    center[i] = MTLSamplePositionMake(0.5, 0.5);
-  [descriptor setSamplePositions:center count:count];
+    positions[i] = MTLSamplePositionMake(
+        0.5f + info->sample_positions[i].x / 16.0f, 0.5f + info->sample_positions[i].y / 16.0f
+    );
+  [descriptor setSamplePositions:positions count:count];
 }
 
 static NTSTATUS
@@ -541,7 +544,7 @@ renderCommandEncoder(void *obj, const struct WMTSampleBufferAttachmentInfo *samp
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
 
-  center_samples(descriptor, info->center_samples);
+  sample_positions(descriptor, info);
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
@@ -4636,7 +4639,7 @@ _MTL4CommandBuffer_encoder(void *obj) {
       descriptor.renderTargetHeight = info->render_target_height;
       descriptor.renderTargetWidth = info->render_target_width;
       descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
-      center_samples(descriptor, info->center_samples);
+      sample_positions(descriptor, info);
 
       if (info->tile_height && info->tile_width) {
         descriptor.tileWidth = info->tile_width;

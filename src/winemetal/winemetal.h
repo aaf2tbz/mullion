@@ -694,6 +694,12 @@ struct WMTStencilAttachmentInfo {
   uint8_t clear_stencil;
 };
 
+// a sample's position in sixteenths of a pixel from its center, as D3D12_SAMPLE_POSITION's
+struct WMTSamplePosition {
+  int8_t x;
+  int8_t y;
+};
+
 struct WMTRenderPassInfo {
   struct WMTColorAttachmentInfo colors[8];
   struct WMTDepthAttachmentInfo depth;
@@ -702,8 +708,11 @@ struct WMTRenderPassInfo {
   uint8_t render_target_array_length;
   uint8_t tile_width;
   uint8_t tile_height;
-  // the samples placed at the pixel center, for targets of the center pattern; 0 keeps Metal's, the standard pattern
-  uint8_t center_samples;
+  // the samples placed at sample_positions, for targets of the center pattern (all at the center) or of positions an
+  // application programs; 0 keeps Metal's, the standard pattern
+  uint8_t programmed_samples;
+  // as many as SetSamplePositions takes
+  struct WMTSamplePosition sample_positions[16];
   uint32_t render_target_height;
   uint32_t render_target_width;
   obj_handle_t visibility_buffer;
