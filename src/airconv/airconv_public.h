@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 83
+#define AIRCONV_VERSION 84
 
 #ifdef __cplusplus
 #include <string>
@@ -458,6 +458,8 @@ enum SM50_SHADER_FLAG {
   /* a group sync does not make globallycoherent memory visible to other groups (before Apple9): in shaders whose
      groups work together, each group sync takes a device-scope fence */
   SM50_SHADER_FLAG_COHERENT_GROUP_SYNC = 1 << 5,
+  /* no sampler has a border color Metal lacks (SM50_SAMPLER_BORDER): samples leave out the custom border's emulation */
+  SM50_SHADER_FLAG_NO_CUSTOM_BORDER = 1 << 6,
 };
 
 struct SM50_SHADER_COMMON_DATA {

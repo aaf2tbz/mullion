@@ -2620,7 +2620,7 @@ Converter::CustomBorder(
   using namespace llvm;
   using namespace llvm::air;
   // D3D's cubes ignore address modes
-  if (!Border || !Tex.Range || AIRBuilder::getTextureInfo(Tex.Logical).is_cube)
+  if (!Border || air.noCustomBorder() || !Tex.Range || AIRBuilder::getTextureInfo(Tex.Logical).is_cube)
     return Value;
   // only samplers with a border pay for it
   auto Head = ir.GetInsertBlock();
