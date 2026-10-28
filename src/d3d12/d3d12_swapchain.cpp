@@ -28,11 +28,14 @@
 #include "mullion_info.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
+#include "log/trace.hpp"
 #include "wsi_window.hpp"
 #include "util_cpu_fence.hpp"
 #include "util_hotpatch.h"
 #include "config/config.hpp"
 #include <bit>
+#include <chrono>
+#include <optional>
 #include <cfloat>
 #include <limits>
 
@@ -124,6 +127,9 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IMTLDXGISwapChain, MTLD3
   // the back buffer the next Present shows
   UINT current_buffer_ = 0;
   DXGI_SWAP_CHAIN_DESC1 desc_;
+  // MULLION_TRACE_PRESENT: when the last Present began, and how many there were
+  std::chrono::steady_clock::time_point traced_present_;
+  uint64_t traced_presents_ = 0;
   SwapChainSettings settings_;
   D3D12_RESOURCE_DESC backbuffer_desc_;
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_;
@@ -784,6 +790,29 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    // MULLION_TRACE_PRESENT: a line for a Present, with the time since the one before and the time in this one; 1 has
+    // the ones 50 ms or more after the one before (a hitch), heavy every one
+    struct Traced {
+      MTLD3D12SwapChain *swap_chain;
+      UINT interval, flags;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      ~Traced() {
+        auto end = std::chrono::steady_clock::now();
+        auto since = swap_chain->traced_present_ == std::chrono::steady_clock::time_point()
+                         ? 0.0
+                         : std::chrono::duration<double, std::milli>(start - swap_chain->traced_present_).count();
+        swap_chain->traced_present_ = start;
+        ++swap_chain->traced_presents_;
+        if (since < 50 && !trace::Heavy(trace::Present))
+          return;
+        TRACE_IN(Present, "swap chain ", swap_chain, ": Present ", swap_chain->traced_presents_, ", interval ",
+                 interval, ", flags ", flags, ", ", since, " ms since the last, ",
+                 std::chrono::duration<double, std::milli>(end - start).count(), " ms in it");
+      }
+    };
+    std::optional<Traced> traced;
+    if (trace::On(trace::Present))
+      traced.emplace(Traced{this, SyncInterval, PresentFlags});
     // TEST validates the interval too (IDXGISwapChain::Present, SyncInterval: 0 through 4).
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;

@@ -47,6 +47,7 @@ The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`)
 | | |
 |---|---|
 | `MULLION_LOG_PATH=<directory>` | Writes a log file for each DLL. Attach it to bug reports. |
+| `MULLION_TRACE_GPU=1` and the other `MULLION_TRACE_` categories | Logs what a problem needs to `~/Library/Logs/Mullion/<executable>/mullion.log`, one category at a time. See `docs/tracing.md`. |
 | `MULLION_D3D12_METAL4=0` | Keeps Direct3D 12 on Metal 3 on macOS 26. If a game draws differently there than on Metal 3, please report it. |
 | `MULLION_CONFIG="dxgi.customVendorId=106b"` | Reports Apple's vendor ID. By default Mullion reports the GPU's own name with AMD's vendor ID, because some games exit at startup when they do not know the vendor. |
 

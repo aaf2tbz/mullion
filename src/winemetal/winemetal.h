@@ -2469,11 +2469,15 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixMetal4NewBuffer, WMTUnixMetal4Encoder,
        WMTUnixMetal4Commands, WMTUnixMetal4EndEncoder, WMTUnixMetal4Commit, WMTUnixMetal4Feedback, WMTUnixMetal4Wait,
        WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
-       WMTUnixCallCount };
+       WMTUnixTraceWrite, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
+// MULLION_TRACE_<CATEGORY> (docs/tracing.md): appends lines to the process's trace log, mullion.log in MULLION_TRACE_DIR or else
+// ~/Library/Logs/Mullion/<executable>/; the first call of a process keeps the last one's log as mullion.prev.log
+// and starts the log with a header. false when the log cannot be written
+WINEMETAL_API bool WMTTraceWrite(const char *lines, uint64_t length);
 // MULLION_DIAG=profile: each bridge call's count and time in QueryPerformanceCounter ticks, by code, since the last
 // totals were taken; the bridge times calls once WMTDiagTimeCalls was called
 struct WMTDiagCall {

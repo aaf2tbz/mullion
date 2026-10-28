@@ -4,6 +4,7 @@
 #include "util_string.hpp"
 #include "thread.hpp"
 #include "log/log.hpp"
+#include "log/trace.hpp"
 #include <algorithm>
 #include <string_view>
 #include <vector>
@@ -32,6 +33,14 @@ Flight(const void *site, Args... args) {
   static_assert(sizeof...(Args) <= 4);
   uint64_t words[4] = {FlightWord(args)...};
   WMTFlightRecord(site, words[0], words[1], words[2], words[3]);
+}
+
+// a flight record's line in the trace log too (MULLION_TRACE_<CATEGORY>)
+template <typename... Args>
+void
+FlightTrace(trace::Category category, const char *format, Args... args) {
+  uint64_t words[4] = {FlightWord(args)...};
+  trace::WriteFlight(category, format, words);
 }
 
 struct TimestampSamples {
@@ -80,10 +89,15 @@ struct TimestampSamples {
 };
 
 // the bridge times its calls from the first library that profiles
-inline const bool profile = env::getEnvVar("MULLION_DIAG") == "profile" && (WMTDiagTimeCalls(), true);
-inline const bool errors = !env::getEnvVar("MULLION_D3D12_GPU_ERRORS").empty();
-// MULLION_TRACE_ENCODERS: every D3D11 render pass is logged with its size and draws as it is encoded
-inline const bool trace_encoders = !env::getEnvVar("MULLION_TRACE_ENCODERS").empty();
+// MULLION_DIAG=profile, or MULLION_TRACE_CPU (whose records go next to the trace log)
+inline const bool profile =
+    (env::getEnvVar("MULLION_DIAG") == "profile" || trace::On(trace::Cpu)) && (WMTDiagTimeCalls(), true);
+// MULLION_D3D12_GPU_ERRORS, or MULLION_TRACE_GPU=heavy: a failed command buffer's report names its passes and what became
+// of each, with the most its indirect commands asked for (the GPU records them as it runs)
+inline const bool errors = !env::getEnvVar("MULLION_D3D12_GPU_ERRORS").empty() || trace::Heavy(trace::Gpu);
+// MULLION_TRACE_ENCODERS, or MULLION_TRACE_PASS=heavy: every D3D11 render pass is logged with its size and draws as it is
+// encoded, and D3D12 queues count their Metal encoders
+inline const bool trace_encoders = !env::getEnvVar("MULLION_TRACE_ENCODERS").empty() || trace::Heavy(trace::Pass);
 
 inline uint64_t
 Nanoseconds(uint64_t ticks) {
@@ -110,7 +124,10 @@ Line(const char *kind, const Fields &...fields) {
 
 inline void
 Write(const std::string &lines) {
-  static const auto directory = env::getEnvVar("MULLION_DIAG_PATH");
+  static const auto directory = [] {
+    auto given = env::getEnvVar("MULLION_DIAG_PATH");
+    return given.empty() && trace::On(trace::Cpu) ? trace::Directory() : given;
+  }();
   if (!WMTDiagWrite(directory.c_str(), lines.data(), lines.size()))
     ERR("Mullion profile: record could not be written");
 }
@@ -390,4 +407,20 @@ struct ProfileBuffer {
     if (false)                                                                                                         \
       ::mullion::diag::FlightFormat(format __VA_OPT__(, ) __VA_ARGS__);                                                \
     ::mullion::diag::Flight(flight_site __VA_OPT__(, ) __VA_ARGS__);                                                   \
+  } while (0)
+
+// a flight record that is also a line of the trace log when MULLION_TRACE_<CATEGORY> turns its category on
+// (FLIGHT_IN), or makes it heavy (FLIGHT_HEAVY: the records of every submission, command buffer or present)
+#define FLIGHT_IN(category, format, ...)                                                                               \
+  do {                                                                                                                 \
+    FLIGHT(format __VA_OPT__(, ) __VA_ARGS__);                                                                         \
+    if (::mullion::trace::On(::mullion::trace::category))                                                             \
+      ::mullion::diag::FlightTrace(::mullion::trace::category, format __VA_OPT__(, ) __VA_ARGS__);                     \
+  } while (0)
+
+#define FLIGHT_HEAVY(category, format, ...)                                                                            \
+  do {                                                                                                                 \
+    FLIGHT(format __VA_OPT__(, ) __VA_ARGS__);                                                                         \
+    if (::mullion::trace::Heavy(::mullion::trace::category))                                                          \
+      ::mullion::diag::FlightTrace(::mullion::trace::category, format __VA_OPT__(, ) __VA_ARGS__);                     \
   } while (0)

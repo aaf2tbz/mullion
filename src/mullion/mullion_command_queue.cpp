@@ -255,7 +255,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
     device.sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
     buffer.committed = diag::Now();
   }
-  FLIGHT("context queue %p: chunk %llu of frame %llu commits as %#llx", this, seq, chunk.frame_, cmdbuf.handle);
+  FLIGHT_HEAVY(Gpu, "context queue %p: chunk %llu of frame %llu commits as %#llx", this, seq, chunk.frame_, cmdbuf.handle);
   cmdbuf.commit();
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
@@ -298,7 +298,7 @@ CommandQueue::WaitForFinishThread() {
       chunk.attached_cmdbuf.waitUntilCompleted();
     }
     auto completed = profile_ ? diag::Now() : 0;
-    FLIGHT("context queue %p: chunk %llu completes, status %llu", this, internal_seq,
+    FLIGHT_HEAVY(Gpu, "context queue %p: chunk %llu completes, status %llu", this, internal_seq,
            uint64_t(chunk.attached_cmdbuf.status()));
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
