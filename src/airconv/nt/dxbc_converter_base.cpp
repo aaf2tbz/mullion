@@ -72,12 +72,16 @@ Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
     return ApplySrcModifier(SrcOp._, llvm::ConstantAggregateZero::get(air.getIntTy(4)), Mask);
   auto Row = LoadOperandIndex(SrcOp.regindex);
   return ApplySrcModifier(
-      SrcOp._, LoadConstantBuffer(*descriptor, Row, ComponentFromScalarMask(Mask, SrcOp._.swizzle)), Mask
+      SrcOp._,
+      LoadConstantBuffer(
+          *descriptor, Row, ComponentFromScalarMask(Mask, SrcOp._.swizzle), MemoryAccessMask(Mask, SrcOp._.swizzle)
+      ),
+      Mask
   );
 }
 
 llvm::Value *
-Converter::LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Value *Row, int Component) {
+Converter::LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Value *Row, int Component, mask_t Dwords) {
   auto TyIntVec4 = air.getIntTy(4);
   llvm::Value *InBounds = nullptr;
   // rows past the bound buffer's size read 0 (D3D11.3 7.5); root CBVs carry no size
@@ -85,10 +89,14 @@ Converter::LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Valu
     InBounds = ir.CreateICmpULT(Row, ir.CreateTrunc(ir.CreateLShr(Buffer.Metadata, 4), air.getIntTy()));
     Row = ir.CreateSelect(InBounds, Row, ir.getInt32(0));
   }
-  auto Value =
-      Component >= 0
-          ? ir.CreateLoad(air.getIntTy(), ir.CreateGEP(TyIntVec4, Buffer.Pointer, {Row, ir.getInt32(Component)}))
-          : ir.CreateLoad(TyIntVec4, ir.CreateGEP(TyIntVec4, Buffer.Pointer, {Row}));
+  auto Load = [&](unsigned Dword) -> llvm::Value * {
+    return ir.CreateLoad(air.getIntTy(), ir.CreateGEP(TyIntVec4, Buffer.Pointer, {Row, ir.getInt32(Dword)}));
+  };
+  // a row's dwords load one by one, only those read: a vector load reads all four, and costs the shader more
+  llvm::Value *Value = Component >= 0 ? Load(Component) : llvm::PoisonValue::get(TyIntVec4);
+  for (unsigned i = 0; Component < 0 && i < 4; i++)
+    if (Dwords & (1 << i))
+      Value = ir.CreateInsertElement(Value, Load(i), i);
   return InBounds ? ir.CreateSelect(InBounds, Value, llvm::Constant::getNullValue(Value->getType())) : Value;
 }
 

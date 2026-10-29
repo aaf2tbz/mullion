@@ -2757,9 +2757,15 @@ convert_dxil(
     case CBufferLoadLegacy: {
       // a 16-byte row, as the elements DXIL reads it as: four of 32 bits, eight of 16 or two of 64
       auto sty = cast<StructType>(ty);
-      auto bits = sty->getElementType(0)->getPrimitiveSizeInBits();
+      unsigned bits = sty->getElementType(0)->getPrimitiveSizeInBits();
+      // the dwords holding the elements the call's users read
+      uint32_t elements = used(call), dwords = 0;
+      for (unsigned i = 0; i < 4; i++)
+        if (elements >> (i * 32 / bits) & llvm::maskTrailingOnes<uint32_t>(std::max(1u, 32 / bits)))
+          dwords |= 1u << i;
       auto row = ir.CreateBitCast(
-          dxbc.LoadConstantBuffer(*handles[a(1)].cbuffer, a(2)), FixedVectorType::get(ir.getIntNTy(bits), 128 / bits)
+          dxbc.LoadConstantBuffer(*handles[a(1)].cbuffer, a(2), -1, dwords),
+          FixedVectorType::get(ir.getIntNTy(bits), 128 / bits)
       );
       ret = UndefValue::get(ty);
       for (unsigned i = 0; i < sty->getNumElements(); i++)
