@@ -1042,73 +1042,55 @@ Converter::FirstBit(IntegerUnaryOp Op, llvm::Value *Value) {
 
 llvm::Value *
 Converter::SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value) {
-  // sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time, where Metal bounds
-  // their error (2^-13 in [-pi, pi], MSL specification, accuracy with fast math), within what D3D asks (D3D11.3
-  // 22.10.20). past it, and for an infinity or a NaN, a lane takes the precise ones, whose range reduction gives what
-  // D3D hardware does there, where the fast ones are 0 from 2^23 radians on and of an infinity. A tangent stays precise: Metal's fast one is NaN for large finite values. Sine and tangent
-  // of a zero are that zero, sign included, and a 32-bit denormal counts as its sign's zero (D3D11.3 22.10.20;
-  // DXIL.rst, Sin and Tan), where Metal's keep the denormal and lose a half zero's sign
+  // sine and cosine use Metal's fast functions, which take a fraction of the precise ones' time, on the angle less its
+  // whole turns, where Metal bounds their error (2^-13 in [-pi, pi], MSL specification, accuracy with fast math),
+  // within what D3D asks up to 100 pi (D3D11.3 22.10.20); no branch splits the shader. the turns come off in two parts,
+  // the second the first's rounding error. a huge angle keeps more than a turn, and is clamped into one: past 100 pi any
+  // value is D3D's, and a DXBC tangent (a sine over a cosine) stays finite. an infinity or a NaN is NaN. A tangent stays
+  // precise: Metal's fast one is NaN for large finite values. Sine and tangent of a zero are that zero, sign included,
+  // and a 32-bit denormal counts as its sign's zero (D3D11.3 22.10.20; DXIL.rst, Sin and Tan), where Metal's keep the
+  // denormal and lose a half zero's sign
+  using llvm::air::AIRBuilder;
   auto Type = Value->getType();
   auto compute = [&](bool Fast) -> llvm::Value * {
-    if (!Type->getScalarType()->isHalfTy())
-      return air.CreateFPUnOp(Op, Value, Fast);
     // a half one is computed as a float and rounded, as precise as D3D asks
-    auto Wide = Type->isVectorTy()
-                    ? llvm::VectorType::get(ir.getFloatTy(), llvm::cast<llvm::VectorType>(Type)->getElementCount())
-                    : ir.getFloatTy();
-    return ir.CreateFPTrunc(air.CreateFPUnOp(Op, ir.CreateFPExt(Value, Wide), Fast), Type);
+    auto Float = Type->getWithNewType(ir.getFloatTy());
+    llvm::Value *Angle = Float == Type ? Value : ir.CreateFPExt(Value, Float);
+    if (Fast) {
+      constexpr double Turn = 2 * llvm::numbers::pi;
+      constexpr float Part = Turn, Rest = Turn - Part;
+      llvm::APFloat Pi(llvm::numbers::pi);
+      bool Lost;
+      Pi.convert(llvm::APFloat::IEEEsingle(), llvm::APFloat::rmTowardZero, &Lost);
+      auto Off = ir.CreateFNeg(air.CreateFPUnOp(AIRBuilder::rint, ir.CreateFMul(Angle, llvm::ConstantFP::get(Float, 1 / Turn))));
+      Angle = air.CreateFMA(Off, llvm::ConstantFP::get(Float, Part), Angle);
+      Angle = air.CreateFMA(Off, llvm::ConstantFP::get(Float, Rest), Angle);
+      Angle = air.CreateFPBinOp(AIRBuilder::fmax, Angle, llvm::ConstantFP::get(Float, -Pi));
+      Angle = air.CreateFPBinOp(AIRBuilder::fmin, Angle, llvm::ConstantFP::get(Float, Pi));
+    }
+    auto Result = air.CreateFPUnOp(Op, Angle, Fast);
+    return Float == Type ? Result : ir.CreateFPTrunc(Result, Type);
   };
   auto Scalar = Type->getScalarType();
   auto Width = Scalar->getScalarSizeInBits();
   auto Bits = ir.CreateBitCast(Value, Type->getWithNewType(ir.getIntNTy(Width)));
   auto Sign = llvm::APInt::getSignMask(Width);
+  auto Inf = llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt();
   llvm::Value *Result;
-  if (Op == llvm::air::AIRBuilder::tan) {
+  if (Op == AIRBuilder::tan) {
     Result = compute(false);
   } else {
-    Result = compute(true);
-    llvm::APFloat Limit(3.14159265358979323846);
-    bool Lost;
-    Limit.convert(Scalar->getFltSemantics(), llvm::APFloat::rmTowardZero, &Lost);
-    // the magnitude's bits order as the magnitudes do, an infinity's and a NaN's above every finite one's
-    llvm::Value *Past = ir.CreateICmpUGT(
-        ir.CreateAnd(Bits, llvm::ConstantInt::get(Bits->getType(), ~Sign)),
-        llvm::ConstantInt::get(Bits->getType(), Limit.bitcastToAPInt())
+    // integer selection survives fast math's cancellation
+    auto NonFinite = ir.CreateICmpEQ(ir.CreateAnd(Bits, Inf), llvm::ConstantInt::get(Bits->getType(), Inf));
+    auto NaN = llvm::APFloat::getQNaN(Scalar->getFltSemantics()).bitcastToAPInt();
+    Result = ir.CreateBitCast(
+        ir.CreateSelect(NonFinite, llvm::ConstantInt::get(Bits->getType(), NaN), ir.CreateBitCast(compute(true), Bits->getType())),
+        Type
     );
-    // lane by lane: a reduction becomes an odd-width integer the Metal compiler does not take
-    if (auto Vector = llvm::dyn_cast<llvm::FixedVectorType>(Past->getType())) {
-      auto Any = ir.CreateExtractElement(Past, uint64_t(0));
-      for (unsigned i = 1; i < Vector->getNumElements(); i++)
-        Any = ir.CreateOr(Any, ir.CreateExtractElement(Past, i));
-      Past = Any;
-    }
-    auto From = ir.GetInsertBlock();
-    auto Done = ir.GetInsertPoint() == From->end() ? llvm::BasicBlock::Create(ctx.llvm, "", From->getParent())
-                                                   : llvm::SplitBlock(From, &*ir.GetInsertPoint());
-    if (auto Branch = From->getTerminator())
-      Branch->eraseFromParent();
-    auto Precise = llvm::BasicBlock::Create(ctx.llvm, "", From->getParent(), Done);
-    ir.SetInsertPoint(From);
-    ir.CreateCondBr(Past, Precise, Done);
-    ir.SetInsertPoint(Precise);
-    auto Slow = compute(false);
-    ir.CreateBr(Done);
-    ir.SetInsertPoint(Done, Done->begin());
-    llvm::PHINode *Merged;
-    {
-      // a phi with fast math flags is another thing the Metal compiler does not take
-      llvm::IRBuilder<>::FastMathFlagGuard Plain(ir);
-      ir.clearFastMathFlags();
-      Merged = ir.CreatePHI(Type, 2);
-    }
-    Merged->addIncoming(Result, From);
-    Merged->addIncoming(Slow, Precise);
-    Result = Merged;
   }
-  if (Op == llvm::air::AIRBuilder::cos)
+  if (Op == AIRBuilder::cos)
     return Result;
   // a 32-bit denormal has no exponent bits; 16-bit denormals are kept (D3D11.3 3.1.5), so there only a zero counts
-  auto Inf = llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt();
   auto Counted = Scalar->isFloatTy() ? Inf : ~Sign;
   auto Zero = ir.CreateICmpEQ(ir.CreateAnd(Bits, Counted), llvm::ConstantInt::get(Bits->getType(), 0));
   return ir.CreateSelect(Zero, ir.CreateBitCast(ir.CreateAnd(Bits, Sign), Type), Result);
