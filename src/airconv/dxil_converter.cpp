@@ -1872,9 +1872,11 @@ convert_dxil(
     auto ptr = ir.CreateGEP(unit, ir.CreatePointerCast(b.Pointer, unit->getPointerTo(space)), {index});
     if (!b.Metadata || inside)
       return ptr;
-    auto bytes = ir.CreateZExt(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt64Ty());
-    auto units = ir.CreateUDiv(bytes, ir.getInt64(unit->getPrimitiveSizeInBits() / 8));
-    return ir.CreateSelect(ir.CreateICmpULT(index, units), ptr, Constant::getNullValue(ptr->getType()));
+    auto units = ir.CreateUDiv(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt32(unit->getPrimitiveSizeInBits() / 8));
+    // a raw index is masked to 32 bits of bytes above, so it compares in the GPU's 32-bit integers
+    auto within = b.StructureStride ? ir.CreateICmpULT(index, ir.CreateZExt(units, index->getType()))
+                                    : ir.CreateICmpULT(ir.CreateTrunc(index, units->getType()), units);
+    return ir.CreateSelect(within, ptr, Constant::getNullValue(ptr->getType()));
   };
   // system inputs read the way DXBC reads them (the coverage mask honors the PSO sample mask)
   auto attribute = [&](shader::common::InputAttribute input, uint32_t component) {
@@ -2810,7 +2812,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
-                options.second.lod, false
+                options.second.lod
             );
           };
           break;
@@ -2823,7 +2825,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
-                options.second.lod, true
+                options.second.lod
             );
           };
           break;
@@ -2852,7 +2854,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *ref) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, ref, options.first.bias,
-                options.second.lod, false
+                options.second.lod
             );
           };
           break;

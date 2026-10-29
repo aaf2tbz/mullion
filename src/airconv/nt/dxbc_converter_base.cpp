@@ -1754,7 +1754,7 @@ Converter::operator()(const InstSample &sample) {
 
   auto Read = [&](llvm::Value *S) {
     return SampleImplicit(
-        *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr, Sampler->Bias, MinLODClamp, false
+        *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr, Sampler->Bias, MinLODClamp
     );
   };
   auto [Value, Residency] = Read(SamplerHandle);
@@ -1907,7 +1907,7 @@ Converter::operator()(const InstSampleBias &sample) {
   auto Bias = ir.CreateFAdd(Sampler->Bias, LoadOperand(sample.src_bias, kMaskComponentX));
 
   auto Read = [&](llvm::Value *S) {
-    return SampleImplicit(*Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr, Bias, MinLODClamp, true);
+    return SampleImplicit(*Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr, Bias, MinLODClamp);
   };
   auto [Value, Residency] = Read(SamplerHandle);
   if (sample.feedback && !std::holds_alternative<DstOperandNull>(*sample.feedback))
@@ -2078,7 +2078,7 @@ Converter::operator()(const InstSampleCompare &sample) {
                                )
                              : SampleImplicit(
                                    *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, Reference,
-                                   Sampler->Bias, MinLODClamp, false
+                                   Sampler->Bias, MinLODClamp
                                );
   };
   auto [Value, Residency] = Read(SamplerHandle);
@@ -2095,7 +2095,7 @@ Converter::operator()(const InstSampleCompare &sample) {
                                     )
                                   : SampleImplicit(
                                         *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, nullptr,
-                                        Sampler->Bias, MinLODClamp, false
+                                        Sampler->Bias, MinLODClamp
                                     ))
             .first;
       },
@@ -2322,8 +2322,7 @@ Converter::CalculateLOD(
 std::pair<llvm::Value *, llvm::Value *>
 Converter::SampleImplicit(
     const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
-    llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD,
-    bool OwnBias
+    llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD
 ) {
   using namespace llvm;
   using namespace llvm::air;
@@ -2338,37 +2337,13 @@ Converter::SampleImplicit(
                 Tex.Logical == Texture::depth2d || Tex.Logical == Texture::depth2d_array;
   if (!Planar || ctx.shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
     return Biased();
-  // the quad's derivatives, before a branch that the quad may not take together
-  auto DDX = air.CreateDerivative(Coord, false), DDY = air.CreateDerivative(Coord, true);
   auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
                                  (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
-  auto Anisotropic = ir.CreateICmpUGT(Anisotropy, ir.getInt64(1));
-  auto Scaled = OwnBias ? Anisotropic
-                        : ir.CreateAnd(Anisotropic, ir.CreateFCmpUNE(Bias, ConstantFP::get(air.getFloatTy(), 0)));
-
-  auto Head = ir.GetInsertBlock();
-  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
-                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
-  if (auto Branch = Head->getTerminator())
-    Branch->eraseFromParent();
-  auto Gradient = llvm::BasicBlock::Create(ctx.llvm, "sample_scaled_gradients", Head->getParent(), Tail);
-  auto Plain = llvm::BasicBlock::Create(ctx.llvm, "sample_biased", Head->getParent(), Tail);
-  ir.SetInsertPoint(Head);
-  ir.CreateCondBr(Scaled, Gradient, Plain);
-  ir.SetInsertPoint(Gradient);
-  auto ByGradient = air.CreateSampleGrad(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, BiasGradient(DDX, Bias),
-                                         BiasGradient(DDY, Bias), MinLOD, Offset, Reference);
-  ir.CreateBr(Tail);
-  ir.SetInsertPoint(Plain);
-  auto ByBias = Biased();
-  ir.CreateBr(Tail);
-  ir.SetInsertPoint(Tail, Tail->begin());
-  auto Value = ir.CreatePHI(ByBias.first->getType(), 2), Residency = ir.CreatePHI(ByBias.second->getType(), 2);
-  Value->addIncoming(ByGradient.first, Gradient);
-  Value->addIncoming(ByBias.first, Plain);
-  Residency->addIncoming(ByGradient.second, Gradient);
-  Residency->addIncoming(ByBias.second, Plain);
-  return {Value, Residency};
+  if (auto Known = dyn_cast<ConstantInt>(ir.CreateICmpUGT(Anisotropy, ir.getInt64(1))); Known && Known->isZero())
+    return Biased();
+  auto DDX = air.CreateDerivative(Coord, false), DDY = air.CreateDerivative(Coord, true);
+  return air.CreateSampleGrad(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, BiasGradient(DDX, Bias),
+                              BiasGradient(DDY, Bias), MinLOD, Offset, Reference);
 }
 
 std::pair<llvm::Value *, llvm::Value *>
@@ -3395,9 +3370,12 @@ Converter::CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Valu
   if (!Buffer.Metadata || Inside) {
     return Addr;
   }
-  auto ByteLength = DecodeRawBufferByteLength(Buffer.Metadata);
-  auto Dwords = ir.CreateZExtOrTrunc(ir.CreateLShr(ByteLength, 2), Index->getType());
-  return ir.CreateSelect(ir.CreateICmpULT(Index, Dwords), Addr, llvm::Constant::getNullValue(Addr->getType()));
+  auto Dwords = ir.CreateLShr(DecodeRawBufferByteLength(Buffer.Metadata), 2);
+  // a raw index is masked to 32 bits of bytes above, so it compares in the GPU's 32-bit integers
+  auto Within = Buffer.StructureStride
+                    ? ir.CreateICmpULT(Index, ir.CreateZExtOrTrunc(Dwords, Index->getType()))
+                    : ir.CreateICmpULT(ir.CreateZExtOrTrunc(Index, Dwords->getType()), Dwords);
+  return ir.CreateSelect(Within, Addr, llvm::Constant::getNullValue(Addr->getType()));
 }
 
 llvm::Value *
@@ -3411,9 +3389,13 @@ Converter::LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm:
   // a null pointer is a bounds result, not a zero-valued load (D3D11.3 22.4.10 and 22.4.12). the load reads the view's
   // first unit instead and its value is dropped: a branch round every load splits the shader into blocks whose live
   // values spill. a null view starts at the device's zero-filled buffer (GetNullBuffer)
-  auto Out = ir.CreateIsNull(Ptr);
-  auto Value = Load(ir.CreateSelect(Out, ir.CreatePointerCast(Buffer.Pointer, Ptr->getType()), Ptr));
-  return ir.CreateSelect(Out, llvm::Constant::getNullValue(Type), Value);
+  // the bounds check's own select (CreateGEPInt32WithBoundCheck, unit_ptr) says where it is without a null compare,
+  // unless the builder folded it
+  auto Check = llvm::dyn_cast<llvm::SelectInst>(Ptr);
+  auto Within = Check ? Check->getCondition() : ir.CreateIsNotNull(Ptr);
+  auto Value = Load(ir.CreateSelect(Within, Check ? Check->getTrueValue() : Ptr,
+                                    ir.CreatePointerCast(Buffer.Pointer, Ptr->getType())));
+  return ir.CreateSelect(Within, Value, llvm::Constant::getNullValue(Type));
 }
 
 // a load of several units from Base, which Read emits. a structured load whose last unit, at Last, is past the end is
