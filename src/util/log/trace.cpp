@@ -158,4 +158,19 @@ WriteFlight(Category category, const char *format, const uint64_t words[4]) {
   Write(category, line);
 }
 
+PresentTrace::~PresentTrace() {
+  if (!presents_)
+    return;
+  using ms = std::chrono::duration<double, std::milli>;
+  auto end = std::chrono::steady_clock::now();
+  double since = presents_->count ? ms(start_ - presents_->last).count() : 0;
+  presents_->last = start_;
+  presents_->count++;
+  if (since < 50 && !Heavy(Present))
+    return;
+  Write(Present, str::format("swap chain ", swap_chain_, ": Present ", presents_->count, ", interval ", interval_,
+                             ", flags ", flags_, ", ", since, " ms since the last, ", ms(end - start_).count(),
+                             " ms in it"));
+}
+
 } // namespace mullion::trace
