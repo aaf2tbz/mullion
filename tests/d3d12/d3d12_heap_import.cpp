@@ -5,7 +5,8 @@
 // vkd3d-proton's test_open_heap_from_address records rejection of an interior address and Map returning the
 // original address. its heap description checks say "Expected Heap desc to have SHARED_CROSS_ADAPTER flag set."
 // and "Expected heap desc to have SHARED flag set." (d3d12_win32_exclusive.c:114-115, also 177-178 for file mappings).
-// sizes cross placement and allocation boundaries; GPU copies in both directions compare the entire allocation.
+// sizes cross placement and allocation boundaries, one page below both; GPU copies in both directions compare the
+// entire allocation.
 #include "d3d12_test.hpp"
 #include <random>
 
@@ -37,8 +38,12 @@ main(int argc, char **argv) {
   }
   if (!exact_write_watch)
     printf("note: the system's write watch reports more than the written page; write watch heaps are not checked\n");
-  for (SIZE_T size :
-       {SIZE_T(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT), SIZE_T(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 3)}) {
+  // one page too, smaller than a buffer's 64KB placement alignment: "HeapOffset plus the resource size must be smaller
+  // than or equal to the heap size" (ID3D12Device::CreatePlacedResource), and a buffer's size is its width, not its
+  // 64KB allocation size (Starfield places one at the start of a heap it imported from a page, dttdrv/mullion#32)
+  // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createplacedresource
+  for (SIZE_T size : {SIZE_T(system.dwPageSize), SIZE_T(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT),
+                      SIZE_T(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 3)}) {
     for (bool mapping : {false, true}) {
       step("seed %u, imported bytes %zu, file mapping %u", seed, size, mapping);
       HANDLE file =
