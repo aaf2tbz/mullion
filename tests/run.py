@@ -440,8 +440,9 @@ def arguments(parser):
                              "and installed into, never the Wine itself: for a signed Wine of another product")
     parser.add_argument("--compilers", type=Path,
                         help="a directory with Microsoft's shader compilers (d3dcompiler_47.dll, dxcompiler.dll and "
-                             "dxil.dll, in any subdirectories), put into the prefix by their machine; default: the "
-                             "Wine's share/wine/shadercompilers, for what the prefix lacks")
+                             "dxil.dll, in any subdirectories: tests/compilers.py makes one), put into the prefix by "
+                             "their machine; default: tests-compilers in the first build, then the Wine's "
+                             "share/wine/shadercompilers, for what the prefix lacks")
 
 
 # Microsoft's shader compilers, which the tests compile their HLSL with (docs/TESTING.md, section 4), and what each is
@@ -589,10 +590,10 @@ def environment(args):
         return builds, None, base
     if not args.no_install:
         install(wine, prefix, unix, pe)
-    # what --compilers names replaces the prefix's; the Wine's own copies (MetalSharp's share/wine/shadercompilers)
-    # give what the prefix lacks
+    # what --compilers names replaces the prefix's; the build's tests-compilers (tests/compilers.py), then the Wine's
+    # own copies (MetalSharp's share/wine/shadercompilers), give what the prefix lacks
     chosen = getattr(args, "compilers", None)
-    for source in [chosen] if chosen else [wine / "share" / "wine" / "shadercompilers"]:
+    for source in [chosen] if chosen else [builds[0] / "tests-compilers", wine / "share" / "wine" / "shadercompilers"]:
         if source.is_dir():
             install_compilers(source, wine, prefix, replace=chosen is not None)
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
