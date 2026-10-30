@@ -589,11 +589,13 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
+    InitReturnPtr(ppPipelineState);
     return mullion::CreateGraphicsPipelineState(this, pDesc, riid, ppPipelineState);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
+    InitReturnPtr(ppPipelineState);
     return mullion::CreateComputePipelineState(this, pDesc, riid, ppPipelineState);
   };
 
@@ -1718,6 +1720,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc, REFIID riid, void **ppPipelineState) {
+    InitReturnPtr(ppPipelineState);
     PipelineStateStream desc;
     if (HRESULT hr = desc.Parse(pDesc); FAILED(hr))
       return hr;

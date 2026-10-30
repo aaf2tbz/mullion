@@ -375,12 +375,13 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
   BasicBlock *entry, context &ctx, llvm::BasicBlock *return_bb
 );
 
+// a pixel shader's outputs are refused when read with any other type than these (handle_signature_ps)
 constexpr air::MSLScalerOrVectorType to_msl_type(RegisterComponentType type) {
   switch (type) {
   default:
   case RegisterComponentType::Unknown: {
     assert(0 && "unknown component type");
-    break;
+    return air::msl_float4;
   }
   case RegisterComponentType::Uint:
     return air::msl_uint4;

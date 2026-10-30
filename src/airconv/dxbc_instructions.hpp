@@ -26,7 +26,12 @@
 #include <variant>
 #include "packed_variant_list.hpp"
 
-#define DXASSERT_DXBC(x) assert(x);
+// what a shader's tokens must be: one that is not refuses the shader (Refuse)
+#define DXASSERT_DXBC(x)                                                                                               \
+  do {                                                                                                                 \
+    if (!(x))                                                                                                          \
+      Refuse("malformed tokens: " #x);                                                                                 \
+  } while (0)
 
 namespace mullion::dxbc {
 
@@ -798,6 +803,14 @@ using InstructionList = PackedVariantList<
   InstAtomicImmIncrement, InstAtomicImmDecrement>;
 
 using Instruction = InstructionList::variant;
+
+// a shader whose tokens the converter cannot take (a garbled container let past its hash, or what it does not handle
+// yet), by the first reason on the thread reading it. reading goes on with stand-ins and SM50Initialize refuses the
+// shader after it: an assertion would end the process, and a release build would go on with undefined values
+void Refuse(const char *reason);
+// the first reason since ResetRefused, or null
+const char *Refused();
+void ResetRefused();
 
 #pragma region basicblock
 
