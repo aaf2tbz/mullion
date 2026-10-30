@@ -58,8 +58,8 @@ def page(repo):
     rows.sort(key=lambda row: row[0].lower())
     lines = [
         "Games that run with Mullion, from the "
-        f"[Game reports](https://github.com/{repo}/discussions/categories/game-reports). This page is generated; "
-        "a new report updates it.",
+        f"[Game reports](https://github.com/{repo}/discussions/categories/game-reports). This page is generated, "
+        "and a new report updates it.",
         "",
         "| " + " | ".join(FIELDS + ["Report"]) + " |",
         "|" + "---|" * (len(FIELDS) + 1),
