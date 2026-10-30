@@ -731,9 +731,9 @@ public:
             auto [buffer_alloc, offset] = enc.access(buffer, slice.byteOffset, slice.byteLength, ResourceAccess::Write);
             enc.emulated_cmd.ClearBufferUint(buffer_alloc->buffer(), slice.byteOffset + offset, slice.byteLength >> 2, value);
           } else {
-            auto [view, element_offset] = enc.access(buffer, viewId, ResourceAccess::Write);
+            auto [view, first] = enc.accessView(buffer, viewId, ResourceAccess::Write, slice.firstElement);
             enc.emulated_cmd.ClearTextureBufferUint(
-                view.texture, slice.firstElement + element_offset, slice.elementCount,
+                view.texture, first, slice.elementCount,
                 ClearUAV<ArgumentEncodingContext>::clearColor(value, buffer->pixelFormat(viewId))
             );
           }
@@ -810,8 +810,8 @@ public:
             auto [buffer_alloc, offset] = enc.access(buffer, slice.byteOffset, slice.byteLength, ResourceAccess::Write);
             enc.emulated_cmd.ClearBufferFloat(buffer_alloc->buffer(), slice.byteOffset + offset, slice.byteLength >> 2, value);
           } else {
-            auto [view, element_offset] = enc.access(buffer, viewId, ResourceAccess::Write);
-            enc.emulated_cmd.ClearTextureBufferFloat(view.texture, slice.firstElement + element_offset, slice.elementCount, value);
+            auto [view, first] = enc.accessView(buffer, viewId, ResourceAccess::Write, slice.firstElement);
+            enc.emulated_cmd.ClearTextureBufferFloat(view.texture, first, slice.elementCount, value);
           }
         }
       });

@@ -141,6 +141,14 @@ Buffer::view_(BufferViewKey key, BufferAllocation *allocation) {
   return *allocation->cached_view_[key.index];
 };
 
+std::pair<BufferView &, uint64_t>
+Buffer::view_(BufferViewKey key, BufferAllocation *allocation, uint64_t texel) {
+  view_(key, allocation);
+  auto &view = *allocation->cached_view_[key.index];
+  auto window = std::min<uint64_t>(texel / kTextureBufferStep, view.windows.size());
+  return {window ? *view.windows[window - 1] : view, texel - window * kTextureBufferStep};
+}
+
 MULLION_RESOURCE_RESIDENCY_STATE &
 Buffer::residency(BufferViewKey key) {
   return residency(key, current_.ptr());
@@ -162,10 +170,9 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     auto texel_size = MTLGetTexelSize(format);
     assert(texel_size);
     assert(!(allocation->suballocation_size_ & (texel_size - 1)));
-    auto total_length = allocation->suballocation_size_ * allocation->suballocation_count_;
+    uint64_t texels = (uint64_t)allocation->suballocation_size_ * allocation->suballocation_count_ / texel_size;
     WMTTextureInfo info{};
     info.type = WMTTextureTypeTextureBuffer;
-    info.width = total_length / (uint64_t)texel_size;
     info.height = 1;
     info.depth = 1;
     info.array_length = 1;
@@ -183,11 +190,17 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     }
     info.usage = usage;
 
-    auto view = allocation->obj_.newTexture(info, 0, total_length);
-
-    allocation->cached_view_.push_back(std::make_unique<BufferView>(
-        std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
-    ));
+    std::unique_ptr<BufferView> first;
+    for (uint64_t start = 0; !first || start + kTextureBufferWidth - kTextureBufferStep < texels;
+         start += kTextureBufferStep) {
+      info.width = std::min(texels - start, kTextureBufferWidth);
+      auto view = allocation->obj_.newTexture(info, start * texel_size, info.width * texel_size);
+      auto window = std::make_unique<BufferView>(
+          std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
+      );
+      first ? (void)first->windows.push_back(std::move(window)) : (void)(first = std::move(window));
+    }
+    allocation->cached_view_.push_back(std::move(first));
   }
   allocation->version_ = version_;
 };

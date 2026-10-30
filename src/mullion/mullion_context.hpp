@@ -408,12 +408,12 @@ public:
   }
 
   template<PipelineStage stage = PipelineStage::Compute>
-  std::pair<BufferView const &, uint32_t>
-  access(Rc<Buffer> const &buffer, uint64_t viewId, int flags) {
+  std::pair<BufferView &, uint64_t>
+  accessView(Rc<Buffer> const &buffer, uint64_t viewId, int flags, uint64_t first) {
     auto allocation = buffer->current();
     trackBuffer<stage>(allocation, flags);
-    auto &view = buffer->view_(viewId, allocation);
-    return {view, allocation->currentSuballocationOffset(view.suballocation_texel)};
+    auto texel = first + allocation->currentSuballocationOffset(buffer->view_(viewId, allocation).suballocation_texel);
+    return buffer->view_(viewId, allocation, texel);
   }
 
   template<PipelineStage stage = PipelineStage::Compute>
@@ -670,6 +670,13 @@ public:
     if (CheckResourceResidency(buffer->residency(viewId, allocation), encoder_id, requested)) {
       makeResident<stage, kind>(buffer->view(viewId, allocation), requested);
     };
+  }
+  template <PipelineStage stage, PipelineKind kind>
+  void
+  makeResident(BufferView &view, bool read = true, bool write = false) {
+    MULLION_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, read, write);
+    if (CheckResourceResidency(view.residency, currentEncoder()->id, requested))
+      makeResident<stage, kind>(view.texture, requested);
   }
   template <PipelineStage stage, PipelineKind kind>
   void

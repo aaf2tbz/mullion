@@ -224,11 +224,7 @@ public:
         memcpy(ctx_.setComputeBytes(2, sizeof(first_slice)), &first_slice, sizeof(first_slice));
     } else if (clearing_buffer_) {
       if (clearing_view_) {
-        auto &dst_ = clearing_buffer_->view_(clearing_view_);
-        auto dst_sub_offset = clearing_buffer_->current()->currentSuballocationOffset(dst_.suballocation_texel);
-        ctx_.setComputeTexelBuffer(0, clearing_buffer_, clearing_view_, ResourceAccess::Write);
-        meta_temp_.offset[0] += dst_sub_offset; // TODO: wrong?
-        assert(!dst_sub_offset);
+        ctx_.setComputeTexelBuffer(0, clearing_buffer_, clearing_view_, ResourceAccess::Write, meta_temp_.offset[0]);
       } else {
         auto dst_ = clearing_buffer_->current();
         auto dst_sub_offset = dst_->currentSuballocationOffset();
