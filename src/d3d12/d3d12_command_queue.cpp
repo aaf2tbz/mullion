@@ -45,7 +45,7 @@
 namespace mullion {
 
 constexpr auto kCommandQueueSize = 32u;
-const auto dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES");
+const std::string dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES"); // as d3d12_device.hpp declares it
 
 // a pass whose every dispatch waits for the one before (a UAV barrier between each two) runs serially, where Metal
 // orders the dispatches itself and a barrier costs nothing: a concurrent encoder's barriers take longer than that.
