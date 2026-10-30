@@ -4121,7 +4121,8 @@ public:
 
   void STDMETHODCALLTYPE
   SetViewInstanceMask(UINT Mask) {
-    IMPLEMENT_ME
+    // no pipeline has view instancing (ViewInstancingTier is NOT_SUPPORTED): "The view instance mask is only honored
+    // by PSOs that have view instancing enabled" (D3D12 View Instancing)
   }
 
   void STDMETHODCALLTYPE
