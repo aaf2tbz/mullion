@@ -44,7 +44,8 @@ to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
   case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE:
     return air::Interpolation::center_no_perspective;
   default:
-    assert(0 && "Unexpected D3D10_SB_INTERPOLATION_MODE");
+    Refuse("an unexpected interpolation mode");
+    return air::Interpolation::center_perspective;
   }
 }
 
@@ -144,7 +145,7 @@ void handle_signature_vs(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled input system value");
+      // Unexpected/unhandled input system value: the declaration is ignored
       break;
     }
     max_input_register = std::max(reg + 1, max_input_register);
@@ -188,7 +189,7 @@ void handle_signature_vs(
       break;
     }
     default:
-      assert(0 && "unhandled vertex shader input");
+      // unhandled vertex shader input: the declaration is ignored
       break;
     }
     break;
@@ -257,7 +258,7 @@ void handle_signature_vs(
       varyings(reg, RegisterComponentType::Uint);
       break;
     default:
-      assert(0 && "Unexpected/unhandled input system value");
+      // Unexpected/unhandled input system value: the declaration is ignored
       break;
     }
     max_output_register = std::max(reg + 1, max_output_register);
@@ -279,13 +280,13 @@ void handle_signature_vs(
       break;
     }
     default:
-      assert(0 && "unhandled vertex shader output");
+      // unhandled vertex shader output: the declaration is ignored
       break;
     }
     break;
   }
   default:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
 };
@@ -444,11 +445,11 @@ void handle_signature_ps(
 
   switch (Inst.m_OpCode) {
   case D3D10_SB_OPCODE_DCL_INPUT_SIV: {
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
   case D3D10_SB_OPCODE_DCL_INPUT_SGV:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   case D3D10_SB_OPCODE_DCL_INPUT: {
     D3D10_SB_OPERAND_TYPE RegType = Inst.m_Operands[0].m_Type;
@@ -470,7 +471,7 @@ void handle_signature_ps(
       // the conservative rasterizer's pixel test has it (conservative_overlap)
       break;
     default:
-      assert(0 && "unimplemented vertex input");
+      // unimplemented vertex input: the declaration is ignored
       break;
     }
     break;
@@ -516,7 +517,7 @@ void handle_signature_ps(
       max_input_register = std::max(reg + 1, max_input_register);
       return;
     default:
-      assert(0 && "Unexpected/unhandled input system value");
+      // Unexpected/unhandled input system value: the declaration is ignored
       break;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
@@ -555,7 +556,7 @@ void handle_signature_ps(
       max_input_register = std::max(reg + 1, max_input_register);
       return;
     default:
-      assert(0 && "Unexpected/unhandled input system value");
+      // Unexpected/unhandled input system value: the declaration is ignored
       break;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
@@ -580,7 +581,7 @@ void handle_signature_ps(
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
+    // dcl_output_sgv should not happen for now: the declaration is ignored
     // only GS PrimitiveID uses this, but we don't support GS for now
     break;
   }
@@ -590,7 +591,7 @@ void handle_signature_ps(
     auto siv = Inst.m_OutputDeclSIV.Name;
     switch (siv) {
     default:
-      assert(0 && "Unexpected/unhandled input system value");
+      // Unexpected/unhandled input system value: the declaration is ignored
       break;
     }
     max_output_register = std::max(reg + 1, max_output_register);
@@ -727,6 +728,11 @@ void handle_signature_ps(
       pso_valid_output_reg_mask |= (1 << reg);
       if (sig.mask() == 0) break;
       auto sig_type = sig.componentType();
+      if (sig_type != RegisterComponentType::Float && sig_type != RegisterComponentType::Uint &&
+          sig_type != RegisterComponentType::Int) {
+        Refuse("a pixel shader output of an unknown component type");
+        break;
+      }
       signature_handlers.push_back([=](SignatureContext &ctx) {
         auto format = uint32_t(ctx.pixel_formats[reg]);
         auto type = component_type_from_pixel_format(air::MTLPixelFormat(format & 0xff));
@@ -760,13 +766,13 @@ void handle_signature_ps(
       break;
     }
     default:
-      assert(0 && "unhandled pixel shader output");
+      // unhandled pixel shader output: the declaration is ignored
       break;
     }
     break;
   }
   default:
-    assert(0 && "unhandled pixel shader output");
+    // unhandled pixel shader output: the declaration is ignored
     break;
   }
 };
@@ -789,7 +795,7 @@ void handle_signature_hs(
     auto sgv = Inst.m_InputDeclSGV.Name;
     switch (sgv) {
     default:
-      assert(0 && "Unexpected/unhandled hull shader sgv");
+      // Unexpected/unhandled hull shader sgv: the declaration is ignored
       break;
     }
     max_input_register = std::max(reg + 1, max_input_register);
@@ -820,13 +826,13 @@ void handle_signature_hs(
     }
 
     default:
-      assert(0 && "unhandled hull shader input");
+      // unhandled hull shader input: the declaration is ignored
       break;
     }
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
+    // dcl_output_sgv should not happen for now: the declaration is ignored
     // only GS PrimitiveID uses this, but we don't support GS for now
     break;
   }
@@ -881,7 +887,7 @@ void handle_signature_hs(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled hull shader output siv");
+      // Unexpected/unhandled hull shader output siv: the declaration is ignored
       break;
     }
     if (phase != ~0u) {
@@ -918,13 +924,13 @@ void handle_signature_hs(
       break;
     }
     default:
-      assert(0 && "unhandled hull shader output");
+      // unhandled hull shader output: the declaration is ignored
       break;
     }
     break;
   }
   default:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
 };
@@ -972,13 +978,14 @@ void handle_signature_ds(
       break;
     }
     default:
-      assert(0 && "unhandled dcl_input_siv in domain shader");
+      // unhandled dcl_input_siv in domain shader: the declaration is ignored
+      break;
     }
 
     break;
   }
   case D3D10_SB_OPCODE_DCL_INPUT_SGV: {
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
   case D3D10_SB_OPCODE_DCL_INPUT: {
@@ -994,7 +1001,7 @@ void handle_signature_ds(
       break;
     }
     case D3D10_SB_OPERAND_TYPE_INPUT:
-      assert(0);
+      // an unexpected signature declaration: the declaration is ignored
       break;
     case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT: {
       unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
@@ -1005,13 +1012,13 @@ void handle_signature_ds(
     case D3D11_SB_OPERAND_TYPE_INPUT_CONTROL_POINT:
       break;
     default:
-      assert(0 && "unhandeld domain shader input");
+      // unhandeld domain shader input: the declaration is ignored
       break;
     }
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
+    // dcl_output_sgv should not happen for now: the declaration is ignored
     // only GS PrimitiveID uses this, but we don't support GS for now
     break;
   }
@@ -1066,7 +1073,7 @@ void handle_signature_ds(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled input system value");
+      // Unexpected/unhandled input system value: the declaration is ignored
       break;
     }
     max_output_register = std::max(reg + 1, max_output_register);
@@ -1088,13 +1095,13 @@ void handle_signature_ds(
       break;
     }
     default:
-      assert(0 && "unhandled domain shader output");
+      // unhandled domain shader output: the declaration is ignored
       break;
     }
     break;
   }
   default:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
 };
@@ -1109,7 +1116,7 @@ void handle_signature_cs(
 
   switch (Inst.m_OpCode) {
   case D3D10_SB_OPCODE_DCL_INPUT_SGV: {
-    assert(0 && "unhandled compute shader sgv");
+    // unhandled compute shader sgv: the declaration is ignored
     break;
   }
   case D3D10_SB_OPCODE_DCL_INPUT: {
@@ -1167,13 +1174,13 @@ void handle_signature_cs(
       break;
     }
     default:
-      assert(0 && "unhandled compute shader input");
+      // unhandled compute shader input: the declaration is ignored
       break;
     }
     break;
   }
   default:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
 };
@@ -1206,7 +1213,7 @@ handle_signature_gs(
     auto sgv = Inst.m_InputDeclSGV.Name;
     switch (sgv) {
     default:
-      assert(0 && "Unexpected/unhandled geometry shader sgv");
+      // Unexpected/unhandled geometry shader sgv: the declaration is ignored
       break;
     }
     break;
@@ -1220,7 +1227,7 @@ handle_signature_gs(
     case D3D10_SB_NAME_CLIP_DISTANCE:
       break;
     default:
-      assert(0 && "Unexpected/unhandled geometry shader siv");
+      // Unexpected/unhandled geometry shader siv: the declaration is ignored
       break;
     }
     break;
@@ -1237,7 +1244,7 @@ handle_signature_gs(
     case microsoft::D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
       break;
     default:
-      assert(0 && "unhandled geometry shader input");
+      // unhandled geometry shader input: the declaration is ignored
       break;
     }
     break;
@@ -1303,7 +1310,7 @@ handle_signature_gs(
       define_mesh_varyings(sm50_shader, reg, RegisterComponentType::Uint);
       break;
     default:
-      assert(0 && "Unexpected/unhandled geometry shader output siv");
+      // Unexpected/unhandled geometry shader output siv: the declaration is ignored
       break;
     }
     max_output_register = std::max(reg + 1, max_output_register);
@@ -1325,13 +1332,13 @@ handle_signature_gs(
       break;
     }
     default:
-      assert(0 && "unhandled geometry shader output");
+      // unhandled geometry shader output: the declaration is ignored
       break;
     }
     break;
   }
   default:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
 };
@@ -1382,7 +1389,7 @@ void handle_signature(
   case D3D10_SB_GEOMETRY_SHADER:
     return handle_signature_gs(inputParser, *outputParser.Signature(0), Inst, shader, phase);
   default:
-    assert(0);
+    // an unexpected signature declaration: the declaration is ignored
     break;
   }
 }

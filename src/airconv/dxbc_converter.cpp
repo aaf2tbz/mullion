@@ -1663,6 +1663,7 @@ static int SM50InitializeUncached(
     return 1;
   }
 
+  ResetRefused();
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
@@ -1723,6 +1724,17 @@ static int SM50InitializeUncached(
     D3D10ShaderBinary::CShaderCodeParser CodeParser((CShaderToken *)DXBCParser.GetBlob(codeBlobIdx));
     sm50_shader->shader_type = CodeParser.ShaderType();
     sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
+  }
+  // tokens or a signature the converter could not take refuse the shader, now that reading is over (Refuse)
+  if (auto reason = Refused()) {
+    // what the converter does not support yet is said as such ("unsupported: ...")
+    if (std::string_view(reason).starts_with("unsupported:"))
+      errorOut << reason;
+    else
+      errorOut << "Invalid DXBC bytecode: " << reason;
+    delete sm50_shader;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
   }
 
   // a library's shaders bind their resources through root signatures only

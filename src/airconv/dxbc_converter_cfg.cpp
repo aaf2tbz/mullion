@@ -36,7 +36,8 @@ to_shader_resource_type(D3D10_SB_RESOURCE_DIMENSION dim) {
   case D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBEARRAY:
     return ResourceType::TextureCubeArray;
   }
-  assert(0 && "invalid D3D10_SB_RESOURCE_DIMENSION");
+  Refuse("an invalid resource dimension");
+  return ResourceType::Texture2D;
 };
 
 inline ScalerDataType
@@ -58,7 +59,8 @@ to_shader_scaler_type(microsoft::D3D10_SB_RESOURCE_RETURN_TYPE type) {
   case microsoft::D3D11_SB_RETURN_TYPE_UNUSED:
     break;
   }
-  assert(0 && "invalid D3D10_SB_RESOURCE_RETURN_TYPE");
+  Refuse("an invalid resource return type");
+  return ScalerDataType::Float;
 };
 
 std::vector<std::unique_ptr<BasicBlock>>
@@ -338,7 +340,7 @@ read_control_flow(
     case D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER: {
       unsigned RangeID = Inst.m_Operands[0].m_Index[0].m_RegIndex;
       unsigned CBufferSize = Inst.m_ConstantBufferDecl.Size;
-      unsigned LB, RangeSize;
+      unsigned LB = 0, RangeSize = 0;
       switch (Inst.m_Operands[0].m_IndexDimension) {
       case D3D10_SB_OPERAND_INDEX_2D: // SM 5.0-
         LB = RangeID;
@@ -364,7 +366,7 @@ read_control_flow(
     case D3D10_SB_OPCODE_DCL_SAMPLER: {
       // Root signature bindings.
       unsigned RangeID = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-      unsigned LB, RangeSize;
+      unsigned LB = 0, RangeSize = 0;
       switch (Inst.m_Operands[0].m_IndexDimension) {
       case D3D10_SB_OPERAND_INDEX_1D: // SM 5.0-
         LB = RangeID;
@@ -394,7 +396,7 @@ read_control_flow(
     case D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED: {
       // Root signature bindings.
       unsigned RangeID = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-      unsigned LB, RangeSize;
+      unsigned LB = 0, RangeSize = 0;
       if (sm_ver_5_1_) {
         LB = Inst.m_Operands[0].m_Index[1].m_RegIndex;
         RangeSize = Inst.m_Operands[0].m_Index[2].m_RegIndex != UINT_MAX
@@ -446,7 +448,7 @@ read_control_flow(
     case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED: {
       // Root signature bindings.
       unsigned RangeID = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-      unsigned LB, RangeSize;
+      unsigned LB = 0, RangeSize = 0;
       if (sm_ver_5_1_) {
         LB = Inst.m_Operands[0].m_Index[1].m_RegIndex;
         RangeSize = Inst.m_Operands[0].m_Index[2].m_RegIndex != UINT_MAX
