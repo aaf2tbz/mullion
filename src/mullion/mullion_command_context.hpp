@@ -39,7 +39,8 @@ template <typename Context> struct SimpleCommandContext {
   void setComputePSO(WMT::ComputePipelineState pso, WMTSize tgsize);
   void dispatch(WMTSize size);
   void setComputeTexture(uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags);
-  void setComputeTexelBuffer(uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags);
+  // binds the window of the view that holds texel `first`, which becomes that texel's index in it
+  void setComputeTexelBuffer(uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags, uint32_t &first);
   void setComputeBuffer(uint32_t index, const Rc<Buffer> &buffer, uint32_t offset, uint32_t length, int flags);
   void *setComputeBytes(uint32_t index, uint32_t length);
 
