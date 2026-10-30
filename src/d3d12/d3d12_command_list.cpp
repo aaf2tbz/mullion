@@ -1185,9 +1185,13 @@ public:
       // a conservative rasterizer clips depth itself, and its grown triangles' depth goes past the polygon's
       cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
-      std::tie(cmd_setrs.depth_bias, cmd_setrs.depth_bias_clamp, cmd_setrs.scole_scale) = depth_bias_.value_or(
+      // one by one: libstdc++ assigns no std::array to a std::tuple of references
+      auto [depth_bias, depth_bias_clamp, scole_scale] = depth_bias_.value_or(
         std::array{pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale}
       );
+      cmd_setrs.depth_bias = depth_bias;
+      cmd_setrs.depth_bias_clamp = depth_bias_clamp;
+      cmd_setrs.scole_scale = scole_scale;
       cmd_setrs.winding = pso_graphics_->winding;
 
       dirty_state_.clr(DirtyState::GraphicsPipelineState);
