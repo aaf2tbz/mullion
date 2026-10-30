@@ -55,7 +55,9 @@ public:
 
     if (pHeap && !pHeap->memory) {
       auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
-      if (size_and_align.size + Offset > pHeap->GetDesc().SizeInBytes)
+      // the Metal heap is the description's size rounded up to its alignment (MTLD3D12Heap)
+      auto heap_desc = pHeap->GetDesc();
+      if (size_and_align.size + Offset > align(heap_desc.SizeInBytes, heap_desc.Alignment))
         return FAIL(E_INVALIDARG);
     }
 
@@ -63,9 +65,11 @@ public:
     uint64_t length = desc_.Width;
     if (pHeap && pHeap->memory) {
       auto size = pHeap->GetDesc().SizeInBytes;
-      length = align(length, desc_.Alignment);
       if (Offset % desc_.Alignment || Offset > size || length > size - Offset)
         return FAIL(E_INVALIDARG);
+      // the memory the heap's owner made ends where the heap does: the rest of a 64KB granule past it is not ours to
+      // wrap
+      length = std::min<uint64_t>(align(length, desc_.Alignment), size - Offset);
       memory = std::shared_ptr<void>(pHeap->memory, (char *)pHeap->memory.get() + Offset);
     } else if (HeapFlags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) {
       SYSTEM_INFO system;

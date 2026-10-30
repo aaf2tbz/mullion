@@ -1318,9 +1318,13 @@ public:
       return hr;
     D3D12_RESOURCE_ALLOCATION_INFO info;
     GetResourceAllocationInfo(&info, 0, 1, pDesc);
-    if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
-        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes) {
-      WARN("CreatePlacedResource: ", info.SizeInBytes, " bytes at alignment ", info.Alignment, " placed at ", Offset,
+    // "HeapOffset plus the resource size must be smaller than or equal to the heap size" (CreatePlacedResource), and a
+    // buffer's size is its width, though its allocation size is given in 64KB (vkd3d-proton checks the width too):
+    // Starfield places a small one at the start of a heap of one page it imported (#32)
+    UINT64 needed = pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? pDesc->Width : info.SizeInBytes;
+    if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment || needed > heap_desc.SizeInBytes ||
+        Offset > heap_desc.SizeInBytes - needed) {
+      WARN("CreatePlacedResource: ", needed, " bytes at alignment ", info.Alignment, " placed at ", Offset,
            " of a heap of ", heap_desc.SizeInBytes, " at alignment ", heap_desc.Alignment, " (dimension ",
            pDesc->Dimension, ", format ", pDesc->Format, ", alignment ", pDesc->Alignment, ")");
       return FAIL(E_INVALIDARG);
