@@ -14,6 +14,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -65,9 +66,10 @@ MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64", 0x14C: "i386"}
 
 
 def machine(pe):
-    data = pe.read_bytes()
-    header = int.from_bytes(data[0x3C:0x40], "little")
-    return MACHINES[int.from_bytes(data[header + 4:header + 6], "little")]
+    with open(pe, "rb") as file:
+        file.seek(0x3C)
+        file.seek(int.from_bytes(file.read(4), "little") + 4)
+        return MACHINES.get(int.from_bytes(file.read(2), "little"))
 
 
 def builtin(pe):
@@ -436,6 +438,57 @@ def arguments(parser):
     parser.add_argument("--clone", nargs="?", const=True, type=Path,
                         help="run in a copy of the Wine, made in this directory (default: tests-wine in the first build) "
                              "and installed into, never the Wine itself: for a signed Wine of another product")
+    parser.add_argument("--compilers", type=Path,
+                        help="a directory with Microsoft's shader compilers (d3dcompiler_47.dll, dxcompiler.dll and "
+                             "dxil.dll, in any subdirectories), put into the prefix by their machine; default: the "
+                             "Wine's share/wine/shadercompilers, for what the prefix lacks")
+
+
+# Microsoft's shader compilers, which the tests compile their HLSL with (docs/TESTING.md, section 4), and what each is
+COMPILERS = {"d3dcompiler_47.dll": "DXBC compiler (d3dcompiler_47)", "dxcompiler.dll": "DXIL compiler (dxcompiler)"}
+
+
+def system(prefix, kind):
+    """the prefix's system directory of a machine's libraries: syswow64 for i386 in a 64-bit prefix"""
+    windows = prefix / "drive_c" / "windows"
+    return windows / "syswow64" if kind == "i386" and (windows / "syswow64").is_dir() else windows / "system32"
+
+
+def compilers(prefix, kind):
+    """the compilers the prefix has for programs of a machine: Microsoft's of that machine, never Wine's own, which
+    compiles fewer of the tests' shaders"""
+    return {name for name in COMPILERS for path in [system(prefix, kind) / name]
+            if path.is_file() and machine(path) == kind and not builtin(path)}
+
+
+def install_compilers(source, wine, prefix, replace):
+    """Microsoft's compilers found under source (and DXC's dxil.dll) into the prefix's system directories, each by its
+    machine: those the Wine runs natively, 64-bit in system32 and i386 in syswow64. without replace only what the
+    prefix lacks"""
+    native = "aarch64" if (wine / "lib" / "wine" / "aarch64-windows").is_dir() else "x86_64"
+    for path in sorted(source.rglob("*.dll")):
+        name = path.name.lower()
+        kind = machine(path)
+        if name not in (*COMPILERS, "dxil.dll") or kind not in (native, "i386"):
+            continue
+        if replace or (COMPILERS.get(name) and name not in compilers(prefix, kind)) or (
+                name == "dxil.dll" and "dxcompiler.dll" not in compilers(prefix, kind)):
+            shutil.copy2(path, system(prefix, kind) / name)
+
+
+@functools.cache
+def compilers_named(program):
+    """the compilers a program names: imports, or loads by name"""
+    data = Path(program).read_bytes().lower()
+    return {name for name in COMPILERS if name.encode() in data}
+
+
+def needs(test):
+    """the compilers a test uses: DXC's unless it runs as dxbc, and d3dcompiler_47 unless it runs as dxil, of those its
+    program names"""
+    argument = test["cmd"][1] if len(test["cmd"]) > 1 else None
+    return {name for name in compilers_named(test["cmd"][0])
+            if not (name == "dxcompiler.dll" and argument == "dxbc") and not (name == "d3dcompiler_47.dll" and argument == "dxil")}
 
 
 class Unusable(Exception):
@@ -513,9 +566,8 @@ def environment(args):
         base.update(ZOMBIES)
     base.pop("MULLION_GPU_FAMILY", None)
     base.pop("MULLION_D3D12_METAL4", None)
-    # the build's libraries in place of the Wine's own, the shader compiler the prefix has (Wine's own when it has
-    # none: winetricks' d3dcompiler_47 is x86 only, so an arm64 Wine's ARM64 tests have no other), and no installer or
-    # debugger that asks in a dialog
+    # the build's libraries in place of the Wine's own, Microsoft's shader compiler the prefix has (a test whose
+    # compiler the prefix lacks is not run: own), and no installer or debugger that asks in a dialog
     own = sorted(path.stem for path in pe.values() if builtin(path))
     native = sorted(path.stem for path in pe.values() if not builtin(path))
     overrides = [f"{','.join(native)}=n"] if native else []
@@ -537,6 +589,12 @@ def environment(args):
         return builds, None, base
     if not args.no_install:
         install(wine, prefix, unix, pe)
+    # what --compilers names replaces the prefix's; the Wine's own copies (MetalSharp's share/wine/shadercompilers)
+    # give what the prefix lacks
+    chosen = getattr(args, "compilers", None)
+    for source in [chosen] if chosen else [wine / "share" / "wine" / "shadercompilers"]:
+        if source.is_dir():
+            install_compilers(source, wine, prefix, replace=chosen is not None)
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
                  files={path.name.lower(): path for path in pe.values()},
                  symbolizer=Path(shutil.which(compiler(builds)[0])).resolve().parent / "llvm-symbolizer")
@@ -632,8 +690,12 @@ def own(args, tests, builds, binary, base):
     verdicts, said_by = {}, {}
     printing = threading.Lock()
     # a test program of an architecture the Wine does not run is not run, and said so: a run without a Wine that can
-    # run arm64 programs (one macOS ends, or an x86_64 Wine) still runs every test that needs none
+    # run arm64 programs (one macOS ends, or an x86_64 Wine) still runs every test that needs none. so is one whose
+    # shader compiler the prefix lacks for its architecture: a missing compiler is missing coverage (docs/TESTING.md,
+    # section 4)
     runs = machines(binary)
+    prefix = Path(base["WINEPREFIX"])
+    present = {}
     not_run = {}
     for test in tests:
         if test["cmd"][0].endswith(".exe"):
@@ -641,6 +703,11 @@ def own(args, tests, builds, binary, base):
             if kind not in runs:
                 not_run[test["name"]] = (f"the Wine runs no {kind} programs" if binary is not None
                                          else "no Wine runs here")
+                continue
+            missing = needs(test) - present.setdefault(kind, compilers(prefix, kind))
+            if missing:
+                not_run[test["name"]] = (f"the prefix has no Microsoft {' or '.join(COMPILERS[name] for name in sorted(missing))} "
+                                         f"for {kind} programs (--compilers)")
     tests = [test for test in tests if test["name"] not in not_run]
 
     def one(family, test, again=False):

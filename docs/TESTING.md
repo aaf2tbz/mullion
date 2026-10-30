@@ -75,6 +75,10 @@ Tests compile HLSL with Microsoft's compilers: the DXBC compiler, available thro
 matches the architecture of the test process, loads, and compiles every profile the tests use: {suite: compiler packages
 by architecture, setup and verification}. A missing compiler is missing coverage, never a pass.
 
+`run.py` puts those of the machines the Wine runs into the prefix: from `--compilers <directory>` when given, which
+replaces the prefix's, or else from a Wine's own `share/wine/shadercompilers`, for what the prefix lacks. A test whose
+compiler the prefix lacks for its architecture is listed as not run, with the compiler it needs; Wine's own `d3dcompiler_47` does not count, as it compiles fewer of the tests' shaders.
+
 The LLVM IR Mullion generates passes the LLVM verifier before it is optimized or compiled for Metal ([CODE.md
 4.1](CODE.md#4-shaders)): {suite: verification, unoptimized conversion included}. A failure that follows unverified
 output is read only after the output passes. A change to cached shader output is tested without the cache, with output
