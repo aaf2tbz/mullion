@@ -245,6 +245,7 @@ public:
 
 private:
   void prepareAllocationViews(BufferAllocation *allocation);
+  BufferView &cachedView(BufferViewKey key, BufferAllocation *allocation);
 
   uint64_t length_;
 
@@ -253,7 +254,7 @@ private:
   std::atomic<uint32_t> refcount_ = {0u};
 
   small_vector<BufferViewDescriptor, 1> viewDescriptors_;
-  mullion::mutex mutex_;
+  mullion::shared_mutex mutex_;
   WMT::Device device_;
 };
 

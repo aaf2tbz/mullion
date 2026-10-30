@@ -135,16 +135,12 @@ Buffer::view_(BufferViewKey key) {
 
 BufferView const &
 Buffer::view_(BufferViewKey key, BufferAllocation *allocation) {
-  if (unlikely(allocation->version_ != version_)) {
-    prepareAllocationViews(allocation);
-  }
-  return *allocation->cached_view_[key.index];
+  return cachedView(key, allocation);
 };
 
 std::pair<BufferView &, uint64_t>
 Buffer::view_(BufferViewKey key, BufferAllocation *allocation, uint64_t texel) {
-  view_(key, allocation);
-  auto &view = *allocation->cached_view_[key.index];
+  auto &view = cachedView(key, allocation);
   auto window = std::min<uint64_t>(texel / kTextureBufferStep, view.windows.size());
   return {window ? *view.windows[window - 1] : view, texel - window * kTextureBufferStep};
 }
@@ -156,15 +152,25 @@ Buffer::residency(BufferViewKey key) {
 
 MULLION_RESOURCE_RESIDENCY_STATE &
 Buffer::residency(BufferViewKey key, BufferAllocation *allocation) {
+  return cachedView(key, allocation).residency;
+}
+
+// views are made on any thread while others read them (Texture::view): the list is read under the lock too, as adding
+// a view may move it, though not the views it points to
+BufferView &
+Buffer::cachedView(BufferViewKey key, BufferAllocation *allocation) {
+  std::shared_lock<mullion::shared_mutex> lock(mutex_);
   if (unlikely(allocation->version_ != version_)) {
+    lock.unlock();
     prepareAllocationViews(allocation);
+    lock.lock();
   }
-  return allocation->cached_view_[key.index]->residency;
+  return *allocation->cached_view_[key.index];
 }
 
 void
 Buffer::prepareAllocationViews(BufferAllocation *allocation) {
-  std::unique_lock<mullion::mutex> lock(mutex_);
+  std::unique_lock<mullion::shared_mutex> lock(mutex_);
   for (unsigned version = allocation->version_; version < version_; version++) {
     auto format = viewDescriptors_[version].format;
     auto texel_size = MTLGetTexelSize(format);
@@ -207,7 +213,7 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
 
 BufferViewKey
 Buffer::createView(BufferViewDescriptor const &descriptor) {
-  std::unique_lock<mullion::mutex> lock(mutex_);
+  std::unique_lock<mullion::shared_mutex> lock(mutex_);
   unsigned i = 0;
   for (; i < version_; i++) {
     if (viewDescriptors_[i].format == descriptor.format && viewDescriptors_[i].write == descriptor.write) {
