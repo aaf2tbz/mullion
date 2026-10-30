@@ -511,8 +511,6 @@ jobs:
   test-gpu:
     if: vars.MULLION_WINE != ''
     runs-on: [self-hosted, macOS, ARM64]
-    env:
-      MULLION_TEST_LOCK: ${{ runner.temp }}/mullion-gpu.lock
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -526,9 +524,13 @@ jobs:
 
       # as the GPU itself and as an M3's, the families the preview supports, under Metal's validation
       - name: Tests
+        env:
+          MULLION_TEST_LOCK: ${{ runner.temp }}/mullion-gpu.lock
         run: python3 tests/run.py --build build --wine "${{ vars.MULLION_WINE }}" --prefix "${{ vars.MULLION_PREFIX }}" --family native,9 --validate
 
       - name: Benchmarks
+        env:
+          MULLION_TEST_LOCK: ${{ runner.temp }}/mullion-gpu.lock
         run: python3 tests/run.py --build build --wine "${{ vars.MULLION_WINE }}" --prefix "${{ vars.MULLION_PREFIX }}" --family native --benchmark
 
       - name: Test evidence
