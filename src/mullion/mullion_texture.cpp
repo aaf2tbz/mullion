@@ -96,13 +96,16 @@ TextureAllocation::free(){
   delete this;
 };
 
+// D3D12 makes views on any thread ("All methods for creating descriptors are free-threaded", Creating descriptors)
+// while others record with the texture: an allocation's views are added under the texture's lock, its version checked
+// again there, so two threads never add one twice
 void
 Texture::prepareAllocationViews(TextureAllocation *allocation) {
+  std::unique_lock<mullion::shared_mutex> lock(mutex_);
   if (allocation->version_ < 1) {
     allocation->cached_view_.push_back(new TextureView(allocation));
     allocation->version_ = 1;
   }
-  std::shared_lock<mullion::shared_mutex> lock(mutex_);
   for (unsigned version = allocation->version_; version < version_; version++) {
     allocation->cached_view_.push_back(new TextureView(allocation, version, viewDescriptors_[version]));
   }
@@ -261,8 +264,12 @@ Texture::view(TextureViewKey key) {
 
 TextureView &
 Texture::view(TextureViewKey key, TextureAllocation* allocation) {
+  // read under the lock too: adding a view may move the list, though not the views it points to
+  std::shared_lock<mullion::shared_mutex> lock(mutex_);
   if (unlikely(allocation->version_ != version_)) {
+    lock.unlock();
     prepareAllocationViews(allocation);
+    lock.lock();
   }
   return *allocation->cached_view_[key.index];
 }
