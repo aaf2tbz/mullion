@@ -292,9 +292,10 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   encoder_last = nullptr;
   encoder_count_ = 0;
 
+  // the pool keeps only what the last use made, so it grows with a use and never past it
+  icb_pool_.clear();
   for (auto &used : icb_)
-    if (icb_pool_.size() < kICBPoolMax)
-      icb_pool_.emplace(used.key, std::move(used));
+    icb_pool_.emplace(used.key, std::move(used));
   icb_.clear();
   sparse_clear_texels_.clear();
   visibility_.clear();

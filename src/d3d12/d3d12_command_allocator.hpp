@@ -203,7 +203,6 @@ private:
   };
   small_vector<PooledICB, 4> icb_;
   std::unordered_multimap<uint64_t, PooledICB> icb_pool_;
-  static constexpr size_t kICBPoolMax = 256;
   WMT::IndirectCommandBuffer AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options);
   uint64_t visibility_address_ = 0;
   size_t visibility_used_ = kVisibilityWindow;
