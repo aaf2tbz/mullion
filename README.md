@@ -32,8 +32,8 @@ too, with screenshots.
 ## Requirements
 
 - A Mac with Apple silicon, M1 or later, on macOS 15 or later.
-- Wine for x86_64 or CrossOver, with [Rosetta](https://support.apple.com/en-us/102527). Stock Wine works, without
-  patches or DLL overrides.
+- Wine for x86_64 or CrossOver, with [Rosetta](https://support.apple.com/en-us/102527), or Wine for arm64, whose x86_64
+  programs load Mullion's ARM64X libraries as ARM64EC. Stock Wine works, without patches or DLL overrides.
 - A 64-bit game. 32-bit games are not supported yet.
 
 ## Install
