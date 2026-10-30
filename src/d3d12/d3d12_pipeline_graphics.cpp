@@ -561,6 +561,8 @@ CompileFunction(
 
 class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12PipelineObject<MTLD3D12GraphicsPipelineState> {
 protected:
+  // held for the pipeline's life, so that pipelines and variants made of the same shaders share their initialization
+  SM50Shader shader_vs, shader_hs, shader_ds, shader_gs, shader_ps, shader_as, shader_ms;
   MTL_SHADER_REFLECTION ref_vs;
   MTL_SHADER_REFLECTION ref_ps{};
 
@@ -1155,7 +1157,6 @@ public:
 
     HRESULT hr;
 
-    SM50Shader shader_vs, shader_hs, shader_ds, shader_gs, shader_ps, shader_as, shader_ms;
     MTL_SHADER_REFLECTION ref_hs, ref_ds, ref_gs, ref_as, ref_ms;
     WMT::Reference<WMT::Error> err;
 
