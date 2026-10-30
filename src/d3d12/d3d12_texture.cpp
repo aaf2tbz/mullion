@@ -161,6 +161,9 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    // an R32 view of the texture is a view in another layout (CastsToR32UnorderedAccess)
+    if (CastsToR32UnorderedAccess(Desc.Format))
+      Usage |= WMTTextureUsagePixelFormatView;
     // and so does a uint clear of a format whose values cannot hold all its bit patterns (GetUIntClearWrite)
     auto pixel = WMTPixelFormat(ORIGINAL_FORMAT(InfoOut.pixel_format));
     if (GetUIntClearWrite(pixel) == UIntClearWrite::IntegerView && MTLGetUnsignedIntegerFormat(pixel) != pixel)
@@ -747,8 +750,11 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
+    const bool r32 = ViewDesc.Format == DXGI_FORMAT_R32_UINT || ViewDesc.Format == DXGI_FORMAT_R32_SINT ||
+                     ViewDesc.Format == DXGI_FORMAT_R32_FLOAT;
     if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format))) {
+        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format) &&
+         !(r32 && CastsToR32UnorderedAccess(desc_.Format)))) {
       WARN("CreateUnorderedAccessView: format ", ViewDesc.Format, ", dimension ", ViewDesc.ViewDimension,
            " of a texture of format ", desc_.Format, ", flags ", desc_.Flags);
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
