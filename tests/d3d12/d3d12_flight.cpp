@@ -1,13 +1,18 @@
-// the runs tests/flight.py reads the flight recorder's dumps of. argv: <removed|exception|quiet|many|d3d11|cost>.
+// the runs tests/flight.py reads the flight recorder's dumps of. argv: <removed|exception|quiet|many|d3d11|busy|cost>.
 // each says what it did in 'fact' lines, which the dump must hold in the same order.
 // removed: a list executes, the queue signals a fence and waits for it, and the device is removed
 // (ID3D12Device5::RemoveDevice). exception: two continuable access violations (RaiseException), which a handler of
 // the program's own, added last, continues. quiet: the work of removed with no removal. many: the queue signals the
 // fence more times than the ring is said to hold, then the device is removed. d3d11: a cleared and flushed context,
-// waited for with an event query. cost: how long a record takes.
+// waited for with an event query. busy: dumps while other threads record without pause, each after a record of the
+// dumping thread's own, whose ring is the oldest. cost: how long a record takes.
 #include "d3d12_test.hpp"
 #include <d3d11.h>
+#include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 static LONG CALLBACK
 resume(EXCEPTION_POINTERS *pointers) {
@@ -43,7 +48,7 @@ d3d11() {
 
 int
 main(int argc, char **argv) {
-  if (!expect(argc == 2, "usage: d3d12_flight <removed|exception|quiet|many|d3d11|cost>"))
+  if (!expect(argc == 2, "usage: d3d12_flight <removed|exception|quiet|many|d3d11|busy|cost>"))
     return verdict();
   std::string mode = argv[1];
   if (mode == "exception") {
@@ -57,12 +62,49 @@ main(int argc, char **argv) {
   }
   if (mode == "d3d11")
     return d3d11();
+  auto metal = LoadLibraryA("winemetal.dll");
+  auto site = (const void *(*)(const char *))GetProcAddress(metal, "WMTFlightSite");
+  auto record = (void (*)(const void *, uint64_t, uint64_t, uint64_t, uint64_t))GetProcAddress(metal, "WMTFlightRecord");
+  auto dump = (void (*)(const char *))GetProcAddress(metal, "WMTFlightDump");
+  if (mode == "busy") {
+    if (!expect(site && record && dump, "winemetal.dll has no flight recorder"))
+      return verdict();
+    auto mark = site("busy %llu"), noise = site("noise %llu");
+    record(mark, 0, 0, 0, 0);
+    // a dump counts each ring's records before it copies them, and a ring grows until it holds kFlightRecords
+    // (winemetal_thunks.c): each dump has a writer of its own, on a new ring that grows while the dump runs, paced
+    // by QueryPerformanceCounter (a system call in Wine) so that it stays below a ring's worth
+    const uint64_t dumps = 8, most = 2048;
+    std::atomic<uint64_t> written[dumps]{};
+    std::atomic<bool> stop[dumps]{}, end = false;
+    std::vector<std::thread> writers;
+    for (uint64_t d = 0; d < dumps; d++) {
+      writers.emplace_back([&, d] {
+        for (uint64_t n = 0; n < most && !stop[d].load(); n++) {
+          LARGE_INTEGER now;
+          QueryPerformanceCounter(&now);
+          record(noise, n, 0, 0, 0);
+          written[d] = n + 1;
+        }
+        // the ring stays this thread's, so the next writer takes a new one
+        while (!end.load())
+          Sleep(1);
+      });
+      while (!written[d].load())
+        YieldProcessor();
+      record(mark, d + 1, 0, 0, 0);
+      dump("busy");
+      stop[d] = true;
+    }
+    end = true;
+    for (auto &writer : writers)
+      writer.join();
+    printf("fact busy %llu\n", (unsigned long long)dumps);
+    return verdict();
+  }
   if (mode == "cost") {
     // what a record costs its thread: records for a second of QueryPerformanceCounter time, in rounds of a ring's
     // worth said generously, and the time a record took on average
-    auto metal = LoadLibraryA("winemetal.dll");
-    auto site = (const void *(*)(const char *))GetProcAddress(metal, "WMTFlightSite");
-    auto record = (void (*)(const void *, uint64_t, uint64_t, uint64_t, uint64_t))GetProcAddress(metal, "WMTFlightRecord");
     if (!expect(site && record, "winemetal.dll has no flight recorder"))
       return verdict();
     auto at = site("cost %llu %llu %llu %llu");
