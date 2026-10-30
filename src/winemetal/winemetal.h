@@ -2486,12 +2486,12 @@ WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t c
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
-// MULLION_TRACE_<CATEGORY> (docs/tracing.md): appends lines to the process's trace log, mullion.log in MULLION_TRACE_DIR or else
-// ~/Library/Logs/Mullion/<executable>/; the first call of a process keeps the last one's log as mullion.prev.log
-// and starts the log with a header. each call also says what the categories turn on in the bridge: command buffers
-// that report their encoders' status (MULLION_TRACE_GPU=heavy) and the memory sampler. false when the log cannot be
-// written
-WINEMETAL_API bool WMTTraceWrite(const char *lines, uint64_t length, bool encoder_errors, bool memory_samples);
+// MULLION_TRACE_<CATEGORY> (docs/tracing.md): appends lines to the process's trace log, mullion.log in `directory` (a
+// macOS path, the one the first call names); the first call keeps the last process's log as mullion.prev.log and starts
+// the log with a header. each call also says what the categories turn on in the bridge: command buffers that report
+// their encoders' status (MULLION_TRACE_GPU=heavy) and the memory sampler. false when the log cannot be written
+WINEMETAL_API bool WMTTraceWrite(const char *directory, const char *lines, uint64_t length, bool encoder_errors,
+                                 bool memory_samples);
 // MULLION_DIAG=profile: each bridge call's count and time in QueryPerformanceCounter ticks, by code, since the last
 // totals were taken; the bridge times calls once WMTDiagTimeCalls was called
 struct WMTDiagCall {

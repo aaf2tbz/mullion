@@ -544,7 +544,7 @@ struct unixcall_wmtdiag_write {
 };
 
 struct unixcall_wmttrace_write {
-  struct WMTConstMemoryPointer directory, executable, lines;
+  struct WMTConstMemoryPointer directory, lines;
   uint64_t length;
   uint32_t encoder_errors, memory_samples;
   uint32_t ret;

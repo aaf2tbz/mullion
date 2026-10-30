@@ -54,12 +54,12 @@ ThreadId() {
 void
 Send(const std::string &lines, const Mask &mask) {
 #ifdef _WIN32
-  using WriteFunction = bool (*)(const char *, uint64_t, bool, bool);
+  using WriteFunction = bool (*)(const char *, const char *, uint64_t, bool, bool);
   static const WriteFunction write = [] {
     HMODULE winemetal = GetModuleHandleA("winemetal.dll");
     return winemetal ? reinterpret_cast<WriteFunction>(GetProcAddress(winemetal, "WMTTraceWrite")) : nullptr;
   }();
-  if (write && write(lines.data(), lines.size(), mask.heavy & Gpu, mask.on & Memory))
+  if (write && write(Directory().c_str(), lines.data(), lines.size(), mask.heavy & Gpu, mask.on & Memory))
     return;
 #endif
   std::cerr << lines;

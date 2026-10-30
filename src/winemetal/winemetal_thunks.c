@@ -1833,24 +1833,9 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
 }
 
 WINEMETAL_API bool
-WMTTraceWrite(const char *lines, uint64_t length, bool encoder_errors, bool memory_samples) {
-  static char directory[MAX_PATH], executable[3 * MAX_PATH];
-  static INIT_ONCE named = INIT_ONCE_STATIC_INIT;
-  BOOL pending;
-  if (InitOnceBeginInitialize(&named, 0, &pending, NULL) && pending) {
-    if (GetEnvironmentVariableA("MULLION_TRACE_DIR", directory, sizeof(directory)) >= sizeof(directory))
-      directory[0] = 0;
-    WCHAR path[MAX_PATH];
-    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
-    WCHAR *name = path + length;
-    while (name > path && name[-1] != '\\' && name[-1] != '/')
-      name--;
-    WideCharToMultiByte(CP_UTF8, 0, name, -1, executable, sizeof(executable), NULL, NULL);
-    InitOnceComplete(&named, 0, NULL);
-  }
+WMTTraceWrite(const char *directory, const char *lines, uint64_t length, bool encoder_errors, bool memory_samples) {
   struct unixcall_wmttrace_write params;
   WMT_MEMPTR_SET(params.directory, directory);
-  WMT_MEMPTR_SET(params.executable, executable);
   WMT_MEMPTR_SET(params.lines, lines);
   params.length = length;
   params.encoder_errors = encoder_errors;

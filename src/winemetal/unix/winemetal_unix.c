@@ -4201,25 +4201,21 @@ _WMTTraceWrite(void *obj) {
     if (!opened) {
       opened = true;
       trace_started = mach_absolute_time();
-      const char *given = params->directory.ptr, *executable = params->executable.ptr;
-      NSString *directory =
-          *given ? [NSString stringWithUTF8String:given]
-                 : [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Mullion"]
-                       stringByAppendingPathComponent:[NSString stringWithUTF8String:executable]];
+      NSString *directory = [NSString stringWithUTF8String:params->directory.ptr];
       NSFileManager *files = [NSFileManager defaultManager];
       [files createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
       NSString *path = [directory stringByAppendingPathComponent:@"mullion.log"];
       NSString *previous = [directory stringByAppendingPathComponent:@"mullion.prev.log"];
       [files removeItemAtPath:previous error:nil];
       [files moveItemAtPath:path toPath:previous error:nil];
-      trace_file = fopen(path.fileSystemRepresentation, "w");
+      trace_file = directory.length ? fopen(path.fileSystemRepresentation, "w") : NULL;
       if (!trace_file)
-        perror("mullion: trace log");
+        fprintf(stderr, "mullion: trace log in '%s': %s\n", directory.UTF8String, strerror(errno));
       else {
         NSString *date = [NSDateFormatter localizedStringFromDate:[NSDate date]
                                                         dateStyle:NSDateFormatterShortStyle
                                                         timeStyle:NSDateFormatterMediumStyle];
-        fprintf(trace_file, "Mullion trace %s, process %d, %s\n", date.UTF8String, getpid(), executable);
+        fprintf(trace_file, "Mullion trace %s, process %d\n", date.UTF8String, getpid());
         fflush(trace_file);
         pthread_t flusher;
         if (!pthread_create(&flusher, NULL, trace_flusher, NULL))
