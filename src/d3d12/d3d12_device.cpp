@@ -2340,6 +2340,12 @@ public:
       memmove(&to[range.destination_tile], &from[range.first_tile], range.tile_count * sizeof(from[0]));
   }
 
+  bool
+  HasSparseBuffers() {
+    std::shared_lock<mullion::shared_mutex> lock(va_lock_);
+    return !sparse_buffer_mappings_.empty();
+  }
+
   std::vector<uint64_t>
   SparseBufferMappings() {
     std::shared_lock<mullion::shared_mutex> lock(va_lock_);

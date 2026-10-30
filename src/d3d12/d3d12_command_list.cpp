@@ -2707,11 +2707,11 @@ public:
     OrderingPoint();
     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
                        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
-    // Metal orders nothing between passes that reach one memory through a reserved buffer and through another
-    // resource, in one command buffer or in two, until the earlier has completed (tests/native/alias_order)
+    // Metal orders passes that reach one memory through a reserved buffer and through another resource only with
+    // what the queue encodes for an aliasing barrier between them (EncoderType::Settle; d3d12_sparse_remap)
     if (std::ranges::any_of(std::span(barriers, Count), [](auto &barrier) {
           return barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
-        }) && !device_->SparseBufferMappings().empty()) {
+        }) && device_->HasSparseBuffers()) {
       va_found_ = nullptr;
       clears_.clear();
       named_.clear();
