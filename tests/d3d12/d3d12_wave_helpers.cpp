@@ -3,6 +3,10 @@
 // "UAV accesses and most wave intrinsics are disabled on helper lanes." triangles cover one or three pixel
 // centers per quad. CPU sums and masks use only pixels that survive discard; every other UAV word stays intact.
 // IsHelperLane after discard includes "pixels that were explicitly discarded" (DirectX-Specs, SM6.6).
+// a loop until WaveReadLaneFirst is the lane's own unique value ends one lane a turn: WaveReadLaneFirst "Returns the
+// value of expr for the active non-helper lane of the current wave with the smallest index" (same page). its value on
+// a helper is undefined, so of a helper's loop the test asks only that it ends within the wave's lanes, as Dragon's
+// Dogma 2's waterfalls need of Windows' drivers (they hung the GPU when it did not); quad reads relay the turns.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <array>
@@ -18,6 +22,7 @@ enum Field {
   active_count,
   sum,
   prefix,
+  turns,
   match,
   ballot = match + 4,
   fields = ballot + 4
@@ -50,6 +55,9 @@ uint ps(V v) : SV_Target {
   output[b + ACTIVE_COUNT] = WaveActiveCountBits(true);
   output[b + SUM] = WaveActiveSum(id + 1);
   output[b + PREFIX] = WavePrefixSum(id + 1);
+  uint t = 0;
+  do t++; while (WaveReadLaneFirst(id) != id && t < 255);
+  output[b + TURNS] = t | QuadReadAcrossX(t) << 8 | QuadReadAcrossY(t) << 16 | QuadReadAcrossDiagonal(t) << 24;
   uint4 matched = WaveMatch(uint(1)), votes = WaveActiveBallot(true);
   for (uint k = 0; k < 4; k++) {
     output[b + MATCH + k] = matched[k];
@@ -80,6 +88,7 @@ main(int argc, char **argv) {
            {"ACTIVE_COUNT", active_count},
            {"SUM", sum},
            {"PREFIX", prefix},
+           {"TURNS", turns},
            {"MATCH", match},
            {"BALLOT", ballot}
        })
@@ -216,7 +225,7 @@ main(int argc, char **argv) {
           expect(waves[r[leader]].emplace(r[lane], i).second, "duplicate lane for pixel %u", i);
       }
       for (auto &[head, lanes] : waves) {
-        UINT total = 0, scanned = 0;
+        UINT total = 0, scanned = 0, scanned_lanes = 0;
         std::array<UINT, 4> mask{};
         for (auto [l, i] : lanes)
           total += i + 1, mask[l / 32] |= UINT(1) << (l % 32);
@@ -226,6 +235,12 @@ main(int argc, char **argv) {
           for (UINT neighbor = 0; neighbor < 4; neighbor++) {
             UINT x = (i % size) ^ (neighbor & 1), y = (i / size) ^ (neighbor >> 1);
             helper_flags |= UINT(!visible[y * size + x]) << neighbor;
+            UINT t = r[turns] >> 8 * neighbor & 0xff;
+            if (!visible[y * size + x])
+              expect(t >= 1 && t <= r[width], "helper beside pixel %u ends its waterfall in %u turns, wave of %u", i, t,
+                     r[width]);
+            else if (!neighbor)
+              expect(t == scanned_lanes + 1, "pixel %u ends its waterfall in %u turns, want %u", i, t, scanned_lanes + 1);
           }
           expect(
               r[helper] == 0 && r[helpers] == helper_flags, "pixel %u helper flags %#x/%#x, want %#x", i, r[helper],
@@ -241,7 +256,7 @@ main(int argc, char **argv) {
           );
           for (UINT k = 0; k < mask.size(); k++)
             expect(r[match + k] == mask[k] && r[ballot + k] == mask[k], "pixel %u mask word %u", i, k);
-          scanned += i + 1;
+          scanned += i + 1, scanned_lanes++;
         }
       }
       readback->Unmap(0, nullptr);
