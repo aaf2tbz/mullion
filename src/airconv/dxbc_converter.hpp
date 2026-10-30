@@ -115,6 +115,9 @@ public:
   uint32_t wave_size = 0;
   std::vector<PhaseInfo> phases;
   uint32_t pull_mode_reg_mask = 0;
+  // the input registers a pixel shader also reads at each vertex of the primitive (DXIL's AttributeAtVertex)
+  uint32_t vertex_value_reg_mask = 0;
+  bool use_barycentrics = false;
 };
 
 Instruction readInstruction(
@@ -174,12 +177,32 @@ struct interpolant_descriptor {
   bool perspective = false;
 };
 
+// a register the pixel shader also reads at each vertex: the function's argument for each component it takes of it,
+// and which of them hold integers
+struct vertex_value_descriptor {
+  std::array<uint32_t, 4> component{~0u, ~0u, ~0u, ~0u};
+  uint32_t integers = 0;
+};
+
+// SV_Barycentrics. Metal's coordinates are at the pixel's center: screen-space ones, and perspective-correct ones times
+// 1/w, are affine on the screen, so `center`, `ddx` and `ddy` give them anywhere in the pixel (At); `value` is the
+// coordinates at the element's own interpolation, and `centroid` the offset D3D takes a centroid at, where needed
+struct barycentrics_descriptor {
+  llvm::Value *center = nullptr, *ddx = nullptr, *ddy = nullptr, *value = nullptr, *centroid = nullptr;
+  bool perspective = false;
+  // the coordinates at `offset` pixels from the center, or at the center for none
+  llvm::Value *At(llvm::IRBuilder<> &ir, llvm::Value *offset) const;
+};
+
 struct io_binding_map {
   llvm::GlobalVariable *icb = nullptr;
   llvm::Value *icb_float = nullptr;
   std::unordered_map<uint32_t, std::pair<uint32_t, llvm::GlobalVariable *>>
     tgsm_map{};
   std::unordered_map<uint32_t, interpolant_descriptor> interpolant_map{};
+  std::unordered_map<uint32_t, vertex_value_descriptor> vertex_value_map{};
+  // by input element
+  std::unordered_map<uint32_t, barycentrics_descriptor> barycentrics{};
 
   register_file input{};
   register_file output{};
@@ -251,6 +274,7 @@ struct io_binding_map {
     uint32_t triangles;
     llvm::Value *slice, *viewports;
     uint32_t flat_inputs, noperspective_inputs;
+    bool barycentrics;
     uint32_t at;
     std::vector<uint32_t> registers[2];
     std::vector<bool> integers[2];
@@ -322,6 +346,9 @@ IREffect init_input_reg_with_interpolation(
   uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
   air::Interpolation interpolation, uint32_t sampleidx_at
 );
+
+// the provoking vertex's value of a vertex_value input
+IREffect init_input_reg_at_vertex(uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask, bool integer);
 
 std::function<IRValue(pvalue)>
 pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element, std::array<int, 4> channels = {0, 1, 2, 3});
@@ -408,6 +435,8 @@ struct SignatureContext {
   uint32_t pull_mode_reg_mask;
   // centroid inputs are interpolated in the shader (llvm::air::AIRBuilder::CentroidCoverage)
   bool pull_centroids;
+  // barycentrics come in SM50_BARYCENTRIC_ROWS
+  bool barycentric_rows = false;
   uint32_t unorm_output_reg_mask;
   // it is considered optional (as a hint)
   air::MTLPixelFormat pixel_formats[8];
@@ -642,6 +671,12 @@ void handle_signature(
   uint32_t phase
 );
 
+// a pixel shader's SV_Barycentrics input element, of interpolation `mode`; `evaluated` when the shader also evaluates
+// it at other places (EvaluateAttribute*)
+void define_barycentrics(
+  SM50ShaderInternal *sm50_shader, uint32_t element, microsoft::D3D10_SB_INTERPOLATION_MODE mode, bool evaluated
+);
+
 llvm::Error convert_dxil_mesh_stage(
   SM50ShaderInternal *pShaderInternal, const char *name, llvm::LLVMContext &context, llvm::Module &module,
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
@@ -812,11 +847,15 @@ ConservativeTriangle conservative_triangle(
     pvalue viewports, pvalue viewport_index
 );
 // the varyings of point `u` the pixel shader tests and divides by (SM50_CONSERVATIVE_VARYINGS, SM50_CONSERVATIVE_RCP_W),
-// from mesh vertex data `at` on
-void conservative_varyings(llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at);
+// and with `barycentrics` the primitive's weights there (SM50_BARYCENTRIC_ROWS), from mesh vertex data `at` on
+void conservative_varyings(
+    llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at,
+    bool barycentrics
+);
+void define_conservative_varyings(air::FunctionSignatureBuilder &signature, uint32_t at, bool barycentrics);
 // the output registers (`output`, int4s) of the triangle's point `u`, from the corners' (`corner`): blended as the
-// pixel shader interpolates them (over w, or in the window), the position the triangle's, flat and integer ones the
-// first corner's
+// pixel shader interpolates them (over w, or in the window), the position the triangle's, flat and integer ones their
+// own corner's
 void conservative_point(
     llvm::IRBuilder<> &builder, air::AirType &types, const ConservativeTriangle &triangle, uint32_t u, const SM50ShaderInternal &stage,
     uint32_t position_reg, uint32_t flat_inputs, uint32_t noperspective_inputs,

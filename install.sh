@@ -16,7 +16,7 @@ if [ "$1" = --crossover ]; then
   cx="$app/Contents/SharedSupport/CrossOver"
   [ -n "$2" ] && [ -f "$conf" ] && [ -d "$cx/lib/dxmt" ] ||
     { echo "usage: $0 --crossover <bottle> [CrossOver.app]" >&2; exit 1; }
-  root="$HOME/Library/Mullion/CrossOver"
+  root="$HOME/Library/Mullion/Bottles/$2"
   rm -rf "$root"
   mkdir -p "$root/lib/dxmt"
   for entry in "$cx"/* "$cx"/lib/*; do

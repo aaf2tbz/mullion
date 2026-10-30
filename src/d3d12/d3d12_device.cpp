@@ -414,7 +414,10 @@ public:
 
   SM50_SHADER_METAL_VERSION
   GetMetalVersion() {
-    static_assert(SM50_SHADER_METAL_310 == uint32_t(WMTMetal310) && SM50_SHADER_METAL_320 == uint32_t(WMTMetal320));
+    static_assert(
+        SM50_SHADER_METAL_310 == uint32_t(WMTMetal310) && SM50_SHADER_METAL_320 == uint32_t(WMTMetal320) &&
+        SM50_SHADER_METAL_400 == uint32_t(WMTMetal400)
+    );
     return SM50_SHADER_METAL_VERSION(ShaderMetalVersion(GetMTLDevice()));
   }
 
@@ -728,8 +731,8 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16 *>(pFeatureData);
-      out->GPUUploadHeapSupported = FALSE;    // TODO(d3d12): gpu upload heap
-      out->DynamicDepthBiasSupported = FALSE; // TODO(d3d12): ID3D12GraphicsCommandList9::RSSetDepthBias
+      out->GPUUploadHeapSupported = TRUE;
+      out->DynamicDepthBiasSupported = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS2: {
@@ -738,7 +741,9 @@ public:
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(pFeatureData);
       // Metal's on Apple10, the pixel shader's elsewhere (d3d12_command_list.cpp, DepthBoundsSamples)
       out->DepthBoundsTestSupported = TRUE;
-      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      // every Apple GPU family places samples where a render pass says (Metal feature set tables), one pattern for
+      // all pixels
+      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
@@ -746,10 +751,15 @@ public:
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(pFeatureData);
       out->CastingFullyTypedFormatSupported = TRUE;
-      out->BarycentricsSupported = FALSE;
+      // Metal 4's shading language reads barycentrics and inputs at each vertex (SM50_SHADER_METAL_400)
+      out->BarycentricsSupported = GetMTLDevice().supportsFamily(WMTGPUFamilyMetal4) &&
+                                   GetMTLDevice().supportsShaderBarycentricCoordinates();
       out->CopyQueueTimestampQueriesSupported = FALSE;
       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
-      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+      // a list's own copies, after the work before them whatever the marker mode (WriteImmediate); bundles record none
+      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
+                                              D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
+                                              D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -979,8 +989,13 @@ public:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS15>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS17:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS17>(pFeatureData, DataSize);
-    case D3D12_FEATURE_D3D12_OPTIONS18:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS18>(pFeatureData, DataSize);
+    case D3D12_FEATURE_D3D12_OPTIONS18: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18))
+        return FAIL(E_INVALIDARG);
+      // tier 0: BeginRenderPass binds and clears its surfaces as the runtime does for drivers without render passes
+      reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS18 *>(pFeatureData)->RenderPassesValid = TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_EXISTING_HEAPS:
       return NotSupported<D3D12_FEATURE_DATA_EXISTING_HEAPS>(pFeatureData, DataSize);
     case D3D12_FEATURE_CROSS_NODE:
@@ -1201,7 +1216,9 @@ public:
       __ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
       __ret->MemoryPoolPreference = advertise_numa_ ? D3D12_MEMORY_POOL_L1 : D3D12_MEMORY_POOL_L0;
       break;
+    // a GPU upload heap's are an upload heap's on a UMA adapter (D3D12 GPU Upload Heaps)
     case D3D12_HEAP_TYPE_UPLOAD:
+    case sdk::D3D12_HEAP_TYPE_GPU_UPLOAD:
       __ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
       __ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
       break;
@@ -1281,8 +1298,12 @@ public:
     D3D12_RESOURCE_ALLOCATION_INFO info;
     GetResourceAllocationInfo(&info, 0, 1, pDesc);
     if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
-        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes)
+        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes) {
+      WARN("CreatePlacedResource: ", info.SizeInBytes, " bytes at alignment ", info.Alignment, " placed at ", Offset,
+           " of a heap of ", heap_desc.SizeInBytes, " at alignment ", heap_desc.Alignment, " (dimension ",
+           pDesc->Dimension, ", format ", pDesc->Format, ", alignment ", pDesc->Alignment, ")");
       return FAIL(E_INVALIDARG);
+    }
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -1984,7 +2005,7 @@ public:
         if (FAILED(ValidateResourceDescs(desc, &heap)))
           goto invalid;
         if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
-          DEBUG("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.\n");
+          WARN("GetResourceAllocationInfo: alignment ", desc->Alignment, " of a buffer");
           goto invalid;
         }
         resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -1993,7 +2014,9 @@ public:
       } else {
         WMTTextureInfo texture_info{};
         if (FAILED(PopulateWMTTextureInfo(this, texture_info, *desc))) {
-          DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
+          WARN("GetResourceAllocationInfo: texture of dimension ", desc->Dimension, ", format ", desc->Format, ", ",
+               desc->Width, "x", desc->Height, "x", desc->DepthOrArraySize, ", ", desc->MipLevels, " levels, ",
+               desc->SampleDesc.Count, " samples, layout ", desc->Layout, ", flags ", desc->Flags, " is refused");
           goto invalid;
         }
         MTL_DXGI_FORMAT_DESC format;

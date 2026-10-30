@@ -1390,6 +1390,15 @@ MTLDevice_supports32BitMSAA(obj_handle_t device) {
   return params.ret;
 }
 
+WINEMETAL_API bool
+MTLDevice_supportsShaderBarycentricCoordinates(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupportsShaderBarycentrics, &params);
+  return params.ret;
+}
+
 WINEMETAL_API uint64_t
 MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device) {
   struct unixcall_generic_obj_uint64_ret params;

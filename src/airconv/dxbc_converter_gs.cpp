@@ -315,12 +315,33 @@ conservative_triangle(
 }
 
 void
-conservative_varyings(llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at) {
+conservative_varyings(
+    llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at,
+    bool barycentrics
+) {
   auto &builder = air.builder;
   for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
     air.CreateSetMeshVertexData(vertex, builder.getInt32(at + i), triangle.window[i / 2][i % 2]);
   for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
     air.CreateSetMeshVertexData(vertex, builder.getInt32(at + SM50_CONSERVATIVE_VARYINGS + i), triangle.rcp_w[u]);
+  // the weights over w, then in the window, as a point of the primitive has them: both linear in the window, as
+  // Metal interpolates over the grown triangle
+  for (uint32_t i = 0; barycentrics && i < SM50_BARYCENTRIC_ROWS; i++)
+    air.CreateSetMeshVertexData(
+        vertex, builder.getInt32(at + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W + i),
+        builder.CreateFDiv((i < 3 ? triangle.over_w : triangle.linear)[u][i % 3], triangle.sum[u])
+    );
+}
+
+void
+define_conservative_varyings(air::FunctionSignatureBuilder &signature, uint32_t at, bool barycentrics) {
+  constexpr uint32_t own = SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W;
+  for (uint32_t i = 0; i < own + (barycentrics ? SM50_BARYCENTRIC_ROWS : 0); i++)
+    signature.DefineMeshVertexOutput(air::OutputMeshData{
+        .user = i < own ? "mullion_conservative" + std::to_string(i) : "mullion_barycentrics" + std::to_string(i - own),
+        .type = air::msl_float,
+        .index = at + i
+    });
 }
 
 void
@@ -339,10 +360,11 @@ conservative_point(
     pvalue value = llvm::UndefValue::get(types._int4);
     for (uint32_t c = 0; c < 4; c++) {
       auto at = [&](uint32_t k) { return builder.CreateExtractElement(corners[k], uint64_t(c)); };
-      // a flat register is the first corner's
+      // a flat register is its own corner's: Metal's flat inputs are the first vertex's, and the pixel shader reads
+      // each one's at a vertex (GetAttributeAtVertex)
       bool flat = reg != position_reg &&
                   (component_types[c] != RegisterComponentType::Float || (flat_inputs >> reg & 1));
-      pvalue component = at(0);
+      pvalue component = at(u);
       if (reg == position_reg) {
         component = builder.CreateBitCast(builder.CreateExtractElement(triangle.position[u], uint64_t(c)), types._int);
       } else if (!flat) {
@@ -472,6 +494,7 @@ convert_dxbc_geometry_shader(
     args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess);
   uint32_t flat_inputs = pso_tess ? pso_tess->flat_inputs : pso_data ? pso_data->flat_inputs : 0;
   uint32_t noperspective_inputs = pso_tess ? pso_tess->noperspective_inputs : pso_data ? pso_data->noperspective_inputs : 0;
+  bool barycentrics = pso_tess ? pso_tess->barycentrics : pso_data && pso_data->barycentrics;
   bool conservative = (pso_tess ? pso_tess->conservative : pso_data && pso_data->conservative) &&
                       topology == air::MeshOutputTopology::Triangle &&
                       max_vertex_out >= 3;
@@ -530,10 +553,7 @@ convert_dxbc_geometry_shader(
         .arg_name = "viewports",
         .raster_order_group = {}
     });
-    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
-      func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-          .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = conservative_at + i
-      });
+    define_conservative_varyings(func_signature, conservative_at, barycentrics);
   }
 
   auto raster_scale = DefineRasterScale(func_signature);
@@ -549,6 +569,7 @@ convert_dxbc_geometry_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -870,7 +891,7 @@ convert_dxbc_geometry_shader(
         for (auto &h : gs_output_handlers)
           co_yield h(gs_out_ctx);
         emit_clip_distances(vertex);
-        conservative_varyings(air, triangle, u, vertex, conservative_at);
+        conservative_varyings(air, triangle, u, vertex, conservative_at, barycentrics);
         air.CreateSetMeshIndex(builder.CreateAdd(vertex_base, builder.getInt32(u)), vertex);
       }
       // culled by a distance all three corners are behind, or by clipping
@@ -1605,6 +1626,13 @@ convert_pass_through_geometry_shader(
     });
   if (!clip_varyings && pVertexStage->clip_distance_scalars.size())
     func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = pVertexStage->clip_distance_scalars.size()});
+  // the pixel shader's barycentrics are the line's, not its quadrilateral's triangles'
+  bool rows = quads && pso_data->barycentrics;
+  uint32_t rows_at = varyings.size() + (clip_varyings ? pVertexStage->clip_distance_scalars.size() : 0);
+  for (uint32_t i = 0; rows && i < SM50_BARYCENTRIC_ROWS; i++)
+    func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+        .user = "mullion_barycentrics" + std::to_string(i), .type = air::msl_float, .index = rows_at + i
+    });
   if (pVertexStage->cull_distance_scalars.size() || conservative)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
@@ -1623,10 +1651,7 @@ convert_pass_through_geometry_shader(
         .arg_name = "viewports",
         .raster_order_group = {}
     });
-    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
-      func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-          .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = conservative_at + i
-      });
+    define_conservative_varyings(func_signature, conservative_at, pso_data->barycentrics);
   }
 
   auto raster_scale = DefineRasterScale(func_signature);
@@ -1761,8 +1786,8 @@ convert_pass_through_geometry_shader(
     for (auto &v : varyings) {
       bool integer = pVertexStage->register_types(v.reg, RegisterComponentType::Float)[v.component] != RegisterComponentType::Float;
       bool flat = integer || (pso_data->flat_inputs >> v.reg & 1);
-      // a flat varying is the first corner's
-      auto value = component(triangle && flat ? 0 : corner, v.reg, v.component);
+      // a flat varying is its own corner's, as conservative_point's
+      auto value = component(corner, v.reg, v.component);
       if (triangle && !flat) {
         bool screen = pso_data->noperspective_inputs >> v.reg & 1;
         air.CreateSetMeshVertexData(
@@ -1783,7 +1808,12 @@ convert_pass_through_geometry_shader(
         air.CreateSetMeshClipDistance(vertex, builder.getInt32(distance.index()), value);
     }
     if (triangle)
-      conservative_varyings(air, *triangle, u, vertex, conservative_at);
+      conservative_varyings(air, *triangle, u, vertex, conservative_at, pso_data->barycentrics);
+    for (uint32_t i = 0; rows && clip[corner] && i < SM50_BARYCENTRIC_ROWS; i++) {
+      auto rcp_w = builder.CreateFDiv(air.getFloat(1), builder.CreateExtractElement(clip[corner], 3));
+      auto weight = i % 3 != corner ? air.getFloat(0) : i < 3 ? rcp_w : air.getFloat(1);
+      air.CreateSetMeshVertexData(vertex, builder.getInt32(rows_at + i), weight);
+    }
     if (own.count == 1)
       air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
   }
@@ -2072,6 +2102,7 @@ convert_dxbc_vertex_for_geometry_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );

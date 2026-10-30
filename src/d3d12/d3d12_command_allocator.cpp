@@ -714,9 +714,10 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeTexture(
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeTexelBuffer(
-    uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags
+    uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags, uint32_t &first
 ) {
-  auto &dst_ = buffer->view_(viewId);
+  auto [dst_, texel] = buffer->view_(viewId, buffer->current(), first);
+  first = texel;
   auto &settexbuf = ctx.EncodeComputeCommand<wmtcmd_compute_settexture>();
   settexbuf.type = WMTComputeCommandSetTexture;
   settexbuf.texture = dst_.texture;

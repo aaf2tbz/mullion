@@ -1,60 +1,62 @@
 # Mullion
 
-Mullion translates Direct3D 10, 11 and 12 to Metal, so Windows games run on Apple silicon through Wine. It is free and open source.
+Mullion translates Direct3D 10, 11 and 12 to Metal, so Windows games run on Apple silicon Macs through Wine. It is free
+and open source, and built on [DXMT](https://github.com/3Shain/dxmt).
 
-This is a pre-release. Expect games that break, and please report them.
+Mullion is a pre-release. Get it from [releases](https://github.com/dttdrv/mullion/releases), and
+[report](https://github.com/dttdrv/mullion/issues/new/choose) the games that break. Games that work go in [Game
+reports](https://github.com/dttdrv/mullion/discussions/categories/game-reports), and
+[Games](https://github.com/dttdrv/mullion/wiki/Games) lists them.
 
-## How it runs today
+## What it supports
 
-| | Mullion | D3DMetal |
+| API | Feature level | |
 |---|---|---|
-| Black Myth: Wukong benchmark, High preset, 1512 × 982, TSR at 100%, no frame generation | 28 FPS | 34 FPS (D3DMetal 4.0 beta 3) |
-| God of War Ragnarök, High preset, 1512 × 982, no vsync, where a save starts | 26 to 28 FPS, 35 ms of GPU time a frame | 29 to 40 FPS, 22 to 25 ms of GPU time a frame (D3DMetal 4.0 beta 3) |
-| 3DMark Fire Strike | 7003 | |
+| Direct3D 12 | up to 12_2 | Shader models up to 6.7, ray tracing tier 1.1, mesh and amplification shaders, conservative rasterization tier 3, variable rate shading tier 2, tiled resources tier 3, the depth bounds test, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries, planar video formats and D3D11On12. |
+| Direct3D 11 | 11_1 | |
+| Direct3D 10 and 10.1 | 10_1 | Runs on the Direct3D 11 implementation. |
 
-Both columns were measured on the same Mac. The God of War numbers are premature: they come from screenshots taken while the game was still compiling shaders, not from a benchmark. Time Spy's graphics tests render correctly, though 3DMark does not report a score for them yet. Steel Nomad does not start yet.
+This describes the main branch. Feature levels 12_1 and 12_2 and Metal 4 come to a release with v0.5.
 
-| Mullion | D3DMetal |
-|---|---|
-| ![Black Myth: Wukong benchmark result on Mullion](docs/wukong-mullion.jpg) | ![The same benchmark on D3DMetal](docs/wukong-d3dmetal.jpg) |
-| ![God of War Ragnarök on Mullion](docs/gow-mullion.jpg) | ![The same place on D3DMetal](docs/gow-d3dmetal.jpg) |
+Direct3D 12 runs on Metal 4 where the GPU has it, and on Metal 3 otherwise. Feature levels 12_0 and above need macOS
+26.4 or later, for Metal's placement sparse resources; on earlier versions Direct3D 12 reports 11_1. Not done yet:
+shader model 6.7's advanced texture operations, writable MSAA textures, and stream output after tessellation. What comes
+next is in the [roadmap](https://github.com/dttdrv/mullion/discussions/categories/announcements).
 
-Direct3D 12 is supported at feature level 12_2 with shader models up to 6.7, including ray tracing at tier 1.1, mesh and amplification shaders, conservative rasterization at tier 3, variable rate shading at tier 2, tiled resources at tier 3, the depth bounds test, tessellation, geometry shaders, stream output, sampler feedback, reserved resources, pipeline libraries and planar video formats, and D3D11On12. On macOS 26 it runs on Metal 4, and on Metal 3 before that. Direct3D 10 and 11 are supported at feature level 11_1. Next for Direct3D 12 is more work on performance and reliability.
+## Results
+
+On the same Mac, the Black Myth: Wukong benchmark runs at 28 FPS on Mullion and 34 FPS on D3DMetal 4.0 beta 3, at the
+High preset and 1512 × 982. [Results](https://github.com/dttdrv/mullion/wiki/Results) has God of War Ragnarök and 3DMark
+too, with screenshots.
 
 ## Requirements
 
-- A Mac with Apple silicon, M1 or later.
-- macOS 15 or later.
-- Wine for x86_64. Stock Wine works, with no patches and no DLL overrides. Only 64-bit games run for now.
+- A Mac with Apple silicon, M1 or later, on macOS 15 or later.
+- Wine for x86_64 or CrossOver, with [Rosetta](https://support.apple.com/en-us/102527). Stock Wine works, without
+  patches or DLL overrides.
+- A 64-bit game. 32-bit games are not supported yet.
 
 ## Install
 
-1. Download the latest [release](https://github.com/dttdrv/mullion/releases) and unpack it.
-2. Run `./install.sh <wine> [prefix ...]`. `<wine>` is the directory that contains `bin/wine`.
+Unpack the release and run `install.sh` from its folder, with the game closed: `./install.sh --crossover "<bottle>"` for
+a CrossOver bottle, or `./install.sh <wine> [prefix ...]` for Wine, where `<wine>` is the folder that holds `bin/wine`.
+[Install](https://github.com/dttdrv/mullion/wiki/Install) covers what each one does, how to undo it, and installing by
+hand.
 
-The script copies the libraries into `<wine>/lib/wine`, where they replace Wine's Direct3D, and into each prefix named on the command line. Prefixes created later need nothing.
-
-In CrossOver, `./install.sh --crossover <bottle>` sets up that bottle and leaves CrossOver.app as it is. The bottle gets a CrossOver root of its own in `~/Library/Mullion/CrossOver`, made of links to CrossOver's files with Mullion as its DXMT, and its graphics are set to DXMT. Updates of CrossOver keep it; run the script again after one, so that files it adds are linked too. Give the path of CrossOver.app as a third argument if it is not in `/Applications` or `~/Applications`. To undo, put back the bottle's `cxbottle.conf.before-mullion`.
-
-Without the script, rename `CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt` to `dxmt-original`, put the unpacked release folder in its place under the name `dxmt`, and set the bottle's graphics to DXMT. Replace the whole folder: CrossOver's 32-bit DXMT cannot drive Mullion, and the release's empty `i386-windows` leaves 32-bit games on Wine's own Direct3D. A CrossOver update brings back its own DXMT this way.
-
-On the first launch macOS blocks `winemetal.so`; allow it under System Settings, Privacy & Security, and start the game again.
-
-The archive has the layout of DXMT's builds (`x86_64-windows` and `x86_64-unix`), so tools that install DXMT can install Mullion the same way. To install by hand, copy both directories into `<wine>/lib/wine`, and the DLLs of `x86_64-windows` into `drive_c/windows/system32` of each existing prefix.
+If macOS blocks `winemetal.so` at the first launch, allow it under System Settings, Privacy & Security, and start the
+game again.
 
 ## Settings
 
-| | |
-|---|---|
-| `MULLION_LOG_PATH=<directory>` | Writes a log file for each DLL. Attach it to bug reports. |
-| `MULLION_D3D12_METAL4=0` | Keeps Direct3D 12 on Metal 3 on macOS 26. If a game draws differently there than on Metal 3, please report it. |
-| `MULLION_CONFIG="dxgi.customVendorId=106b"` | Reports Apple's vendor ID. By default Mullion reports the GPU's own name with AMD's vendor ID, because some games exit at startup when they do not know the vendor. |
-
-Options can also go in a `mullion.conf` next to the game's executable, or in the file `MULLION_CONFIG_FILE` names. The `mullion.conf` in this repository lists them. The `DXMT_` names and `dxmt.conf` of earlier builds still work.
+`MULLION_LOG_PATH=<folder>` writes a log for each DLL into the folder. Attach the logs to a bug report. The other
+settings are on the [Settings](https://github.com/dttdrv/mullion/wiki/Settings) page, and [`mullion.conf`](mullion.conf)
+lists every option.
 
 ## Building
 
-You need macOS, Meson 1.3 or later, Xcode with its Metal toolchain, LLVM 15 as static libraries for x86_64, [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) and a Wine build tree.
+Building needs macOS, [Meson](https://mesonbuild.com) 1.3 or later, Xcode with the macOS 26.4 SDK and its Metal
+toolchain, [LLVM](https://github.com/llvm/llvm-project) 15 as static libraries for x86_64,
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw) on `PATH`, and a Wine build tree.
 
 ```sh
 git submodule update --init
@@ -64,32 +66,30 @@ meson setup build --cross-file build-win64.txt \
 meson install -C build
 ```
 
-`install/` then has the layout of a release. With `-Dwine_builtin_dll=false` the DLLs are built for a prefix's `system32` instead, and need `WINEDLLOVERRIDES="d3d12,d3d12core,d3d11,d3d10core,dxgi=n"`.
+`install/` then has the layout of a release. The tests are described in [TESTING.md](docs/TESTING.md).
 
-## Tests
+## Contributing
 
-About 200 test programs draw, read the result back and compare it with what the Direct3D specification says, each run as every Apple GPU family. Wine's and vkd3d-proton's Direct3D tests also run against Mullion, and their verdicts are recorded in `tests/conformance`.
-
-Configure with `-Denable_tests=true`, then run the suite in a Wine:
-
-```sh
-python3 tests/run.py --build build --wine <wine> --prefix <prefix> --family native,9
-```
-
-The tests compile their own shaders, so the prefix needs `d3dcompiler_47.dll` (from [winetricks](https://github.com/Winetricks/winetricks)) and `dxcompiler.dll` (from [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)) in its `system32`.
-
-## Reporting a problem
-
-Open an issue with the Mac model, the macOS version, how the game was run, and the log. A screenshot helps most. Reports of games that work are welcome as well. Patches are covered in `CONTRIBUTING.md`.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers reports, changes and review. The rules the code follows are in
+[CODE.md](docs/CODE.md), and how it is laid out is in [ARCHITECTURE.md](docs/ARCHITECTURE.md). Questions go to
+[Q&A](https://github.com/dttdrv/mullion/discussions/categories/q-a), and problems with Mullion go here, not to DXMT.
 
 ## Credits
 
-Mullion is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and CodeWeavers, from commit `7c8dee1` (16 September 2026). DXMT provides the Direct3D 10 and 11 foundation, the DXBC shader converter and the Metal bridge. The DXIL front end and most of Direct3D 12 were written for Mullion, about 28,000 lines of source and 78,000 lines of tests so far.
+Mullion is built on [DXMT](https://github.com/3Shain/dxmt) by Feifan He and CodeWeavers, from commit
+[`7c8dee1`](https://github.com/3Shain/dxmt/commit/7c8dee1c2d73415301ceb7d1fa810861cef4cd67) (16 September 2026). DXMT
+provides the Direct3D 10 and 11 foundation, the DXBC shader converter and the Metal bridge. The DXIL front end and most
+of Direct3D 12 were written for Mullion.
 
-Mullion is a separate project. Please do not report its problems to DXMT.
-
-Thanks to [DXVK](https://github.com/doitsujin/dxvk), whose utility code DXMT carries; to [Wine](https://www.winehq.org) and [LLVM](https://llvm.org); to Microsoft for the [DirectX specifications](https://microsoft.github.io/DirectX-Specs/) and [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler); to Apple for the [Metal documentation](https://developer.apple.com/documentation/metal); and to [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) and [Mesa](https://www.mesa3d.org), whose tests and drivers we learned from.
+Thanks to [DXVK](https://github.com/doitsujin/dxvk), whose utility code DXMT carries, to [Wine](https://www.winehq.org)
+and [LLVM](https://llvm.org), to Microsoft for the [DirectX specifications](https://microsoft.github.io/DirectX-Specs/)
+and [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler), to Apple for the [Metal
+documentation](https://developer.apple.com/documentation/metal), and to
+[vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) and [Mesa](https://www.mesa3d.org), whose tests and
+drivers Mullion learned from.
 
 ## License
 
-LGPL, version 2.1 or later, like DXMT. See `LICENSE`. `LICENSE.OLD` is the license DXMT had before April 2026, which still covers the code from then.
+The [GNU Lesser General Public License](LICENSE), version 2.1 or later, like DXMT. DXMT's own notice is in
+[docs/licenses/dxmt.txt](docs/licenses/dxmt.txt), and [docs/licenses/dxmt-mit.txt](docs/licenses/dxmt-mit.txt) is the
+MIT license of DXMT's releases up to v0.80, which still covers the code from them.

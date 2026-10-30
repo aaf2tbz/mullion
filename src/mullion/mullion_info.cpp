@@ -51,9 +51,13 @@ GetVersionDescriptionText(uint32_t ApiVersion, uint32_t FeatureLevel) {
 WMTMetalVersion
 ShaderMetalVersion(WMT::Device device) {
   int asked = Config::getInstance().getOption<int>("mullion.shaderMetalVersion", Config::getInstance().getOption<int>("dxmt.shaderMetalVersion", 0));
-  auto version = asked == WMTMetal310 || asked == WMTMetal320 ? WMTMetalVersion(asked) : WMTMetalVersionMax;
+  auto version = asked == WMTMetal310 || asked == WMTMetal320 || asked == WMTMetal400 ? WMTMetalVersion(asked)
+                                                                                      : WMTMetalVersionMax;
   uint64_t macos_major_version = 0;
   WMTGetOSVersion(&macos_major_version, nullptr, nullptr);
+  // Metal 4.0 is macOS 26's and its GPU family's
+  if (macos_major_version < 26 || !device.supportsFamily(WMTGPUFamilyMetal4))
+    version = std::min(WMTMetal320, version);
   // Metal 3.2 is macOS 15's, and what the converter needs of it is basically not there on other GPUs
   if (macos_major_version < 15 || !device.supportsFamily(WMTGPUFamilyApple7))
     version = std::min(WMTMetal310, version);

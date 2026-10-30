@@ -226,6 +226,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   FLOAT blend_factor_[4];
   UINT8 stencil_ref_;
   UINT8 back_stencil_ref_;
+  // SetSamplePositions' pattern, of programmed_samples_ samples a pixel
+  uint8_t programmed_samples_;
+  decltype(RenderEncoderData::sample_positions) sample_positions_;
+  // RSSetDepthBias's bias, clamp and slope scale, until a pipeline state is set again
+  std::optional<std::array<FLOAT, 3>> depth_bias_;
   // OMSetDepthBounds' range, NaN as 0; the pass has a range set when depth_bounds_set_
   FLOAT depth_bounds_[2];
   bool depth_bounds_set_ = false;
@@ -716,6 +721,8 @@ public:
     blend_factor_[2] = 1.0f;
     blend_factor_[3] = 1.0f;
     stencil_ref_ = back_stencil_ref_ = 0;
+    programmed_samples_ = 0;
+    depth_bias_.reset();
     depth_bounds_[0] = 0.0f;
     depth_bounds_[1] = 1.0f;
     shading_rate_ = D3D12_SHADING_RATE_1X1;
@@ -790,7 +797,8 @@ public:
         riid == __uuidof(ID3D12GraphicsCommandList1) || riid == __uuidof(ID3D12GraphicsCommandList2) ||
         riid == __uuidof(ID3D12GraphicsCommandList3) || riid == __uuidof(ID3D12GraphicsCommandList4) ||
         riid == __uuidof(ID3D12GraphicsCommandList5) || riid == __uuidof(ID3D12GraphicsCommandList6) ||
-        riid == __uuidof(ID3D12GraphicsCommandList7) || riid == __uuidof(ID3D12GraphicsCommandList8)) {
+        riid == __uuidof(ID3D12GraphicsCommandList7) || riid == __uuidof(ID3D12GraphicsCommandList8) ||
+        riid == __uuidof(ID3D12GraphicsCommandList9)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -1024,6 +1032,11 @@ public:
 
   DrawCallStatus
   PreDraw(bool SkipResourceBinding = false) {
+    // a sampler with a custom border may have come since the pipeline was set (MTLD3D12PipelineState::borderless)
+    if (pso_graphics_ && pso_graphics_->borderless && device_->custom_borders) {
+      pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pso_graphics_->Bordered(device_));
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+    }
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
     // a draw that tests the depth bounds where the GPU cannot finds the samples that pass first, unless the pass it is
@@ -1061,7 +1074,7 @@ public:
 
       unsigned render_target_width = 16384, render_target_height = 16384, render_target_array_length = 0;
 
-      unsigned effective_rtvs = 0;
+      unsigned effective_rtvs = 0, samples = 0;
       render_serial_ = barrier_serial_;
       targets_pass_ = render;
       targets_.fill(nullptr);
@@ -1073,7 +1086,8 @@ public:
           continue;
         effective_rtvs++;
         if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
-          render->center_samples = AttachmentDesc.Texture->sampleCount();
+          render->programmed_samples = AttachmentDesc.Texture->sampleCount();
+        samples = AttachmentDesc.Texture->sampleCount();
         targets_[i] = AttachmentDesc.Texture;
         auto &rt = render->colors[i];
         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
@@ -1088,7 +1102,8 @@ public:
         auto &AttachmentDesc = dsv;
         effective_rtvs++;
         if (AttachmentDesc.Texture->centered || pso_graphics_->forced_sample_count == 1)
-          render->center_samples = AttachmentDesc.Texture->sampleCount();
+          render->programmed_samples = AttachmentDesc.Texture->sampleCount();
+        samples = AttachmentDesc.Texture->sampleCount();
         targets_.back() = AttachmentDesc.Texture;
         auto dsv_planar_flags =
             DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View)) & pso_graphics_->dsv_mask;
@@ -1117,6 +1132,11 @@ public:
       render->render_target_width = render_target_width;
       render->render_target_height = render_target_height;
       render->render_target_array_length = render_target_array_length;
+      // SetSamplePositions' pattern is for targets of its sample count; with others what the draws sample is undefined
+      if (programmed_samples_ && programmed_samples_ == samples) {
+        render->programmed_samples = programmed_samples_;
+        render->sample_positions = sample_positions_;
+      }
       if (effective_rtvs == 0) {
         render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
       }
@@ -1165,9 +1185,9 @@ public:
       // a conservative rasterizer clips depth itself, and its grown triangles' depth goes past the polygon's
       cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
-      cmd_setrs.depth_bias = pso_graphics_->depth_bias;
-      cmd_setrs.depth_bias_clamp = pso_graphics_->depth_bias_clamp;
-      cmd_setrs.scole_scale = pso_graphics_->scole_scale;
+      std::tie(cmd_setrs.depth_bias, cmd_setrs.depth_bias_clamp, cmd_setrs.scole_scale) = depth_bias_.value_or(
+        std::array{pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale}
+      );
       cmd_setrs.winding = pso_graphics_->winding;
 
       dirty_state_.clr(DirtyState::GraphicsPipelineState);
@@ -1261,7 +1281,7 @@ public:
                                viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
         }
         *(float *)scale =
-            EnlargeViewports({metal_viewport, count}, D3D12_VIEWPORT_BOUNDS_MIN, D3D12_VIEWPORT_BOUNDS_MAX);
+            EnlargeViewports({metal_viewport, count}, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
         auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
         cmd.type = WMTRenderCommandSetViewports;
         cmd.viewports.set(metal_viewport);
@@ -1831,6 +1851,10 @@ public:
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
       Overlap(StartComputePass(), {});
 
+    if (pso_compute_ && pso_compute_->borderless && device_->custom_borders) {
+      pso_compute_ = static_cast<MTLD3D12ComputePipelineState *>(pso_compute_->Bordered(device_));
+      dirty_state_.set(DirtyState::ComputePipelineState);
+    }
     if (!pso_compute_)
         return false;
 
@@ -2570,9 +2594,29 @@ public:
   }
 
   void STDMETHODCALLTYPE
+  RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) {
+    if (Bundled() && Record([=](auto *l) { l->RSSetDepthBias(DepthBias, DepthBiasClamp, SlopeScaledDepthBias); }))
+      return;
+    depth_bias_ = {DepthBias, DepthBiasClamp, SlopeScaledDepthBias};
+    dirty_state_.set(DirtyState::GraphicsPipelineState);
+  }
+
+  void STDMETHODCALLTYPE
+  IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) {
+    // geometry shader pipelines build the cut in, so OPTIONS15 reports no DynamicIndexBufferStripCutSupported
+    ERR("IASetIndexBufferStripCutValue: dynamic strip cut is not supported");
+    recording_error_ = E_INVALIDARG;
+  }
+
+  void STDMETHODCALLTYPE
   SetPipelineState(ID3D12PipelineState *pPSO) {
     if (Bundled() && Record([pso = Com<ID3D12PipelineState>(pPSO)](auto *l) { l->SetPipelineState(pso.ptr()); }))
       return;
+    // setting a pipeline state again takes its depth bias back, the same one included
+    if (depth_bias_) {
+      depth_bias_.reset();
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+    }
     if (!pPSO) {
       pso_graphics_ = nullptr;
       pso_compute_ = nullptr;
@@ -3890,7 +3934,21 @@ public:
 
   void STDMETHODCALLTYPE
   SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION *pSamplePositions) {
-    IMPLEMENT_ME
+    // one pattern for every pixel (tier 1), or none to take the standard one back; other calls are dropped
+    bool reset = !NumSamplesPerPixel && !NumPixels;
+    if (!reset && (NumPixels != 1 || !std::has_single_bit(NumSamplesPerPixel) ||
+                   NumSamplesPerPixel > sample_positions_.size()))
+      return;
+    auto positions = std::span(pSamplePositions, reset ? 0 : NumSamplesPerPixel);
+    if (programmed_samples_ == positions.size() &&
+        std::ranges::equal(positions, std::span(sample_positions_).first(positions.size()), [](auto &a, auto &b) {
+          return a.X == b.x && a.Y == b.y;
+        }))
+      return;
+    programmed_samples_ = positions.size();
+    std::ranges::transform(positions, sample_positions_.begin(), [](auto &p) { return WMTSamplePosition{p.X, p.Y}; });
+    // a render pass has one pattern
+    allocator_->InvalidateCurrentPass();
   }
 
   // ResolveSubresourceRegion's sampler feedback modes, between a map and an R8_UINT texture or, for a MinMip map
@@ -4141,11 +4199,23 @@ public:
         for (auto &sub : std::span(end.Resolve.pSubresourceParameters, end.Resolve.SubresourceCount))
           pass_resolves_.push_back({end.Resolve, sub});
     };
+    // the surfaces bound for raster (Render Passes, "Surfaces That BeginRenderPass Binds For Raster")
+    auto bound = [](const D3D12_RENDER_PASS_BEGINNING_ACCESS &begin, bool read_only) {
+      UINT type = begin.Type;
+      return type == sdk::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_SRV
+                 ? read_only
+                 : type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS &&
+                       type != sdk::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_UAV;
+    };
     for (UINT i = 0; i < NumRenderTargets; i++) {
-      targets[i] = pRenderTargets[i].cpuDescriptor;
+      targets[i] = bound(pRenderTargets[i].BeginningAccess, false) ? pRenderTargets[i].cpuDescriptor
+                                                                    : D3D12_CPU_DESCRIPTOR_HANDLE{};
       resolve(pRenderTargets[i].EndingAccess);
     }
-    OMSetRenderTargets(NumRenderTargets, targets, FALSE, pDepthStencil ? &pDepthStencil->cpuDescriptor : nullptr);
+    bool depth_stencil = pDepthStencil &&
+                         (bound(pDepthStencil->DepthBeginningAccess, Flags & D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_DEPTH) ||
+                          bound(pDepthStencil->StencilBeginningAccess, Flags & D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_STENCIL));
+    OMSetRenderTargets(NumRenderTargets, targets, FALSE, depth_stencil ? &pDepthStencil->cpuDescriptor : nullptr);
     for (UINT i = 0; i < NumRenderTargets; i++)
       if (pRenderTargets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
         ClearRenderTargetView(targets[i], pRenderTargets[i].BeginningAccess.Clear.ClearValue.Color, 0, nullptr);

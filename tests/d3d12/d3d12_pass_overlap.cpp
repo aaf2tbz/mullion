@@ -2,7 +2,11 @@
 // rendering results must match results produced by serial processing of tasks" (D3D11.3 functional specification,
 // 4.2 Fixed Order of Pipeline Results), UAV accesses aside. a slow draw is followed, with no barrier, by a dispatch or a
 // draw elsewhere, then by a quick draw to the slow one's color or depth target: the quick one's pixels must land last.
+// argv[2] "bench": how long a list of small passes that nothing orders takes, each a draw to its own target, as a
+// game's shadow cascades and post-processing chains are; the median and fastest of its runs, argv[3] of them.
+// "bench-mixed" follows each draw with a dispatch, as a game's compute between its passes does.
 #include "d3d12_test.hpp"
+#include <algorithm>
 
 static constexpr UINT size = 512, group = 64, repeats = 4;
 // so many iterations a pixel that work after the slow draw which did not wait for it would run first
@@ -19,7 +23,12 @@ uint ps(float4 position : SV_Position) : SV_Target {
     v = v * 1664525u + 1013904223u;
   return value + (v & mask);
 }
-[numthreads(GROUP, 1, 1)] void cs(uint3 tid : SV_DispatchThreadID) { written[tid.x] = value; }
+[numthreads(GROUP, 1, 1)] void cs(uint3 tid : SV_DispatchThreadID) {
+  uint v = tid.x;
+  [loop] for (uint i = 0; i < work; i++)
+    v = v * 1664525u + 1013904223u;
+  written[tid.x] = value + (v & mask);
+}
 )hlsl";
 
 enum Case { Dispatch, Target, Depth, Cases };
@@ -78,6 +87,69 @@ main(int argc, char **argv) {
   CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
   CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
   CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+
+  if (argc > 2 && !strncmp(argv[2], "bench", 5)) {
+    constexpr UINT passes = 32, side = 64, bench_work = 1u << 12;
+    const UINT runs = argc > 3 ? atoi(argv[3]) : 21;
+    const bool mixed = !strcmp(argv[2], "bench-mixed");
+    auto written = buffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, group * sizeof(UINT), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    CHECK(written ? S_OK : E_FAIL);
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0},
+                             D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> targets[passes];
+    ComPtr<ID3D12DescriptorHeap> heap;
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, passes};
+    CHECK(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)));
+    const UINT step_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (UINT i = 0; i < passes; i++) {
+      CHECK(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            nullptr, IID_PPV_ARGS(&targets[i])));
+      device->CreateRenderTargetView(targets[i].Get(), nullptr, {heap->GetCPUDescriptorHandleForHeapStart().ptr + i * step_size});
+    }
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    std::vector<double> took;
+    CHECK(list->Close());
+    for (UINT run = 0; run < runs; run++) {
+      CHECK(allocator->Reset());
+      CHECK(list->Reset(allocator.Get(), pipelines[Plain].Get()));
+      list->SetGraphicsRootSignature(roots.Get());
+      list->SetComputeRootSignature(roots.Get());
+      list->SetComputeRootUnorderedAccessView(1, written->GetGPUVirtualAddress());
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      D3D12_VIEWPORT viewport{0, 0, float(side), float(side), 0, 1};
+      D3D12_RECT scissor{0, 0, LONG(side), LONG(side)};
+      for (UINT i = 0; i < passes; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{heap->GetCPUDescriptorHandleForHeapStart().ptr + i * step_size};
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        UINT constants[] = {i, bench_work, 0, 0};
+        list->SetGraphicsRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
+        list->DrawInstanced(3, 1, 0, 0);
+        if (mixed) {
+          list->SetPipelineState(compute.Get());
+          const UINT constants[] = {i, 0, 0};
+          list->SetComputeRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
+          list->Dispatch(1, 1, 1);
+          list->SetPipelineState(pipelines[Plain].Get());
+        }
+      }
+      LARGE_INTEGER began, ended;
+      QueryPerformanceCounter(&began);
+      CHECK(submit(device.Get(), queue.Get(), list.Get()));
+      QueryPerformanceCounter(&ended);
+      took.push_back(double(ended.QuadPart - began.QuadPart) * 1000 / frequency.QuadPart);
+    }
+    // the first run makes the pipelines' Metal objects
+    took.erase(took.begin());
+    std::sort(took.begin(), took.end());
+    printf("bench: %u passes of %ux%u%s, median %.3f ms, fastest %.3f ms\n", passes, side, side,
+           mixed ? " each with a dispatch" : "", took[took.size() / 2], took[0]);
+    return verdict();
+  }
 
   // the slow draw's target, the target drawn between, and the quick draw's target when only depth is shared
   D3D12_RESOURCE_DESC color_desc{
@@ -157,17 +229,19 @@ main(int argc, char **argv) {
         list->ClearRenderTargetView(rtv, zero, 0, nullptr);
       list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
       // the last repeat's dispatch is overwritten with zeros here, with no view for ClearUnorderedAccessViewUint
-      const UINT none = 0;
+      const UINT none[3] = {};
       list->SetPipelineState(compute.Get());
-      list->SetComputeRoot32BitConstants(0, 1, &none, 0);
+      list->SetComputeRoot32BitConstants(0, 3, none, 0);
       list->Dispatch(elements / group, 1, 1);
       D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_UAV};
       list->ResourceBarrier(1, &barrier);
       const bool depth_case = c == Depth;
       draw(pipelines[depth_case ? Writes : Plain].Get(), 0, depth_case, slow, work);
       if (c == Dispatch) {
+        // longer than the slow draw, so that the copies after it which did not wait for it would read first
+        const UINT constants[] = {dispatched, 2 * work, 0};
         list->SetPipelineState(compute.Get());
-        list->SetComputeRoot32BitConstants(0, 1, &dispatched, 0);
+        list->SetComputeRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
         list->Dispatch(elements / group, 1, 1);
       } else {
         draw(pipelines[Plain].Get(), 1, false, between, 0);

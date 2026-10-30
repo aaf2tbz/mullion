@@ -731,9 +731,9 @@ public:
             auto [buffer_alloc, offset] = enc.access(buffer, slice.byteOffset, slice.byteLength, ResourceAccess::Write);
             enc.emulated_cmd.ClearBufferUint(buffer_alloc->buffer(), slice.byteOffset + offset, slice.byteLength >> 2, value);
           } else {
-            auto [view, element_offset] = enc.access(buffer, viewId, ResourceAccess::Write);
+            auto [view, first] = enc.accessView(buffer, viewId, ResourceAccess::Write, slice.firstElement);
             enc.emulated_cmd.ClearTextureBufferUint(
-                view.texture, slice.firstElement + element_offset, slice.elementCount,
+                view.texture, first, slice.elementCount,
                 ClearUAV<ArgumentEncodingContext>::clearColor(value, buffer->pixelFormat(viewId))
             );
           }
@@ -810,8 +810,8 @@ public:
             auto [buffer_alloc, offset] = enc.access(buffer, slice.byteOffset, slice.byteLength, ResourceAccess::Write);
             enc.emulated_cmd.ClearBufferFloat(buffer_alloc->buffer(), slice.byteOffset + offset, slice.byteLength >> 2, value);
           } else {
-            auto [view, element_offset] = enc.access(buffer, viewId, ResourceAccess::Write);
-            enc.emulated_cmd.ClearTextureBufferFloat(view.texture, slice.firstElement + element_offset, slice.elementCount, value);
+            auto [view, first] = enc.accessView(buffer, viewId, ResourceAccess::Write, slice.firstElement);
+            enc.emulated_cmd.ClearTextureBufferFloat(view.texture, first, slice.elementCount, value);
           }
         }
       });
@@ -5874,7 +5874,7 @@ public:
         viewports[i] = {d3dViewport.TopLeftX, d3dViewport.TopLeftY, d3dViewport.Width,
                         d3dViewport.Height,   d3dViewport.MinDepth, d3dViewport.MaxDepth};
       }
-      scale = EnlargeViewports(viewports.span(), D3D11_VIEWPORT_BOUNDS_MIN, D3D11_VIEWPORT_BOUNDS_MAX);
+      scale = EnlargeViewports(viewports.span(), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
       pass_viewports_ += viewport_count;
       EmitST([viewports = std::move(viewports)](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();

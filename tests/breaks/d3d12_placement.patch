@@ -1,0 +1,14 @@
+# a resource that ends where its heap does is refused
+# family native
+# family 7
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -1281,7 +1281,7 @@ public:
+     D3D12_RESOURCE_ALLOCATION_INFO info;
+     GetResourceAllocationInfo(&info, 0, 1, pDesc);
+     if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
+-        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes)
++        info.SizeInBytes > heap_desc.SizeInBytes || Offset >= heap_desc.SizeInBytes - info.SizeInBytes)
+       return FAIL(E_INVALIDARG);
+     switch (pDesc->Dimension) {
+     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:

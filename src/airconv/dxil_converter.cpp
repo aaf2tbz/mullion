@@ -165,6 +165,7 @@ enum Op : uint32_t {
   LegacyF16ToF32 = 131,
   WaveAllBitCount = 135,
   WavePrefixBitCount = 136,
+  AttributeAtVertex = 137,
   ViewID = 138,
   RawBufferLoad = 139,
   RawBufferStore = 140,
@@ -237,6 +238,7 @@ enum Semantic : uint32_t {
   DepthLessEqual,
   DepthGreaterEqual,
   StencilRef,
+  SemanticBarycentrics = 28,
   SemanticShadingRate = 29,
   SemanticCullPrimitive = 30,
 };
@@ -910,7 +912,7 @@ read_dxil(
       {Coverage, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK},
       {InnerCoverage, D3D11_SB_OPERAND_TYPE_INNER_COVERAGE},
   };
-  std::set<uint32_t> used_ops;
+  std::set<uint32_t> used_ops, evaluated_barycentrics;
   for (auto &F : M) {
     if (!F.getName().startswith("dx.op."))
       continue;
@@ -918,12 +920,23 @@ read_dxil(
       auto call = cast<CallInst>(user);
       auto op = opcode(call);
       used_ops.insert(op);
+      if (op != EvalSnapped && op != EvalSampleIndex && op != EvalCentroid && op != AttributeAtVertex)
+        continue;
+      auto id = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+      auto &e = entry.input[id];
+      if (e.semantic == SemanticBarycentrics) {
+        evaluated_barycentrics.insert(id);
+        continue;
+      }
+      // the rows it reads: all of the element's for a dynamic row
+      uint32_t rows = uint32_t((1ull << e.rows) - 1) << e.row;
+      if (auto row = dyn_cast<ConstantInt>(call->getArgOperand(2)))
+        rows = 1u << (e.row + row->getZExtValue());
+      if (op == AttributeAtVertex)
+        info.vertex_value_reg_mask |= rows;
       // evaluated attributes are interpolated in the shader, as DXBC's eval instructions mark them
-      if ((op == EvalSnapped || op == EvalSampleIndex || op == EvalCentroid) &&
-          isa<ConstantInt>(call->getArgOperand(2)))
-        info.pull_mode_reg_mask |= 1u
-                                   << (entry.input[cast<ConstantInt>(call->getArgOperand(1))->getZExtValue()].row +
-                                       cast<ConstantInt>(call->getArgOperand(2))->getZExtValue());
+      else if (isa<ConstantInt>(call->getArgOperand(2)))
+        info.pull_mode_reg_mask |= rows;
     }
   }
 
@@ -1001,6 +1014,9 @@ read_dxil(
   auto rows = [&](auto &elements, auto &parser, auto opcode_of, D3D10_SB_OPERAND_TYPE type, uint32_t phase = ~0u) {
     for (unsigned id = 0; id < elements.size(); id++) {
       auto &e = elements[id];
+      // barycentrics have no register (define_barycentrics)
+      if (e.semantic == SemanticBarycentrics)
+        continue;
       for (uint32_t row = e.row; row < e.row + e.rows; row++) {
         uint32_t mask = ((1u << e.cols) - 1) << e.col;
         auto name = system_value(parser, row, mask);
@@ -1061,6 +1077,13 @@ read_dxil(
     auto [opcode, type, row, name, id, interpolation, phase] = key;
     declare(opcode, type, row, mask, name, interpolation, phase);
   }
+  // after the position's declaration, whose interpolation stays its own where barycentrics take the position too
+  if (pixel)
+    for (unsigned id = 0; id < entry.input.size(); id++)
+      if (entry.input[id].semantic == SemanticBarycentrics)
+        define_barycentrics(
+            shader, id, D3D10_SB_INTERPOLATION_MODE(entry.input[id].interpolation), evaluated_barycentrics.contains(id)
+        );
   // groupshared 64-bit atomics hash their locks with the threadgroup's position (`locked`); those on resources share
   // their locks among threadgroups
   for (auto &F : M)
@@ -1849,9 +1872,11 @@ convert_dxil(
     auto ptr = ir.CreateGEP(unit, ir.CreatePointerCast(b.Pointer, unit->getPointerTo(space)), {index});
     if (!b.Metadata || inside)
       return ptr;
-    auto bytes = ir.CreateZExt(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt64Ty());
-    auto units = ir.CreateUDiv(bytes, ir.getInt64(unit->getPrimitiveSizeInBits() / 8));
-    return ir.CreateSelect(ir.CreateICmpULT(index, units), ptr, Constant::getNullValue(ptr->getType()));
+    auto units = ir.CreateUDiv(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt32(unit->getPrimitiveSizeInBits() / 8));
+    // a raw index is masked to 32 bits of bytes above, so it compares in the GPU's 32-bit integers
+    auto within = b.StructureStride ? ir.CreateICmpULT(index, ir.CreateZExt(units, index->getType()))
+                                    : ir.CreateICmpULT(ir.CreateTrunc(index, units->getType()), units);
+    return ir.CreateSelect(within, ptr, Constant::getNullValue(ptr->getType()));
   };
   // system inputs read the way DXBC reads them (the coverage mask honors the PSO sample mask)
   auto attribute = [&](shader::common::InputAttribute input, uint32_t component) {
@@ -2254,10 +2279,11 @@ convert_dxil(
     Value *ret = nullptr;
     auto a = [&](unsigned i) { return arg(call, i); };
     // Metal's SIMD-group functions take every active lane, a helper's too: where D3D leaves helpers out, they skip
-    // the operation, and get zero for its undefined result
+    // the operation, and get zero for its undefined result. WaveReadLaneFirst they take part in (below)
     llvm::BasicBlock *skipped = nullptr;
     if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves &&
-        ((op >= WaveIsFirstLane && op <= WavePrefixOp && op != WaveGetLaneIndex && op != WaveGetLaneCount) ||
+        ((op >= WaveIsFirstLane && op <= WavePrefixOp && op != WaveGetLaneIndex && op != WaveGetLaneCount &&
+          op != WaveReadLaneFirst) ||
          op == WaveAllBitCount || op == WavePrefixBitCount || (op >= WaveMatch && op <= WaveMultiPrefixBitCount))) {
       skipped = ir.GetInsertBlock();
       auto join = SplitBlock(skipped, call);
@@ -2327,6 +2353,10 @@ convert_dxil(
                    : op == LoadOutputControlPoint ? ctx.resource.output
                                                   : ctx.resource.patch_constant_output;
       auto &elements = op == LoadInput ? entry.input : op == LoadOutputControlPoint ? entry.output : entry.patch;
+      if (op == LoadInput && elements[constant(a(1))].semantic == SemanticBarycentrics) {
+        ret = ir.CreateExtractElement(ctx.resource.barycentrics[constant(a(1))].value, a(3));
+        break;
+      }
       auto ptr = element_ptr(file, elements[constant(a(1))], call, op == LoadPatchConstant ? nullptr : a(4));
       ret = narrow(ir.CreateLoad(ir.getInt32Ty(), ptr), ty);
       break;
@@ -2412,7 +2442,21 @@ convert_dxil(
       ret = move("simd_shuffle", a(1), {i16(a(2))});
       break;
     case WaveReadLaneFirst:
-      ret = move("simd_broadcast_first", a(1), {});
+      if (ctx.shader_type == D3D10_SB_PIXEL_SHADER && !helper_waves) {
+        // the first lane that is not a helper, as D3D has it, and its value for every lane, the helpers' too: in a
+        // loop that runs until a lane's value is the first lane's (a "waterfall" over the wave's distinct values), a
+        // helper given zero, or a first lane that is a helper, never matches, and the loop never ends (Dragon's
+        // Dogma 2's PS_Culltest hung the GPU). a loop only helpers are still in takes the first of them
+        auto ctz = ctx.module.getOrInsertFunction(
+            "air.ctz.i64", FunctionType::get(ir.getInt64Ty(), {ir.getInt64Ty(), ir.getInt1Ty()}, false)
+        );
+        auto helper = simd("simd_is_helper_thread", ir.getInt1Ty(), {});
+        auto real = simd("simd_ballot", ir.getInt64Ty(), {ir.CreateNot(helper)}, ir.getInt64Ty());
+        auto active = simd("simd_ballot", ir.getInt64Ty(), {ir.getTrue()}, ir.getInt64Ty());
+        auto lanes = ir.CreateSelect(ir.CreateICmpNE(real, ir.getInt64(0)), real, active);
+        ret = move("simd_shuffle", a(1), {i16(ir.CreateCall(ctz, {lanes, ir.getFalse()}))});
+      } else
+        ret = move("simd_broadcast_first", a(1), {});
       break;
     case QuadReadLaneAt:
       ret = move("quad_shuffle", a(1), {i16(a(2))});
@@ -2719,9 +2763,15 @@ convert_dxil(
     case CBufferLoadLegacy: {
       // a 16-byte row, as the elements DXIL reads it as: four of 32 bits, eight of 16 or two of 64
       auto sty = cast<StructType>(ty);
-      auto bits = sty->getElementType(0)->getPrimitiveSizeInBits();
+      unsigned bits = sty->getElementType(0)->getPrimitiveSizeInBits();
+      // the dwords holding the elements the call's users read
+      uint32_t elements = used(call), dwords = 0;
+      for (unsigned i = 0; i < 4; i++)
+        if (elements >> (i * 32 / bits) & llvm::maskTrailingOnes<uint32_t>(std::max(1u, 32 / bits)))
+          dwords |= 1u << i;
       auto row = ir.CreateBitCast(
-          dxbc.LoadConstantBuffer(*handles[a(1)].cbuffer, a(2)), FixedVectorType::get(ir.getIntNTy(bits), 128 / bits)
+          dxbc.LoadConstantBuffer(*handles[a(1)].cbuffer, a(2), -1, dwords),
+          FixedVectorType::get(ir.getIntNTy(bits), 128 / bits)
       );
       ret = UndefValue::get(ty);
       for (unsigned i = 0; i < sty->getNumElements(); i++)
@@ -2774,7 +2824,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
-                options.second.lod, false
+                options.second.lod
             );
           };
           break;
@@ -2787,7 +2837,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
-                options.second.lod, true
+                options.second.lod
             );
           };
           break;
@@ -2816,7 +2866,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *ref) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, ref, options.first.bias,
-                options.second.lod, false
+                options.second.lod
             );
           };
           break;
@@ -3321,6 +3371,21 @@ convert_dxil(
     case EvalCentroid:
     case EvalSampleIndex:
     case EvalSnapped: {
+      if (entry.input[constant(a(1))].semantic == SemanticBarycentrics) {
+        auto &b = ctx.resource.barycentrics[constant(a(1))];
+        // eval_snapped's offset is in 1/16 pixel steps, [-8, 7]
+        auto snapped = [&] {
+          auto steps = ir.CreateAnd(ir.CreateAdd(vec(call, 4, 2, air.getIntTy(2)), air.getInt2(8, 8)), air.getInt2(0b1111, 0b1111));
+          return ir.CreateFSub(
+              ir.CreateFMul(air.CreateConvertToFloat(steps), air.getFloat2(1.0f / 16.0f, 1.0f / 16.0f)), air.getFloat2(0.5f, 0.5f)
+          );
+        };
+        auto offset = op == EvalCentroid      ? b.centroid
+                      : op == EvalSampleIndex ? air.CreateRasterizerSamplePos(a(4))
+                                              : snapped();
+        ret = ir.CreateExtractElement(b.At(ir, offset), a(3));
+        break;
+      }
       auto itp = interpolant(call);
       if (!itp)
         return make_error<UnsupportedFeature>(
@@ -3561,6 +3626,27 @@ convert_dxil(
         auto byte = ir.CreateTrunc(ir.CreateLShr(a(2), 8 * i), ir.getInt8Ty());
         ret = ir.CreateInsertValue(ret, constant(a(1)) ? ir.CreateSExt(byte, elem) : ir.CreateZExt(byte, elem), {i});
       }
+      break;
+    }
+    case AttributeAtVertex: {
+      if (ty->getPrimitiveSizeInBits() > 32)
+        return make_error<UnsupportedFeature>("DXIL 64-bit inputs are not lowered yet");
+      auto &e = entry.input[constant(a(1))];
+      auto at = [&](uint32_t row) -> Value * {
+        auto &values = ctx.resource.vertex_value_map[e.row + row];
+        auto c = e.col + constant(a(3));
+        auto value = air.CreateGetVertexValue(
+            ctx.function->getArg(values.component[c]), values.integers >> c & 1 ? ir.getInt32Ty() : ir.getFloatTy(),
+            ir.CreateZExt(a(4), ir.getInt32Ty())
+        );
+        return ir.CreateBitCast(value, ir.getInt32Ty());
+      };
+      // a dynamic row picks among the element's
+      bool dynamic = !isa<ConstantInt>(a(2));
+      Value *value = at(dynamic ? 0 : constant(a(2)));
+      for (uint32_t row = 1; dynamic && row < e.rows; row++)
+        value = ir.CreateSelect(ir.CreateICmpEQ(a(2), ir.getInt32(row)), at(row), value);
+      ret = narrow(value, ty);
       break;
     }
     case ViewID:
@@ -3887,11 +3973,11 @@ convert_dxil(
       for (uint32_t u = 0; u < 3; u++) {
         auto vertex = ir.CreateAdd(vertex_base, ir.getInt32(u));
         air.CreateSetMeshPosition(vertex, triangle.position[u]);
-        // a flat varying is the first corner's
+        // a flat varying is its own corner's, as conservative_point's
         for (uint32_t i = 0; i < cm->registers[0].size(); i++) {
           auto reg = cm->registers[0][i];
           bool integer = cm->integers[0][i], flat = integer || (cm->flat_inputs >> reg & 1);
-          Value *value = flat ? word(conservative_vertices, corner[0], i)
+          Value *value = flat ? word(conservative_vertices, corner[u], i)
                               : blend(cm->noperspective_inputs >> reg & 1 ? triangle.linear : triangle.over_w, u, i);
           if (flat && !integer)
             value = real(value);
@@ -3899,7 +3985,7 @@ convert_dxil(
         }
         for (uint32_t i = 0; i < clip_count; i++)
           air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(triangle.over_w, u, position_at + 4 + i));
-        conservative_varyings(air, triangle, u, vertex, cm->at);
+        conservative_varyings(air, triangle, u, vertex, cm->at, cm->barycentrics);
         air.CreateSetMeshIndex(ir.CreateAdd(vertex_base, ir.getInt32(u)), ir.CreateTrunc(vertex, i8));
       }
       // a primitive is culled when one distance puts all its vertices out, when the shader culls it itself, or when
@@ -4075,6 +4161,7 @@ convert_dxil_mesh_stage(
     resource_map.conservative_mesh->triangles = link->triangles;
     resource_map.conservative_mesh->flat_inputs = link->flat_inputs;
     resource_map.conservative_mesh->noperspective_inputs = link->noperspective_inputs;
+    resource_map.conservative_mesh->barycentrics = link->barycentrics;
   }
   resource_map.mesh_slices = slices;
 
@@ -4165,10 +4252,7 @@ convert_dxil_mesh_stage(
     if (conservative) {
       auto &cm = *resource_map.conservative_mesh;
       cm.at = cm.registers[0].size();
-      for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
-        func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-            .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = cm.at + i
-        });
+      define_conservative_varyings(func_signature, cm.at, cm.barycentrics);
     }
   } else {
     func_signature.DefineInput(air::InputMeshGridProperties{});
@@ -4209,6 +4293,7 @@ convert_dxil_mesh_stage(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -4354,6 +4439,7 @@ convert_dxil_ray_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );

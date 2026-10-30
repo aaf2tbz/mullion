@@ -33,6 +33,7 @@
 #include "mullion_presenter.hpp"
 #include "mullion_ring_bump_allocator.hpp"
 #include "mullion_texture.hpp"
+#include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include <atomic>
@@ -87,6 +88,17 @@ struct D3D12_DEPTH_STENCIL_DESC2 {
 };
 #endif
 
+#ifndef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+#define __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+/** ID3D12GraphicsCommandList9 as the D3D12 headers declare it: dynamic depth bias and index buffer strip cut. */
+MIDL_INTERFACE("34ed2808-ffe6-4c2b-b11a-cabd2b0c59e1")
+ID3D12GraphicsCommandList9 : public ID3D12GraphicsCommandList8 {
+  virtual void STDMETHODCALLTYPE RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) = 0;
+  virtual void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) = 0;
+};
+__CRT_UUID_DECL(ID3D12GraphicsCommandList9, 0x34ed2808, 0xffe6, 0x4c2b, 0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1)
+#endif
+
 namespace mullion {
 
 bool ExperimentalShaderModelsEnabled();
@@ -114,7 +126,7 @@ constexpr uint64_t kGPUTimestampFrequency = 1'000'000'000;
 class MTLD3D12CommandAllocator;
 class MTLD3D12Device;
 
-class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList8 {
+class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList9 {
 public:
   EncoderData *entry;
   size_t encoder_count;
@@ -417,6 +429,7 @@ public:
 };
 
 using PipelineShaderCache = std::unordered_map<Sha1Digest, WMT::Reference<WMT::DispatchData>>;
+struct PipelineStateStream;
 
 class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
@@ -424,6 +437,12 @@ public:
   Sha1Digest library_key;
   mullion::mutex shader_mutex;
   PipelineShaderCache cached_shaders;
+  // made while no sampler had a border color Metal lacks (MTLD3D12Device::custom_borders), its shaders leave out the
+  // emulation of one (SM50_SHADER_FLAG_NO_CUSTOM_BORDER): what it is made of, to make it again with the emulation
+  // once a draw or dispatch can read such a sampler
+  std::shared_ptr<const PipelineStateStream> borderless;
+  Com<ID3D12PipelineState> bordered;
+  ID3D12PipelineState *Bordered(MTLD3D12Device *Device);
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
 
@@ -529,6 +548,10 @@ public:
     mullion::mutex mutex;
     std::unordered_set<std::shared_ptr<Reached>> values;
   } fences;
+
+  // a sampler has a border color Metal lacks (PopulateWMTSamplerInfo), so pipelines made from now on emulate it
+  // (MTLD3D12PipelineState::borderless)
+  std::atomic<bool> custom_borders{false};
 
   // the most mesh threadgroups an object threadgroup may start, which a pipeline tells; 0 until one has
   std::atomic<uint32_t> max_mesh_threadgroups{0};
@@ -856,6 +879,15 @@ UINT DecomposeSubresource(
     const D3D12_RESOURCE_DESC &Desc, UINT Subresource = 0, UINT *pMipSlice = NULL, UINT *pArraySlice = NULL,
     UINT *pPlaneSlice = NULL
 );
+
+namespace sdk {
+// GPU upload heaps (DirectX-Specs, D3D12 GPU Upload Heaps), which the toolchain's d3d12.h lacks
+constexpr auto D3D12_HEAP_TYPE_GPU_UPLOAD = D3D12_HEAP_TYPE(5);
+// render passes' local accesses (DirectX-Specs, Render Passes), which the toolchain's d3d12.h lacks too, past the
+// range of its D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE
+constexpr UINT D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_SRV = 5;
+constexpr UINT D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_UAV = 6;
+} // namespace sdk
 
 bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
 

@@ -1,10 +1,11 @@
-// contract: profiling records each pass's stages and pipelines, each present and each submission without changing
-// results, including each pipeline run's draw/dispatch, vertex and index counts. "When the GPU starts or finishes a
-// stage, it samples the counters" (Apple, Sampling GPU data into counter
+// contract: profiling records each pass's stages, pipelines and targets, each present and each submission without
+// changing results, including each pipeline run's draw/dispatch, vertex and index counts. "When the GPU starts or
+// finishes a stage, it samples the counters" (Apple, Sampling GPU data into counter
 // sample buffers, Sample counters at stage boundaries). queries retain "The value should be sampled at the instant
 // that the GPU is finished with all the preceding workload." (D3D11.3 20.4.3). the record follows the profile contract.
 // vertex and index counts include instances: "same set repeated for each Instance" (D3D11.3 8.4 and 8.6).
 #include "d3d12_test.hpp"
+#include "../../src/winemetal/winemetal.h"
 #include <dxgi1_4.h>
 #include <wincrypt.h>
 #include <algorithm>
@@ -501,7 +502,7 @@ main(int argc, char **argv) {
     using Key = std::pair<std::string, UINT64>;
     std::map<Key, std::vector<std::string>> buffers;
     std::map<Key, std::array<UINT64, 4>> calibrations;
-    std::vector<std::vector<std::string>> passes, presents;
+    std::vector<std::vector<std::string>> passes, presents, targets;
     std::map<std::string, UINT> frame_counts;
     UINT files = 0, clocks = 0, spans = 0, statistics = 0, totals = 0;
     // the bridge's calls a 'unix' record counts, each named once before (mullion_diag.hpp's Calls)
@@ -540,6 +541,8 @@ main(int argc, char **argv) {
           presents.push_back(row);
         } else if (row[0] == "pass" && expect(row.size() == 9 || row.size() == 11, "malformed pass")) {
           passes.push_back(row);
+        } else if (row[0] == "target") {
+          targets.push_back(row);
         } else if (row[0] == "gpu") {
           // the driver's statistics at the frame's end, name=value each
           statistics++;
@@ -670,14 +673,13 @@ main(int argc, char **argv) {
                      "application query %llu to %llu does not bracket the sampled kernel %llu to %llu", query[0],
                      query[1], number(row[7]), number(row[8]));
               auto at = size_t(&row - passes.data());
-              if (expect(at > 0 && at + 1 < passes.size(), "kernel has no surrounding query passes")) {
-                // a query has the clock as the pass before it ends (20.4.3): each one here follows a kernel or a
-                // resolve, so its pass is a blit of its own
-                auto &before = passes[at - 1], &after = passes[at + 1];
-                expect(before[1] == row[1] && before[2] == row[2] && after[1] == row[1] && after[2] == row[2] &&
-                           before[4] == "Blit" && after[4] == "Blit" && query[0] != ~UINT64(0) &&
-                           query[1] != ~UINT64(0) && query[0] == number(before[8]) && query[1] == number(after[8]),
-                       "application timestamps shifted from the kernel's surrounding query passes");
+              if (expect(at > 0, "kernel has no query pass before it")) {
+                // a query has the clock as the pass before it ends (20.4.3): the one before the kernel follows a
+                // resolve, so its pass is a blit, and the one after it has the kernel's end
+                auto &before = passes[at - 1];
+                expect(before[1] == row[1] && before[2] == row[2] && before[4] == "Blit" && query[0] != ~UINT64(0) &&
+                           query[1] != ~UINT64(0) && query[0] == number(before[8]) && query[1] == number(row[8]),
+                       "application timestamps shifted from the kernel's pass and the query pass before it");
               }
             }
             times.push_back(gpu);
@@ -688,15 +690,35 @@ main(int argc, char **argv) {
           run_counts[run_name]++;
       }
       // a frame's clear is its render pass's load action, and that pass ends with the first kernel's first query:
-      // three queries and the copies are a frame's blits. the burst's clears stay passes; its queries are a blit
-      // at the list's start and the last clear's end
+      // the queries and the resolve between the kernels are a blit, and the queries, resolve and copies after them
+      // another. the burst's clears stay passes; its queries are a blit at the list's start and the last clear's end
       expect(kinds["Render"] == frames && kinds["Compute"] == 2 * frames && kinds["Clear"] == capacity + 1 &&
-                 kinds["Blit"] == 4 * frames + 1 && kinds.size() == 4,
+                 kinds["Blit"] == 2 * frames + 1 && kinds.size() == 4,
              "pass kinds or counts differ from recording");
       expect(unsampled > 0, "overflow did not use unsampled sentinel");
       for (UINT i = 0; i < std::size(render_runs); i++)
         expect(run_counts[render_runs[i]] == frames && run_counts[compute_runs[i]] == frames,
                "pipeline lost on list replay");
+      // a render or clear pass names its one target, as D3D11's profile has them: the back buffer of a queue's swap
+      // chain, cleared on load and stored
+      std::map<std::tuple<Key, UINT64>, UINT> attachments;
+      std::set<std::string> textures;
+      for (auto &row : targets)
+        if (expect(row.size() == 15, "malformed target")) {
+          attachments[{Key{row[1], number(row[2])}, number(row[3])}]++;
+          textures.insert(row[6]);
+          expect(row[4] == "color" && !number(row[5]) && number(row[6]) && number(row[7]) == width &&
+                     number(row[8]) == height && number(row[9]) == WMTPixelFormatRGBA8Unorm && !number(row[10]) &&
+                     !number(row[11]) && number(row[12]) == 1 && number(row[13]) == WMTLoadActionClear &&
+                     number(row[14]) == WMTStoreActionStore,
+                 "target metadata wrong");
+        }
+      for (auto &row : passes)
+        expect(attachments[{Key{row[1], number(row[2])}, number(row[3])}] ==
+                   UINT(row[4] == "Render" || row[4] == "Clear"),
+               "pass lost or gained targets");
+      expect(targets.size() == kinds["Render"] + kinds["Clear"] && textures.size() == frame_counts.size(),
+             "targets lost or mixed");
       for (UINT frame = 0; frame < frames; frame++) {
         auto &fast = kernel_times[compute_runs[0]], &slow = kernel_times[compute_runs[1]];
         if (expect(fast.size() == frames && slow.size() == frames, "kernel samples missing"))

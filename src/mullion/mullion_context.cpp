@@ -421,11 +421,10 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (srv.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto [view, offset] = access<stage>(srv.buffer, srv.viewId, ResourceAccess::Read);
+          auto [view, first] = accessView<stage>(srv.buffer, srv.viewId, ResourceAccess::Read, srv.slice.firstElement);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
-          encoded_buffer[arg.StructurePtrOffset + 1] =
-              ((uint64_t)srv.slice.elementCount << 32) | (uint64_t)(srv.slice.firstElement + offset);
-          makeResident<stage, kind>(srv.buffer.ptr(), srv.viewId);
+          encoded_buffer[arg.StructurePtrOffset + 1] = ((uint64_t)srv.slice.elementCount << 32) | first;
+          makeResident<stage, kind>(view);
         } else if (srv.texture.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
@@ -480,11 +479,10 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (uav.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto [view, offset] = access<stage>(uav.buffer, uav.viewId, access_flags);
+          auto [view, first] = accessView<stage>(uav.buffer, uav.viewId, access_flags, uav.slice.firstElement);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
-          encoded_buffer[arg.StructurePtrOffset + 1] =
-              ((uint64_t)uav.slice.elementCount << 32) | (uint64_t)(uav.slice.firstElement + offset);
-          makeResident<stage, kind>(uav.buffer.ptr(), uav.viewId, read, write);
+          encoded_buffer[arg.StructurePtrOffset + 1] = ((uint64_t)uav.slice.elementCount << 32) | first;
+          makeResident<stage, kind>(view, read, write);
         } else if (uav.texture.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = uav.texture->checkViewUseArray(uav.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
@@ -1245,7 +1243,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           stencil_info.clear_stencil = stencil_data.clear_stencil;
         }
         render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
-        render_pass_info.center_samples = data->center_samples;
+        render_pass_info.programmed_samples = data->center_samples;
         render_pass_info.render_target_array_length = data->render_target_array_length;
         render_pass_info.render_target_width = data->render_target_width;
         render_pass_info.render_target_height = data->render_target_height;
@@ -2085,9 +2083,10 @@ SimpleCommandContext<ArgumentEncodingContext>::setComputeTexture(
 template <>
 void
 SimpleCommandContext<ArgumentEncodingContext>::setComputeTexelBuffer(
-    uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags
+    uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags, uint32_t &first
 ) {
-  auto [dst_, dst_sub_offset] = ctx.access(buffer, viewId, flags);
+  auto [dst_, texel] = ctx.accessView(buffer, viewId, flags, first);
+  first = texel;
   auto &settexbuf = ctx.encodeComputeCommand<wmtcmd_compute_settexture>();
   settexbuf.type = WMTComputeCommandSetTexture;
   settexbuf.texture = dst_.texture;

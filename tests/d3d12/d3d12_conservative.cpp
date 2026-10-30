@@ -24,6 +24,10 @@
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_conservative_rasterization_tier
 // each run's SV_Coverage is every sample (15.17.5), and the attributes hold in perspective however steep: a triangle
 // whose plane's 1/w is below 0 within a pixel of it.
+// a pixel shader that interpolates the attributes itself, of SV_Barycentrics and each vertex's (GetAttributeAtVertex),
+// sees the same on every path, where the device has barycentrics: the weights are of "the original API primitive
+// prior to clipping", "not constrained to be within [0...1]" outside it, and vertex 0's is the provoking vertex's.
+// https://github.com/microsoft/DirectXShaderCompiler/wiki/SV_Barycentrics
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <array>
@@ -73,6 +77,24 @@ float ps_evaluate(V v, bool front : SV_IsFrontFace) : SV_Target {
   InterlockedOr(o[PIXELS + i].w, front ? 2 : 1, was);
   return 1;
 }
+#ifdef BARYCENTRICS
+struct W {
+  float4 position : SV_Position;
+  nointerpolation float perspective : PERSPECTIVE;
+  nointerpolation float screen : SCREEN;
+  nointerpolation uint flat : FLAT;
+};
+float ps_barycentrics(W v, float3 b : SV_Barycentrics, noperspective float3 n : SV_Barycentrics1) : SV_Target {
+  uint2 p = uint2(v.position.xy);
+  uint i = p.y * WIDTH + p.x, was;
+  float3 perspective = {GetAttributeAtVertex(v.perspective, 0), GetAttributeAtVertex(v.perspective, 1),
+                        GetAttributeAtVertex(v.perspective, 2)},
+         screen = {GetAttributeAtVertex(v.screen, 0), GetAttributeAtVertex(v.screen, 1), GetAttributeAtVertex(v.screen, 2)};
+  o[i].xyz = uint3(asuint(dot(b, perspective)), asuint(dot(n, screen)), v.flat);
+  InterlockedAdd(o[PIXELS + i].x, 1, was);
+  return 1;
+}
+#endif
 float4 vs_depth(float4 position : POSITION) : SV_Position { return position; }
 // the triangle, then a strip of a triangle without area past the viewport's right, which rasterizes nothing there
 [maxvertexcount(6)] void gs(triangle V v[3], inout TriangleStream<V> s) {
@@ -432,6 +454,19 @@ main(int argc, char **argv) {
       return 1;
     }
   }
+  // barycentrics are DXIL's (shader model 6.1), on a device that has them
+  D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
+  device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3));
+  std::string ps_barycentrics;
+  if (compiler.dxc && options3.BarycentricsSupported) {
+    auto barycentric_defines = defines;
+    barycentric_defines.push_back("BARYCENTRICS");
+    ps_barycentrics = compiler.compile(hlsl, "ps_barycentrics", "ps_6_1", barycentric_defines);
+    if (ps_barycentrics.empty()) {
+      printf("failed: the barycentrics shader did not compile\n");
+      return 1;
+    }
+  }
 
   // the UAV the pixel shader writes, and the corners a mesh shader reads
   D3D12_ROOT_PARAMETER params[2] = {{D3D12_ROOT_PARAMETER_TYPE_UAV}, {D3D12_ROOT_PARAMETER_TYPE_SRV}};
@@ -481,7 +516,7 @@ main(int argc, char **argv) {
   };
   // by the stages, conservative rasterization and sample count
   ComPtr<ID3D12PipelineState> pso[kPaths][2][2], depth_pso[kPaths], inner_pso[kPaths], unclipped_pso, shaded_pso[kPaths],
-      shaded_unclipped_pso;
+      shaded_unclipped_pso, barycentric_pso[kPaths];
   for (int geometry = 0; geometry < kPaths; geometry++)
     for (int conservative = 0; conservative < 2; conservative++)
       for (int msaa = 0; msaa < 2; msaa++) {
@@ -533,6 +568,14 @@ main(int argc, char **argv) {
             CHECK(mesh_pipeline(geometry, desc, inner_pso[geometry]));
           } else {
             CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&inner_pso[geometry])));
+          }
+          if (!ps_barycentrics.empty()) {
+            desc.PS = bytecode(ps_barycentrics);
+            if (meshed(geometry)) {
+              CHECK(mesh_pipeline(geometry, desc, barycentric_pso[geometry]));
+            } else {
+              CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&barycentric_pso[geometry])));
+            }
           }
         }
       }
@@ -801,7 +844,8 @@ main(int argc, char **argv) {
     return S_OK;
   };
 
-  static Pixels normal, conservative, multisampled, depth_only, unclipped, evaluated, inner, shaded, shaded_unclipped;
+  static Pixels normal, conservative, multisampled, depth_only, unclipped, evaluated, inner, shaded, shaded_unclipped,
+      barycentric;
   // a pixel inside the viewport and target: what a draw can reach
   auto reachable = [&](int x, int y) {
     return x >= kViewport.TopLeftX && y >= kViewport.TopLeftY && x < kViewport.TopLeftX + kViewport.Width &&
@@ -838,6 +882,9 @@ main(int argc, char **argv) {
         CHECK(draw(t, evaluate_pso.Get(), 0, false, evaluated, false));
       CHECK(draw(t, inner_pso[geometry].Get(), 0, false, inner, patch, mesh));
       CHECK(draw(t, shaded_pso[geometry].Get(), 0, true, shaded, patch, mesh));
+      bool barycentrics = barycentric_pso[geometry];
+      if (barycentrics)
+        CHECK(draw(t, barycentric_pso[geometry].Get(), 0, false, barycentric, patch, mesh));
       if (!geometry && unclippable) {
         CHECK(draw(t, unclipped_pso.Get(), 0, true, unclipped, false));
         CHECK(draw(t, shaded_unclipped_pso.Get(), 0, true, shaded_unclipped, false));
@@ -930,6 +977,12 @@ main(int argc, char **argv) {
           }
           if (ran && conservative.attributes[i][2] != 7)
             fail("%s: pixel (%d, %d): flat %u, want the first vertex's 7", t.what, x, y, conservative.attributes[i][2]);
+          if (barycentrics && (barycentric.runs[i][0] != 0) != ran)
+            fail("%s: pixel (%d, %d) ran the barycentrics shader %u times, the other %d", t.what, x, y,
+                 barycentric.runs[i][0], ran);
+          if (barycentrics && ran && barycentric.attributes[i][2] != 7)
+            fail("%s: pixel (%d, %d): flat %u beside barycentrics, want the first vertex's 7", t.what, x, y,
+                 barycentric.attributes[i][2]);
           // the attributes are their plane's at the center, inside or not (15.17.4), the leading vertex's where the
           // triangle has no area; noperspective ones are taken of a triangle before the eye. inside, they are the
           // ordinary rasterizer's
@@ -941,6 +994,10 @@ main(int argc, char **argv) {
             const char *name = a ? "noperspective" : "perspective";
             if (!std::isnan(want) && (!a || unclippable) && !(std::fabs(got - want) <= error))
               fail("%s: pixel (%d, %d): %s %g, want %g", t.what, x, y, name, got, want);
+            float own;
+            memcpy(&own, &barycentric.attributes[i][a], 4);
+            if (barycentrics && !std::isnan(want) && (!a || unclippable) && !(std::fabs(own - want) <= error))
+              fail("%s: pixel (%d, %d): %s %g of barycentrics, want %g", t.what, x, y, name, own, want);
             float normal_got;
             memcpy(&normal_got, &normal.attributes[i][a], 4);
             if ((!a || unclippable) && reachable(x, y) && center_inside(polygon, x, y, 0.05) && normal.runs[i][0] &&

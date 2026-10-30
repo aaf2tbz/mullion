@@ -1599,17 +1599,28 @@ AIRBuilder::CreateInterpolateAtCentroid(Value *Interpoant, bool Perspective) {
   );
   if (!CentroidCoverage)
     return builder.CreateCall(Fn, {Interpoant});
+  auto [center, first] = CreateCentroidSample(CentroidCoverage, CentroidMask);
+  return builder.CreateSelect(
+      center, CreateInterpolateAtCenter(Interpoant, Perspective), CreateInterpolateAtSample(Interpoant, first, Perspective)
+  );
+}
+
+std::pair<Value *, Value *>
+AIRBuilder::CreateCentroidSample(Value *Coverage, Value *Mask) {
   // the center when every sample is covered, else the first covered; a helper run covers none, and takes the
   // mask's first sample, or the center with all of them
   auto all = builder.CreateSub(builder.CreateShl(getInt(1), CreateGetNumSamples()), getInt(1));
-  auto mask = builder.CreateAnd(CentroidMask, all), covered = builder.CreateAnd(CentroidCoverage, mask);
+  auto mask = builder.CreateAnd(Mask, all), covered = builder.CreateAnd(Coverage, mask);
   auto pick = builder.CreateSelect(builder.CreateICmpNE(covered, getInt(0)), covered, mask);
   auto ctz = getModule()->getOrInsertFunction("air.ctz.i32", FunctionType::get(getIntTy(), {getIntTy(), builder.getInt1Ty()}, false));
-  auto first = builder.CreateCall(ctz, {pick, builder.getFalse()});
-  return builder.CreateSelect(
-      builder.CreateICmpEQ(pick, all), CreateInterpolateAtCenter(Interpoant, Perspective),
-      CreateInterpolateAtSample(Interpoant, first, Perspective)
-  );
+  return {builder.CreateICmpEQ(pick, all), builder.CreateCall(ctz, {pick, builder.getFalse()})};
+}
+
+Value *
+AIRBuilder::CreateCentroidOffset(Value *Coverage) {
+  auto [center, first] =
+      CreateCentroidSample(CentroidCoverage ? CentroidCoverage : Coverage, CentroidMask ? CentroidMask : getInt(~0u));
+  return builder.CreateSelect(center, ConstantAggregateZero::get(getFloatTy(2)), CreateRasterizerSamplePos(first));
 }
 
 Value *
@@ -1649,6 +1660,25 @@ AIRBuilder::CreateInterpolateAtOffset(Value *Interpoant, Value *Offset, bool Per
   );
 
   return builder.CreateCall(Fn, {Interpoant, Offset});
+}
+
+Value *
+AIRBuilder::CreateGetVertexValue(Value *VertexValue, Type *Ty, Value *Index) {
+  auto &Context = getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{1U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {1U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ArgMemOnly)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)}}
+  );
+  auto Fn = getModule()->getOrInsertFunction(
+      "air.get_vertex_value" +
+          getTypeOverloadSuffix(Ty, Ty->isFloatingPointTy() ? Signedness::DontCare : Signedness::Unsigned),
+      FunctionType::get(Ty, {VertexValue->getType(), getIntTy()}, false), Attrs
+  );
+  return builder.CreateCall(Fn, {VertexValue, Index});
 }
 
 CallInst *

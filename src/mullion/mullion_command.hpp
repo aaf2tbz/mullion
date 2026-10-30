@@ -70,20 +70,22 @@ void EncodePipelineStatisticsDraw(Emit emit, WMT::RenderPipelineState count, WMT
   previous.pso = restore;
 }
 
-// Metal clips a triangle that reaches 1.5 of a viewport past its center into pieces, and on their seams runs a pixel
-// shader once for each piece. D3D allows that (D3D11.3 15.4), but applications draw
-// past the viewport as if it never happened, a full-screen triangle reaches 3. so Metal's viewports are made larger
-// about their centers, and the stage before the rasterizer multiplies x and y by the inverse
-// (SM50_BINDING_INDEX_RASTER_SCALE): positions land on the same pixels, and the cut moves out by the factor. it is the
-// largest power of two, which keeps the scale exact, that leaves the viewports in the bounds an application may give
-// them itself. returns the inverse
+// Metal clips a triangle that reaches 1.5 past its viewport's center, in normalized coordinates, into pieces, and on
+// their seams runs a pixel shader once for each piece. D3D allows that (D3D11.3 15.4), but applications draw past the
+// viewport as if it never happened, a full-screen triangle reaches 3. so Metal's viewports are made larger about their
+// centers, and the stage before the rasterizer multiplies x and y by the inverse (SM50_BINDING_INDEX_RASTER_SCALE):
+// positions land on the same pixels, and the cut moves out by the factor. a cut past that of the largest viewport, a
+// whole target of `largest` pixels, loses the depth plane (#72; an M5 Pro keeps it exact up to the cut of its own
+// largest, 32768 pixels). the factor is the largest power of two, which keeps the scale exact, that keeps every cut
+// inside that one. returns the inverse
 inline float
-EnlargeViewports(std::span<WMTViewport> viewports, double bound_min, double bound_max) {
+EnlargeViewports(std::span<WMTViewport> viewports, double largest) {
+  constexpr double cut = 1.5;
   double reach = INFINITY;
   for (auto &v : viewports)
     for (auto [origin, size] : {std::pair{v.originX, v.width}, std::pair{v.originY, v.height}})
       if (size > 0)
-        reach = std::min({reach, (origin - bound_min) / (size / 2) + 1, (bound_max - origin) / (size / 2) - 1});
+        reach = std::min(reach, (largest - std::abs(2 * origin + size - largest) / cut) / size);
   double factor = std::isfinite(reach) && reach >= 1 ? std::exp2(std::floor(std::log2(reach))) : 1;
   for (auto &v : viewports) {
     v.originX -= (factor - 1) * v.width / 2, v.originY -= (factor - 1) * v.height / 2;

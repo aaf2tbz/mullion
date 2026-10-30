@@ -1493,6 +1493,32 @@ IsIntegerFormat(WMTPixelFormat format) {
   return false;
 }
 
+UIntClearWrite
+GetUIntClearWrite(WMTPixelFormat format) {
+  switch (format) {
+  case WMTPixelFormatR8Unorm:
+  case WMTPixelFormatRG8Unorm:
+  case WMTPixelFormatRGBA8Unorm:
+  case WMTPixelFormatBGRA8Unorm:
+  case WMTPixelFormatR16Unorm:
+  case WMTPixelFormatRG16Unorm:
+  case WMTPixelFormatRGBA16Unorm:
+  case WMTPixelFormatRGB10A2Unorm:
+  case WMTPixelFormatBGR10A2Unorm:
+    return UIntClearWrite::Unorm;
+  case WMTPixelFormatR16Float:
+  case WMTPixelFormatRG16Float:
+  case WMTPixelFormatRGBA16Float:
+    return UIntClearWrite::Half;
+  case WMTPixelFormatR32Float:
+  case WMTPixelFormatRG32Float:
+  case WMTPixelFormatRGBA32Float:
+    return UIntClearWrite::Float;
+  default:
+    return UIntClearWrite::IntegerView;
+  }
+}
+
 bool
 CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed) {
   MTL_DXGI_FORMAT_DESC own, other;

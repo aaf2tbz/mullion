@@ -481,16 +481,19 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
-// a render pass whose samples all lie at the pixel center (WMTRenderPassInfo). one sample lies there already, and
-// Metal takes custom positions only for more
+// a render pass's own sample positions (WMTRenderPassInfo). one sample lies at the center already, and Metal takes
+// custom positions only for more, from the pixel's top left corner
 static void
-center_samples(id descriptor, unsigned count) {
+sample_positions(id descriptor, const struct WMTRenderPassInfo *info) {
+  unsigned count = info->programmed_samples;
   if (count <= 1)
     return;
-  MTLSamplePosition center[count];
+  MTLSamplePosition positions[count];
   for (unsigned i = 0; i < count; i++)
-    center[i] = MTLSamplePositionMake(0.5, 0.5);
-  [descriptor setSamplePositions:center count:count];
+    positions[i] = MTLSamplePositionMake(
+        0.5f + info->sample_positions[i].x / 16.0f, 0.5f + info->sample_positions[i].y / 16.0f
+    );
+  [descriptor setSamplePositions:positions count:count];
 }
 
 static NTSTATUS
@@ -541,7 +544,7 @@ renderCommandEncoder(void *obj, const struct WMTSampleBufferAttachmentInfo *samp
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
 
-  center_samples(descriptor, info->center_samples);
+  sample_positions(descriptor, info);
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
@@ -1589,6 +1592,13 @@ _MTLDevice_supports32BitMSAA(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_supportsShaderBarycentricCoordinates(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle supportsShaderBarycentricCoordinates];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_maxArgumentBufferSamplerCount(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLDevice>)params->handle maxArgumentBufferSamplerCount];
@@ -2301,6 +2311,7 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool conservative;
   bool coarse_shading;
   uint32_t shading_rate_varying;
+  bool quad_lines;
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -2325,6 +2336,7 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA32 {
   bool pipeline_statistics;
   bool clip_distance_varyings;
   bool quad_lines;
+  bool barycentrics;
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
@@ -2350,6 +2362,7 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA32 {
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
+  bool barycentrics;
 };
 
 struct SM50_SHADER_ROOT_SIGNATURE_DATA32 {
@@ -2406,6 +2419,7 @@ sm50_compilation_argument32_convert(
       data->conservative = src->conservative;
       data->coarse_shading = src->coarse_shading;
       data->shading_rate_varying = src->shading_rate_varying;
+      data->quad_lines = src->quad_lines;
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -2448,6 +2462,7 @@ sm50_compilation_argument32_convert(
       data->pipeline_statistics = src->pipeline_statistics;
       data->clip_distance_varyings = src->clip_distance_varyings;
       data->quad_lines = src->quad_lines;
+      data->barycentrics = src->barycentrics;
       data->conservative = src->conservative;
       data->flat_inputs = src->flat_inputs;
       data->noperspective_inputs = src->noperspective_inputs;
@@ -2503,6 +2518,7 @@ sm50_compilation_argument32_convert(
       data->conservative = src->conservative;
       data->flat_inputs = src->flat_inputs;
       data->noperspective_inputs = src->noperspective_inputs;
+      data->barycentrics = src->barycentrics;
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:
@@ -4231,6 +4247,15 @@ _DispatchData_getBytes(void *obj) {
   return STATUS_SUCCESS;
 }
 
+enum {
+  Metal4VertexBinding,
+  Metal4FragmentBinding,
+  Metal4ObjectBinding,
+  Metal4MeshBinding,
+  Metal4ComputeBinding,
+  Metal4BindingStageCount
+};
+
 API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
 @public
   id<MTLDevice> device;
@@ -4259,29 +4284,26 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
   // the sample the open compute encoder's last pass ended with
   obj_handle_t stamp_heap;
   uint64_t stamp_index;
+  // the buffer's encoders share its tables, whose bindings Metal takes at each draw and dispatch (MTL4ArgumentTable);
+  // a render encoder clears the slots below those counts as it ends, so the next starts as a new table does
+  id<MTL4ArgumentTable> tables[Metal4BindingStageCount];
+  unsigned buffers_set[Metal4BindingStageCount], textures_set[Metal4BindingStageCount];
 }
 - (void)closeCompute;
 - (void)fail:(NSError *)error;
 @end
 
-enum {
-  Metal4VertexBinding,
-  Metal4FragmentBinding,
-  Metal4ObjectBinding,
-  Metal4MeshBinding,
-  Metal4ComputeBinding,
-  Metal4BindingStageCount
-};
-
 API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
 @public
   MullionMetal4Buffer *owner;
   id<MTL4CommandEncoder> encoder;
-  id<MTL4ArgumentTable> tables[Metal4BindingStageCount];
+  bool tables_set[Metal4BindingStageCount];
   MTLGPUAddress *bases;
   MTLSize threadgroup;
   struct WMTSampleBufferAttachmentInfo samples;
   bool render;
+  // a compute encoder that updates a fence of its own overlaps other passes: its end leaves the buffer's fence
+  bool overlaps;
 }
 @end
 
@@ -4290,13 +4312,26 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
   [encoder setLabel:label];
 }
 - (void)dealloc {
-  for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
-    [tables[i] release];
   free(bases);
   [encoder release];
   [super dealloc];
 }
 @end
+
+// the queue's allocators that no work holds: a new one costs its command buffer tens of microseconds to make, and its
+// commit as long again before the GPU starts it, where a reset one costs neither
+static NSMutableArray *
+API_AVAILABLE(macos(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
+  static char key;
+  @synchronized(queue) {
+    NSMutableArray *pool = objc_getAssociatedObject(queue, &key);
+    if (!pool) {
+      pool = [NSMutableArray array];
+      objc_setAssociatedObject(queue, &key, pool, OBJC_ASSOCIATION_RETAIN);
+    }
+    return pool;
+  }
+}
 
 @implementation MullionMetal4Buffer
 // a debug group is the command buffer's, so none of its encoders is open
@@ -4320,18 +4355,30 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
   MullionMetal4Encoder *state = compute;
   if (!state)
     return;
-  [state->encoder updateFence:fence afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+  if (!state->overlaps)
+    [state->encoder updateFence:fence
+             afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
   [state->encoder endEncoding];
   compute = nil;
   stamp_heap = 0;
 }
 - (void)dealloc {
   dispatch_release(feedback_ready);
+  for (unsigned i = 0; i < Metal4BindingStageCount; i++)
+    [tables[i] release];
   [objects release];
   [allocations release];
   [residency release];
-  [allocator release];
   [buffer release];
+  // the GPU is done with the commands once the buffer's feedback came, and never had those of one not committed
+  if (allocator && (finished || feedback.status < WMTCommandBufferStatusCommitted)) {
+    [allocator reset];
+    NSMutableArray *pool = metal4_allocators(queue);
+    @synchronized(pool) {
+      [pool addObject:allocator];
+    }
+  }
+  [allocator release];
   [event release];
   [fence release];
   [queue release];
@@ -4365,29 +4412,33 @@ API_AVAILABLE(macos(26.0)) metal4_range(MullionMetal4Buffer *state, obj_handle_t
 
 static id<MTL4ArgumentTable>
 API_AVAILABLE(macos(26.0)) metal4_table(MullionMetal4Encoder *state, unsigned stage) {
-  if (!state->tables[stage]) {
+  MullionMetal4Buffer *owner = state->owner;
+  if (!owner->tables[stage]) {
     MTL4ArgumentTableDescriptor *desc = [[MTL4ArgumentTableDescriptor alloc] init];
-    desc.maxBufferBindCount = state->owner->bindings.buffers;
-    desc.maxTextureBindCount = state->owner->bindings.textures;
-    desc.maxSamplerStateBindCount = state->owner->bindings.samplers;
+    desc.maxBufferBindCount = owner->bindings.buffers;
+    desc.maxTextureBindCount = owner->bindings.textures;
+    desc.maxSamplerStateBindCount = owner->bindings.samplers;
     desc.initializeBindings = YES;
     NSError *error = nil;
-    state->tables[stage] = [state->owner->device newArgumentTableWithDescriptor:desc error:&error];
+    owner->tables[stage] = [owner->device newArgumentTableWithDescriptor:desc error:&error];
     [desc release];
-    if (!state->tables[stage]) {
-      [state->owner fail:error];
+    if (!owner->tables[stage]) {
+      [owner fail:error];
       return nil;
     }
+  }
+  if (!state->tables_set[stage]) {
+    state->tables_set[stage] = true;
     if (state->render) {
       const MTLRenderStages stages[] = {
           MTLRenderStageVertex, MTLRenderStageFragment, MTLRenderStageObject, MTLRenderStageMesh
       };
-      [(id<MTL4RenderCommandEncoder>)state->encoder setArgumentTable:state->tables[stage] atStages:stages[stage]];
+      [(id<MTL4RenderCommandEncoder>)state->encoder setArgumentTable:owner->tables[stage] atStages:stages[stage]];
     } else {
-      [(id<MTL4ComputeCommandEncoder>)state->encoder setArgumentTable:state->tables[stage]];
+      [(id<MTL4ComputeCommandEncoder>)state->encoder setArgumentTable:owner->tables[stage]];
     }
   }
-  return state->tables[stage];
+  return owner->tables[stage];
 }
 
 static void
@@ -4397,6 +4448,7 @@ API_AVAILABLE(macos(26.0)) metal4_buffer(
   MTLGPUAddress base = metal4_address(state->owner, buffer);
   state->bases[stage * state->owner->bindings.buffers + index] = base;
   [metal4_table(state, stage) setAddress:base ? base + offset : 0 atIndex:index];
+  state->owner->buffers_set[stage] = MAX(state->owner->buffers_set[stage], index + 1);
 }
 
 static void
@@ -4437,6 +4489,7 @@ API_AVAILABLE(macos(26.0)) metal4_texture(
 ) {
   metal4_resident(state->owner, (id<MTLTexture>)texture);
   [metal4_table(state, stage) setTexture:[(id<MTLTexture>)texture gpuResourceID] atIndex:index];
+  state->owner->textures_set[stage] = MAX(state->owner->textures_set[stage], index + 1);
 }
 
 static NTSTATUS
@@ -4449,7 +4502,14 @@ _MTL4CommandBuffer_new(void *obj) {
     state->queue = [(id<MTL4CommandQueue>)p->queue retain];
     state->device = [state->queue device];
     state->buffer = [state->device newCommandBuffer];
-    state->allocator = [state->device newCommandAllocator];
+    NSMutableArray *pool = metal4_allocators(state->queue);
+    @synchronized(pool) {
+      state->allocator = [[pool lastObject] retain];
+      if (state->allocator)
+        [pool removeLastObject];
+    }
+    if (!state->allocator)
+      state->allocator = [state->device newCommandAllocator];
     state->fence = [(id<MTLFence>)p->fence retain];
     state->event = [(id<MTLSharedEvent>)p->event retain];
     state->value = p->value;
@@ -4541,7 +4601,7 @@ _MTL4CommandBuffer_encoder(void *obj) {
     if (owner->feedback.error)
       return STATUS_SUCCESS;
     state->bases =
-        calloc(owner->bindings.buffers * (sizeof(state->tables) / sizeof(state->tables[0])), sizeof(MTLGPUAddress));
+        calloc(owner->bindings.buffers * Metal4BindingStageCount, sizeof(MTLGPUAddress));
     if (!state->bases) {
       [owner fail:nil];
       return STATUS_SUCCESS;
@@ -4592,7 +4652,7 @@ _MTL4CommandBuffer_encoder(void *obj) {
       descriptor.renderTargetHeight = info->render_target_height;
       descriptor.renderTargetWidth = info->render_target_width;
       descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
-      center_samples(descriptor, info->center_samples);
+      sample_positions(descriptor, info);
 
       if (info->tile_height && info->tile_width) {
         descriptor.tileWidth = info->tile_width;
@@ -4660,9 +4720,17 @@ _MTL4CommandEncoder_endEncoding(void *obj) {
       }
       state->samples.sample_buffer = 0;
     }
-    if (state->render)
+    if (state->render) {
+      MullionMetal4Buffer *owner = state->owner;
+      for (unsigned stage = 0; stage < Metal4ComputeBinding; stage++) {
+        for (unsigned i = 0; i < owner->buffers_set[stage]; i++)
+          [owner->tables[stage] setAddress:0 atIndex:i];
+        for (unsigned i = 0; i < owner->textures_set[stage]; i++)
+          [owner->tables[stage] setTexture:(MTLResourceID){0} atIndex:i];
+        owner->buffers_set[stage] = owner->textures_set[stage] = 0;
+      }
       [state->encoder endEncoding];
-    else if (!p->arg)
+    } else if (!p->arg)
       [state->owner closeCompute];
   }
   return STATUS_SUCCESS;
@@ -5334,7 +5402,9 @@ API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const str
     }
     case WMTComputeCommandUpdateFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageDispatch];
+      [encoder updateFence:(id<MTLFence>)body->fence
+          afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+      state->overlaps = true;
       break;
     }
     case WMTComputeCommandSetVisibleFunctionTable: {
@@ -5346,7 +5416,9 @@ API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const str
     }
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageDispatch];
+      // the encoder runs blits and acceleration structure builds as well (Metal4CommandBuffer)
+      [encoder waitForFence:(id<MTLFence>)body->fence
+          beforeEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
       break;
     }
     case WMTComputeCommandMemoryBarrier: {
@@ -5857,6 +5929,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_queryTimestampFrequency,
     &_MTL4CommandBuffer_present,
     &_MTL4CommandBuffer_waitForEvent,
+    &_MTLDevice_supportsShaderBarycentricCoordinates,
 };
 
 #ifndef MULLION_NATIVE
@@ -6053,6 +6126,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_queryTimestampFrequency,
     &_MTL4CommandBuffer_present,
     &_MTL4CommandBuffer_waitForEvent,
+    &_MTLDevice_supportsShaderBarycentricCoordinates,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

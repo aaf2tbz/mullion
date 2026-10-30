@@ -260,6 +260,31 @@ IREffect init_input_reg(
   });
 };
 
+IREffect init_input_reg_at_vertex(uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask, bool integer) {
+  return make_effect_bind([=](context ctx) {
+    auto value = ctx.air.CreateGetVertexValue(
+        ctx.function->getArg(with_fnarg_at), integer ? ctx.types._int : ctx.types._float, ctx.builder.getInt32(0)
+    );
+    return store_at_vec4_array_masked(
+        integer ? ctx.resource.input.ptr_int4 : ctx.resource.input.ptr_float4, ctx.builder.getInt32(to_reg), value, mask
+    );
+  });
+}
+
+llvm::Value *
+barycentrics_descriptor::At(llvm::IRBuilder<> &ir, llvm::Value *offset) const {
+  auto along = [&](unsigned i) { return ir.CreateVectorSplat(3, ir.CreateExtractElement(offset, i)); };
+  auto at = offset ? ir.CreateFAdd(center, ir.CreateFAdd(ir.CreateFMul(ddx, along(0)), ir.CreateFMul(ddy, along(1))))
+                   : center;
+  if (!perspective)
+    return at;
+  // perspective-correct coordinates sum to 1, which takes 1/w back out
+  auto sum = ir.CreateFAdd(
+      ir.CreateFAdd(ir.CreateExtractElement(at, uint64_t(0)), ir.CreateExtractElement(at, 1)), ir.CreateExtractElement(at, 2)
+  );
+  return ir.CreateFDiv(at, ir.CreateVectorSplat(3, sum));
+}
+
 IREffect init_input_reg_with_interpolation(
   uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
   air::Interpolation interpolation, uint32_t sampleidx_at
