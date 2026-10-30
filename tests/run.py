@@ -78,18 +78,51 @@ def builtin(pe):
         return file.read(16) == b"Wine builtin DLL"
 
 
+# the directories a Wine keeps its Direct3D-on-Metal libraries in apart from lib/wine, and loads them from in place of
+# those: MetalSharp's lib/mullion and CrossOver's lib/dxmt. a build installed only into lib/wine runs there unseen
+RUNTIMES = ("mullion", "dxmt")
+
+
 def install(wine, prefix, unix, pe):
     windows = prefix / "drive_c" / "windows"
+    runtimes = [wine / "lib" / name for name in RUNTIMES if (wine / "lib" / name).is_dir()]
     for path in pe.values():
         # a 32-bit library's system directory in a 64-bit prefix is syswow64
         wow64 = windows / "syswow64"
         shutil.copy2(path, wow64 if machine(path) == "i386" and wow64.is_dir() else windows / "system32")
         if builtin(path):
             shutil.copy2(path, wine / "lib" / "wine" / f"{machine(path)}-windows")
+            for runtime in runtimes:
+                if (runtime / f"{machine(path)}-windows" / path.name).exists():
+                    shutil.copy2(path, runtime / f"{machine(path)}-windows")
         if path.stem + ".so" in unix:
             # a WoW64 Wine runs a 32-bit library's unix side as the host's, from the one unix directory it has
             own = wine / "lib" / "wine" / f"{machine(path)}-unix"
             shutil.copy2(unix[path.stem + ".so"], own if own.is_dir() else next((wine / "lib" / "wine").glob("*-unix")))
+            for runtime in runtimes:
+                for theirs in runtime.glob(f"*-unix/{path.stem}.so"):
+                    shutil.copy2(unix[path.stem + ".so"], theirs)
+
+
+def clone(wine, to):
+    """a copy of a Wine's installation to install builds into, made again when the Wine changes. macOS lets an arm64
+    Wine run Windows programs only with the 4KB-page entitlement, which a Wine one builds and signs ad hoc cannot have,
+    and honours that entitlement only in the app bundle whose provisioning profile grants it: the copy is of the whole
+    outermost bundle the Wine is in (or of the Wine alone outside one), its binaries kept as they are, with their
+    signatures and entitlements (ditto), so a Wine of another product runs the tests without the runner changing it"""
+    source = wine.resolve()
+    bundle = next((parent for parent in reversed(source.parents) if parent.suffix == ".app"), None)
+    root = bundle or source
+    copy = to / root.name if bundle else to
+    stamp = to / ".mullion-clone"
+    key = f"{source}\n{(source / 'bin' / 'wine').resolve().stat().st_mtime_ns}\n"
+    if not (stamp.exists() and stamp.read_text() == key):
+        if to.exists():
+            shutil.rmtree(to)
+        to.mkdir(parents=True)
+        subprocess.run(["ditto", str(root), str(copy)], check=True)
+        stamp.write_text(key)
+    return copy / source.relative_to(bundle) if bundle else copy
 
 
 # what the library and Metal say when the GPU's work went wrong under a test: a command buffer that failed
@@ -396,11 +429,32 @@ def arguments(parser):
     parser.add_argument("--prefix", type=Path, help="the Wine prefix of the tests (made if missing); default: tests-prefix in the first build")
     parser.add_argument("--validate", action="store_true", help="run under Metal's API and shader validation")
     parser.add_argument("--no-install", action="store_true", help="leave the Wine's libraries as they are")
+    parser.add_argument("--clone", nargs="?", const=True, type=Path,
+                        help="run in a copy of the Wine, made in this directory (default: tests-wine in the first build) "
+                             "and installed into, never the Wine itself: for a signed Wine of another product")
+
+
+def killed(process, binary):
+    """a Wine's setup command that failed, said plainly when macOS ended it"""
+    if process.returncode in (-signal.SIGKILL, 128 + signal.SIGKILL):
+        sys.exit(f"macOS ended {binary} (SIGKILL): an arm64 Wine needs the 4KB-page entitlement, which only a Wine "
+                 "signed with it in its own app bundle has. run in such a Wine; --clone copies one, bundle and all, "
+                 "without changing it (docs/TESTING.md, section 3)")
+    process.check_returncode()
+
+
+def cloned(args):
+    """the Wine the tests run in: --clone's copy of --wine, once made (clone)"""
+    if getattr(args, "clone", None):
+        to = args.clone if isinstance(args.clone, Path) else args.build[0] / "tests-wine"
+        args.wine, args.clone = clone(args.wine, to.resolve()), None
+    return args.wine
 
 
 @contextlib.contextmanager
 def session(args):
     """keep a Wine's installed libraries unchanged until its tests finish, even between GPU turns"""
+    cloned(args)
     wine = args.wine.resolve().stat()
     directory = Path("/tmp") / f"mullion-tests-{os.getuid()}"
     directory.mkdir(mode=0o700, exist_ok=True)
@@ -424,7 +478,7 @@ def as_family(base, family):
 def environment(args):
     """the builds, the Wine's binary and the environment of a test in it, with the builds' libraries installed"""
     builds = [build.resolve() for build in args.build]
-    wine = args.wine.resolve()
+    wine = cloned(args).resolve()
     prefix = (args.prefix or builds[0] / "tests-prefix").resolve()
     unix, pe = libraries(builds)
     base = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG=os.environ.get("WINEDEBUG", "-all"), MULLION_SHADER_CACHE="0")
@@ -446,11 +500,11 @@ def environment(args):
         base.update(VALIDATION)
     binary = wine / "bin" / "wine"
     if not (prefix / "drive_c").exists():
-        subprocess.run([binary, "wineboot", "-u"], env=base, stdin=subprocess.DEVNULL, check=True)
+        killed(subprocess.run([binary, "wineboot", "-u"], env=base, stdin=subprocess.DEVNULL), binary)
     # a display mode a test asks for is Wine's to give (win32u, sysparams.c), never the machine's display's: in every
     # prefix, as one made before the runner set this changes the real display
-    subprocess.run([binary, "reg", "add", r"HKCU\Software\Wine\X11 Driver", "/v", "EmulateModeset", "/d", "Y", "/f"],
-                   env=base, stdin=subprocess.DEVNULL, check=True)
+    killed(subprocess.run([binary, "reg", "add", r"HKCU\Software\Wine\X11 Driver", "/v", "EmulateModeset", "/d", "Y", "/f"],
+                          env=base, stdin=subprocess.DEVNULL), binary)
     if not args.no_install:
         install(wine, prefix, unix, pe)
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
