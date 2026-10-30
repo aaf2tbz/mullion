@@ -2028,10 +2028,23 @@ public:
     if (!PreCopy(hoisted, pDstBuffer, 0, pSrcBuffer, 0))
       return;
 
+    obj_handle_t src = static_cast<MTLD3D12Resource *>(pSrcBuffer)->buffer->current()->buffer();
+    obj_handle_t dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
+    // a copy that goes on where the pass's last command, a copy between the same two buffers, ended in both is that
+    // copy made longer: Metal runs each copy as a blit of its own, and titles upload small blocks one after another
+    // (per-object constants). the buffers differ, so neither part reads what the other writes
+    auto last = reinterpret_cast<wmtcmd_blit_copy_from_buffer_to_buffer *>(
+        static_cast<BlitEncoderData *>(allocator_->encoder_current)->cmd_tail
+    );
+    if (src != dst && last->type == WMTBlitCommandCopyFromBufferToBuffer && last->src == src && last->dst == dst &&
+        last->src_offset + last->copy_length == SrcOffset && last->dst_offset + last->copy_length == DstOffset) {
+      last->copy_length += ByteCount;
+      return;
+    }
     auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
     cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
-    cmd_cp.src = static_cast<MTLD3D12Resource *>(pSrcBuffer)->buffer->current()->buffer();
-    cmd_cp.dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
+    cmd_cp.src = src;
+    cmd_cp.dst = dst;
     cmd_cp.src_offset = SrcOffset;
     cmd_cp.dst_offset = DstOffset;
     cmd_cp.copy_length = ByteCount;
