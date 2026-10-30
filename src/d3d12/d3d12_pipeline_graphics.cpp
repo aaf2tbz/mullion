@@ -237,7 +237,15 @@ ExtractMTLInputLayoutElements(
 
 void
 MTLD3D12PipelineState::DumpShaders(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders) {
-  static const auto dir = env::getEnvVar("MULLION_SHADER_DUMP_PATH");
+  // MULLION_TRACE_SHADER=heavy: into shaders/ next to the trace log
+  static const auto dir = [] {
+    auto given = env::getEnvVar("MULLION_SHADER_DUMP_PATH");
+    if (!given.empty() || !trace::Heavy(trace::Shader) || trace::WindowsDirectory().empty())
+      return given;
+    auto shaders = trace::WindowsDirectory() + "/shaders";
+    env::createDirectory(shaders);
+    return shaders;
+  }();
   if (dir.empty())
     return;
   // a shader shared by many pipelines is written once
@@ -264,7 +272,7 @@ MTLD3D12PipelineState::Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders
     if (Shader.pShaderBytecode)
       name += Sha1HashState::compute(Shader.pShaderBytecode, Shader.BytecodeLength).string() + " ";
   static const bool dump_all = env::getEnvVar("MULLION_SHADER_DUMP_ALL") == "1";
-  if (dump_all || Logger::logLevel() == LogLevel::Trace)
+  if (dump_all || Logger::logLevel() == LogLevel::Trace || trace::Heavy(trace::Shader))
     DumpShaders(Shaders);
 }
 

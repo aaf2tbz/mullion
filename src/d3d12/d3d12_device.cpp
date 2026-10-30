@@ -192,6 +192,21 @@ private:
   MTLD3D12Device *device_;
 };
 
+// MULLION_TRACE_RESOURCE: a line for a resource made, with what it is, how and where it was made and what came of it;
+// 1 has the reserved resources and the failures, heavy every one (MULLION_TRACE_MEMORY has the heaps)
+static HRESULT
+TraceResource(HRESULT hr, const char *how, const D3D12_RESOURCE_DESC *desc, void **resource, const std::string &where) {
+  if (!trace::On(trace::Resource) || !desc ||
+      (SUCCEEDED(hr) && strcmp(how, "reserved") && !trace::Heavy(trace::Resource)))
+    return hr;
+  TRACE_IN(Resource, how, desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? " buffer " : " texture ",
+           desc->Width, "x", desc->Height, "x", desc->DepthOrArraySize, ", dimension ", uint32_t(desc->Dimension),
+           ", format ", uint32_t(desc->Format), ", mips ", desc->MipLevels, ", samples ", desc->SampleDesc.Count,
+           ", layout ", uint32_t(desc->Layout), ", flags ", uint32_t(desc->Flags), where, ": ",
+           SUCCEEDED(hr) && resource ? *resource : nullptr, SUCCEEDED(hr) ? "" : str::format(", failed ", uint32_t(hr)));
+  return hr;
+}
+
 class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DDestructionNotifier, ID3D12DeviceConfiguration1>> {
   bool experimental_shader_models_ = ExperimentalShaderModelsEnabled();
   uint32_t simd_width_ = 0, total_lanes_ = 0;
@@ -1253,12 +1268,14 @@ public:
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-      return CreateCommittedTexture(
-          this, pHeapProps, HeapFlags, pDesc, InitialState, OptimizedClearValue, riid, ppResource
+      return TraceResource(
+          CreateCommittedTexture(this, pHeapProps, HeapFlags, pDesc, InitialState, OptimizedClearValue, riid, ppResource),
+          "committed", pDesc, ppResource, str::format(", heap type ", uint32_t(pHeapProps->Type))
       );
     case D3D12_RESOURCE_DIMENSION_BUFFER:
-      return CreateCommittedBuffer(
-          this, pHeapProps, HeapFlags, pDesc, InitialState, OptimizedClearValue, riid, ppResource
+      return TraceResource(
+          CreateCommittedBuffer(this, pHeapProps, HeapFlags, pDesc, InitialState, OptimizedClearValue, riid, ppResource),
+          "committed", pDesc, ppResource, str::format(", heap type ", uint32_t(pHeapProps->Type))
       );
     default:
       break;
@@ -1272,7 +1289,11 @@ public:
     hr = ValidateHeapProperties(&pDesc->Properties, pDesc->Flags, advertise_numa_);
     if (FAILED(hr))
       return hr;
-    return mullion::CreateHeap(this, pDesc, riid, ppHeap);
+    hr = mullion::CreateHeap(this, pDesc, riid, ppHeap);
+    TRACE_IN(Memory, "heap of ", pDesc->SizeInBytes >> 10, " KB, type ", uint32_t(pDesc->Properties.Type), ", flags ",
+             uint32_t(pDesc->Flags), ": ", SUCCEEDED(hr) && ppHeap ? *ppHeap : nullptr,
+             SUCCEEDED(hr) ? "" : str::format(", failed ", uint32_t(hr)));
+    return hr;
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1308,9 +1329,15 @@ public:
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-      return CreatePlacedTexture(this, d3d12heap, Offset, pDesc, InitialState, OptimizedClearValue, riid, ppResource);
+      return TraceResource(
+          CreatePlacedTexture(this, d3d12heap, Offset, pDesc, InitialState, OptimizedClearValue, riid, ppResource),
+          "placed", pDesc, ppResource, str::format(", heap ", pHeap, " at ", Offset)
+      );
     case D3D12_RESOURCE_DIMENSION_BUFFER:
-      return CreatePlacedBuffer(this, d3d12heap, Offset, pDesc, InitialState, OptimizedClearValue, riid, ppResource);
+      return TraceResource(
+          CreatePlacedBuffer(this, d3d12heap, Offset, pDesc, InitialState, OptimizedClearValue, riid, ppResource),
+          "placed", pDesc, ppResource, str::format(", heap ", pHeap, " at ", Offset)
+      );
     default:
       break;
     }
@@ -1334,9 +1361,10 @@ public:
       return hr;
     if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && OptimizedClearValue)
       return FAIL(E_INVALIDARG);
-    return pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
-               ? CreateReservedBuffer(this, pDesc, riid, resource)
-               : CreateReservedTexture(this, pDesc, InitialState, riid, resource);
+    return TraceResource(pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                             ? CreateReservedBuffer(this, pDesc, riid, resource)
+                             : CreateReservedTexture(this, pDesc, InitialState, riid, resource),
+                         "reserved", pDesc, resource, "");
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1403,7 +1431,7 @@ public:
         return;
       pending.swap(fences.values);
     }
-    FLIGHT("device %p is removed: %#llx", this, uint64_t(uint32_t(Reason)));
+    FLIGHT_IN(Gpu, "device %p is removed: %#llx", this, uint64_t(uint32_t(Reason)));
     WMTFlightDump("a removed device");
     // RemoveDevice signals all fences to UINT64_MAX; late queue signals must not take them back.
     for (auto &fence : pending)
@@ -2074,7 +2102,7 @@ public:
 
   bool
   NamesPasses() {
-    static const bool names = diag::errors || diag::profile;
+    static const bool names = diag::errors || diag::profile || trace::Heavy(trace::Pass);
     return names;
   }
 
@@ -2111,9 +2139,14 @@ public:
   void
   PipelineMade(const std::string &name, const char *kind, std::chrono::steady_clock::time_point start) {
     auto end = std::chrono::steady_clock::now(), present = first_present.load();
-    if (present == std::chrono::steady_clock::time_point() || end < present)
-      return;
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
+    bool late = present != std::chrono::steady_clock::time_point() && end >= present;
+    // MULLION_TRACE_SHADER: 1 has the pipelines that take 20 ms or more or are made after the first present (a
+    // stutter), heavy every one
+    if (late || ms >= 20 || trace::Heavy(trace::Shader))
+      TRACE_IN(Shader, kind, " pipeline ", name, ": ", ms, " ms", late ? ", after the first present" : "");
+    if (!late)
+      return;
     std::lock_guard<mullion::mutex> lock(pass_names_lock_);
     late_pipelines_++;
     pipeline_ms_ += ms;
