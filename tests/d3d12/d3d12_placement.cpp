@@ -171,6 +171,60 @@ int main(int, char **) {
         place(desc, props, props.Type == D3D12_HEAP_TYPE_DEFAULT || !usage,
               D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
       }
+  // a texture whose most-detailed mip of one slice D3D12 estimates at 64KB or less may ask for 4KB alignment, whatever
+  // its real size: "applications can create smaller aligned resources when the estimated size of the most-detailed
+  // mip level is a total of the larger alignment restriction or less" (D3D12_RESOURCE_DESC, Alignment). the estimate
+  // is width times height in elements (blocks for a compressed format) times their bytes, the depth or array size left
+  // out: "Windows uses the slice size to determine small alignment eligibility. DepthOrArraySize is ignored"
+  // (vkd3d-proton, libs/vkd3d/resource.c, d3d12_resource_supports_small_resource_alignment). each eligible case is
+  // given its size and an alignment of 4KB or 64KB ("Alignment may be one of 0, 4KB, 64KB, or 4MB"), and is placed and
+  // committed there; each case one element past it is refused. Starfield's 320x180 R8_TYPELESS with unordered access
+  // asks for it (dttdrv/mullion#32)
+  const struct {
+    D3D12_RESOURCE_DIMENSION dimension;
+    DXGI_FORMAT format;
+    UINT64 width;
+    UINT height;
+    UINT16 depth;
+    D3D12_RESOURCE_FLAGS flags;
+    bool eligible;
+  } small_cases[] = {
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8_TYPELESS, 320, 180, 1,
+       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8_UNORM, 256, 256, 1, D3D12_RESOURCE_FLAG_NONE, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8_UNORM, 257, 256, 1, D3D12_RESOURCE_FLAG_NONE, false},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8_UNORM, 4, 4096, 1, D3D12_RESOURCE_FLAG_NONE, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_BC1_UNORM, 512, 256, 1, D3D12_RESOURCE_FLAG_NONE, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_BC1_UNORM, 516, 256, 1, D3D12_RESOURCE_FLAG_NONE, false},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32G32B32A32_FLOAT, 64, 64, 1, D3D12_RESOURCE_FLAG_NONE, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32G32B32A32_FLOAT, 65, 64, 1, D3D12_RESOURCE_FLAG_NONE, false},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE3D, DXGI_FORMAT_R8_UNORM, 64, 64, 64, D3D12_RESOURCE_FLAG_NONE, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE1D, DXGI_FORMAT_R32_FLOAT, 16384, 1, 1, D3D12_RESOURCE_FLAG_NONE, true},
+      {D3D12_RESOURCE_DIMENSION_TEXTURE1D, DXGI_FORMAT_R32_FLOAT, 16385, 1, 1, D3D12_RESOURCE_FLAG_NONE, false},
+  };
+  for (auto &c : small_cases) {
+    step("4KB alignment: dimension %u, format %u, %llux%ux%u", c.dimension, c.format, c.width, c.height, c.depth);
+    D3D12_RESOURCE_DESC small{c.dimension, D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, c.width, c.height, c.depth, 1,
+                              c.format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, c.flags};
+    auto info = device->GetResourceAllocationInfo(0, 1, &small);
+    ComPtr<ID3D12Resource> committed;
+    HRESULT hr = device->CreateCommittedResource(&device_local, D3D12_HEAP_FLAG_NONE, &small, state(device_local),
+                                                 nullptr, IID_PPV_ARGS(&committed));
+    if (!c.eligible) {
+      expect(info.SizeInBytes == std::numeric_limits<UINT64>::max() && hr == E_INVALIDARG,
+             "an ineligible 4KB alignment gives %llu bytes and %08lx", info.SizeInBytes, hr);
+      continue;
+    }
+    if (!expect(info.SizeInBytes != std::numeric_limits<UINT64>::max() &&
+                    (info.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT ||
+                     info.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) &&
+                    hr == S_OK,
+                "an eligible 4KB alignment gives %llu bytes at alignment %llu, and %08lx", info.SizeInBytes,
+                info.Alignment, hr))
+      continue;
+    UINT64 slot = (info.SizeInBytes + info.Alignment - 1) / info.Alignment * info.Alignment;
+    place_in(device_local, slot + info.SizeInBytes, info.Alignment, {{&small, 0}, {&small, slot}});
+  }
   // a heap's size need not be a multiple of its alignment: "non-aligned SizeInBytes is also supported, for
   // convenience" (D3D12_HEAP_DESC), so the heap is its size rounded up to it. "HeapOffset plus the resource size must
   // be smaller than or equal to the heap size" (ID3D12Device::CreatePlacedResource), and a buffer's size is its width:
