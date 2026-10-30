@@ -856,6 +856,29 @@ static std::vector<Scene> base_scenes()
             }
             extras.add("record_us_per_barrier", (qpc_ms() - t) * 1000.0 / 1000);
         } },
+        // Starfield's pattern (dttdrv/mullion#32): ~300 aliasing barriers naming no resource a frame, while a reserved
+        // buffer exists. a translation that drains the GPU at each runs at a few frames a second
+        { "alias_barriers", "300 aliasing barriers (no resources named) between draws, with a reserved buffer alive", [] {
+            flat = create_pso({});
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = 1 << 20;
+            desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            static ID3D12Resource *reserved;
+            if (FAILED(p.device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&reserved))))
+                fprintf(stderr, "alias_barriers: no reserved buffer\n");
+        }, [](UINT f) {
+            set_quad_state(p.list, flat);
+            for (UINT i = 0; i < 300; i++)
+            {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+                p.list->ResourceBarrier(1, &b);
+                small_quad(p.list, i, f * 0.01f);
+            }
+        } },
         { "upload_buffer", "4 MiB written to an upload heap and copied to a default buffer per frame", [] {
             flat = create_pso({});
             buffers_default = create_buffer(4 << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);

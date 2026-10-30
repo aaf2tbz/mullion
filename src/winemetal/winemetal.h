@@ -2481,7 +2481,7 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixMetal4NewBuffer, WMTUnixMetal4Encoder,
        WMTUnixMetal4Commands, WMTUnixMetal4EndEncoder, WMTUnixMetal4Commit, WMTUnixMetal4Feedback, WMTUnixMetal4Wait,
        WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
-       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixCallCount };
+       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
@@ -2563,5 +2563,8 @@ WINEMETAL_API uint64_t MTLDevice_queryTimestampFrequency(obj_handle_t device);
 WINEMETAL_API void MTL4CommandBuffer_present(obj_handle_t buffer, obj_handle_t drawable, double after);
 
 WINEMETAL_API void MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value);
+// the buffer's next encoder begins with a barrier, against all the queue's work before it, that makes memory reached
+// through aliased addresses consistent: a reserved buffer's tiles and a placed resource over the same heap memory
+WINEMETAL_API void MTL4CommandBuffer_orderAliases(obj_handle_t buffer);
 
 #endif

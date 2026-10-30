@@ -1979,3 +1979,9 @@ MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t
   struct unixcall_mtl4_event p = {.queue = buffer, .event = event, .value = value};
   UNIX_CALL(WMTUnixMetal4WaitEvent, &p);
 }
+
+WINEMETAL_API void
+MTL4CommandBuffer_orderAliases(obj_handle_t buffer) {
+  struct unixcall_generic_obj_noret p = {.handle = buffer};
+  UNIX_CALL(WMTUnixMetal4OrderAliases, &p);
+}
