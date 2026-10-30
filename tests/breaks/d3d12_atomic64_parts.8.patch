@@ -1,0 +1,13 @@
+# a lane that leaves its lock word to the round's first lane never takes it, and its 64-bit atomic is lost
+# family native
+--- a/src/airconv/dxil_converter.cpp
++++ b/src/airconv/dxil_converter.cpp
+@@ -2224,7 +2224,7 @@
+     incoming(given_up, ir.getFalse(), PoisonValue::get(ir.getInt64Ty()), spins, last);
+     // still waiting: a lane that lost this round, one that left its word to the first, and one with nothing to do
+     incoming(waiting, ir.getTrue(), old, spun, seen);
+-    incoming(deferred, ir.getTrue(), old, spins, last);
++    incoming(deferred, ir.getFalse(), old, spins, last);
+     incoming(attempt, pending, old, spins, last);
+     pending->addIncoming(still, next);
+     old->addIncoming(got, next);
