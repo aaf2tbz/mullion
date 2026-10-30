@@ -52,14 +52,14 @@ ThreadId() {
 // winemetal.dll is already loaded wherever Mullion is (every Mullion DLL imports it): the first check may come while a
 // DLL initializes, where loading one is not safe
 void
-Send(const std::string &lines) {
+Send(const std::string &lines, const Mask &mask) {
 #ifdef _WIN32
-  using WriteFunction = bool (*)(const char *, uint64_t);
+  using WriteFunction = bool (*)(const char *, uint64_t, bool, bool);
   static const WriteFunction write = [] {
     HMODULE winemetal = GetModuleHandleA("winemetal.dll");
     return winemetal ? reinterpret_cast<WriteFunction>(GetProcAddress(winemetal, "WMTTraceWrite")) : nullptr;
   }();
-  if (write && write(lines.data(), lines.size()))
+  if (write && write(lines.data(), lines.size(), mask.heavy & Gpu, mask.on & Memory))
     return;
 #endif
   std::cerr << lines;
@@ -96,7 +96,7 @@ Get() {
     }
     // the log opens with the first check of a process that traces, before the device and its queues are made
     if (read.on)
-      Send(str::format("[trace] ", env::getExeBaseName(), ": ", on, '\n'));
+      Send(str::format("[trace] ", env::getExeBaseName(), ": ", on, '\n'), read);
     return read;
   }();
   return mask;
@@ -140,12 +140,12 @@ Write(Category category, const std::string &message) {
   std::stringstream stream(message);
   for (std::string line; std::getline(stream, line, '\n');)
     lines += prefix + line + '\n';
-  Send(lines);
+  Send(lines, Get());
 }
 
 void
 WriteLine(const std::string &line) {
-  Send(line.empty() || line.back() != '\n' ? line + '\n' : line);
+  Send(line.empty() || line.back() != '\n' ? line + '\n' : line, Get());
 }
 
 void

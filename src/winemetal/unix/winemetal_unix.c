@@ -93,33 +93,13 @@ _NSArray_count(void *obj) {
   return STATUS_SUCCESS;
 }
 
-// MULLION_TRACE_<CATEGORY>: whether `name` (upper case) is on, and with `heavy` whether it is heavy, as the process's
-// trace log opened with them (_WMTTraceWrite, name=value) or as the environment has them
-static const char *trace_categories;
+// MULLION_D3D12_GPU_ERRORS, or MULLION_TRACE_GPU=heavy as the process's trace calls say (_WMTTraceWrite): the error of
+// a command buffer the GPU failed lists its encoders and what became of each
+static bool encoder_errors;
 
-static bool
-trace_category(const char *name, bool heavy) {
-  const char *value = NULL;
-  char variable[32], given[16];
-  if (trace_categories) {
-    size_t length = strlen(name);
-    for (const char *at = trace_categories; at && *at;) {
-      if (!strncmp(at, name, length) && at[length] == '=') {
-        size_t end = strcspn(at + length + 1, ",");
-        snprintf(given, sizeof(given), "%.*s", (int)end, at + length + 1);
-        value = given;
-        break;
-      }
-      at = strchr(at, ',');
-      at = at ? at + 1 : NULL;
-    }
-  } else {
-    snprintf(variable, sizeof(variable), "MULLION_TRACE_%s", name);
-    value = getenv(variable);
-  }
-  if (!value || !*value || !strcmp(value, "0") || !strcasecmp(value, "off"))
-    return false;
-  return !heavy || !strcasecmp(value, "heavy");
+__attribute__((constructor)) static void
+init_encoder_errors(void) {
+  encoder_errors = getenv("MULLION_D3D12_GPU_ERRORS") || getenv("DXMT_D3D12_GPU_ERRORS");
 }
 
 static NTSTATUS
@@ -176,9 +156,7 @@ _NSAutoreleasePool_alloc_init(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_commandBuffer(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  // MULLION_D3D12_GPU_ERRORS or MULLION_TRACE_GPU=heavy: the error of a command buffer the GPU failed lists its
-  // encoders and what became of each
-  if (getenv("MULLION_D3D12_GPU_ERRORS") ?: getenv("DXMT_D3D12_GPU_ERRORS") ?: (trace_category("GPU", true) ? "1" : NULL)) {
+  if (__atomic_load_n(&encoder_errors, __ATOMIC_RELAXED)) {
     MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
     descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
     params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBufferWithDescriptor:descriptor];
@@ -4224,8 +4202,6 @@ _WMTTraceWrite(void *obj) {
       opened = true;
       trace_started = mach_absolute_time();
       const char *given = params->directory.ptr, *executable = params->executable.ptr;
-      const char *categories = params->categories.ptr;
-      trace_categories = strdup(categories);
       NSString *directory =
           *given ? [NSString stringWithUTF8String:given]
                  : [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Mullion"]
@@ -4243,19 +4219,20 @@ _WMTTraceWrite(void *obj) {
         NSString *date = [NSDateFormatter localizedStringFromDate:[NSDate date]
                                                         dateStyle:NSDateFormatterShortStyle
                                                         timeStyle:NSDateFormatterMediumStyle];
-        fprintf(trace_file, "Mullion trace %s, process %d, %s, categories %s\n", date.UTF8String, getpid(),
-                executable, categories);
+        fprintf(trace_file, "Mullion trace %s, process %d, %s\n", date.UTF8String, getpid(), executable);
         fflush(trace_file);
         pthread_t flusher;
         if (!pthread_create(&flusher, NULL, trace_flusher, NULL))
           pthread_detach(flusher);
-        if (trace_category("MEMORY", false)) {
+        if (params->memory_samples) {
           pthread_t sampler;
           if (!pthread_create(&sampler, NULL, trace_memory_sampler, NULL))
             pthread_detach(sampler);
         }
       }
     }
+    if (params->encoder_errors)
+      __atomic_store_n(&encoder_errors, true, __ATOMIC_RELAXED);
     if (trace_file && params->lines.ptr)
       trace_lines(params->lines.ptr, params->length);
     params->ret = trace_file != NULL;

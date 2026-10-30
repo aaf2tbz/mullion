@@ -4,7 +4,6 @@
 #define WINEMETAL_API
 #endif
 
-#include <stdio.h>
 #include "winemetal_thunks.h"
 #include <wineunixlib.h>
 #include "assert.h"
@@ -1834,25 +1833,13 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
 }
 
 WINEMETAL_API bool
-WMTTraceWrite(const char *lines, uint64_t length) {
-  static char directory[MAX_PATH], executable[3 * MAX_PATH], categories[256];
+WMTTraceWrite(const char *lines, uint64_t length, bool encoder_errors, bool memory_samples) {
+  static char directory[MAX_PATH], executable[3 * MAX_PATH];
   static INIT_ONCE named = INIT_ONCE_STATIC_INIT;
   BOOL pending;
   if (InitOnceBeginInitialize(&named, 0, &pending, NULL) && pending) {
     if (GetEnvironmentVariableA("MULLION_TRACE_DIR", directory, sizeof(directory)) >= sizeof(directory))
       directory[0] = 0;
-    // MULLION_TRACE_<CATEGORY> as the bridge reads them: name=value, comma-separated
-    static const char *const names[] = {"SHADER", "PRESENT", "MEMORY", "RESOURCE", "SYNC", "GPU", "CPU", "API", "PASS"};
-    for (unsigned i = 0, used = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-      char variable[32], value[16];
-      snprintf(variable, sizeof(variable), "MULLION_TRACE_%s", names[i]);
-      DWORD length = GetEnvironmentVariableA(variable, value, sizeof(value));
-      if (!length || length >= sizeof(value))
-        continue;
-      int written = snprintf(categories + used, sizeof(categories) - used, "%s%s=%s", used ? "," : "", names[i], value);
-      if (written > 0 && used + written < sizeof(categories))
-        used += written;
-    }
     WCHAR path[MAX_PATH];
     DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
     WCHAR *name = path + length;
@@ -1864,9 +1851,10 @@ WMTTraceWrite(const char *lines, uint64_t length) {
   struct unixcall_wmttrace_write params;
   WMT_MEMPTR_SET(params.directory, directory);
   WMT_MEMPTR_SET(params.executable, executable);
-  WMT_MEMPTR_SET(params.categories, categories);
   WMT_MEMPTR_SET(params.lines, lines);
   params.length = length;
+  params.encoder_errors = encoder_errors;
+  params.memory_samples = memory_samples;
   params.ret = 0;
   UNIX_CALL(WMTUnixTraceWrite, &params);
   return params.ret;
