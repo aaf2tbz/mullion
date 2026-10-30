@@ -1281,7 +1281,7 @@ public:
                                viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
         }
         *(float *)scale =
-            EnlargeViewports({metal_viewport, count}, D3D12_VIEWPORT_BOUNDS_MIN, D3D12_VIEWPORT_BOUNDS_MAX);
+            EnlargeViewports({metal_viewport, count}, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
         auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
         cmd.type = WMTRenderCommandSetViewports;
         cmd.viewports.set(metal_viewport);

@@ -5874,7 +5874,7 @@ public:
         viewports[i] = {d3dViewport.TopLeftX, d3dViewport.TopLeftY, d3dViewport.Width,
                         d3dViewport.Height,   d3dViewport.MinDepth, d3dViewport.MaxDepth};
       }
-      scale = EnlargeViewports(viewports.span(), D3D11_VIEWPORT_BOUNDS_MIN, D3D11_VIEWPORT_BOUNDS_MAX);
+      scale = EnlargeViewports(viewports.span(), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
       pass_viewports_ += viewport_count;
       EmitST([viewports = std::move(viewports)](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
