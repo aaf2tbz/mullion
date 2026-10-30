@@ -532,7 +532,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         for (auto &allocator : inflight.allocators)
           if (allocator)
             allocator->pending--;
+        if (inflight.semaphore)
+          ReleaseSemaphore(inflight.semaphore, 1, nullptr);
         inflight = {};
+        retired_.Reach(internal_seq);
         inflight_cmdbuf_count_.fetch_sub(1, std::memory_order_release);
         inflight_cmdbuf_count_.notify_one();
         internal_seq++;
