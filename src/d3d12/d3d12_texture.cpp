@@ -748,8 +748,11 @@ public:
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
     if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format))) {
+      WARN("CreateUnorderedAccessView: format ", ViewDesc.Format, ", dimension ", ViewDesc.ViewDimension,
+           " of a texture of format ", desc_.Format, ", flags ", desc_.Flags);
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
+    }
 
     view_descriptor.format = metal_format.PixelFormat;
 

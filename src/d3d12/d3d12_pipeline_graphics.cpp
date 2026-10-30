@@ -986,8 +986,10 @@ public:
                                    ? pDesc->RasterizerState.ForcedSampleCount
                                    : std::max(pDesc->SampleDesc.Count, 1u);
     // refused before its shaders are compiled for a pipeline Metal would refuse
-    if (!device_->GetMTLDevice().supportsTextureSampleCount(info.raster_sample_count))
+    if (!device_->GetMTLDevice().supportsTextureSampleCount(info.raster_sample_count)) {
+      WARN("InitializePSO: ", info.raster_sample_count, " samples, which this GPU does not rasterize");
       return FAIL(E_INVALIDARG);
+    }
     // Metal refuses a mesh pipeline that asks for indirect command buffers on GPUs before Apple9, where mesh draws
     // never go in them (d3d12_command_allocator.cpp)
     info.support_indirect_command_buffers = std::is_same_v<RenderPipelineInfo, WMTRenderPipelineInfo> ||
