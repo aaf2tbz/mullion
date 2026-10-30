@@ -9,7 +9,7 @@
 // every format, dimension, usage, sample count, array size, layout, and a small and a large size; the large size is
 // past a 64KB tile in every format, and neither is a power of two. each texture goes also in one heap the size
 // GetResourceAllocationInfo1 gives it after a texture of one block, at the offset it gives. buffers go in every heap
-// type, below, at and past 64KB.
+// type, below, at and past 64KB, and a page's buffer in heaps whose size is not a multiple of 64KB.
 #include "d3d12_test.hpp"
 #include <limits>
 
@@ -171,5 +171,26 @@ int main(int, char **) {
         place(desc, props, props.Type == D3D12_HEAP_TYPE_DEFAULT || !usage,
               D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
       }
+  // a heap's size need not be a multiple of its alignment: "non-aligned SizeInBytes is also supported, for
+  // convenience" (D3D12_HEAP_DESC), so the heap is its size rounded up to it. "HeapOffset plus the resource size must
+  // be smaller than or equal to the heap size" (ID3D12Device::CreatePlacedResource), and a buffer's size is its width:
+  // a buffer of one page fills the start of a heap of one page, and the start of the second 64KB of a heap one page
+  // past 64KB (dttdrv/mullion#32)
+  // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createplacedresource
+  for (const auto &props : buffer_heaps) {
+    step("buffer of a page in a heap of a page, heap type %u, page %u", props.Type, props.CPUPageProperty);
+    D3D12_RESOURCE_DESC page{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    place_in(props, page.Width, 0, {{&page, 0}});
+    step("buffers of a page in a heap of 64KB and a page, heap type %u, page %u", props.Type, props.CPUPageProperty);
+    place_in(props, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT + page.Width, 0,
+             {{&page, 0}, {&page, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT}});
+    // a size that is no multiple of a page fills a heap of its own size
+    step("buffer of a page and four bytes in a heap of that size, heap type %u, page %u", props.Type,
+         props.CPUPageProperty);
+    D3D12_RESOURCE_DESC odd = page;
+    odd.Width += 4;
+    place_in(props, odd.Width, 0, {{&odd, 0}});
+  }
   return verdict();
 }
