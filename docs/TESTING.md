@@ -57,6 +57,11 @@ binaries' signatures, and installs the build into the copy (in `tests-wine` of t
 `--clone` names). A Wine that keeps its Direct3D libraries apart from `lib/wine` (MetalSharp's
 `lib/mullion`, CrossOver's `lib/dxmt`) has the build installed there too, since it loads them from there.
 
+What needs no such Wine still runs without one. An x86_64 Wine runs under Rosetta with no entitlement, and runs an
+x86_64 build's tests (`build-win64.txt`). A test program of an architecture the Wine does not run (an arm64 build's in
+an x86_64 Wine, x86_64 programs in an arm64 Wine without FEX) is not run, and the tests of the host's own still run when
+macOS ends the Wine: the run lists each test it did not run, with why, apart from its results.
+
 A run records what it actually loaded, so a result can be traced to the source that produced it: {suite: loaded artifact
 manifest}. The record covers the source revision and any local changes, the build options, the Wine version, and for
 each test executable, library and shader compiler loaded, its resolved path, its content hash and the build that

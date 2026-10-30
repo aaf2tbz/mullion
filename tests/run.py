@@ -86,7 +86,11 @@ RUNTIMES = ("mullion", "dxmt")
 def install(wine, prefix, unix, pe):
     windows = prefix / "drive_c" / "windows"
     runtimes = [wine / "lib" / name for name in RUNTIMES if (wine / "lib" / name).is_dir()]
+    # a library of an architecture the Wine runs no programs of has nowhere to go (an arm64 build in an x86_64 Wine)
+    runs = machines(wine / "bin" / "wine")
     for path in pe.values():
+        if machine(path) not in runs:
+            continue
         # a 32-bit library's system directory in a 64-bit prefix is syswow64
         wow64 = windows / "syswow64"
         shutil.copy2(path, wow64 if machine(path) == "i386" and wow64.is_dir() else windows / "system32")
@@ -434,13 +438,34 @@ def arguments(parser):
                              "and installed into, never the Wine itself: for a signed Wine of another product")
 
 
+class Unusable(Exception):
+    """a Wine that cannot run Windows programs here"""
+
+
 def killed(process, binary):
     """a Wine's setup command that failed, said plainly when macOS ended it"""
     if process.returncode in (-signal.SIGKILL, 128 + signal.SIGKILL):
-        sys.exit(f"macOS ended {binary} (SIGKILL): an arm64 Wine needs the 4KB-page entitlement, which only a Wine "
-                 "signed with it in its own app bundle has. run in such a Wine; --clone copies one, bundle and all, "
-                 "without changing it (docs/TESTING.md, section 3)")
+        raise Unusable(f"macOS ended {binary} (SIGKILL): an arm64 Wine needs the 4KB-page entitlement, which only a "
+                       "Wine signed with it in its own app bundle has. an x86_64 Wine (Rosetta) needs none, and "
+                       "--clone runs in a copy of a signed Wine, bundle and all (docs/TESTING.md, section 3)")
     process.check_returncode()
+
+
+def machines(binary):
+    """the architectures of Windows programs a Wine runs: its own, and with an arm64 Wine x86_64 and i386 programs
+    when it has FEX (xtajit64.dll, and xtajit.dll in a WoW64 Wine) to emulate them"""
+    if binary is None:
+        return set()
+    lib = binary.resolve().parent.parent / "lib" / "wine"
+    own = {path.name.split("-")[0] for path in lib.glob("*-windows")}
+    if "aarch64" in own:
+        if not (lib / "aarch64-windows" / "xtajit64.dll").exists():
+            own.discard("x86_64")
+        else:
+            own.add("x86_64")
+        if not ((lib / "aarch64-windows" / "xtajit.dll").exists() or (lib / "i386-windows" / "xtajit.dll").exists()):
+            own.discard("i386")
+    return own
 
 
 def cloned(args):
@@ -499,12 +524,17 @@ def environment(args):
     if args.validate:
         base.update(VALIDATION)
     binary = wine / "bin" / "wine"
-    if not (prefix / "drive_c").exists():
-        killed(subprocess.run([binary, "wineboot", "-u"], env=base, stdin=subprocess.DEVNULL), binary)
-    # a display mode a test asks for is Wine's to give (win32u, sysparams.c), never the machine's display's: in every
-    # prefix, as one made before the runner set this changes the real display
-    killed(subprocess.run([binary, "reg", "add", r"HKCU\Software\Wine\X11 Driver", "/v", "EmulateModeset", "/d", "Y", "/f"],
-                          env=base, stdin=subprocess.DEVNULL), binary)
+    # a Wine macOS will not run runs no test of Windows: the host's own tests still run
+    try:
+        if not (prefix / "drive_c").exists():
+            killed(subprocess.run([binary, "wineboot", "-u"], env=base, stdin=subprocess.DEVNULL), binary)
+        # a display mode a test asks for is Wine's to give (win32u, sysparams.c), never the machine's display's: in
+        # every prefix, as one made before the runner set this changes the real display
+        killed(subprocess.run([binary, "reg", "add", r"HKCU\Software\Wine\X11 Driver", "/v", "EmulateModeset", "/d", "Y",
+                               "/f"], env=base, stdin=subprocess.DEVNULL), binary)
+    except Unusable as reason:
+        print(f"{reason}\n", flush=True)
+        return builds, None, base
     if not args.no_install:
         install(wine, prefix, unix, pe)
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
@@ -601,6 +631,17 @@ def own(args, tests, builds, binary, base):
     families = args.family.split(",")
     verdicts, said_by = {}, {}
     printing = threading.Lock()
+    # a test program of an architecture the Wine does not run is not run, and said so: a run without a Wine that can
+    # run arm64 programs (one macOS ends, or an x86_64 Wine) still runs every test that needs none
+    runs = machines(binary)
+    not_run = {}
+    for test in tests:
+        if test["cmd"][0].endswith(".exe"):
+            kind = machine(Path(test["cmd"][0]))
+            if kind not in runs:
+                not_run[test["name"]] = (f"the Wine runs no {kind} programs" if binary is not None
+                                         else "no Wine runs here")
+    tests = [test for test in tests if test["name"] not in not_run]
 
     def one(family, test, again=False):
         env = as_family(base, family)
@@ -651,12 +692,16 @@ def own(args, tests, builds, binary, base):
         if alone_only:
             print("\npassed alone after failing beside others: " + ", ".join(alone_only), flush=True)
 
-    width = max(len(test["name"]) for test in tests)
+    width = max((len(test["name"]) for test in tests), default=0)
     column = max(len(family) for family in families + ["skipped"])
     print("\n" + " " * width + "".join(f"  {family:>{column}}" for family in families))
     for test in tests:
         print(f"{test['name']:{width}}" + "".join(f"  {verdicts.get((test['name'], family), '-'):>{column}}" for family in families))
     counts = {word: sum(verdict == word for verdict in verdicts.values()) for word in ("passed", "failed", "skipped")}
+    if not_run:
+        reasons = sorted(set(not_run.values()))
+        print(f"\n{len(not_run)} tests not run: " + "; ".join(
+            f"{reason} ({sum(why == reason for why in not_run.values())})" for reason in reasons), flush=True)
     print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; logs in {logs}")
 
     chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
