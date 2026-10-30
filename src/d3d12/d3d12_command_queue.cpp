@@ -1622,10 +1622,12 @@ public:
   };
 
   // encodes a pass of draws, copies, dispatches or a resolve into `cmdbuf`: it needs nothing of the queue's but its
-  // fences (`sync`), so the encoding threads run it too (EncodeParallel). false when the device is lost
+  // fences (`sync`), so the encoding threads run it too (EncodeParallel). `attachment` is the caller's: a Metal 4 pass
+  // may start with the sample the pass before it ended with, which the bridge writes into it. false when the device
+  // is lost
   bool
   EncodePass(
-      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo attachment,
+      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo &attachment,
       WMT::Buffer sparse_mappings, InflightCommandBuffer &inflight, const GPUListRecords *records, const PassSync &sync
   ) {
     auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
@@ -1936,8 +1938,9 @@ public:
     std::atomic<bool> lost = false;
     auto part = [&](unsigned k) {
       InflightCommandBuffer unused;
+      WMTSampleBufferAttachmentInfo unsampled{};
       for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++)
-        if (!EncodePass(buffers[k], passes[i].first, {}, sparse_mappings, unused, nullptr, syncs[i]))
+        if (!EncodePass(buffers[k], passes[i].first, unsampled, sparse_mappings, unused, nullptr, syncs[i]))
           lost = true;
     };
     {
