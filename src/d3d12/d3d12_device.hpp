@@ -638,6 +638,8 @@ public:
       BufferAllocation *src, BufferAllocation *dst, const std::vector<WMTSparseBufferMappingCopy> &ranges
   ) = 0;
   virtual std::vector<uint64_t> SparseBufferMappings() = 0;
+  // whether a reserved buffer exists, which SparseBufferMappings has an entry for whatever it maps
+  virtual bool HasSparseBuffers() = 0;
 
   virtual InternalCommandLibrary& GetLib() = 0;
 

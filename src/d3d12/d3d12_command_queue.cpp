@@ -89,6 +89,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   using MetalCommandQueue = std::conditional_t<Metal4, WMT::MTL4CommandQueue, WMT::CommandQueue>;
   WMT::Reference<MetalCommandQueue> queue_;
   WMT::Reference<WMT::SharedEvent> completion_event_;
+  // Metal 3: an aliasing barrier's command buffer signals it, and the next waits for it (CommittingScope::OrderAliases)
+  WMT::Reference<WMT::SharedEvent> alias_event_;
+  uint64_t alias_value_ = 0;
+  // Metal 4: the next command buffer's first encoder orders aliased memory too, for a barrier its command buffer ended
+  // before an encoder could
+  bool order_aliases_ = false;
   WMT::Reference<WMT::Fence> fence_;
   // the clock of the timestamps the queue's work writes: Metal 3 samples nanoseconds, a Metal 4 counter heap ticks
   // (MTLDevice.h queryTimestampFrequency: "the frequency of the GPU timestamp in ticks per second")
@@ -845,6 +851,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         inflight->cmdbuf = encoded ? std::move(encoded) : queue->NewCommandBuffer(seq);
         if (!inflight->cmdbuf)
           queue->device_->LoseDevice();
+        else if (!encoded && queue->order_aliases_)
+          inflight->cmdbuf.orderAliases();
       } else {
         inflight->cmdbuf = encoded ? std::move(encoded) : queue->queue_.commandBuffer();
       }
@@ -884,6 +892,26 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       queue->inflight_cmdbuf_seq_.notify_one();
       pool = nullptr;
       return ended;
+    }
+
+    // what follows sees memory the work so far reached through aliased addresses (a reserved buffer's tiles and a
+    // resource placed over the same heap memory): Metal 4 begins the next encoder with a barrier of resource-alias
+    // visibility, Metal 3 ends the command buffer and starts the next behind a GPU wait on an MTLSharedEvent it
+    // signals; neither waits on the CPU (d3d12_sparse_remap, d3d12_alias_submissions)
+    void
+    OrderAliases() {
+      if constexpr (Metal4) {
+        inflight->cmdbuf.orderAliases();
+        // and again at each command buffer after it, until a pass has taken it: one that ends first, or that is only a
+        // queue's wait, has no encoder to begin with the barrier
+        queue->order_aliases_ = true;
+      } else {
+        auto value = ++queue->alias_value_;
+        inflight->cmdbuf.encodeSignalEvent(queue->alias_event_, value);
+        End();
+        Start();
+        inflight->cmdbuf.encodeWaitForEvent(queue->alias_event_, value);
+      }
     }
 
     // ends the command buffer and waits for it, past the fence a Wait before it names: what the work so far leaves
@@ -1002,6 +1030,9 @@ public:
     } else {
       // the slots' command buffers, and those encoded ahead of them on the encoding threads
       queue_ = metal_device.newCommandQueue(kCommandQueueSize + kMaxEncodeThreads);
+      alias_event_ = metal_device.newSharedEvent();
+      if (!alias_event_)
+        return E_OUTOFMEMORY;
     }
     if (!queue_)
       return FAIL(E_FAIL);
@@ -1425,6 +1456,8 @@ public:
         case EncoderType::Resolve:
           if (!EncodePass(cmdbuf, current, attachment, sparse_mappings, *scope.inflight, records, sync))
             return;
+          // its encoder began with an aliasing barrier the queue carried (OrderAliases)
+          order_aliases_ = false;
           break;
         case EncoderType::AccelerationStructure: {
           // which structures are built is the device's, and another queue's builds change it
@@ -1490,7 +1523,9 @@ public:
           break;
         }
         case EncoderType::Settle:
-          settle();
+          // an aliasing barrier once a reserved buffer exists
+          scope.OrderAliases();
+          cmdbuf = scope.inflight->cmdbuf;
           break;
         case EncoderType::Predicate: {
           // what its region's kernel decided is in memory once the command buffer with the kernel has completed
@@ -1922,10 +1957,14 @@ public:
     buffers[0] = scope.inflight->cmdbuf;
     // a part's command buffer is the slot's after the one before, which commits it next
     for (unsigned k = 1; k < parts; k++) {
-      if constexpr (Metal4)
+      if constexpr (Metal4) {
         buffers[k] = NewCommandBuffer(inflight_cmdbuf_seq_.load(std::memory_order_relaxed) + k);
-      else
+        // each part's encoders run apart from the first part's, so each orders aliased memory itself
+        if (order_aliases_ && buffers[k])
+          buffers[k].orderAliases();
+      } else {
         buffers[k] = queue_.commandBuffer();
+      }
       if (!buffers[k]) {
         device_->LoseDevice();
         return false;
@@ -1963,6 +2002,7 @@ public:
     for (unsigned k = 0; k < parts; k++) {
       for (auto i = bounds[k]; i < bounds[k + 1]; i++)
         scope.inflight->encoders[size_t(passes[i].first->type)]++;
+      order_aliases_ = false;
       if (sparse_mappings)
         scope.inflight->sparse_mappings = sparse_mappings;
       if (k + 1 < parts) {

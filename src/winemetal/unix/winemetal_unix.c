@@ -4418,6 +4418,9 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
   id<MTLDrawable> drawable;
   id<MTLEvent> wait_event;
   uint64_t wait_value;
+  // the next encoder begins with a barrier against all the queue's work before it that makes aliased memory
+  // consistent (MTL4CommandBuffer_orderAliases)
+  bool order_aliases;
   double after;
   // the sample the open compute encoder's last pass ended with
   obj_handle_t stamp_heap;
@@ -4706,6 +4709,9 @@ _MTL4CommandBuffer_encoder(void *obj) {
   struct unixcall_metal4_encoder *p = obj;
   if (@available(macOS 26.0, *)) {
     MullionMetal4Buffer *owner = (MullionMetal4Buffer *)p->buffer;
+    // a barrier against the queue's earlier work takes an encoder of its own: the open compute encoder ends first
+    if (owner->order_aliases)
+      [owner closeCompute];
     if (p->kind != WMTMetal4Render && owner->compute) {
       MullionMetal4Encoder *state = owner->compute;
       [(id<MTL4ComputeCommandEncoder>)state->encoder
@@ -4822,8 +4828,26 @@ _MTL4CommandBuffer_encoder(void *obj) {
       owner->feedback.render_passes++;
     else
       owner->feedback.compute_passes++;
+    if (owner->order_aliases) {
+      // memory one resource writes and another reads through an aliased address is consistent only after a barrier
+      // with resource-alias visibility: a fence orders execution alone, and device visibility leaves the aliased
+      // addresses' caches (MTL4VisibilityOptionResourceAlias; d3d12_sparse_remap)
+      owner->order_aliases = false;
+      [(id<MTL4CommandEncoder>)state->encoder barrierAfterQueueStages:MTLStageAll
+                                                       beforeStages:MTLStageAll
+                                                  visibilityOptions:MTL4VisibilityOptionDevice |
+                                                                    MTL4VisibilityOptionResourceAlias];
+    }
     metal4_begin_samples(state, p->samples.ptr);
   }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandBuffer_orderAliases(void *obj) {
+  struct unixcall_generic_obj_noret *p = obj;
+  if (@available(macOS 26.0, *))
+    ((MullionMetal4Buffer *)p->handle)->order_aliases = true;
   return STATUS_SUCCESS;
 }
 
@@ -6069,6 +6093,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4CommandBuffer_waitForEvent,
     &_MTLDevice_supportsShaderBarycentricCoordinates,
     &_WMTTraceWrite,
+    &_MTL4CommandBuffer_orderAliases,
 };
 
 #ifndef MULLION_NATIVE
@@ -6267,6 +6292,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4CommandBuffer_waitForEvent,
     &_MTLDevice_supportsShaderBarycentricCoordinates,
     &_WMTTraceWrite,
+    &_MTL4CommandBuffer_orderAliases,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");
