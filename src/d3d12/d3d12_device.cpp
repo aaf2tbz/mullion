@@ -2063,6 +2063,14 @@ public:
                                    : desc->SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                                 : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         resource_info.Alignment = std::max(resource_info.Alignment, requested_alignment);
+        // an alignment D3D12 has: "Alignment may be one of 0, 4KB, 64KB, or 4MB" (D3D12_RESOURCE_DESC), the next one
+        // up from Metal's, which can lie between them where 4KB was asked for
+        if (resource_info.Alignment > D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
+            resource_info.Alignment < D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+          resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        else if (resource_info.Alignment > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+                 resource_info.Alignment < D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+          resource_info.Alignment = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
       }
 
       resource_info.SizeInBytes = align(resource_info.SizeInBytes, resource_info.Alignment);
