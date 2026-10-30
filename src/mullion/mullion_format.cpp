@@ -1520,6 +1520,20 @@ GetUIntClearWrite(WMTPixelFormat format) {
 }
 
 bool
+CastsToR32UnorderedAccess(uint32_t format) {
+  switch (format) {
+  case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+  case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+  case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+  case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+  case DXGI_FORMAT_R16G16_TYPELESS:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool
 CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed) {
   MTL_DXGI_FORMAT_DESC own, other;
   if (FAILED(MTLQueryDXGIFormat(device, format, own)))

@@ -118,6 +118,12 @@ bool IsIntegerFormat(WMTPixelFormat format);
 // keep _FLOAT and other formats apart (DirectX-Specs, D3D12 Relaxed Format Casting Rules)
 bool CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed);
 
+// whether a texture of the format takes an R32_UINT, R32_SINT or R32_FLOAT unordered access view, though R32 is not
+// of its type group: "D3D allows Texture1D/2D/3D resources created with any of the following small set of 32-bit per
+// element formats to have UAVs created from them with R32_UINT/_SINT/_FLOAT as the type" (D3D11.3 5.3.9.5, which
+// D3D12 keeps: vkd3d-proton's test_typed_srv_uav_cast). R32_TYPELESS, the set's sixth, is R32's own group
+bool CastsToR32UnorderedAccess(uint32_t format);
+
 void SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color);
 
 // the stored channel red, green, blue and alpha each land in: a view's component swizzle is undone for render target
