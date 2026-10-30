@@ -1,0 +1,13 @@
+# the converter's kernels go to the shader cache under one key, whatever the shader
+# family native
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -551,7 +551,7 @@
+   hash(uint64_t(root_signature->MSCParameters.size()));
+   for (auto &[type, reg, space, value, visibility] : root_signature->MSCParameters)
+     hash(type, reg, space, value, visibility);
+-  return CachedFunction(device, pipeline, h.final(), name, [&]() -> WMT::Reference<WMT::DispatchData> {
++  return CachedFunction(device, pipeline, Sha1HashState().final(), name, [&]() -> WMT::Reference<WMT::DispatchData> {
+     char error[512] = "";
+     auto &parameters = root_signature->MSCParameters;
+     WMT::Reference<WMT::DispatchData> data(WMTMSCConvert(

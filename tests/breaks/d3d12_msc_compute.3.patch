@@ -1,0 +1,13 @@
+# a block of an odd number of constants before another goes to the converter, which packs the second block 4 bytes earlier
+# family native
+--- a/src/d3d12/d3d12_root_signature.cpp
++++ b/src/d3d12/d3d12_root_signature.cpp
+@@ -613,7 +613,7 @@
+         break;
+       }
+       bool constants = parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-      if (constants && (parameter.Constants.Num32BitValues & 1) && i + 1 < desc.NumParameters &&
++      if (false && constants && (parameter.Constants.Num32BitValues & 1) && i + 1 < desc.NumParameters &&
+           desc.pParameters[i + 1].ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+         MSCCompatible = false;
+         break;

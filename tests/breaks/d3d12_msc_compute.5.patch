@@ -1,0 +1,13 @@
+# conversions are never written to the shader cache, so each process converts again
+# family native
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -657,8 +657,6 @@
+     ERR("Failed to load ", name, ": ", library ? "no such function" : error.description().getUTF8String());
+     return {};
+   }
+-  if (auto writer = cache.getWriter())
+-    writer->set(key, data);
+   {
+     std::lock_guard lock(pipeline->shader_mutex);
+     pipeline->cached_shaders.emplace(key, data);

@@ -1,0 +1,14 @@
+# ray queries go to the converter, which reads Mullion's acceleration structures as its own header
+# family native
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -534,8 +534,7 @@
+   auto part = parser.FindNextMatchingBlob((microsoft::DXBCFourCC)MAKEFOURCC('S', 'F', 'I', '0'));
+   if (part != DXBC_BLOB_NOT_FOUND && parser.GetBlobSize(part) >= sizeof(features))
+     memcpy(&features, parser.GetBlob(part), sizeof(features));
+-  if (features & RaytracingTier11)
+-    return {};
++  (void)features;
+   Sha1HashState h;
+   auto hash = [&](const auto &...values) { (h.update(values), ...); };
+   auto bytes = [&](const void *data, size_t size) {

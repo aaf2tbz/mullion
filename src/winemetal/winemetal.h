@@ -625,6 +625,25 @@ enum WMTAttributeFormat : uint32_t {
 
 WINEMETAL_API obj_handle_t MTLDevice_newLibrary(obj_handle_t device, obj_handle_t data, obj_handle_t *err_out);
 
+/* Metal Shader Converter (libmetalirconverter.dylib, beside the Wine's libraries): a root parameter of the root
+   signature a shader is converted with, D3D12's fields in D3D12's numbering, which the converter shares */
+struct WMTMSCRootParameter {
+  uint32_t type;       /* D3D12_ROOT_PARAMETER_TYPE */
+  uint32_t shader_register;
+  uint32_t register_space;
+  uint32_t value;      /* Num32BitValues of constants, Flags of a root descriptor */
+  uint32_t visibility; /* D3D12_SHADER_VISIBILITY */
+};
+/* the converter's identity (its size and modification time), which a cache of its conversions keys on; 0 when it
+   cannot be loaded */
+WINEMETAL_API uint64_t WMTMSCIdentity(void);
+/* converts a DXIL container to a metallib whose entry point is `entry_point`, with a root signature of `count`
+   parameters and no tables or static samplers: its dispatch data, or 0 and the converter's message in `error` */
+WINEMETAL_API obj_handle_t WMTMSCConvert(
+    const void *dxil, uint64_t dxil_size, const struct WMTMSCRootParameter *parameters, uint32_t count,
+    const char *entry_point, char *error, uint32_t error_size
+);
+
 WINEMETAL_API obj_handle_t MTLLibrary_newFunction(obj_handle_t library, const char *name);
 
 WINEMETAL_API uint64_t NSString_lengthOfBytesUsingEncoding(obj_handle_t str, enum WMTStringEncoding encoding);
@@ -2587,6 +2606,7 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixBootstrapKeep, WMTUnixDeviceSupportsSamplerReduction, WMTUnixCommandBufferWaitSignal,
        WMTUnixDeviceNewSpatialScaler4, WMTUnixMetal4SpatialScale, WMTUnixDeviceNewTemporalScaler4,
        WMTUnixMetal4TemporalScale, WMTUnixDeviceNewDenoisedScaler, WMTUnixCommandBufferDenoisedScale,
+       WMTUnixMSCIdentity, WMTUnixMSCConvert,
        WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
