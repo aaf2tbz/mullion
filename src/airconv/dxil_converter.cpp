@@ -2307,19 +2307,25 @@ convert_dxil(
         if (descriptor)
           h.buffer = dxbc.MakeBufferHandle(*descriptor, swizzle_identity);
       };
+      // the shader's information may be shared by compilations on other threads: look up, don't insert
+      auto entry = [](const auto &map, auto key) -> const auto & {
+        static const typename std::remove_cvref_t<decltype(map)>::mapped_type none{};
+        auto found = map.find(key);
+        return found == map.end() ? none : found->second;
+      };
       switch (cls) {
       case SRV:
-        if (info.srvMap[id].resource_type == shader::common::ResourceType::NonApplicable)
+        if (entry(info.srvMap, id).resource_type == shader::common::ResourceType::NonApplicable)
           buffer(ctx.binding.GetSRVBuffer(air, id, a(3)));
         else
           texture(ctx.binding.GetSRVTexture(air, id, a(3)));
         break;
       case UAV:
-        if (info.uavMap[id].resource_type == shader::common::ResourceType::NonApplicable)
+        if (entry(info.uavMap, id).resource_type == shader::common::ResourceType::NonApplicable)
           buffer(ctx.binding.GetUAVBuffer(air, id, a(3)));
         else
           texture(ctx.binding.GetUAVTexture(air, id, a(3)));
-        if (info.uavMap[id].with_counter)
+        if (entry(info.uavMap, id).with_counter)
           h.counter = ctx.binding.GetUAVCounter(air, id, a(3));
         break;
       case CBV:

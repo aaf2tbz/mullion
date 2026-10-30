@@ -1,3 +1,4 @@
+#include <mutex>
 #include <cstdlib>
 #include <cstring>
 #include "llvm/IR/Constants.h"
@@ -66,7 +67,7 @@ void initializeModule(llvm::Module &M) {
 
 };
 
-static std::atomic_flag llvm_overwrite = false;
+static std::once_flag llvm_overwrite;
 
 bool
 runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
@@ -74,13 +75,14 @@ runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
   if (verifyModule(M, &Error))
     return false;
 
-  if (!llvm_overwrite.test_and_set()) {
+  // once, before any compilation on any thread runs InstCombine, which reads it
+  std::call_once(llvm_overwrite, [] {
     auto Map = cl::getRegisteredOptions();
     auto InfiniteLoopThreshold = Map["instcombine-infinite-loop-threshold"];
     if (InfiniteLoopThreshold) {
       reinterpret_cast<cl::opt<unsigned> *>(InfiniteLoopThreshold)->setValue(1000);
     }
-  }
+  });
 
   // Following optimization passes are picked from default LLVM pipelines
   // An unoptimized shader can make PSO compilation take a very long time
