@@ -19,6 +19,7 @@ util_src = files([
   'config/config.cpp',
 
   'log/log.cpp',
+  'log/trace.cpp',
 
   'sha1/sha1.c',
   'sha1/sha1_util.cpp',

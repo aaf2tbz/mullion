@@ -13,6 +13,7 @@ counts the others overwritten.
 cost: not judged; how long a record takes its thread, printed.
 d3d11: MULLION_FLIGHT=exit dumps a run that failed nothing; it holds the context's command buffer committing and
 completing.
+busy: each dump made while other threads record holds the dumping thread's record from just before it.
 """
 import argparse
 import re
@@ -50,7 +51,7 @@ def judge(mode, facts, dump):
     if isinstance(got, str):
         return [f"a line that is no record: {got[:120]!r}"]
     want = {"removed": ["a removed device", "exit"], "exception": ["exception", "exit"], "many": ["a removed device", "exit"],
-            "d3d11": ["exit"]}[mode]
+            "d3d11": ["exit"], "busy": ["busy"] * int(facts["busy"][0][0]) + ["exit"] if "busy" in facts else []}[mode]
     wrong = [] if [reason for reason, _, _ in got] == want else [f"dumps {[reason for reason, _, _ in got]}, want {want}"]
     for reason, _, records in got:
         times = [ms for ms, _, _ in records]
@@ -84,6 +85,10 @@ def judge(mode, facts, dump):
             wrong.append(f"{overwritten} overwritten, the first signal kept is {values[:1]}")
         elif values != list(range(values[0], int(signals) + 1)):
             wrong.append(f"the signals kept are not the last ones in order: {values[:3]} ... {values[-3:]}")
+    elif mode == "busy":
+        for d, (_, _, records) in enumerate(got[:-1], 1):
+            if not any(text == f"busy {d}" for _, _, text in records):
+                wrong.append(f"dump {d} has not its thread's record 'busy {d}'")
     elif mode == "d3d11":
         for pattern in [r"chunk \d+ of frame \d+ commits as", f"chunk \\d+ completes, status {COMPLETED}$"]:
             if not any(re.search(pattern, text) for text in first):
@@ -102,7 +107,7 @@ def main():
         base = run.as_family(base, args.family)
         exe = next(path for build in builds for path in build.glob("tests/*/d3d12_flight.exe"))
         failed = 0
-        for mode in ("removed", "exception", "quiet", "many", "d3d11"):
+        for mode in ("removed", "exception", "quiet", "many", "d3d11", "busy"):
             out = (args.out / mode).resolve()
             shutil.rmtree(out, ignore_errors=True)
             out.mkdir(parents=True)

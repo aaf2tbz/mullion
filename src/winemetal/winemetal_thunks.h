@@ -543,6 +543,13 @@ struct unixcall_wmtdiag_write {
   uint32_t ret;
 };
 
+struct unixcall_wmttrace_write {
+  struct WMTConstMemoryPointer directory, lines;
+  uint64_t length;
+  uint32_t encoder_errors, memory_samples;
+  uint32_t ret;
+};
+
 struct unixcall_wmtflight_write {
   struct WMTConstMemoryPointer reason, directory, executable, records;
   uint64_t count, frequency, now, lost, overwritten;

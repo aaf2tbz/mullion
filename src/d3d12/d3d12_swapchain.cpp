@@ -28,6 +28,7 @@
 #include "mullion_info.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
+#include "log/trace.hpp"
 #include "wsi_window.hpp"
 #include "util_cpu_fence.hpp"
 #include "util_hotpatch.h"
@@ -124,6 +125,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IMTLDXGISwapChain, MTLD3
   // the back buffer the next Present shows
   UINT current_buffer_ = 0;
   DXGI_SWAP_CHAIN_DESC1 desc_;
+  trace::Presents presents_;
   SwapChainSettings settings_;
   D3D12_RESOURCE_DESC backbuffer_desc_;
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_;
@@ -784,6 +786,7 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    trace::PresentTrace traced(presents_, this, SyncInterval, PresentFlags);
     // TEST validates the interval too (IDXGISwapChain::Present, SyncInterval: 0 through 4).
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;

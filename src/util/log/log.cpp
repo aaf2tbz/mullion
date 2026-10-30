@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "log.hpp"
+#include "trace.hpp"
 
 #include "../util_env.hpp"
 #include "util_string.hpp"
@@ -50,12 +51,30 @@ void Logger::log(LogLevel level, const std::string &message) {
 // the bytes of a line that fit Wine's 1020 with a newline and the terminator
 constexpr size_t kWineLine = 1018;
 
+// MULLION_TRACE_<CATEGORY>: the trace log has the warnings and errors whatever MULLION_LOG_LEVEL is (a game's own output
+// may go nowhere), MULLION_TRACE_API its info and debug lines too, and MULLION_TRACE_API=heavy its trace lines
+static bool Traced(LogLevel level) {
+  if (!trace::Any())
+    return false;
+  if (level >= LogLevel::Warn)
+    return true;
+  return trace::On(trace::Api) && (level >= LogLevel::Debug || trace::Heavy(trace::Api));
+}
+
 void Logger::emitMsg(LogLevel level, const std::string &message) {
+  static std::array<const char *, 5> s_prefixes = {
+      {"trace: ", "debug: ", "info:  ", "warn:  ", "err:   "}};
+
+  if (level < LogLevel::None && Traced(level)) {
+    std::stringstream stream(message);
+    std::string traced;
+    for (std::string line; std::getline(stream, line, '\n');)
+      traced += s_prefixes.at(static_cast<uint32_t>(level)) + line + '\n';
+    trace::WriteLine(traced);
+  }
+
   if (level >= m_minLevel) {
     std::lock_guard<mullion::mutex> lock(m_mutex);
-
-    static std::array<const char *, 5> s_prefixes = {
-        {"trace: ", "debug: ", "info:  ", "warn:  ", "err:   "}};
 
     const char *prefix = s_prefixes.at(static_cast<uint32_t>(level));
 

@@ -48,9 +48,10 @@ game again.
 
 ## Settings
 
-`MULLION_LOG_PATH=<folder>` writes a log for each DLL into the folder. Attach the logs to a bug report. The other
-settings are on the [Settings](https://github.com/dttdrv/mullion/wiki/Settings) page, and [`mullion.conf`](mullion.conf)
-lists every option.
+`MULLION_LOG_PATH=<folder>` writes a log for each DLL into the folder. Attach the logs to a bug report.
+`MULLION_TRACE_GPU=1` and the other `MULLION_TRACE_` categories log one kind of problem in detail, as
+[docs/tracing.md](docs/tracing.md) describes. The other settings are on the
+[Settings](https://github.com/dttdrv/mullion/wiki/Settings) page, and [`mullion.conf`](mullion.conf) lists every option.
 
 ## Building
 

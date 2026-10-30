@@ -73,7 +73,9 @@ enum { kFlightRecords = 4096 };
 struct flight_ring {
   struct flight_ring *next;
   DWORD owner;
-  int64_t written;
+  // `dumped`: the count the dump holding flight_dump_lock read and copies to, so that what threads write meanwhile
+  // cannot take the room it counted for another ring's records
+  int64_t written, dumped;
   struct WMTFlightEntry entries[kFlightRecords];
 };
 static struct flight_ring *flight_rings;
@@ -155,15 +157,15 @@ WMTFlightDump(const char *reason) {
   uint64_t count = 0, overwritten = 0;
   struct flight_ring *rings = __atomic_load_n(&flight_rings, __ATOMIC_ACQUIRE), *ring;
   for (ring = rings; ring; ring = ring->next)
-    count += flight_kept(__atomic_load_n(&ring->written, __ATOMIC_ACQUIRE));
+    count += flight_kept(ring->dumped = __atomic_load_n(&ring->written, __ATOMIC_ACQUIRE));
   struct WMTFlightEntry *entries =
       count ? VirtualAlloc(NULL, count * sizeof(*entries), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : NULL;
   if (count && !entries)
     count = 0;
   uint64_t at = 0;
   for (ring = rings; ring && at < count; ring = ring->next) {
-    int64_t written = __atomic_load_n(&ring->written, __ATOMIC_ACQUIRE), kept = flight_kept(written);
-    for (int64_t i = written - kept; i < written && at < count; i++)
+    int64_t written = ring->dumped, kept = flight_kept(written);
+    for (int64_t i = written - kept; i < written; i++)
       entries[at++] = ring->entries[i % kFlightRecords];
     overwritten += written - kept;
   }
@@ -1829,6 +1831,19 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
   params.length = length;
   params.ret = 0;
   UNIX_CALL(WMTUnixDiagWrite, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+WMTTraceWrite(const char *directory, const char *lines, uint64_t length, bool encoder_errors, bool memory_samples) {
+  struct unixcall_wmttrace_write params;
+  WMT_MEMPTR_SET(params.directory, directory);
+  WMT_MEMPTR_SET(params.lines, lines);
+  params.length = length;
+  params.encoder_errors = encoder_errors;
+  params.memory_samples = memory_samples;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixTraceWrite, &params);
   return params.ret;
 }
 

@@ -799,7 +799,8 @@ public:
         ((PresentFlags & DXGI_PRESENT_STEREO_PREFER_RIGHT) && !desc_.Stereo) ||
         (PresentFlags & (DXGI_PRESENT_STEREO_TEMPORARY_MONO | DXGI_PRESENT_RESTRICT_TO_OUTPUT)))
       return DXGI_ERROR_INVALID_CALL;
-    FLIGHT("swap chain %p: Present, interval %llu, flags %#llx", this, uint64_t(SyncInterval), uint64_t(PresentFlags));
+    FLIGHT_HEAVY(Present, "swap chain %p: Present, interval %llu, flags %#llx", this, uint64_t(SyncInterval), uint64_t(PresentFlags));
+    trace::PresentTrace traced(presents_, this, SyncInterval, PresentFlags);
 
     HRESULT hr = S_OK;
     follower_.follow(hWnd, native_view_);
@@ -1134,6 +1135,7 @@ private:
   WMT::MetalLayer layer_weak_;
   ULONG presentation_count_;
   DXGI_SWAP_CHAIN_DESC1 desc_;
+  trace::Presents presents_;
   SwapChainSettings settings_;
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_;
   D3D11_TEXTURE2D_DESC1 backbuffer_desc_;

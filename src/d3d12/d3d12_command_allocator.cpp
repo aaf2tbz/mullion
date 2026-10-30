@@ -20,6 +20,7 @@
 #include "com/com_pointer.hpp"
 #include "mullion_diag.hpp"
 #include <map>
+#include <bit>
 
 namespace mullion {
 
@@ -291,6 +292,10 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   encoder_last = nullptr;
   encoder_count_ = 0;
 
+  // the pool keeps only what the last use made, so it grows with a use and never past it
+  icb_pool_.clear();
+  for (auto &used : icb_)
+    icb_pool_.emplace(used.key, std::move(used));
   icb_.clear();
   sparse_clear_texels_.clear();
   visibility_.clear();
@@ -351,6 +356,8 @@ MTLD3D12CommandAllocatorImpl::EncodeComputeResolver(MTLD3D12CommandSignature *pC
   cmd_setpso_res.type = WMTComputeCommandSetPSO;
   cmd_setpso_res.pso = pCmdSig->compute_resolver;
   cmd_setpso_res.threadgroup_size = {pCmdSig->compute_resolver.maxTotalThreadsPerThreadgroup(), 1, 1};
+  if (device_->NamesPasses())
+    device_->NamePass(encoder_current, "indirect resolver", pCmdSig->compute_resolver);
 
   auto &cmd_argbuf_res = EncodeComputeCommand<wmtcmd_compute_setbuffer>();
   cmd_argbuf_res.type = WMTComputeCommandSetBuffer;
@@ -363,6 +370,42 @@ MTLD3D12CommandAllocatorImpl::EncodeComputeResolver(MTLD3D12CommandSignature *pC
   cmd_dispatch_res.size = {std::max<size_t>(MaxCount, 1), 1, 1};
   OrderDispatches();
   return data;
+}
+
+// an indirect command buffer of the kind `info` describes, for `count` commands: a pooled one of the same kind and
+// size when the allocator has one, else a new one, of the next power of two in size so that others fit it. both
+// leave its GPU resource ID in `info`; the lists keep it until the allocator is reset
+WMT::IndirectCommandBuffer
+MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options) {
+  uint64_t capacity = std::bit_ceil(std::max<uint64_t>(count, 1));
+  WMTIndirectCommandBufferInfo kind = info;
+  kind.padding_bits = 0;
+  kind.padding = 0;
+  kind.gpu_resource_id = 0;
+  uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(&kind), sizeof(kind)));
+  key ^= (capacity * 0x9e3779b97f4a7c15ull) ^ (uint64_t(options) << 56);
+  PooledICB entry;
+  bool pooled = false;
+  for (auto [it, end] = icb_pool_.equal_range(key); it != end; ++it)
+    if (it->second.capacity == capacity && it->second.options == options &&
+        !memcmp(&it->second.kind, &kind, sizeof(kind))) {
+      entry = std::move(it->second);
+      icb_pool_.erase(it);
+      pooled = true;
+      break;
+    }
+  if (!pooled) {
+    entry.icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, capacity, options);
+    entry.gpu_resource_id = info.gpu_resource_id;
+    entry.key = key;
+    entry.kind = kind;
+    entry.capacity = capacity;
+    entry.options = options;
+  }
+  info.gpu_resource_id = entry.gpu_resource_id;
+  WMT::IndirectCommandBuffer icb = entry.icb;
+  icb_.push_back(std::move(entry));
+  return icb;
 }
 
 IndirectComputeCommandData *
@@ -389,7 +432,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  auto icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, MaxCount, WMTResourceStorageModeShared);
+  auto icb = AcquireICB(info, MaxCount, WMTResourceStorageModeShared);
 
   auto &cmd_use_icb = EncodeComputeCommand<wmtcmd_compute_useresource>();
   cmd_use_icb.type = WMTComputeCommandUseResource;
@@ -406,6 +449,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
   cmd_setpso.type = WMTComputeCommandSetPSO;
   cmd_setpso.pso = pPSO->pso;
   cmd_setpso.threadgroup_size = pPSO->threadgroup_size; // not really used
+  if (device_->NamesPasses())
+    device_->NamePass(encoder_current, pPSO->name, pPSO->pso);
 
   auto &cmd = EncodeComputeCommand<wmtcmd_compute_executecommands_indirect>();
   cmd.type = WMTComputeCommandExecuteCommandsInBufferIndirect;
@@ -413,8 +458,6 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
   cmd.indirect_buffer = gpu_heap_buffer_;
   cmd.indirect_buffer_offset = reinterpret_cast<char *>(data) - static_cast<char *>(gpu_heap_) +
                                offsetof(IndirectComputeCommandData, execution_range);
-
-  icb_.push_back(std::move(icb));
 
   return data;
 }
@@ -452,9 +495,9 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
 
   // an indexed command of an ordinary pipeline is kIndexedCommands (IndirectRenderCommandData::zeros)
   size_t each = !tessellation && pCmdSig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? kIndexedCommands : 1;
-  WMT::Reference<WMT::IndirectCommandBuffer> icb;
+  WMT::IndirectCommandBuffer icb;
   if (!draws)
-    icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, MaxCount * each, WMTResourceStorageModePrivate);
+    icb = AcquireICB(info, MaxCount * each, WMTResourceStorageModePrivate);
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
   if (records_)
@@ -583,7 +626,6 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   cmd.indirect_buffer = gpu_heap_buffer_;
   cmd.indirect_buffer_offset = Offset + offsetof(IndirectRenderCommandData, execution_range);
 
-  icb_.push_back(std::move(icb));
 
   return data;
 }

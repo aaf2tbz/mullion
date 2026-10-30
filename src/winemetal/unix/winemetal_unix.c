@@ -13,6 +13,9 @@
 #include "objc/objc-runtime.h"
 #include <bootstrap.h>
 #include <mach/mach_port.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <sys/sysctl.h>
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
@@ -90,6 +93,15 @@ _NSArray_count(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// MULLION_D3D12_GPU_ERRORS, or MULLION_TRACE_GPU=heavy as the process's trace calls say (_WMTTraceWrite): the error of
+// a command buffer the GPU failed lists its encoders and what became of each
+static bool encoder_errors;
+
+__attribute__((constructor)) static void
+init_encoder_errors(void) {
+  encoder_errors = getenv("MULLION_D3D12_GPU_ERRORS") || getenv("DXMT_D3D12_GPU_ERRORS");
+}
+
 static NTSTATUS
 _MTLCopyAllDevices(void *obj) {
   struct unixcall_generic_obj_ret *params = obj;
@@ -144,8 +156,7 @@ _NSAutoreleasePool_alloc_init(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_commandBuffer(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  // MULLION_D3D12_GPU_ERRORS: the error of a command buffer the GPU failed lists its encoders and what became of each
-  if (getenv("MULLION_D3D12_GPU_ERRORS") ?: getenv("DXMT_D3D12_GPU_ERRORS")) {
+  if (__atomic_load_n(&encoder_errors, __ATOMIC_RELAXED)) {
     MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
     descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
     params->ret = (obj_handle_t)[(id<MTLCommandQueue>)params->handle commandBufferWithDescriptor:descriptor];
@@ -4099,6 +4110,133 @@ _WMTDiagWrite(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// MULLION_TRACE's log: one file for the process, whose DLLs each write their categories' lines through here, each line
+// after its time in ms since the log was opened
+static pthread_mutex_t trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *trace_file;
+static uint64_t trace_started;
+
+static double
+trace_ms(void) {
+  static mach_timebase_info_data_t timebase;
+  if (!timebase.denom)
+    mach_timebase_info(&timebase);
+  return (double)(mach_absolute_time() - trace_started) * timebase.numer / timebase.denom / 1e6;
+}
+
+// the lines go to the file as they come and reach the disk within a second (trace_flusher); a GPU line, a warning or an
+// error reaches it at once, so a process that ends or hangs right after has them
+static void
+trace_lines(const char *lines, uint64_t length) {
+  double ms = trace_ms();
+  bool now = false;
+  for (const char *line = lines, *end = lines + length; line < end;) {
+    const char *newline = memchr(line, '\n', end - line);
+    const char *next = newline ? newline + 1 : end;
+    int size = (int)((newline ? newline : end) - line);
+    fprintf(trace_file, "%10.3f %.*s\n", ms, size, line);
+    now |= !strncmp(line, "[gpu]", 5) || !strncmp(line, "err:", 4) || !strncmp(line, "warn:", 5);
+    line = next;
+  }
+  if (now)
+    fflush(trace_file);
+}
+
+static void *
+trace_flusher(void *unused) {
+  (void)unused;
+  pthread_setname_np("mullion-trace-flush");
+  for (;;) {
+    sleep(1);
+    pthread_mutex_lock(&trace_lock);
+    fflush(trace_file);
+    pthread_mutex_unlock(&trace_lock);
+  }
+  return NULL;
+}
+
+// `memory`: every 5 s, the process's memory footprint and the system's swap and paging, as a game that runs out of
+// memory or starts paging shows it
+static void *
+trace_memory_sampler(void *unused) {
+  (void)unused;
+  pthread_setname_np("mullion-trace-memory");
+  uint64_t pageouts = 0, swapouts = 0;
+  for (;;) {
+    task_vm_info_data_t task;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t vm_count = HOST_VM_INFO64_COUNT;
+    struct xsw_usage swap = {0};
+    size_t swap_size = sizeof(swap);
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&task, &count) == KERN_SUCCESS &&
+        host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &vm_count) == KERN_SUCCESS) {
+      sysctlbyname("vm.swapusage", &swap, &swap_size, NULL, 0);
+      uint64_t page = vm_kernel_page_size;
+      char line[256];
+      int length = snprintf(line, sizeof(line),
+                            "[memory] sampler: process footprint %llu MB (peak %llu MB); system: swap used %llu MB, "
+                            "compressed %llu MB, free %llu MB, %llu pageouts and %llu swapouts in the last 5 s",
+                            task.phys_footprint >> 20, task.ledger_phys_footprint_peak >> 20, swap.xsu_used >> 20,
+                            (vm.compressor_page_count * page) >> 20, (vm.free_count * page) >> 20,
+                            pageouts ? vm.pageouts - pageouts : 0, swapouts ? vm.swapouts - swapouts : 0);
+      pageouts = vm.pageouts;
+      swapouts = vm.swapouts;
+      pthread_mutex_lock(&trace_lock);
+      trace_lines(line, length);
+      fflush(trace_file);
+      pthread_mutex_unlock(&trace_lock);
+    }
+    sleep(5);
+  }
+  return NULL;
+}
+
+static NTSTATUS
+_WMTTraceWrite(void *obj) {
+  @autoreleasepool {
+    struct unixcall_wmttrace_write *params = obj;
+    static bool opened;
+    pthread_mutex_lock(&trace_lock);
+    if (!opened) {
+      opened = true;
+      trace_started = mach_absolute_time();
+      NSString *directory = [NSString stringWithUTF8String:params->directory.ptr];
+      NSFileManager *files = [NSFileManager defaultManager];
+      [files createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+      NSString *path = [directory stringByAppendingPathComponent:@"mullion.log"];
+      NSString *previous = [directory stringByAppendingPathComponent:@"mullion.prev.log"];
+      [files removeItemAtPath:previous error:nil];
+      [files moveItemAtPath:path toPath:previous error:nil];
+      trace_file = directory.length ? fopen(path.fileSystemRepresentation, "w") : NULL;
+      if (!trace_file)
+        fprintf(stderr, "mullion: trace log in '%s': %s\n", directory.UTF8String, strerror(errno));
+      else {
+        NSString *date = [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                        dateStyle:NSDateFormatterShortStyle
+                                                        timeStyle:NSDateFormatterMediumStyle];
+        fprintf(trace_file, "Mullion trace %s, process %d\n", date.UTF8String, getpid());
+        fflush(trace_file);
+        pthread_t flusher;
+        if (!pthread_create(&flusher, NULL, trace_flusher, NULL))
+          pthread_detach(flusher);
+        if (params->memory_samples) {
+          pthread_t sampler;
+          if (!pthread_create(&sampler, NULL, trace_memory_sampler, NULL))
+            pthread_detach(sampler);
+        }
+      }
+    }
+    if (params->encoder_errors)
+      __atomic_store_n(&encoder_errors, true, __ATOMIC_RELAXED);
+    if (trace_file && params->lines.ptr)
+      trace_lines(params->lines.ptr, params->length);
+    params->ret = trace_file != NULL;
+    pthread_mutex_unlock(&trace_lock);
+  }
+  return STATUS_SUCCESS;
+}
+
 static int
 flight_order(const void *a, const void *b) {
   uint64_t x = ((const struct WMTFlightEntry *)a)->time, y = ((const struct WMTFlightEntry *)b)->time;
@@ -5930,6 +6068,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4CommandBuffer_present,
     &_MTL4CommandBuffer_waitForEvent,
     &_MTLDevice_supportsShaderBarycentricCoordinates,
+    &_WMTTraceWrite,
 };
 
 #ifndef MULLION_NATIVE
@@ -6127,6 +6266,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4CommandBuffer_present,
     &_MTL4CommandBuffer_waitForEvent,
     &_MTLDevice_supportsShaderBarycentricCoordinates,
+    &_WMTTraceWrite,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");
