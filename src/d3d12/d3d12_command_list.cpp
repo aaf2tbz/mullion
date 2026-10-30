@@ -295,7 +295,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // render target or depth write state, where copies, dispatches and other passes cannot touch it until a barrier names
   // its resource. so a clear stays foldable across them until then, until a pass draws to it, or until something that
   // needs no barrier (a clear of rectangles, a resolve) uses it. the textures are the clear pass's colors', then its
-  // depth stencil view's
+  // depth stencil view's. a render pass takes the attachments it draws to (FoldClears), and the others stay pending
+  // past it, as a clear of one view does until a pass draws to it
   struct PendingClear {
     RenderEncoderData *pass;
     std::array<const Texture *, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 1> textures{};
@@ -332,10 +333,21 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       named_[resource] = {subresource, state, barrier_serial_};
   }
 
-  // a texture used where no barrier says so: no clear of it before may fold into a later pass
+  // a texture used where no barrier says so: no clear of it before may fold into a later pass. a clear that stays
+  // where it is keeps the older clears of its other textures there too, the latest first: one of them folding later
+  // would come after it (a clear pass whose other attachments a render pass took no longer names those)
   void
   UsedTexture(const Texture *texture) {
-    std::erase_if(clears_, [&](auto &clear) { return std::ranges::find(clear.textures, texture) != clear.textures.end(); });
+    std::vector<const Texture *> fixed{texture};
+    for (auto pending = clears_.size(); pending--;) {
+      auto &textures = clears_[pending].textures;
+      if (std::ranges::none_of(textures, [&](auto t) { return t && std::ranges::find(fixed, t) != fixed.end(); }))
+        continue;
+      for (auto t : textures)
+        if (t)
+          fixed.push_back(t);
+      clears_.erase(clears_.begin() + pending);
+    }
   }
 
   // occlusion queries: the running ones, each from the first visibility slot it counts in; the slots' GPU addresses,
@@ -961,25 +973,21 @@ public:
     for (auto pending = clears_.size(); pending--;) {
       auto clear = clears_[pending].pass;
       auto &textures = clears_[pending].textures;
+      auto is_kept = [&](const Texture *texture) {
+        return texture && std::ranges::find(kept.begin(), kept.begin() + kept_count, texture) != kept.begin() + kept_count;
+      };
+      auto keep_all = [&] {
+        for (auto texture : textures)
+          if (texture && kept_count < kept.size())
+            kept[kept_count++] = texture;
+      };
       auto folds = [&] {
         if (clear->render_target_width != render->render_target_width ||
             clear->render_target_height != render->render_target_height ||
             clear->render_target_array_length != render->render_target_array_length ||
             // a timestamp query on the clear has the clock when the clear is done
-            clear->stamps ||
-            (clear->depth.attachment && clear->depth.attachment != render->depth.attachment) ||
-            (clear->stencil.attachment && clear->stencil.attachment != render->stencil.attachment) ||
-            // a plane bound read-only may be sampled in the pass, and a load action clears only the tile's copy
-            ((clear->depth.attachment || clear->stencil.attachment) && render->dsv_readonly_flags))
+            clear->stamps)
           return false;
-        for (auto texture : textures)
-          if (texture && std::ranges::find(kept.begin(), kept.begin() + kept_count, texture) != kept.begin() + kept_count)
-            return false;
-        for (auto &cleared : clear->colors)
-          if (cleared.attachment && std::ranges::none_of(render->colors, [&](auto &rt) {
-                return rt.attachment == cleared.attachment && rt.depth_plane == cleared.depth_plane;
-              }))
-            return false;
         for (auto between = clear->next; between; between = between->next)
           if (between->type != EncoderType::Clear && between->type != EncoderType::Render &&
               between->type != EncoderType::Blit && between->type != EncoderType::Compute &&
@@ -988,31 +996,58 @@ public:
         return true;
       };
       if (!folds()) {
-        for (auto texture : textures)
-          if (texture && kept_count < kept.size())
-            kept[kept_count++] = texture;
+        keep_all();
         if (kept_count == kept.size())
           break;
         continue;
       }
-      for (auto &cleared : clear->colors) {
+      // each attachment on its own: clears of one size join one clear pass whatever passes then draw to them
+      // (JoinableClear), so it may hold attachments of this pass and others of a later one. the depth and stencil
+      // planes, one texture, go together, and not into a pass that binds them read-only: such a plane may be sampled
+      // in the pass, and a load action clears only the tile's copy
+      bool stays = false;
+      for (unsigned i = 0; i < std::size(clear->colors); i++) {
+        auto &cleared = clear->colors[i];
         if (!cleared.attachment)
           continue;
         auto color = std::ranges::find_if(render->colors, [&](auto &rt) {
           return rt.attachment == cleared.attachment && rt.depth_plane == cleared.depth_plane;
         });
+        if (color == std::end(render->colors) || is_kept(textures[i])) {
+          stays = true;
+          continue;
+        }
         if (color->load_action == WMTLoadActionLoad) {
           color->load_action = WMTLoadActionClear;
           color->clear_color = cleared.clear_color;
         }
+        cleared = {};
+        textures[i] = nullptr;
       }
-      if (clear->depth.attachment && render->depth.load_action == WMTLoadActionLoad) {
-        render->depth.load_action = WMTLoadActionClear;
-        render->depth.clear_depth = clear->depth.clear_depth;
+      if (clear->depth.attachment || clear->stencil.attachment) {
+        if (!is_kept(textures.back()) && !render->dsv_readonly_flags &&
+            (!clear->depth.attachment || clear->depth.attachment == render->depth.attachment) &&
+            (!clear->stencil.attachment || clear->stencil.attachment == render->stencil.attachment)) {
+          if (clear->depth.attachment && render->depth.load_action == WMTLoadActionLoad) {
+            render->depth.load_action = WMTLoadActionClear;
+            render->depth.clear_depth = clear->depth.clear_depth;
+          }
+          if (clear->stencil.attachment && render->stencil.load_action == WMTLoadActionLoad) {
+            render->stencil.load_action = WMTLoadActionClear;
+            render->stencil.clear_stencil = clear->stencil.clear_stencil;
+          }
+          clear->depth = {};
+          clear->stencil = {};
+          textures.back() = nullptr;
+        } else {
+          stays = true;
+        }
       }
-      if (clear->stencil.attachment && render->stencil.load_action == WMTLoadActionLoad) {
-        render->stencil.load_action = WMTLoadActionClear;
-        render->stencil.clear_stencil = clear->stencil.clear_stencil;
+      if (stays) {
+        keep_all();
+        if (kept_count == kept.size())
+          break;
+        continue;
       }
       // out of the list, which only clear passes leave: the next one, if a clear, follows the one before now
       clear->previous->next = clear->next;
