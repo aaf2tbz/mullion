@@ -2135,8 +2135,11 @@ convert_dxil(
   };
   // a 64-bit atomic, which Apple GPUs lack (but min and max without a result): `update` of `word`'s old value under a
   // lock word of `locks` hashed from its key, returning the old value. every 64-bit atomic takes a lock, so none races
-  // a lock-free one. one lane of a SIMD group at a time takes one: a lane waiting on its own group's lock holder would
-  // wait forever, as the group's lanes do not run while one spins
+  // a lock-free one. the lanes of a SIMD group take their locks in rounds: in each, the first pending lane and every
+  // pending lane whose lock word is not the first's try theirs once, and a lane that takes its lock updates the word
+  // and releases it in the same round. so no lane waits across rounds on a lock its own group holds (the group's lanes
+  // do not run apart), lanes of different words do not wait for each other, and lanes of one word take turns as one
+  // lane at a time did
   auto locked = [&](const Word64 &word, Value *locks, std::function<Value *(Value *)> update) -> Value * {
     if (air.DiscardWrites && word.memory != llvm::air::MemFlags::Threadgroup)
       return word.read();
@@ -2145,52 +2148,56 @@ convert_dxil(
     auto head = ir.GetInsertBlock();
     auto exit = SplitBlock(head, &*ir.GetInsertPoint());
     auto block = [&](const char *name) { return llvm::BasicBlock::Create(ctx.llvm, name, ctx.function, exit); };
-    auto loop = block("atomic64"), pending_lane = block("atomic64_pending"), elected = block("atomic64_elected"),
-         spin = block("atomic64_spin"), held = block("atomic64_held"), given_up = block("atomic64_given_up"),
+    auto loop = block("atomic64"), attempt = block("atomic64_attempt"), gate = block("atomic64_gate"),
+         try_lock = block("atomic64_try"), deferred = block("atomic64_deferred"), held = block("atomic64_held"),
+         retry = block("atomic64_retry"), waiting = block("atomic64_waiting"), given_up = block("atomic64_given_up"),
          next = block("atomic64_next");
     // a pixel shader's helper lanes take no part: their atomics do nothing, so one would spin on a lock forever
     ir.SetInsertPoint(head->getTerminator());
     Value *lane = ctx.shader_type == D3D10_SB_PIXEL_SHADER
                       ? ir.CreateNot(simd("simd_is_helper_thread", ir.getInt1Ty(), {}))
                       : (Value *)ir.getTrue();
-    head->getTerminator()->setSuccessor(0, loop);
-    ir.SetInsertPoint(loop);
-    auto pending = ir.CreatePHI(ir.getInt1Ty(), 2), old = ir.CreatePHI(ir.getInt64Ty(), 2);
-    pending->addIncoming(lane, head);
-    old->addIncoming(PoisonValue::get(ir.getInt64Ty()), head);
-    ir.CreateCondBr(simd("simd_any", ir.getInt1Ty(), {pending}), pending_lane, exit);
-    ir.SetInsertPoint(pending_lane);
-    ir.CreateCondBr(pending, elected, next);
-    // the first pending lane
-    ir.SetInsertPoint(elected);
-    auto first = simd("simd_is_first", ir.getInt1Ty(), {});
     // Fibonacci hashing of the key, the table's mask in its word 0
     auto hash =
         ir.CreateTrunc(ir.CreateLShr(ir.CreateMul(word.key, ir.getInt64(0x9e3779b97f4a7c15)), 32), ir.getInt32Ty());
     auto mask = ir.CreateLoad(ir.getInt32Ty(), locks);
-    auto lock = ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(ir.CreateAnd(hash, mask), ir.getInt32(1))});
-    ir.CreateCondBr(first, spin, next);
+    auto index = ir.CreateAdd(ir.CreateAnd(hash, mask), ir.getInt32(1));
+    auto lock = ir.CreateGEP(ir.getInt32Ty(), locks, {index});
+    head->getTerminator()->setSuccessor(0, loop);
     // a lock word counts its holders: even is free, odd is held, and each release makes it the next even number.
     // the wait is bounded, well inside the GPU's watchdog, so a lock whose holder never runs again cannot hang the GPU:
     // a lane gives up once the word has not changed for kSpins tries, and raises the table's flag, which removes the
     // device (MTLD3D12Device::CheckAtomicLocks). a word that changes is a lock passing between other lanes: under
     // contention (every thread of a large dispatch on one word) a lane may lose to them many times, and still waits
     constexpr uint32_t kSpins = 1u << 24;
-    ir.SetInsertPoint(spin);
+    ir.SetInsertPoint(loop);
+    auto pending = ir.CreatePHI(ir.getInt1Ty(), 2), old = ir.CreatePHI(ir.getInt64Ty(), 2);
     auto spins = ir.CreatePHI(ir.getInt32Ty(), 2), last = ir.CreatePHI(ir.getInt32Ty(), 2);
-    spins->addIncoming(ir.getInt32(0), elected);
-    last->addIncoming(ir.getInt32(0), elected);
+    pending->addIncoming(lane, head);
+    old->addIncoming(PoisonValue::get(ir.getInt64Ty()), head);
+    spins->addIncoming(ir.getInt32(0), head);
+    last->addIncoming(ir.getInt32(0), head);
+    ir.CreateCondBr(simd("simd_any", ir.getInt1Ty(), {pending}), attempt, exit);
+    ir.SetInsertPoint(attempt);
+    ir.CreateCondBr(pending, gate, next);
+    // the pending lanes alone: the first's lock word, which the others of it leave to the first this round
+    ir.SetInsertPoint(gate);
+    auto first_index = move("simd_broadcast_first", index, {});
+    auto first = simd("simd_is_first", ir.getInt1Ty(), {});
+    ir.CreateCondBr(ir.CreateOr(first, ir.CreateICmpNE(index, first_index)), try_lock, deferred);
+    ir.SetInsertPoint(deferred);
+    ir.CreateBr(next);
+    ir.SetInsertPoint(try_lock);
     auto expected = ir.CreateAnd(last, ir.getInt32(~1u));
     auto exchange = ir.CreateAtomicCmpXchg(lock, expected, ir.CreateOr(expected, ir.getInt32(1)), {},
                                            AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
     auto seen = ir.CreateExtractValue(exchange, 0), taken = ir.CreateExtractValue(exchange, 1);
-    auto retry = block("atomic64_retry");
     ir.CreateCondBr(taken, held, retry);
     ir.SetInsertPoint(retry);
     auto spun = ir.CreateSelect(ir.CreateICmpEQ(seen, last), ir.CreateAdd(spins, ir.getInt32(1)), ir.getInt32(0));
-    ir.CreateCondBr(ir.CreateICmpEQ(spun, ir.getInt32(kSpins)), given_up, spin);
-    spins->addIncoming(spun, retry);
-    last->addIncoming(seen, retry);
+    ir.CreateCondBr(ir.CreateICmpEQ(spun, ir.getInt32(kSpins)), given_up, waiting);
+    ir.SetInsertPoint(waiting);
+    ir.CreateBr(next);
     ir.SetInsertPoint(given_up);
     air.CreateAtomicRMW(AtomicRMWInst::Or, ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(mask, ir.getInt32(2))}), ir.getInt32(1));
     ir.CreateBr(next);
@@ -2204,17 +2211,25 @@ convert_dxil(
     air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
     ir.CreateBr(next);
     ir.SetInsertPoint(next);
-    auto still = ir.CreatePHI(ir.getInt1Ty(), 4), got = ir.CreatePHI(ir.getInt64Ty(), 4);
-    still->addIncoming(ir.getFalse(), held);
-    got->addIncoming(value, held);
-    still->addIncoming(ir.getFalse(), given_up);
-    got->addIncoming(PoisonValue::get(ir.getInt64Ty()), given_up);
-    for (auto from : {pending_lane, elected}) {
-      still->addIncoming(pending, from);
-      got->addIncoming(old, from);
-    }
+    auto still = ir.CreatePHI(ir.getInt1Ty(), 5), got = ir.CreatePHI(ir.getInt64Ty(), 5);
+    auto spins_next = ir.CreatePHI(ir.getInt32Ty(), 5), last_next = ir.CreatePHI(ir.getInt32Ty(), 5);
+    auto incoming = [&](llvm::BasicBlock *from, Value *s, Value *g, Value *n, Value *l) {
+      still->addIncoming(s, from);
+      got->addIncoming(g, from);
+      spins_next->addIncoming(n, from);
+      last_next->addIncoming(l, from);
+    };
+    // done: the lane that held its lock, and one that gave up
+    incoming(held, ir.getFalse(), value, spins, last);
+    incoming(given_up, ir.getFalse(), PoisonValue::get(ir.getInt64Ty()), spins, last);
+    // still waiting: a lane that lost this round, one that left its word to the first, and one with nothing to do
+    incoming(waiting, ir.getTrue(), old, spun, seen);
+    incoming(deferred, ir.getTrue(), old, spins, last);
+    incoming(attempt, pending, old, spins, last);
     pending->addIncoming(still, next);
     old->addIncoming(got, next);
+    spins->addIncoming(spins_next, next);
+    last->addIncoming(last_next, next);
     ir.CreateBr(loop);
     ir.SetInsertPoint(&*exit->getFirstInsertionPt());
     return old;
