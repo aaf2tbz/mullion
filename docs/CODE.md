@@ -181,7 +181,7 @@ is, and keep it as small as the gain allows. Measure the whole path the change a
 together, against the same build without it, with the output unchanged. A real measured gain is worth the lines it
 takes. Code added for speed without a measurement is not.
 
-Reason: as Pike put it, "Don't tune for speed until you've measured." Less rendering can look faster, and a gain
+Reason: Pike's advice holds: "Don't tune for speed until you've measured." Less rendering can look faster, and a gain
 in one stage can be lost in the next.
 
 ## 6. Tests

@@ -32,8 +32,8 @@ A performance report also gives the place in the game, the resolution and settin
 compiling, how frame rate or frame time was measured, and the comparison it makes, measured the same way on the same
 Mac.
 
-Games that work go in [Game reports](https://github.com/dttdrv/mullion/discussions/categories/game-reports), not in
-an issue.
+Reports of games that work are welcome as well, in
+[Game reports](https://github.com/dttdrv/mullion/discussions/categories/game-reports).
 
 ## 2. Preparing a change
 
@@ -52,7 +52,8 @@ one logical change that builds and works on its own. A fix and its test go in th
 review" or "try again" are folded into the commits they correct before review, for example with
 [`git rebase --autosquash`](https://git-scm.com/docs/git-rebase).
 
-A change is as large as a reviewer can check. Independent parts are separate pull requests.
+The size of a change is set by what a reviewer can check, not by a line count. Independent parts are separate pull
+requests.
 
 ## 3. Showing that it works
 
