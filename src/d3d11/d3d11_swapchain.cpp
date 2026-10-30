@@ -1194,7 +1194,10 @@ CreateSwapChain(
     return DXGI_ERROR_INVALID_CALL;
   }
   Com<IDXGISwapChain1> swapchain;
-  if (env::getEnvVar("MULLION_METALFX_SPATIAL_SWAPCHAIN") == "1") {
+  // d3d11.metalSpatialUpscale in the config turns it on as the environment variable does, so a
+  // program started by another (a launcher, a game client) follows the config file it reads at start
+  if (env::getEnvVar("MULLION_METALFX_SPATIAL_SWAPCHAIN") == "1" ||
+      Config::getInstance().getOption<bool>("d3d11.metalSpatialUpscale", false)) {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
       swapchain = Com<IDXGISwapChain1>::transfer(new MTLD3D11SwapChain<true>(
           pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
