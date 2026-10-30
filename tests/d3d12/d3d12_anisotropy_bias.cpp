@@ -7,7 +7,8 @@
 // texel (LESS), so two references half a mip on either side of the expected LOD tell it apart. footprints are
 // axis-aligned powers of two, so every expected LOD is a whole mip. MaxAnisotropy 1 and a bias of 0 are controls;
 // footprints longer and shorter than MaxAnisotropy on both axes, a 2D and a 2D array texture, descriptor and static
-// samplers, and biases of both signs vary what the conversion of each instruction depends on.
+// samplers, and biases of both signs vary what the conversion of each instruction depends on. the static samplers are
+// listed out of register order after one of another stage, so each is told apart by its register.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <bit>
@@ -210,7 +211,13 @@ main(int argc, char **argv) {
       if (!draw.fixed)
         device->CreateSampler(&desc, {samplers->GetCPUDescriptorHandleForHeapStart().ptr + (2 * i + k) * sampler_step});
     }
-    auto root = draw.fixed ? root_signature(device.Get(), {2, params, 2, fixed})
+    // the static samplers out of register order, after one the shader does not take: a point sampler of a vertex
+    // shader's register, whose state is not theirs
+    D3D12_STATIC_SAMPLER_DESC listed[3] = {
+        {D3D12_FILTER_MIN_MAG_MIP_POINT, desc.AddressU, desc.AddressV, desc.AddressW, 0, 1, desc.ComparisonFunc,
+         D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, 0, D3D12_FLOAT32_MAX, 7, 0, D3D12_SHADER_VISIBILITY_VERTEX},
+        fixed[1], fixed[0]};
+    auto root = draw.fixed ? root_signature(device.Get(), {2, params, 3, listed})
                            : root_signature(device.Get(), {3, params});
     if (!expect(bool(root), "root signature was not created"))
       return verdict();

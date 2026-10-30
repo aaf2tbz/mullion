@@ -552,9 +552,10 @@ Converter::LoadSampler(const SrcOperandSampler &SrcOp) {
   if (!descriptor)
     return {};
 
+  auto Bias = DecodeSamplerBias(descriptor->Metadata);
+  NoteSampler(*descriptor);
   return llvm::Optional<SamplerHandle>(
-      {descriptor->SamplerHandle, descriptor->CubeSamplerHandle, DecodeSamplerBias(descriptor->Metadata),
-       descriptor->Metadata, descriptor->Border}
+      {descriptor->SamplerHandle, descriptor->CubeSamplerHandle, Bias, descriptor->Metadata, descriptor->Border}
   );
 }
 
@@ -2327,6 +2328,16 @@ Converter::SampleImplicit(
                 Tex.Logical == Texture::depth2d || Tex.Logical == Texture::depth2d_array;
   if (!Planar || ctx.shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
     return Biased();
+  // a static sampler is known when the pipeline is made: one that is not anisotropic, or a sample whose only bias is
+  // the sampler's own and that is none, reads Metal's own LOD. Metal's gradient sample below costs about twice its
+  // implicit one (the probe's sample scenes on an M4), and a sampler of a descriptor keeps it: what it is is known only
+  // when the shader runs
+  if (auto Known = KnownSamplers.find(SamplerMetadata); Known != KnownSamplers.end()) {
+    auto Own = SamplerBiases.find(Bias);
+    if (!Known->second.Anisotropic ||
+        (!Known->second.Biased && Own != SamplerBiases.end() && Own->second == SamplerMetadata))
+      return Biased();
+  }
   auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
                                  (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
   if (auto Known = dyn_cast<ConstantInt>(ir.CreateICmpUGT(Anisotropy, ir.getInt64(1))); Known && Known->isZero())

@@ -2333,6 +2333,8 @@ convert_dxil(
         break;
       default:
         h.sampler = ctx.binding.GetSampler(air, id, a(3));
+        if (h.sampler)
+          dxbc.NoteSampler(*h.sampler);
         break;
       }
       if (!h.texture && !h.buffer && !h.cbuffer && !h.sampler)

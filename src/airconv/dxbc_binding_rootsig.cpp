@@ -23,6 +23,7 @@
 #include "../mullion/mullion_command_constants.hpp"
 #include "llvm/IR/DerivedTypes.h"
 #include <algorithm>
+#include <cmath>
 #include <cassert>
 
 namespace mullion::dxbc {
@@ -169,6 +170,11 @@ public:
       );
       // a static sampler's border color is one of Metal's own (D3D12_STATIC_BORDER_COLOR)
       Static.Border = nullptr;
+      if (auto Known = llvm::dyn_cast<llvm::ConstantInt>(Index)) {
+        auto At = Known->getZExtValue() - Sampler.range.lower_bound + Sampler.arg_index;
+        if (At < StaticSamplerStates.size())
+          std::tie(Static.Anisotropic, Static.Biased) = StaticSamplerStates[At];
+      }
       return Static;
     }
     if (~RootSignatureArgumentIndex == 0)
@@ -355,6 +361,8 @@ public:
   llvm::StructType *RootArgumentsType = nullptr;
   llvm::Value *RootArguments = nullptr;
   llvm::Value *StaticSamplers = nullptr;
+  // each static sampler's anisotropy and LOD bias as its metadata has them (mullion::Sampler::createSampler)
+  std::vector<std::pair<bool, bool>> StaticSamplerStates;
   uint32_t SparseBufferMappingsIndex;
   llvm::Value *SparseBufferMappings = nullptr;
 
@@ -688,6 +696,11 @@ setup_binding_rootsig(
 
   for (unsigned i = 0; i < root_sig.NumStaticSamplers; i++) {
     auto &State = root_sig.pStaticSamplers[i];
+    binding_map->StaticSamplerStates.emplace_back(
+        D3D12_DECODE_IS_ANISOTROPIC_FILTER(State.Filter) && State.MaxAnisotropy > 1,
+        std::lround(std::clamp(std::ldexp(State.MipLODBias, SM50_SAMPLER_METADATA_LOD_FRACTION_BITS), (float)INT16_MIN,
+                               (float)INT16_MAX)) != 0
+    );
 
     for (auto &[_, sampler] : shader_info->samplerMap) {
       if (sampler.range.space != State.RegisterSpace)
