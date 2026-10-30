@@ -2,6 +2,7 @@
 
 #include "air_builder.hpp"
 #include "llvm/IR/Value.h"
+#include <optional>
 
 namespace mullion::dxbc {
 
@@ -15,6 +16,9 @@ struct SamplerDescriptor {
   llvm::Value *CubeSamplerHandle;
   llvm::Value *Metadata;
   llvm::Value *Border = nullptr; // SM50_SAMPLER_BORDER's address, when the binding can have one
+  // a static sampler's, known when the pipeline is made: whether it filters anisotropically, and whether its metadata
+  // holds a LOD bias
+  std::optional<bool> Anisotropic, Biased;
 };
 
 struct TextureDescirptor {
