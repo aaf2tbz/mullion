@@ -24,6 +24,17 @@
 
 namespace mullion {
 
+// the size D3D12 estimates a texture's most-detailed mip level of one slice at, for 4KB alignment: its width and height
+// in elements (blocks of a block-compressed format) times the element's bytes. "Windows uses the slice size to
+// determine small alignment eligibility. DepthOrArraySize is ignored" (vkd3d-proton, libs/vkd3d/resource.c,
+// d3d12_resource_supports_small_resource_alignment, whose tests run on Windows too). UINT64_MAX past 64 bits
+static uint64_t
+SmallResourceEstimate(const D3D12_RESOURCE_DESC &Desc, const MTL_DXGI_FORMAT_DESC &Format) {
+  uint32_t block = Format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+  unsigned __int128 size = (unsigned __int128)Desc.Width * Desc.Height * Format.BytesPerTexel / (block * block);
+  return size > UINT64_MAX ? UINT64_MAX : uint64_t(size);
+}
+
 HRESULT
 PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc, UINT Plane) {
   MTL_DXGI_FORMAT_DESC Format;
@@ -150,13 +161,24 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
 
   WMTTextureUsage Usage = ORIGINAL_FORMAT(InfoOut.pixel_format) == WMTPixelFormatDepth32Float_Stencil8
                               ? WMTTextureUsagePixelFormatView : WMTTextureUsageUnknown;
-  if ((Format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_EMULATED_RGB32)) ||
-      CastsAcrossLayouts(Device->GetMTLDevice(), Desc.Format, true))
+  // a view in another layout needs Metal's format view, which takes the texture's lossless compression: only a format
+  // D3D12 lets a view cast across layouts gets one (its typeless family, or Relaxed Format Casting's), and never a
+  // depth texture, which every view reads as itself
+  if ((Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32) ||
+      (!DepthStencilPlanarFlags(WMTPixelFormat(ORIGINAL_FORMAT(InfoOut.pixel_format))) &&
+       CastsAcrossLayouts(Device->GetMTLDevice(), Desc.Format, !(Format.Flag & MTL_DXGI_FORMAT_TYPELESS))))
     Usage |= WMTTextureUsagePixelFormatView;
   if (Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
-    Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
+    Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    // an R32 view of the texture is a view in another layout (CastsToR32UnorderedAccess)
+    if (CastsToR32UnorderedAccess(Desc.Format))
+      Usage |= WMTTextureUsagePixelFormatView;
+    // and so does a uint clear of a format whose values cannot hold all its bit patterns (GetUIntClearWrite)
+    auto pixel = WMTPixelFormat(ORIGINAL_FORMAT(InfoOut.pixel_format));
+    if (GetUIntClearWrite(pixel) == UIntClearWrite::IntegerView && MTLGetUnsignedIntegerFormat(pixel) != pixel)
+      Usage |= WMTTextureUsagePixelFormatView;
     // Metal runs a shader's atomic functions only on a texture made for them
     if (any_bit_set(Device->GetMTLPixelFormatCapability(InfoOut.pixel_format) & FormatCapability::Atomic))
       Usage |= WMTTextureUsageShaderAtomic;
@@ -195,23 +217,31 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
       if (Desc.SampleDesc.Count > 1)
         return FAIL(E_INVALIDARG);
 
+      // "applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
+      // total of the larger alignment restriction or less. The runtime will use an architecture-independent mechanism
+      // of size-estimation" (D3D12_RESOURCE_DESC, Alignment): D3D12's estimate (SmallResourceEstimate), not Metal's
+      // size, which may be larger. GetResourceAllocationInfo then gives Metal's size, at Metal's alignment rounded up
+      // to one D3D12 has (Starfield's 320x180 R8_TYPELESS, dttdrv/mullion#32). one plane of a planar format, asked for
+      // by itself, was decided with its texture
+      if (Plane != ~0u)
+        return S_OK;
+      if (!(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) {
+        if (SmallResourceEstimate(Desc, Format) > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+          return FAIL(E_INVALIDARG);
+        return S_OK;
+      }
+      // a planar format's estimate is Metal's size of its planes
       WMTTextureInfo info_one_slice = InfoOut;
       info_one_slice.mipmap_level_count = 1;
       info_one_slice.array_length = 1;
       auto size_and_align = Device->GetMTLDevice().heapTextureSizeAndAlign(info_one_slice);
-      uint64_t size = size_and_align.size;
-      if (Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) {
-        MTL_DXGI_FORMAT_DESC chroma;
-        MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, chroma, 1);
-        info_one_slice.width /= chroma.SubsampleWidth;
-        info_one_slice.height /= chroma.SubsampleHeight;
-        info_one_slice.pixel_format = chroma.PixelFormat;
-        auto chroma_size = Device->GetMTLDevice().heapTextureSizeAndAlign(info_one_slice);
-        size = align(size, chroma_size.align) + chroma_size.size;
-      }
-      // Applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
-      // total of the larger alignment restriction or less.
-      if (size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+      MTL_DXGI_FORMAT_DESC chroma;
+      MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, chroma, 1);
+      info_one_slice.width /= chroma.SubsampleWidth;
+      info_one_slice.height /= chroma.SubsampleHeight;
+      info_one_slice.pixel_format = chroma.PixelFormat;
+      auto chroma_size = Device->GetMTLDevice().heapTextureSizeAndAlign(info_one_slice);
+      if (align(size_and_align.size, chroma_size.align) + chroma_size.size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
         return FAIL(E_INVALIDARG);
     }
   }
@@ -739,9 +769,15 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
+    const bool r32 = ViewDesc.Format == DXGI_FORMAT_R32_UINT || ViewDesc.Format == DXGI_FORMAT_R32_SINT ||
+                     ViewDesc.Format == DXGI_FORMAT_R32_FLOAT;
     if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format) &&
+         !(r32 && CastsToR32UnorderedAccess(desc_.Format)))) {
+      WARN("CreateUnorderedAccessView: format ", ViewDesc.Format, ", dimension ", ViewDesc.ViewDimension,
+           " of a texture of format ", desc_.Format, ", flags ", desc_.Flags);
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
+    }
 
     view_descriptor.format = metal_format.PixelFormat;
 

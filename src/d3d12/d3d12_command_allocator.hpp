@@ -203,7 +203,6 @@ private:
   };
   small_vector<PooledICB, 4> icb_;
   std::unordered_multimap<uint64_t, PooledICB> icb_pool_;
-  static constexpr size_t kICBPoolMax = 256;
   WMT::IndirectCommandBuffer AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options);
   uint64_t visibility_address_ = 0;
   size_t visibility_used_ = kVisibilityWindow;
@@ -361,13 +360,14 @@ public:
     return at ? ptr_add(cpu_heap_, *at) : nullptr;
   }
 
+  // what logs call a pass: one count for every kind, as a profile's target names its pass by it
+  static inline std::atomic<uint64_t> passes_;
+
   template <typename T>
   T *
   AllocatePass() {
     auto p = (new (AllocateCPUHeap(sizeof(T), alignof(T))) T());
-    // what logs call the pass
-    static std::atomic<uint64_t> passes;
-    p->id = ++passes;
+    p->id = ++passes_;
     p->event_path = event;
     encoder_current = p;
     return p;

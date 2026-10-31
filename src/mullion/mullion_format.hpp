@@ -103,6 +103,12 @@ bool TypedUnorderedAccess(FormatCapability texture, FormatCapability buffer);
 
 WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);
 
+// how a uint clear's channel bits (D3D11.3 5.2.3.2) are written through a texture's own format to store bit for bit,
+// where the texture has no integer view: as the values unorm bits encode, as halves, or as floats. other formats lose
+// patterns that way (snorm's -128 has -127's value, a small float drops a NaN's payload) and need an integer view
+enum class UIntClearWrite { IntegerView, Unorm, Half, Float };
+UIntClearWrite GetUIntClearWrite(WMTPixelFormat format);
+
 bool IsUnorm8RenderTargetFormat(WMTPixelFormat format);
 
 bool IsIntegerFormat(WMTPixelFormat format);
@@ -111,6 +117,12 @@ bool IsIntegerFormat(WMTPixelFormat format);
 // pixel format view, which it waives for sRGB twins. `fully_typed` takes D3D12's casts of fully typed resources, which
 // keep _FLOAT and other formats apart (DirectX-Specs, D3D12 Relaxed Format Casting Rules)
 bool CastsAcrossLayouts(WMT::Device device, uint32_t format, bool fully_typed);
+
+// whether a texture of the format takes an R32_UINT, R32_SINT or R32_FLOAT unordered access view, though R32 is not
+// of its type group: "D3D allows Texture1D/2D/3D resources created with any of the following small set of 32-bit per
+// element formats to have UAVs created from them with R32_UINT/_SINT/_FLOAT as the type" (D3D11.3 5.3.9.5, which
+// D3D12 keeps: vkd3d-proton's test_typed_srv_uav_cast). R32_TYPELESS, the set's sixth, is R32's own group
+bool CastsToR32UnorderedAccess(uint32_t format);
 
 void SanitizeRTVClearColor(WMTPixelFormat format, WMTClearColor &color);
 

@@ -853,6 +853,32 @@ struct MullionClearUintMetadata {
   tex.write(meta.value, uint3(meta.offset + pos.xy, first_slice + pos.z));
 }
 
+// a half written as a half keeps a NaN's payload, which one converted from a float loses
+[[kernel]] void cs_clear_texture2d_half(
+    texture2d<half, access::write> tex [[texture(0)]],
+    constant MullionClearUintMetadata& meta [[buffer(1)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+  tex.write(as_type<half4>(ushort4(meta.value)), meta.offset + pos);
+}
+
+[[kernel]] void cs_clear_texture2d_array_half(
+    texture2d_array<half, access::write> tex [[texture(0)]],
+    constant MullionClearUintMetadata& meta [[buffer(1)]],
+    uint3 pos [[thread_position_in_grid]]
+) {
+  tex.write(as_type<half4>(ushort4(meta.value)), meta.offset + pos.xy, pos.z);
+}
+
+[[kernel]] void cs_clear_texture3d_half(
+    texture3d<half, access::write> tex [[texture(0)]],
+    constant MullionClearUintMetadata& meta [[buffer(1)]],
+    constant uint& first_slice [[buffer(2)]],
+    uint3 pos [[thread_position_in_grid]]
+) {
+  tex.write(as_type<half4>(ushort4(meta.value)), uint3(meta.offset + pos.xy, first_slice + pos.z));
+}
+
 [[kernel]] void cs_clear_tbuffer_float(
     texture_buffer<float, access::write> tex [[texture(0)]],
     constant MullionClearFloatMetadata& meta [[buffer(1)]],

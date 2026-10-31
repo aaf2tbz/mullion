@@ -27,6 +27,31 @@ constexpr UINT D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE = 56;
 constexpr UINT D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED = 57;
 constexpr UINT D3D12_FEATURE_SHADER_CACHE_ABI_SUPPORT = 61;
 constexpr UINT D3D12_FEATURE_BARRIER_LAYOUT = 64;
+constexpr UINT D3D12_FEATURE_D3D12_OPTIONS19 = 48;
+constexpr UINT D3D12_FEATURE_D3D12_OPTIONS20 = 49;
+constexpr UINT D3D12_FEATURE_D3D12_OPTIONS21 = 53;
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS19 {
+  BOOL MismatchingOutputDimensionsSupported;
+  UINT SupportedSampleCountsWithNoOutputs;
+  BOOL PointSamplingAddressesNeverRoundUp;
+  BOOL RasterizerDesc2Supported;
+  BOOL NarrowQuadrilateralLinesSupported;
+  BOOL AnisoFilterWithPointMipSupported;
+  UINT MaxSamplerDescriptorHeapSize;
+  UINT MaxSamplerDescriptorHeapSizeWithStaticSamplers;
+  UINT MaxViewDescriptorHeapSize;
+  BOOL ComputeOnlyCustomHeapSupported;
+};
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS20 {
+  BOOL ComputeOnlyWriteWatchSupported;
+  UINT RecreateAtTier;
+};
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS21 {
+  UINT WorkGraphsTier;
+  UINT ExecuteIndirectTier;
+  BOOL SampleCmpGradientAndBiasSupported;
+  BOOL ExtendedCommandInfoSupported;
+};
 constexpr UINT D3D12_FEATURE_D3D12_OPTIONS22 = 65;
 struct D3D12_FEATURE_DATA_D3D12_OPTIONS22 {
   BOOL ShaderExecutionReorderingActuallyReorders;
@@ -309,6 +334,97 @@ main(int argc, char **argv) {
     expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS22), &options,
                                        size) == E_INVALIDARG,
            "dispatch limits accept size %u", size);
+  // titles ask for OPTIONS19, 20 and 21 (Onimusha: Way of the Sword, dttdrv/mullion#69), and so does D3DX12's
+  // CD3DX12FeatureSupport (DirectX-Headers, d3dx12_check_feature_support.h): each is answered, with its size checked,
+  // and what it reports holds. one sample is a count a pass with no outputs takes ("will report a value of 1,
+  // indicating simple-sampled only, for drivers that do not support the feature", DirectX-Specs, VulkanOn12), a
+  // shader-visible heap of the largest size given is made, and none of the capabilities Mullion has no test for are
+  // reported
+  step("options 19");
+  reference::D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19{};
+  if (expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS19), &options19,
+                                         sizeof(options19)) == S_OK,
+             "options 19 query failed")) {
+    expect(options19.SupportedSampleCountsWithNoOutputs == 1, "sample counts %#x without outputs",
+           options19.SupportedSampleCountsWithNoOutputs);
+    expect(!options19.MismatchingOutputDimensionsSupported && !options19.PointSamplingAddressesNeverRoundUp &&
+               !options19.RasterizerDesc2Supported && !options19.NarrowQuadrilateralLinesSupported &&
+               !options19.AnisoFilterWithPointMipSupported && !options19.ComputeOnlyCustomHeapSupported,
+           "options 19 reports a capability");
+    expect(options19.MaxSamplerDescriptorHeapSize >= D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE &&
+               options19.MaxSamplerDescriptorHeapSizeWithStaticSamplers >= D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE &&
+               options19.MaxViewDescriptorHeapSize >= D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1,
+           "heap sizes %u, %u and %u are below the legacy values", options19.MaxSamplerDescriptorHeapSize,
+           options19.MaxSamplerDescriptorHeapSizeWithStaticSamplers, options19.MaxViewDescriptorHeapSize);
+    for (auto [type, count] : {std::pair{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, options19.MaxViewDescriptorHeapSize},
+                               {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, options19.MaxSamplerDescriptorHeapSize}}) {
+      D3D12_DESCRIPTOR_HEAP_DESC heap_desc{type, count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+      ComPtr<ID3D12DescriptorHeap> heap;
+      expect(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))),
+             "a shader-visible heap of type %u and the %u descriptors reported is refused", type, count);
+    }
+  }
+  for (UINT size : {0u, UINT(sizeof(options19) - 1), UINT(sizeof(options19) + 1)})
+    expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS19), &options19, size) ==
+               E_INVALIDARG,
+           "options 19 accepts size %u", size);
+  step("options 20");
+  reference::D3D12_FEATURE_DATA_D3D12_OPTIONS20 options20{TRUE, ~0u};
+  expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS20), &options20,
+                                     sizeof(options20)) == S_OK &&
+             !options20.ComputeOnlyWriteWatchSupported && !options20.RecreateAtTier,
+         "options 20: write watch %u, recreate tier %u", options20.ComputeOnlyWriteWatchSupported,
+         options20.RecreateAtTier);
+  for (UINT size : {0u, UINT(sizeof(options20) - 1), UINT(sizeof(options20) + 1)})
+    expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS20), &options20, size) ==
+               E_INVALIDARG,
+           "options 20 accepts size %u", size);
+  // tier 1.0 is ExecuteIndirect's base, which the feature levels Mullion reports require; Mullion has no work graphs,
+  // nor tier 1.1's incrementing constant, nor the two capabilities
+  step("options 21");
+  reference::D3D12_FEATURE_DATA_D3D12_OPTIONS21 options21{~0u, ~0u, ~0, ~0};
+  expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS21), &options21,
+                                     sizeof(options21)) == S_OK &&
+             options21.WorkGraphsTier == 0 && options21.ExecuteIndirectTier == 10 &&
+             !options21.SampleCmpGradientAndBiasSupported && !options21.ExtendedCommandInfoSupported,
+         "options 21: work graphs %u, ExecuteIndirect tier %u, %u, %u", options21.WorkGraphsTier,
+         options21.ExecuteIndirectTier, options21.SampleCmpGradientAndBiasSupported,
+         options21.ExtendedCommandInfoSupported);
+  for (UINT size : {0u, UINT(sizeof(options21) - 1), UINT(sizeof(options21) + 1)})
+    expect(device->CheckFeatureSupport(D3D12_FEATURE(reference::D3D12_FEATURE_D3D12_OPTIONS21), &options21, size) ==
+               E_INVALIDARG,
+           "options 21 accepts size %u", size);
+  // a priority reported for a queue type makes a queue of that type and priority, and normal is always one
+  // (D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY). a global realtime queue that cannot be had is refused: "the request
+  // succeeds or fails as-is" (D3D12_COMMAND_QUEUE_PRIORITY)
+  for (auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY})
+    for (INT priority : {D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
+                         D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME}) {
+      step("queue type %u, priority %d", type, priority);
+      D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY query{type, UINT(priority), ~0};
+      if (!expect(device->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &query, sizeof(query)) == S_OK,
+                  "priority query failed"))
+        continue;
+      expect(query.PriorityForTypeIsSupported || priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
+             "normal priority is not supported");
+      if (query.PriorityForTypeIsSupported) {
+        D3D12_COMMAND_QUEUE_DESC queue_desc{type, priority};
+        ComPtr<ID3D12CommandQueue> queue;
+        expect(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))) &&
+                   queue->GetDesc().Priority == priority,
+               "a queue of a supported priority is refused or changed");
+      } else if (priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+        D3D12_COMMAND_QUEUE_DESC queue_desc{type, priority};
+        ID3D12CommandQueue *queue = (ID3D12CommandQueue *)(uintptr_t)1;
+        HRESULT hr = device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue));
+        expect(FAILED(hr) && !queue, "a global realtime queue reported unsupported gives %08lx", hr);
+        if (SUCCEEDED(hr) && queue)
+          queue->Release();
+      }
+      for (UINT size : {0u, UINT(sizeof(query) - 1), UINT(sizeof(query) + 1)})
+        expect(device->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &query, size) == E_INVALIDARG,
+               "priority query accepts size %u", size);
+    }
   // "Resource Layouts MUST be compatible with the type of Queue performing the layout transition"
   // (DirectX-Specs, Enhanced Barriers, Command Queue Layout Compatibility)
   for (UINT kind = D3D12_COMMAND_LIST_TYPE_DIRECT; kind <= D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE + 1; kind++) {

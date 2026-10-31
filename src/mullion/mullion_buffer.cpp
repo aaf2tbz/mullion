@@ -135,11 +135,15 @@ Buffer::view_(BufferViewKey key) {
 
 BufferView const &
 Buffer::view_(BufferViewKey key, BufferAllocation *allocation) {
-  if (unlikely(allocation->version_ != version_)) {
-    prepareAllocationViews(allocation);
-  }
-  return *allocation->cached_view_[key.index];
+  return cachedView(key, allocation);
 };
+
+std::pair<BufferView &, uint64_t>
+Buffer::view_(BufferViewKey key, BufferAllocation *allocation, uint64_t texel) {
+  auto &view = cachedView(key, allocation);
+  auto window = std::min<uint64_t>(texel / kTextureBufferStep, view.windows.size());
+  return {window ? *view.windows[window - 1] : view, texel - window * kTextureBufferStep};
+}
 
 MULLION_RESOURCE_RESIDENCY_STATE &
 Buffer::residency(BufferViewKey key) {
@@ -148,31 +152,33 @@ Buffer::residency(BufferViewKey key) {
 
 MULLION_RESOURCE_RESIDENCY_STATE &
 Buffer::residency(BufferViewKey key, BufferAllocation *allocation) {
+  return cachedView(key, allocation).residency;
+}
+
+// views are made on any thread while others read them (Texture::view): the list is read under the lock too, as adding
+// a view may move it, though not the views it points to
+BufferView &
+Buffer::cachedView(BufferViewKey key, BufferAllocation *allocation) {
+  std::shared_lock<mullion::shared_mutex> lock(mutex_);
   if (unlikely(allocation->version_ != version_)) {
+    lock.unlock();
     prepareAllocationViews(allocation);
+    lock.lock();
   }
-  return allocation->cached_view_[key.index]->residency;
+  return *allocation->cached_view_[key.index];
 }
 
 void
 Buffer::prepareAllocationViews(BufferAllocation *allocation) {
-  std::unique_lock<mullion::mutex> lock(mutex_);
+  std::unique_lock<mullion::shared_mutex> lock(mutex_);
   for (unsigned version = allocation->version_; version < version_; version++) {
     auto format = viewDescriptors_[version].format;
     auto texel_size = MTLGetTexelSize(format);
     assert(texel_size);
     assert(!(allocation->suballocation_size_ & (texel_size - 1)));
-    uint64_t total_length = (uint64_t)allocation->suballocation_size_ * allocation->suballocation_count_;
+    uint64_t texels = (uint64_t)allocation->suballocation_size_ * allocation->suballocation_count_ / texel_size;
     WMTTextureInfo info{};
     info.type = WMTTextureTypeTextureBuffer;
-    info.width = total_length / (uint64_t)texel_size;
-    // Metal caps texture buffers at 2^28 texels (maxTextureBufferWidth); larger D3D12 typed views
-    // (e.g. a 1.6 GB R32 buffer) would abort in MTLTextureDescriptor validation. Clamp the view.
-    constexpr uint64_t kMaxTextureBufferWidth = 268435456ull;
-    if (info.width > kMaxTextureBufferWidth) {
-      info.width = kMaxTextureBufferWidth;
-      total_length = kMaxTextureBufferWidth * (uint64_t)texel_size;
-    }
     info.height = 1;
     info.depth = 1;
     info.array_length = 1;
@@ -190,18 +196,24 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     }
     info.usage = usage;
 
-    auto view = allocation->obj_.newTexture(info, 0, total_length);
-
-    allocation->cached_view_.push_back(std::make_unique<BufferView>(
-        std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
-    ));
+    std::unique_ptr<BufferView> first;
+    for (uint64_t start = 0; !first || start + kTextureBufferWidth - kTextureBufferStep < texels;
+         start += kTextureBufferStep) {
+      info.width = std::min(texels - start, kTextureBufferWidth);
+      auto view = allocation->obj_.newTexture(info, start * texel_size, info.width * texel_size);
+      auto window = std::make_unique<BufferView>(
+          std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
+      );
+      first ? (void)first->windows.push_back(std::move(window)) : (void)(first = std::move(window));
+    }
+    allocation->cached_view_.push_back(std::move(first));
   }
   allocation->version_ = version_;
 };
 
 BufferViewKey
 Buffer::createView(BufferViewDescriptor const &descriptor) {
-  std::unique_lock<mullion::mutex> lock(mutex_);
+  std::unique_lock<mullion::shared_mutex> lock(mutex_);
   unsigned i = 0;
   for (; i < version_; i++) {
     if (viewDescriptors_[i].format == descriptor.format && viewDescriptors_[i].write == descriptor.write) {

@@ -45,7 +45,7 @@
 namespace mullion {
 
 constexpr auto kCommandQueueSize = 32u;
-const auto dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES");
+const std::string dump_frames = env::getEnvVar("MULLION_D3D12_DUMP_FRAMES"); // as d3d12_device.hpp declares it
 
 // a pass whose every dispatch waits for the one before (a UAV barrier between each two) runs serially, where Metal
 // orders the dispatches itself and a barrier costs nothing: a concurrent encoder's barriers take longer than that.
@@ -89,6 +89,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   using MetalCommandQueue = std::conditional_t<Metal4, WMT::MTL4CommandQueue, WMT::CommandQueue>;
   WMT::Reference<MetalCommandQueue> queue_;
   WMT::Reference<WMT::SharedEvent> completion_event_;
+  // Metal 3: an aliasing barrier's command buffer signals it, and the next waits for it (CommittingScope::OrderAliases)
+  WMT::Reference<WMT::SharedEvent> alias_event_;
+  uint64_t alias_value_ = 0;
+  // Metal 4: the next command buffer's first encoder orders aliased memory too, for a barrier its command buffer ended
+  // before an encoder could
+  bool order_aliases_ = false;
   WMT::Reference<WMT::Fence> fence_;
   // the clock of the timestamps the queue's work writes: Metal 3 samples nanoseconds, a Metal 4 counter heap ticks
   // (MTLDevice.h queryTimestampFrequency: "the frequency of the GPU timestamp in ticks per second")
@@ -113,8 +119,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   static bool
   PassesOverlap() {
-    // not Metal 4's, whose passes barriers order
-    static const bool overlap = !Metal4 && env::getEnvVar("MULLION_D3D12_PASS_OVERLAP") != "0";
+    static const bool overlap = env::getEnvVar("MULLION_D3D12_PASS_OVERLAP") != "0";
     return overlap;
   }
 
@@ -152,17 +157,27 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   PassSync
   NextSync(const EncoderData *pass) {
     PassSync sync;
+    // a Metal 4 pass of compute or blit work that waits for every pass before it, as WaitAll's encoders do, is a
+    // segment of the buffer's one compute encoder, which barriers order and whose end updates fence_ (closeCompute).
+    // one that joins a group is an encoder of its own, as on Metal 3
+    bool segment = Metal4 && pass->type != EncoderType::Render && pass->type != EncoderType::Clear &&
+                   pass->type != EncoderType::Resolve;
     if (!PassesOverlap()) {
       sync.waits[sync.wait_count++] = fence_;
-      sync.update = fence_;
+      if (!segment)
+        sync.update = fence_;
       return sync;
     }
     if (!Encodes(pass)) {
       order_next_ |= pass->overlap == PassOverlap::Ordered;
       return sync;
     }
-    sync.waits[sync.wait_count++] = fence_;
     auto overlap = std::exchange(order_next_, false) ? PassOverlap::Ordered : pass->overlap;
+    if (segment && (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses)) {
+      WaitAll([&](WMT::Fence fence) { sync.waits[sync.wait_count++] = fence; });
+      return sync;
+    }
+    sync.waits[sync.wait_count++] = fence_;
     if (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses) {
       overlap = PassOverlap::Ordered;
       previous_count_ = group_count_;
@@ -256,7 +271,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // a submission's runs of passes that need nothing but a command buffer (EncodePass) are encoded by several threads
   // at once, the queue's own among them, each into a command buffer of its own, and committed in the queue's order:
   // Metal's encoding of draws is what a frame of many waits for. MULLION_D3D12_ENCODE_THREADS=1 encodes on one.
-  // Metal 3 only: a Metal 4 queue's command buffers are its own (MTL4CommandBuffer_new)
   static constexpr unsigned kMaxEncodeThreads = 8;
   // commands: a run of fewer is encoded on one thread, and a thread is given no fewer
   // (MULLION_D3D12_PARALLEL_COMMANDS, for tests: both are that number)
@@ -654,7 +668,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         for (auto &allocator : inflight.allocators)
           if (allocator)
             allocator->pending--;
+        if (inflight.semaphore)
+          ReleaseSemaphore(inflight.semaphore, 1, nullptr);
         inflight = {};
+        retired_.Reach(internal_seq);
         inflight_cmdbuf_count_.fetch_sub(1, std::memory_order_release);
         inflight_cmdbuf_count_.notify_one();
         internal_seq++;
@@ -831,13 +848,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
       pool = WMT::MakeAutoreleasePool();
       if constexpr (Metal4) {
-        inflight->cmdbuf = WMT::Reference<MetalCommandBuffer>(MTL4CommandBuffer_new(
-            queue->queue_, queue->fence_, queue->completion_event_, seq, queue->device_->GetGlobalResidencySet(),
-            {kCustomBufferArgumentIndex0 + 1, D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
-             D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT}
-        ));
+        inflight->cmdbuf = encoded ? std::move(encoded) : queue->NewCommandBuffer(seq);
         if (!inflight->cmdbuf)
           queue->device_->LoseDevice();
+        else if (!encoded && queue->order_aliases_)
+          inflight->cmdbuf.orderAliases();
       } else {
         inflight->cmdbuf = encoded ? std::move(encoded) : queue->queue_.commandBuffer();
       }
@@ -879,6 +894,26 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return ended;
     }
 
+    // what follows sees memory the work so far reached through aliased addresses (a reserved buffer's tiles and a
+    // resource placed over the same heap memory): Metal 4 begins the next encoder with a barrier of resource-alias
+    // visibility, Metal 3 ends the command buffer and starts the next behind a GPU wait on an MTLSharedEvent it
+    // signals; neither waits on the CPU (d3d12_sparse_remap, d3d12_alias_submissions)
+    void
+    OrderAliases() {
+      if constexpr (Metal4) {
+        inflight->cmdbuf.orderAliases();
+        // and again at each command buffer after it, until a pass has taken it: one that ends first, or that is only a
+        // queue's wait, has no encoder to begin with the barrier
+        queue->order_aliases_ = true;
+      } else {
+        auto value = ++queue->alias_value_;
+        inflight->cmdbuf.encodeSignalEvent(queue->alias_event_, value);
+        End();
+        Start();
+        inflight->cmdbuf.encodeWaitForEvent(queue->alias_event_, value);
+      }
+    }
+
     // ends the command buffer and waits for it, past the fence a Wait before it names: what the work so far leaves
     // in memory is then there. false when the queue ended behind that Wait
     bool
@@ -900,6 +935,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   CommittingScope
   StartCommitting() {
     return CommittingScope(this);
+  }
+
+  // a Metal 4 command buffer for the slot of sequence number `seq`, whose commit signals that number
+  WMT::Reference<MetalCommandBuffer>
+  NewCommandBuffer(uint64_t seq) {
+    return WMT::Reference<MetalCommandBuffer>(MTL4CommandBuffer_new(
+        queue_, fence_, completion_event_, seq, device_->GetGlobalResidencySet(),
+        {kCustomBufferArgumentIndex0 + 1, D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+         D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT}
+    ));
   }
 
 public:
@@ -985,6 +1030,9 @@ public:
     } else {
       // the slots' command buffers, and those encoded ahead of them on the encoding threads
       queue_ = metal_device.newCommandQueue(kCommandQueueSize + kMaxEncodeThreads);
+      alias_event_ = metal_device.newSharedEvent();
+      if (!alias_event_)
+        return E_OUTOFMEMORY;
     }
     if (!queue_)
       return FAIL(E_FAIL);
@@ -993,10 +1041,9 @@ public:
     gate_->device = device_;
 
     fence_ = metal_device.newFence();
-    if constexpr (!Metal4)
-      for (auto &fence : group_fences_)
-        if (!(fence = metal_device.newFence()))
-          return E_FAIL;
+    for (auto &fence : group_fences_)
+      if (!(fence = metal_device.newFence()))
+        return E_FAIL;
     // the work before the first present is frame 0, as Present numbers the work after it
     capture_.frame(metal_device, 0);
     if (profile_) {
@@ -1409,6 +1456,8 @@ public:
         case EncoderType::Resolve:
           if (!EncodePass(cmdbuf, current, attachment, sparse_mappings, *scope.inflight, records, sync))
             return;
+          // its encoder began with an aliasing barrier the queue carried (OrderAliases)
+          order_aliases_ = false;
           break;
         case EncoderType::AccelerationStructure: {
           // which structures are built is the device's, and another queue's builds change it
@@ -1428,8 +1477,9 @@ public:
             scope.inflight->physical[WMTMetal4AccelerationStructure]++;
           auto encoder = attachment.sample_buffer ? cmdbuf.accelerationStructureCommandEncoder(attachment)
                                                   : cmdbuf.accelerationStructureCommandEncoder();
-          if constexpr (!Metal4)
-            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+          PassSync all;
+          WaitAll([&](WMT::Fence fence) { all.waits[all.wait_count++] = fence; });
+          encoder.waitForFences(all.waits, all.wait_count);
           encoder.encodeCommands(&data->cmd_head);
           if constexpr (!Metal4)
             encoder.updateFence(fence_);
@@ -1462,8 +1512,7 @@ public:
           if (diag::trace_encoders)
             scope.inflight->physical[WMTMetal4Blit]++;
           auto encoder = cmdbuf.blitCommandEncoder();
-          if constexpr (!Metal4)
-            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+          WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
           encoder.copyFromBuffer(staging, 0, data->dst, data->dst_offset, data->count * sizeof(uint64_t));
           if constexpr (!Metal4)
             encoder.updateFence(fence_);
@@ -1474,7 +1523,9 @@ public:
           break;
         }
         case EncoderType::Settle:
-          settle();
+          // an aliasing barrier once a reserved buffer exists
+          scope.OrderAliases();
+          cmdbuf = scope.inflight->cmdbuf;
           break;
         case EncoderType::Predicate: {
           // what its region's kernel decided is in memory once the command buffer with the kernel has completed
@@ -1496,8 +1547,7 @@ public:
             if (diag::trace_encoders)
               scope.inflight->physical[WMTMetal4Blit]++;
             auto encoder = cmdbuf.blitCommandEncoder();
-            if constexpr (!Metal4)
-              WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
+            WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence); });
             if (allocation)
               encoder.copyFromBuffer(allocation->buffer(), offset, staging, 0, length);
             if constexpr (!Metal4)
@@ -1576,7 +1626,7 @@ public:
     // lists whose every pass encodes on any thread, as many as follow each other: their passes, and what they cost.
     // not with what keeps state of a slot's own (profiles, GPU records, debug groups, encoder counts)
     std::vector<std::pair<EncoderData *, uint64_t>> passes;
-    bool parallel = !Metal4 && EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
+    bool parallel = EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
                     !diag::trace_encoders;
     for (size_t i = 0; i < recorded.size();) {
       size_t j = i;
@@ -1594,14 +1644,12 @@ public:
           break;
         }
       }
-      if constexpr (!Metal4) {
-        if (commands >= kParallelCommands && passes.size() > 1) {
-          if (!EncodeParallel(scope, passes, commands, sparse_mappings))
-            return;
-          cmdbuf = scope.inflight->cmdbuf;
-          i = j;
-          continue;
-        }
+      if (commands >= kParallelCommands && passes.size() > 1) {
+        if (!EncodeParallel(scope, passes, commands, sparse_mappings))
+          return;
+        cmdbuf = scope.inflight->cmdbuf;
+        i = j;
+        continue;
       }
       for (j = std::max(j, i + 1); i < j; i++)
         encode(encode, recorded[i], keeps.allocators[i].ptr());
@@ -1609,27 +1657,24 @@ public:
   };
 
   // encodes a pass of draws, copies, dispatches or a resolve into `cmdbuf`: it needs nothing of the queue's but its
-  // fences (`sync`), so the encoding threads run it too (EncodeParallel). false when the device is lost
+  // fences (`sync`), so the encoding threads run it too (EncodeParallel). `attachment` is the caller's: a Metal 4 pass
+  // may start with the sample the pass before it ended with, which the bridge writes into it. false when the device
+  // is lost
   bool
   EncodePass(
-      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo attachment,
+      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo &attachment,
       WMT::Buffer sparse_mappings, InflightCommandBuffer &inflight, const GPUListRecords *records, const PassSync &sync
   ) {
-    // a Metal 4 pass of compute or blit work is a segment of the buffer's one compute encoder, which barriers
-    // order (_MTL4CommandBuffer_encoder)
-    auto wait = [&](auto &encoder) {
-      if constexpr (!Metal4)
-        for (unsigned i = 0; i < sync.wait_count; i++)
-          encoder.waitForFence(sync.waits[i]);
-    };
+    auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
+    // a Metal 4 pass of compute or blit work with no fence of its own is a segment of the buffer's one compute
+    // encoder (NextSync), and so is a render pass's work before it
     auto end = [&](auto &encoder) {
-      if constexpr (Metal4) {
-        encoder.endSegment();
-      } else {
-        if (sync.update.handle)
-          encoder.updateFence(sync.update);
-        encoder.endEncoding();
-      }
+      if constexpr (Metal4)
+        if (!sync.update.handle || current->type == EncoderType::Render || current->type == EncoderType::Clear)
+          return encoder.endSegment();
+      if (sync.update.handle)
+        encoder.updateFence(sync.update);
+      encoder.endEncoding();
     };
     switch (current->type) {
     case EncoderType::Clear:
@@ -1678,7 +1723,8 @@ public:
           stencil_info.clear_stencil = stencil_data.clear_stencil;
         }
         render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
-        render_pass_info.center_samples = data->center_samples;
+        render_pass_info.programmed_samples = data->programmed_samples;
+        std::ranges::copy(data->sample_positions, render_pass_info.sample_positions);
         render_pass_info.render_target_array_length = data->render_target_array_length;
         render_pass_info.render_target_width = data->render_target_width;
         render_pass_info.render_target_height = data->render_target_height;
@@ -1738,13 +1784,24 @@ public:
       if (current->type == EncoderType::Clear)
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
       // the object and mesh stages read what earlier passes wrote as the vertex stage does. a pass that draws to what
-      // one of its group drew to waits for that one's pixels before its own
+      // one of its group drew to waits for that one's pixels before its own. the waits go to Metal in one call
+      std::array<wmtcmd_render_fence_op, std::tuple_size_v<decltype(sync.waits)> + 1 +
+                                             std::tuple_size_v<decltype(sync.pixels)>>
+          waits;
+      unsigned waited = 0;
+      auto wait_for = [&](WMT::Fence fence, WMTRenderStages stages) {
+        auto &op = waits[waited] = {WMTRenderCommandWaitForFence, {}, {}, fence.handle, stages};
+        if (waited++)
+          waits[waited - 2].next.set(&op);
+      };
       for (unsigned i = 0; i < sync.wait_count; i++)
-        encoder.waitForFence(sync.waits[i], WMTRenderStagePreRaster);
+        wait_for(sync.waits[i], WMTRenderStagePreRaster);
       if (data->before_head.next.get() && sync.update.handle)
-        encoder.waitForFence(sync.update, WMTRenderStagePreRaster);
+        wait_for(sync.update, WMTRenderStagePreRaster);
       for (unsigned i = 0; i < sync.pixel_count; i++)
-        encoder.waitForFence(sync.pixels[i], WMTRenderStageFragment);
+        wait_for(sync.pixels[i], WMTRenderStageFragment);
+      if (waited)
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(waits.data()));
       if (sparse_mappings) {
         inflight.sparse_mappings = sparse_mappings;
         encoder.setVertexBuffer(sparse_mappings, 0, kSparseBufferArgumentIndex);
@@ -1900,15 +1957,29 @@ public:
       syncs.push_back(NextSync(pass));
     std::vector<WMT::Reference<MetalCommandBuffer>> buffers(parts);
     buffers[0] = scope.inflight->cmdbuf;
-    for (unsigned k = 1; k < parts; k++)
-      buffers[k] = queue_.commandBuffer();
+    // a part's command buffer is the slot's after the one before, which commits it next
+    for (unsigned k = 1; k < parts; k++) {
+      if constexpr (Metal4) {
+        buffers[k] = NewCommandBuffer(inflight_cmdbuf_seq_.load(std::memory_order_relaxed) + k);
+        // each part's encoders run apart from the first part's, so each orders aliased memory itself
+        if (order_aliases_ && buffers[k])
+          buffers[k].orderAliases();
+      } else {
+        buffers[k] = queue_.commandBuffer();
+      }
+      if (!buffers[k]) {
+        device_->LoseDevice();
+        return false;
+      }
+    }
     // the parts the encoding threads have yet to finish, under the lock
     unsigned left = parts - 1;
     std::atomic<bool> lost = false;
     auto part = [&](unsigned k) {
       InflightCommandBuffer unused;
+      WMTSampleBufferAttachmentInfo unsampled{};
       for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++)
-        if (!EncodePass(buffers[k], passes[i].first, {}, sparse_mappings, unused, nullptr, syncs[i]))
+        if (!EncodePass(buffers[k], passes[i].first, unsampled, sparse_mappings, unused, nullptr, syncs[i]))
           lost = true;
     };
     {
@@ -1934,6 +2005,7 @@ public:
     for (unsigned k = 0; k < parts; k++) {
       for (auto i = bounds[k]; i < bounds[k + 1]; i++)
         scope.inflight->encoders[size_t(passes[i].first->type)]++;
+      order_aliases_ = false;
       if (sparse_mappings)
         scope.inflight->sparse_mappings = sparse_mappings;
       if (k + 1 < parts) {
@@ -2183,8 +2255,7 @@ public:
     if (diag::trace_encoders)
       inflight.physical[WMTMetal4Blit]++;
     auto blit = inflight.cmdbuf.blitCommandEncoder();
-    if constexpr (!Metal4)
-      WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
+    WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
     blit.encodeCommands((const wmtcmd_blit_nop *)&copy);
     if constexpr (!Metal4)
       blit.updateFence(fence_);
@@ -2231,8 +2302,7 @@ public:
     if (!copies.empty()) {
       auto p = reinterpret_cast<MTLD3D12Resource *>(previous);
       auto blit = cmdbuf.blitCommandEncoder();
-      if constexpr (!Metal4)
-        WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
+      WaitAll([&](WMT::Fence fence) { blit.waitForFence(fence); });
       for (auto [to, from] : copies)
         for (uint32_t eye = 0; eye < g->texture->arrayLength(); eye++) {
           wmtcmd_blit_copy_from_texture_to_texture copy{.type = WMTBlitCommandCopyFromTextureToTexture};

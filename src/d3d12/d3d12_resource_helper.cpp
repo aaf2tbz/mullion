@@ -301,6 +301,7 @@ IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps) {
   switch (pHeapProps->Type) {
   case D3D12_HEAP_TYPE_UPLOAD:
   case D3D12_HEAP_TYPE_READBACK:
+  case sdk::D3D12_HEAP_TYPE_GPU_UPLOAD:
     return true;
   case D3D12_HEAP_TYPE_CUSTOM:
     return pHeapProps->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
@@ -333,6 +334,7 @@ ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, const D3D12_HEAP_PROPERT
   }
   case D3D12_HEAP_TYPE_DEFAULT:
   case D3D12_HEAP_TYPE_CUSTOM:
+  case sdk::D3D12_HEAP_TYPE_GPU_UPLOAD:
     break;
   default:
     return FAIL(E_INVALIDARG);
@@ -383,7 +385,8 @@ ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS
       return FAIL(E_INVALIDARG);
     [[fallthrough]];
   }
-  case D3D12_HEAP_TYPE_UPLOAD: {
+  case D3D12_HEAP_TYPE_UPLOAD:
+  case sdk::D3D12_HEAP_TYPE_GPU_UPLOAD: {
     if (pHeapProps->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN)
       return FAIL(E_INVALIDARG);
     if (pHeapProps->MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN)
@@ -413,6 +416,10 @@ ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS
   }
 
   if ((Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) && IsCpuVisibleHeap(pHeapProps))
+    return FAIL(E_INVALIDARG);
+  // D3D12 GPU Upload Heaps, Restrictions
+  if (pHeapProps->Type == sdk::D3D12_HEAP_TYPE_GPU_UPLOAD &&
+      (Flags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY)))
     return FAIL(E_INVALIDARG);
 
   // TODO(d3d12): check NodeMask

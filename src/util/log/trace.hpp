@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -59,6 +60,30 @@ void Write(Category category, const std::string &message);
 void WriteLine(const std::string &line);
 // a flight record's site, a printf format of up to four 64-bit integers, with its words, in the trace log
 void WriteFlight(Category category, const char *format, const uint64_t words[4]);
+
+// MULLION_TRACE_PRESENT: a swap chain's Presents, each with a PresentTrace for its call
+struct Presents {
+  std::chrono::steady_clock::time_point last;
+  uint64_t count = 0;
+};
+
+// as the Present returns, its line: the time since the one before and the time in it. 1 has the ones 50 ms or more
+// after the one before (a hitch), heavy every one
+class PresentTrace {
+  Presents *presents_ = nullptr;
+  const void *swap_chain_;
+  unsigned interval_, flags_;
+  std::chrono::steady_clock::time_point start_;
+
+public:
+  PresentTrace(Presents &presents, const void *swap_chain, unsigned interval, unsigned flags) :
+      swap_chain_(swap_chain), interval_(interval), flags_(flags) {
+    if (On(Present))
+      presents_ = &presents, start_ = std::chrono::steady_clock::now();
+  }
+  PresentTrace(const PresentTrace &) = delete;
+  ~PresentTrace();
+};
 
 } // namespace mullion::trace
 

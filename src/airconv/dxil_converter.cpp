@@ -165,6 +165,7 @@ enum Op : uint32_t {
   LegacyF16ToF32 = 131,
   WaveAllBitCount = 135,
   WavePrefixBitCount = 136,
+  AttributeAtVertex = 137,
   ViewID = 138,
   RawBufferLoad = 139,
   RawBufferStore = 140,
@@ -237,6 +238,7 @@ enum Semantic : uint32_t {
   DepthLessEqual,
   DepthGreaterEqual,
   StencilRef,
+  SemanticBarycentrics = 28,
   SemanticShadingRate = 29,
   SemanticCullPrimitive = 30,
 };
@@ -910,7 +912,7 @@ read_dxil(
       {Coverage, D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK},
       {InnerCoverage, D3D11_SB_OPERAND_TYPE_INNER_COVERAGE},
   };
-  std::set<uint32_t> used_ops;
+  std::set<uint32_t> used_ops, evaluated_barycentrics;
   for (auto &F : M) {
     if (!F.getName().startswith("dx.op."))
       continue;
@@ -918,12 +920,23 @@ read_dxil(
       auto call = cast<CallInst>(user);
       auto op = opcode(call);
       used_ops.insert(op);
+      if (op != EvalSnapped && op != EvalSampleIndex && op != EvalCentroid && op != AttributeAtVertex)
+        continue;
+      auto id = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+      auto &e = entry.input[id];
+      if (e.semantic == SemanticBarycentrics) {
+        evaluated_barycentrics.insert(id);
+        continue;
+      }
+      // the rows it reads: all of the element's for a dynamic row
+      uint32_t rows = uint32_t((1ull << e.rows) - 1) << e.row;
+      if (auto row = dyn_cast<ConstantInt>(call->getArgOperand(2)))
+        rows = 1u << (e.row + row->getZExtValue());
+      if (op == AttributeAtVertex)
+        info.vertex_value_reg_mask |= rows;
       // evaluated attributes are interpolated in the shader, as DXBC's eval instructions mark them
-      if ((op == EvalSnapped || op == EvalSampleIndex || op == EvalCentroid) &&
-          isa<ConstantInt>(call->getArgOperand(2)))
-        info.pull_mode_reg_mask |= 1u
-                                   << (entry.input[cast<ConstantInt>(call->getArgOperand(1))->getZExtValue()].row +
-                                       cast<ConstantInt>(call->getArgOperand(2))->getZExtValue());
+      else if (isa<ConstantInt>(call->getArgOperand(2)))
+        info.pull_mode_reg_mask |= rows;
     }
   }
 
@@ -1001,6 +1014,9 @@ read_dxil(
   auto rows = [&](auto &elements, auto &parser, auto opcode_of, D3D10_SB_OPERAND_TYPE type, uint32_t phase = ~0u) {
     for (unsigned id = 0; id < elements.size(); id++) {
       auto &e = elements[id];
+      // barycentrics have no register (define_barycentrics)
+      if (e.semantic == SemanticBarycentrics)
+        continue;
       for (uint32_t row = e.row; row < e.row + e.rows; row++) {
         uint32_t mask = ((1u << e.cols) - 1) << e.col;
         auto name = system_value(parser, row, mask);
@@ -1061,6 +1077,13 @@ read_dxil(
     auto [opcode, type, row, name, id, interpolation, phase] = key;
     declare(opcode, type, row, mask, name, interpolation, phase);
   }
+  // after the position's declaration, whose interpolation stays its own where barycentrics take the position too
+  if (pixel)
+    for (unsigned id = 0; id < entry.input.size(); id++)
+      if (entry.input[id].semantic == SemanticBarycentrics)
+        define_barycentrics(
+            shader, id, D3D10_SB_INTERPOLATION_MODE(entry.input[id].interpolation), evaluated_barycentrics.contains(id)
+        );
   // groupshared 64-bit atomics hash their locks with the threadgroup's position (`locked`); those on resources share
   // their locks among threadgroups
   for (auto &F : M)
@@ -1849,9 +1872,11 @@ convert_dxil(
     auto ptr = ir.CreateGEP(unit, ir.CreatePointerCast(b.Pointer, unit->getPointerTo(space)), {index});
     if (!b.Metadata || inside)
       return ptr;
-    auto bytes = ir.CreateZExt(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt64Ty());
-    auto units = ir.CreateUDiv(bytes, ir.getInt64(unit->getPrimitiveSizeInBits() / 8));
-    return ir.CreateSelect(ir.CreateICmpULT(index, units), ptr, Constant::getNullValue(ptr->getType()));
+    auto units = ir.CreateUDiv(dxbc.DecodeRawBufferByteLength(b.Metadata), ir.getInt32(unit->getPrimitiveSizeInBits() / 8));
+    // a raw index is masked to 32 bits of bytes above, so it compares in the GPU's 32-bit integers
+    auto within = b.StructureStride ? ir.CreateICmpULT(index, ir.CreateZExt(units, index->getType()))
+                                    : ir.CreateICmpULT(ir.CreateTrunc(index, units->getType()), units);
+    return ir.CreateSelect(within, ptr, Constant::getNullValue(ptr->getType()));
   };
   // system inputs read the way DXBC reads them (the coverage mask honors the PSO sample mask)
   auto attribute = [&](shader::common::InputAttribute input, uint32_t component) {
@@ -2110,8 +2135,11 @@ convert_dxil(
   };
   // a 64-bit atomic, which Apple GPUs lack (but min and max without a result): `update` of `word`'s old value under a
   // lock word of `locks` hashed from its key, returning the old value. every 64-bit atomic takes a lock, so none races
-  // a lock-free one. one lane of a SIMD group at a time takes one: a lane waiting on its own group's lock holder would
-  // wait forever, as the group's lanes do not run while one spins
+  // a lock-free one. the lanes of a SIMD group take their locks in rounds: in each, the first pending lane and every
+  // pending lane whose lock word is not the first's try theirs once, and a lane that takes its lock updates the word
+  // and releases it in the same round. so no lane waits across rounds on a lock its own group holds (the group's lanes
+  // do not run apart), lanes of different words do not wait for each other, and lanes of one word take turns as one
+  // lane at a time did
   auto locked = [&](const Word64 &word, Value *locks, std::function<Value *(Value *)> update) -> Value * {
     if (air.DiscardWrites && word.memory != llvm::air::MemFlags::Threadgroup)
       return word.read();
@@ -2120,52 +2148,56 @@ convert_dxil(
     auto head = ir.GetInsertBlock();
     auto exit = SplitBlock(head, &*ir.GetInsertPoint());
     auto block = [&](const char *name) { return llvm::BasicBlock::Create(ctx.llvm, name, ctx.function, exit); };
-    auto loop = block("atomic64"), pending_lane = block("atomic64_pending"), elected = block("atomic64_elected"),
-         spin = block("atomic64_spin"), held = block("atomic64_held"), given_up = block("atomic64_given_up"),
+    auto loop = block("atomic64"), attempt = block("atomic64_attempt"), gate = block("atomic64_gate"),
+         try_lock = block("atomic64_try"), deferred = block("atomic64_deferred"), held = block("atomic64_held"),
+         retry = block("atomic64_retry"), waiting = block("atomic64_waiting"), given_up = block("atomic64_given_up"),
          next = block("atomic64_next");
     // a pixel shader's helper lanes take no part: their atomics do nothing, so one would spin on a lock forever
     ir.SetInsertPoint(head->getTerminator());
     Value *lane = ctx.shader_type == D3D10_SB_PIXEL_SHADER
                       ? ir.CreateNot(simd("simd_is_helper_thread", ir.getInt1Ty(), {}))
                       : (Value *)ir.getTrue();
-    head->getTerminator()->setSuccessor(0, loop);
-    ir.SetInsertPoint(loop);
-    auto pending = ir.CreatePHI(ir.getInt1Ty(), 2), old = ir.CreatePHI(ir.getInt64Ty(), 2);
-    pending->addIncoming(lane, head);
-    old->addIncoming(PoisonValue::get(ir.getInt64Ty()), head);
-    ir.CreateCondBr(simd("simd_any", ir.getInt1Ty(), {pending}), pending_lane, exit);
-    ir.SetInsertPoint(pending_lane);
-    ir.CreateCondBr(pending, elected, next);
-    // the first pending lane
-    ir.SetInsertPoint(elected);
-    auto first = simd("simd_is_first", ir.getInt1Ty(), {});
     // Fibonacci hashing of the key, the table's mask in its word 0
     auto hash =
         ir.CreateTrunc(ir.CreateLShr(ir.CreateMul(word.key, ir.getInt64(0x9e3779b97f4a7c15)), 32), ir.getInt32Ty());
     auto mask = ir.CreateLoad(ir.getInt32Ty(), locks);
-    auto lock = ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(ir.CreateAnd(hash, mask), ir.getInt32(1))});
-    ir.CreateCondBr(first, spin, next);
+    auto index = ir.CreateAdd(ir.CreateAnd(hash, mask), ir.getInt32(1));
+    auto lock = ir.CreateGEP(ir.getInt32Ty(), locks, {index});
+    head->getTerminator()->setSuccessor(0, loop);
     // a lock word counts its holders: even is free, odd is held, and each release makes it the next even number.
     // the wait is bounded, well inside the GPU's watchdog, so a lock whose holder never runs again cannot hang the GPU:
     // a lane gives up once the word has not changed for kSpins tries, and raises the table's flag, which removes the
     // device (MTLD3D12Device::CheckAtomicLocks). a word that changes is a lock passing between other lanes: under
     // contention (every thread of a large dispatch on one word) a lane may lose to them many times, and still waits
     constexpr uint32_t kSpins = 1u << 24;
-    ir.SetInsertPoint(spin);
+    ir.SetInsertPoint(loop);
+    auto pending = ir.CreatePHI(ir.getInt1Ty(), 2), old = ir.CreatePHI(ir.getInt64Ty(), 2);
     auto spins = ir.CreatePHI(ir.getInt32Ty(), 2), last = ir.CreatePHI(ir.getInt32Ty(), 2);
-    spins->addIncoming(ir.getInt32(0), elected);
-    last->addIncoming(ir.getInt32(0), elected);
+    pending->addIncoming(lane, head);
+    old->addIncoming(PoisonValue::get(ir.getInt64Ty()), head);
+    spins->addIncoming(ir.getInt32(0), head);
+    last->addIncoming(ir.getInt32(0), head);
+    ir.CreateCondBr(simd("simd_any", ir.getInt1Ty(), {pending}), attempt, exit);
+    ir.SetInsertPoint(attempt);
+    ir.CreateCondBr(pending, gate, next);
+    // the pending lanes alone: the first's lock word, which the others of it leave to the first this round
+    ir.SetInsertPoint(gate);
+    auto first_index = move("simd_broadcast_first", index, {});
+    auto first = simd("simd_is_first", ir.getInt1Ty(), {});
+    ir.CreateCondBr(ir.CreateOr(first, ir.CreateICmpNE(index, first_index)), try_lock, deferred);
+    ir.SetInsertPoint(deferred);
+    ir.CreateBr(next);
+    ir.SetInsertPoint(try_lock);
     auto expected = ir.CreateAnd(last, ir.getInt32(~1u));
     auto exchange = ir.CreateAtomicCmpXchg(lock, expected, ir.CreateOr(expected, ir.getInt32(1)), {},
                                            AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
     auto seen = ir.CreateExtractValue(exchange, 0), taken = ir.CreateExtractValue(exchange, 1);
-    auto retry = block("atomic64_retry");
     ir.CreateCondBr(taken, held, retry);
     ir.SetInsertPoint(retry);
     auto spun = ir.CreateSelect(ir.CreateICmpEQ(seen, last), ir.CreateAdd(spins, ir.getInt32(1)), ir.getInt32(0));
-    ir.CreateCondBr(ir.CreateICmpEQ(spun, ir.getInt32(kSpins)), given_up, spin);
-    spins->addIncoming(spun, retry);
-    last->addIncoming(seen, retry);
+    ir.CreateCondBr(ir.CreateICmpEQ(spun, ir.getInt32(kSpins)), given_up, waiting);
+    ir.SetInsertPoint(waiting);
+    ir.CreateBr(next);
     ir.SetInsertPoint(given_up);
     air.CreateAtomicRMW(AtomicRMWInst::Or, ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(mask, ir.getInt32(2))}), ir.getInt32(1));
     ir.CreateBr(next);
@@ -2179,17 +2211,25 @@ convert_dxil(
     air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
     ir.CreateBr(next);
     ir.SetInsertPoint(next);
-    auto still = ir.CreatePHI(ir.getInt1Ty(), 4), got = ir.CreatePHI(ir.getInt64Ty(), 4);
-    still->addIncoming(ir.getFalse(), held);
-    got->addIncoming(value, held);
-    still->addIncoming(ir.getFalse(), given_up);
-    got->addIncoming(PoisonValue::get(ir.getInt64Ty()), given_up);
-    for (auto from : {pending_lane, elected}) {
-      still->addIncoming(pending, from);
-      got->addIncoming(old, from);
-    }
+    auto still = ir.CreatePHI(ir.getInt1Ty(), 5), got = ir.CreatePHI(ir.getInt64Ty(), 5);
+    auto spins_next = ir.CreatePHI(ir.getInt32Ty(), 5), last_next = ir.CreatePHI(ir.getInt32Ty(), 5);
+    auto incoming = [&](llvm::BasicBlock *from, Value *s, Value *g, Value *n, Value *l) {
+      still->addIncoming(s, from);
+      got->addIncoming(g, from);
+      spins_next->addIncoming(n, from);
+      last_next->addIncoming(l, from);
+    };
+    // done: the lane that held its lock, and one that gave up
+    incoming(held, ir.getFalse(), value, spins, last);
+    incoming(given_up, ir.getFalse(), PoisonValue::get(ir.getInt64Ty()), spins, last);
+    // still waiting: a lane that lost this round, one that left its word to the first, and one with nothing to do
+    incoming(waiting, ir.getTrue(), old, spun, seen);
+    incoming(deferred, ir.getTrue(), old, spins, last);
+    incoming(attempt, pending, old, spins, last);
     pending->addIncoming(still, next);
     old->addIncoming(got, next);
+    spins->addIncoming(spins_next, next);
+    last->addIncoming(last_next, next);
     ir.CreateBr(loop);
     ir.SetInsertPoint(&*exit->getFirstInsertionPt());
     return old;
@@ -2308,6 +2348,8 @@ convert_dxil(
         break;
       default:
         h.sampler = ctx.binding.GetSampler(air, id, a(3));
+        if (h.sampler)
+          dxbc.NoteSampler(*h.sampler);
         break;
       }
       if (!h.texture && !h.buffer && !h.cbuffer && !h.sampler)
@@ -2328,6 +2370,10 @@ convert_dxil(
                    : op == LoadOutputControlPoint ? ctx.resource.output
                                                   : ctx.resource.patch_constant_output;
       auto &elements = op == LoadInput ? entry.input : op == LoadOutputControlPoint ? entry.output : entry.patch;
+      if (op == LoadInput && elements[constant(a(1))].semantic == SemanticBarycentrics) {
+        ret = ir.CreateExtractElement(ctx.resource.barycentrics[constant(a(1))].value, a(3));
+        break;
+      }
       auto ptr = element_ptr(file, elements[constant(a(1))], call, op == LoadPatchConstant ? nullptr : a(4));
       ret = narrow(ir.CreateLoad(ir.getInt32Ty(), ptr), ty);
       break;
@@ -2734,9 +2780,15 @@ convert_dxil(
     case CBufferLoadLegacy: {
       // a 16-byte row, as the elements DXIL reads it as: four of 32 bits, eight of 16 or two of 64
       auto sty = cast<StructType>(ty);
-      auto bits = sty->getElementType(0)->getPrimitiveSizeInBits();
+      unsigned bits = sty->getElementType(0)->getPrimitiveSizeInBits();
+      // the dwords holding the elements the call's users read
+      uint32_t elements = used(call), dwords = 0;
+      for (unsigned i = 0; i < 4; i++)
+        if (elements >> (i * 32 / bits) & llvm::maskTrailingOnes<uint32_t>(std::max(1u, 32 / bits)))
+          dwords |= 1u << i;
       auto row = ir.CreateBitCast(
-          dxbc.LoadConstantBuffer(*handles[a(1)].cbuffer, a(2)), FixedVectorType::get(ir.getIntNTy(bits), 128 / bits)
+          dxbc.LoadConstantBuffer(*handles[a(1)].cbuffer, a(2), -1, dwords),
+          FixedVectorType::get(ir.getIntNTy(bits), 128 / bits)
       );
       ret = UndefValue::get(ty);
       for (unsigned i = 0; i < sty->getNumElements(); i++)
@@ -2789,7 +2841,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
-                options.second.lod, false
+                options.second.lod
             );
           };
           break;
@@ -2802,7 +2854,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
-                options.second.lod, true
+                options.second.lod
             );
           };
           break;
@@ -2831,7 +2883,7 @@ convert_dxil(
           read = [&, options](Value *s, Value *ref) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, ref, options.first.bias,
-                options.second.lod, false
+                options.second.lod
             );
           };
           break;
@@ -3336,6 +3388,21 @@ convert_dxil(
     case EvalCentroid:
     case EvalSampleIndex:
     case EvalSnapped: {
+      if (entry.input[constant(a(1))].semantic == SemanticBarycentrics) {
+        auto &b = ctx.resource.barycentrics[constant(a(1))];
+        // eval_snapped's offset is in 1/16 pixel steps, [-8, 7]
+        auto snapped = [&] {
+          auto steps = ir.CreateAnd(ir.CreateAdd(vec(call, 4, 2, air.getIntTy(2)), air.getInt2(8, 8)), air.getInt2(0b1111, 0b1111));
+          return ir.CreateFSub(
+              ir.CreateFMul(air.CreateConvertToFloat(steps), air.getFloat2(1.0f / 16.0f, 1.0f / 16.0f)), air.getFloat2(0.5f, 0.5f)
+          );
+        };
+        auto offset = op == EvalCentroid      ? b.centroid
+                      : op == EvalSampleIndex ? air.CreateRasterizerSamplePos(a(4))
+                                              : snapped();
+        ret = ir.CreateExtractElement(b.At(ir, offset), a(3));
+        break;
+      }
       auto itp = interpolant(call);
       if (!itp)
         return make_error<UnsupportedFeature>(
@@ -3576,6 +3643,27 @@ convert_dxil(
         auto byte = ir.CreateTrunc(ir.CreateLShr(a(2), 8 * i), ir.getInt8Ty());
         ret = ir.CreateInsertValue(ret, constant(a(1)) ? ir.CreateSExt(byte, elem) : ir.CreateZExt(byte, elem), {i});
       }
+      break;
+    }
+    case AttributeAtVertex: {
+      if (ty->getPrimitiveSizeInBits() > 32)
+        return make_error<UnsupportedFeature>("DXIL 64-bit inputs are not lowered yet");
+      auto &e = entry.input[constant(a(1))];
+      auto at = [&](uint32_t row) -> Value * {
+        auto &values = ctx.resource.vertex_value_map[e.row + row];
+        auto c = e.col + constant(a(3));
+        auto value = air.CreateGetVertexValue(
+            ctx.function->getArg(values.component[c]), values.integers >> c & 1 ? ir.getInt32Ty() : ir.getFloatTy(),
+            ir.CreateZExt(a(4), ir.getInt32Ty())
+        );
+        return ir.CreateBitCast(value, ir.getInt32Ty());
+      };
+      // a dynamic row picks among the element's
+      bool dynamic = !isa<ConstantInt>(a(2));
+      Value *value = at(dynamic ? 0 : constant(a(2)));
+      for (uint32_t row = 1; dynamic && row < e.rows; row++)
+        value = ir.CreateSelect(ir.CreateICmpEQ(a(2), ir.getInt32(row)), at(row), value);
+      ret = narrow(value, ty);
       break;
     }
     case ViewID:
@@ -3902,11 +3990,11 @@ convert_dxil(
       for (uint32_t u = 0; u < 3; u++) {
         auto vertex = ir.CreateAdd(vertex_base, ir.getInt32(u));
         air.CreateSetMeshPosition(vertex, triangle.position[u]);
-        // a flat varying is the first corner's
+        // a flat varying is its own corner's, as conservative_point's
         for (uint32_t i = 0; i < cm->registers[0].size(); i++) {
           auto reg = cm->registers[0][i];
           bool integer = cm->integers[0][i], flat = integer || (cm->flat_inputs >> reg & 1);
-          Value *value = flat ? word(conservative_vertices, corner[0], i)
+          Value *value = flat ? word(conservative_vertices, corner[u], i)
                               : blend(cm->noperspective_inputs >> reg & 1 ? triangle.linear : triangle.over_w, u, i);
           if (flat && !integer)
             value = real(value);
@@ -3914,7 +4002,7 @@ convert_dxil(
         }
         for (uint32_t i = 0; i < clip_count; i++)
           air.CreateSetMeshClipDistance(vertex, ir.getInt32(i), blend(triangle.over_w, u, position_at + 4 + i));
-        conservative_varyings(air, triangle, u, vertex, cm->at);
+        conservative_varyings(air, triangle, u, vertex, cm->at, cm->barycentrics);
         air.CreateSetMeshIndex(ir.CreateAdd(vertex_base, ir.getInt32(u)), ir.CreateTrunc(vertex, i8));
       }
       // a primitive is culled when one distance puts all its vertices out, when the shader culls it itself, or when
@@ -4090,6 +4178,7 @@ convert_dxil_mesh_stage(
     resource_map.conservative_mesh->triangles = link->triangles;
     resource_map.conservative_mesh->flat_inputs = link->flat_inputs;
     resource_map.conservative_mesh->noperspective_inputs = link->noperspective_inputs;
+    resource_map.conservative_mesh->barycentrics = link->barycentrics;
   }
   resource_map.mesh_slices = slices;
 
@@ -4180,10 +4269,7 @@ convert_dxil_mesh_stage(
     if (conservative) {
       auto &cm = *resource_map.conservative_mesh;
       cm.at = cm.registers[0].size();
-      for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
-        func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-            .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = cm.at + i
-        });
+      define_conservative_varyings(func_signature, cm.at, cm.barycentrics);
     }
   } else {
     func_signature.DefineInput(air::InputMeshGridProperties{});
@@ -4224,6 +4310,7 @@ convert_dxil_mesh_stage(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -4369,6 +4456,7 @@ convert_dxil_ray_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );

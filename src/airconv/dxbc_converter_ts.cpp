@@ -404,6 +404,7 @@ convert_dxbc_vertex_hull_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -1035,10 +1036,7 @@ convert_dxbc_tesselator_domain_shader(
         .arg_name = "viewports",
         .raster_order_group = {}
     });
-    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W; i++)
-      func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-          .user = "mullion_conservative" + std::to_string(i), .type = air::msl_float, .index = conservative_at + i
-      });
+    define_conservative_varyings(func_signature, conservative_at, pso_tess->barycentrics);
     auto stash_type = llvm::ArrayType::get(registers_type, pieces.primitives * 3);
     stash = new llvm::GlobalVariable(
         module, stash_type, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(stash_type), "", nullptr,
@@ -1068,6 +1066,7 @@ convert_dxbc_tesselator_domain_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -1287,7 +1286,7 @@ convert_dxbc_tesselator_domain_shader(
           );
           air.CreateSetMeshClipDistance(vertex, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr));
         }
-        conservative_varyings(air, triangle, u, vertex, conservative_at);
+        conservative_varyings(air, triangle, u, vertex, conservative_at, pso_tess->barycentrics);
         air.CreateSetMeshIndex(vertex, vertex);
       }
       // culled by a distance all three corners are behind, or by clipping

@@ -74,8 +74,10 @@ def main():
     parser.add_argument("--out", required=True, type=Path, help="where the records and logs go")
     parser.add_argument("--frames", type=int, default=48, help="frames a run presents (default: %(default)s)")
     parser.add_argument("--seconds", type=int, default=300, help="the most a run may take (default: %(default)s)")
+    parser.add_argument("--family", default="native", help="the Apple GPU family to run as, as tests/run.py names it")
     args = parser.parse_args()
     with run.session(args) as (builds, binary, base):
+        base = run.as_family(base, args.family)
         failed = 0
         for program, front in PROGRAMS.items():
             exe = next(path for build in builds for path in build.glob(f"tests/*/{program}.exe"))

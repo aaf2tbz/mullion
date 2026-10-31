@@ -24,7 +24,7 @@ int main(int, char **) {
   ComPtr<IDXGIFactory4> factory;
   CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
   DXGI_SWAP_CHAIN_DESC1 desc{1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0}, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2,
-                            DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD};
+                            DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT};
   HWND window = CreateWindowA("static", "d3d12_device_removal", WS_POPUP, 0, 0, desc.Width, desc.Height,
                               nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
   if (!expect(window != nullptr, "CreateWindow"))
@@ -68,10 +68,19 @@ int main(int, char **) {
   CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&copy)));
   copy->CopyBufferRegion(readback.Get(), 0, upload.Get(), 0, size);
   CHECK(copy->Close());
+  ComPtr<IDXGISwapChain2> chain2;
+  CHECK(chain.As(&chain2));
+  HANDLE waitable = chain2->GetFrameLatencyWaitableObject();
+  expect(WaitForSingleObject(waitable, 1000) == WAIT_OBJECT_0, "initial latency token");
+  ComPtr<ID3D12Fence> held;
+  CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&held)));
+  presenting->Wait(held.Get(), 1);
+  expect(SUCCEEDED(chain->Present(0, 0)), "held present");
   HRESULT created = E_FAIL;
   std::thread creation([&] { created = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&raced)); });
   device->RemoveDevice();
   creation.join();
+  expect(WaitForSingleObject(waitable, 2000) == WAIT_OBJECT_0, "the held present gives its latency token back");
   step("observe removal after concurrent CreateFence returned %08lx", created);
   expect(created == S_OK ? bool(raced) : created == DXGI_ERROR_DEVICE_REMOVED && !raced,
          "concurrent fence creation: %08lx", created);

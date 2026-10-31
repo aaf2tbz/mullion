@@ -28,6 +28,15 @@ spec.loader.exec_module(tool)
 
 
 class Mutations(unittest.TestCase):
+    def setUp(self):
+        # the runner keeps the peaks of this machine's tests, which these tests' commands are not
+        import run
+        peaks = tempfile.TemporaryDirectory()
+        self.addCleanup(peaks.cleanup)
+        patcher = patch.object(run, "PEAKS", Path(peaks.name) / "peaks.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make(self, source, active=None):
         return tool.mutations(source, "src/example.cpp", active)[1]
 
@@ -481,6 +490,8 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                       "is_parallel": name != "serial"} for name in ["a", "b", "flaky", "serial"]]
             args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=len(tests))
             run.KNOWN = root / "known.txt"
+            # each measured, as one never measured runs alone
+            run.PEAKS.write_text(json.dumps({run.measured(t["cmd"], dict(os.environ, **t["env"])): 0 for t in tests}))
             with redirect_stdout(StringIO()) as out:
                 failed = run.own(args, tests, [root], None, dict(os.environ))
             runs = [line.split() for line in (root / "runs").read_text().splitlines()]

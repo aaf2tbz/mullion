@@ -267,6 +267,16 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
     module.setTargetTriple("air64-apple-macosx15.0.0");
     break;
   }
+  case SM50_SHADER_METAL_400: {
+    airVersion->addOperand(
+        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)})
+    );
+    airLangVersion->addOperand(MDTuple::get(
+        context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(0), createUnsignedInteger(0)}
+    ));
+    module.setTargetTriple("air64_v28-apple-macosx26.0.0");
+    break;
+  }
   default: {
     airVersion->addOperand(
         MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(6), createUnsignedInteger(0)})
@@ -603,6 +613,9 @@ llvm::Error convert_dxbc_pixel_shader(
     metal_version = sm50_common->metal_version;
     shader_flags = sm50_common->flags;
   }
+  // barycentrics and inputs read at each vertex are Metal 4's
+  if (shader_info->use_barycentrics || shader_info->vertex_value_reg_mask)
+    metal_version = SM50_SHADER_METAL_400;
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
@@ -626,6 +639,7 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output || early_tests;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
+    sig_ctx.barycentric_rows = pso_data && (pso_data->quad_lines || pso_data->conservative);
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
@@ -856,6 +870,7 @@ llvm::Error convert_dxbc_pixel_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -1192,6 +1207,7 @@ llvm::Error convert_dxbc_compute_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -1347,6 +1363,7 @@ llvm::Error convert_dxbc_vertex_shader(
           .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
       },
       builder, nulldbg
   );
@@ -1646,6 +1663,7 @@ static int SM50InitializeUncached(
     return 1;
   }
 
+  ResetRefused();
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
@@ -1706,6 +1724,17 @@ static int SM50InitializeUncached(
     D3D10ShaderBinary::CShaderCodeParser CodeParser((CShaderToken *)DXBCParser.GetBlob(codeBlobIdx));
     sm50_shader->shader_type = CodeParser.ShaderType();
     sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
+  }
+  // tokens or a signature the converter could not take refuse the shader, now that reading is over (Refuse)
+  if (auto reason = Refused()) {
+    // what the converter does not support yet is said as such ("unsupported: ...")
+    if (std::string_view(reason).starts_with("unsupported:"))
+      errorOut << reason;
+    else
+      errorOut << "Invalid DXBC bytecode: " << reason;
+    delete sm50_shader;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
   }
 
   // a library's shaders bind their resources through root signatures only
@@ -1943,7 +1972,7 @@ static int SM50InitializeUncached(
           components[primitive] += e.rows * e.cols;
       uint32_t staged = sm50_shader->mesh_max_vertices * (components[0] + 1) * 4 +
                         sm50_shader->mesh_max_primitives * (components[1] * 4 + 8);
-      uint32_t vertex_size = (components[0] + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4;
+      uint32_t vertex_size = (components[0] + mullion::dxbc::conservative_floats) * 4;
       uint32_t triangles = staged <= mullion::dxbc::conservative_stash_limit
                                ? std::min({256u / 3, 512u, std::max(sm50_shader->mesh_max_primitives, 1u)})
                                : 0;
@@ -2015,7 +2044,7 @@ static int SM50InitializeUncached(
       // primitives
       uint32_t triangles = sm50_shader->gs_max_vertex_output >= 3 ? sm50_shader->gs_max_vertex_output - 2 : 0;
       uint32_t vertex_size = sizeof(float[4]) +
-                             (sm50_shader->num_mesh_vertex_data + SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W) * 4 +
+                             (sm50_shader->num_mesh_vertex_data + mullion::dxbc::conservative_floats) * 4 +
                              sm50_shader->clip_distance_scalars.size() * sizeof(float);
       pRefl->GeometryShader.ConservativeFits =
           sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && triangles &&
@@ -2028,6 +2057,7 @@ static int SM50InitializeUncached(
                             sm50_shader->ps_noperspective_input_mask};
       // EvaluateAttribute* evaluates where the shader chooses, which coarse shading does not move
       pRefl->PixelShader.FineShading = sm50_shader->ps_fine_shading || sm50_shader->shader_info.pull_mode_reg_mask;
+      pRefl->PixelShader.Barycentrics = sm50_shader->shader_info.use_barycentrics;
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;

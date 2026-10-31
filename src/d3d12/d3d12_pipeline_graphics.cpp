@@ -33,6 +33,7 @@
 #include <mutex>
 #include <array>
 #include <unordered_set>
+#include <deque>
 #include <variant>
 
 namespace mullion {
@@ -416,9 +417,9 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds,
-             late, conservative, coarse, rate] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+             late, conservative, coarse, rate, quads] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
       hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds, late,
-           conservative, coarse, rate);
+           conservative, coarse, rate, quads);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -431,9 +432,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
-      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads, conservative, flat, noperspective] =
-          *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
-      hash(strip, cut, index, primitive, pass, statistics, clips, quads, conservative, flat, noperspective);
+      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads, barycentrics, conservative, flat,
+             noperspective] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
+      hash(strip, cut, index, primitive, pass, statistics, clips, quads, barycentrics, conservative, flat, noperspective);
       break;
     }
     case SM50_SHADER_GS_PASS_THROUGH: {
@@ -442,9 +443,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
-      auto &[next, type, factor, size, groups, geometry, conservative, flat, noperspective] =
+      auto &[next, type, factor, size, groups, geometry, conservative, flat, noperspective, barycentrics] =
           *(SM50_SHADER_PSO_TESSELLATOR_DATA *)arg;
-      hash(factor, size, groups, bool(geometry), conservative, flat, noperspective);
+      hash(factor, size, groups, bool(geometry), conservative, flat, noperspective, barycentrics);
       break;
     }
     case SM50_SHADER_ROOT_SIGNATURE:
@@ -466,9 +467,9 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
-      auto &[next, type, pixel, conservative, amplified, triangles, slices, flat, noperspective] =
+      auto &[next, type, pixel, conservative, amplified, triangles, slices, flat, noperspective, barycentrics] =
           *(SM50_SHADER_MESH_SHADER_DATA *)arg;
-      hash(bool(pixel), conservative, amplified, triangles, slices, flat, noperspective);
+      hash(bool(pixel), conservative, amplified, triangles, slices, flat, noperspective, barycentrics);
       break;
     }
     default:
@@ -568,6 +569,8 @@ CompileFunction(
 
 class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12PipelineObject<MTLD3D12GraphicsPipelineState> {
 protected:
+  // held for the pipeline's life, so that pipelines and variants made of the same shaders share their initialization
+  SM50Shader shader_vs, shader_hs, shader_ds, shader_gs, shader_ps, shader_as, shader_ms;
   MTL_SHADER_REFLECTION ref_vs;
   MTL_SHADER_REFLECTION ref_ps{};
 
@@ -635,7 +638,7 @@ protected:
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut;
     uint32_t primitive; // D3D10_SB_PRIMITIVE of the topology type
     bool clip_distance_varyings;
-    bool quad_lines;
+    bool quad_lines, barycentrics;
     // conservative rasterization, and how the pixel shader interpolates its inputs
     bool conservative;
     uint32_t flat_inputs, noperspective_inputs;
@@ -679,6 +682,7 @@ protected:
     pso_gs.clip_distance_varyings = in.clip_distance_varyings;
     pso_gs.quad_lines = in.quad_lines && pass_through && !counting;
     pso_gs.conservative = in.conservative && !counting && (!in.gs.empty() || pass_through);
+    pso_gs.barycentrics = in.barycentrics && (pso_gs.quad_lines || pso_gs.conservative);
     pso_gs.flat_inputs = in.flat_inputs;
     pso_gs.noperspective_inputs = in.noperspective_inputs;
     so = in.so;
@@ -992,8 +996,10 @@ public:
                                    ? pDesc->RasterizerState.ForcedSampleCount
                                    : std::max(pDesc->SampleDesc.Count, 1u);
     // refused before its shaders are compiled for a pipeline Metal would refuse
-    if (!device_->GetMTLDevice().supportsTextureSampleCount(info.raster_sample_count))
+    if (!device_->GetMTLDevice().supportsTextureSampleCount(info.raster_sample_count)) {
+      WARN("InitializePSO: ", info.raster_sample_count, " samples, which this GPU does not rasterize");
       return FAIL(E_INVALIDARG);
+    }
     // Metal refuses a mesh pipeline that asks for indirect command buffers on GPUs before Apple9, where mesh draws
     // never go in them (d3d12_command_allocator.cpp)
     info.support_indirect_command_buffers = std::is_same_v<RenderPipelineInfo, WMTRenderPipelineInfo> ||
@@ -1159,12 +1165,11 @@ public:
 
     HRESULT hr;
 
-    SM50Shader shader_vs, shader_hs, shader_ds, shader_gs, shader_ps, shader_as, shader_ms;
     MTL_SHADER_REFLECTION ref_hs, ref_ds, ref_gs, ref_as, ref_ms;
     WMT::Reference<WMT::Error> err;
 
     SM50_SHADER_COMMON_DATA common;
-    common.flags = device_->GetShaderFlags();
+    common.flags = SM50_SHADER_FLAG(device_->GetShaderFlags() | (borderless ? SM50_SHADER_FLAG_NO_CUSTOM_BORDER : 0));
     common.type = SM50_SHADER_COMMON;
     common.metal_version = device_->GetMetalVersion();
     common.simd_width = device_->GetSIMDWidth();
@@ -1357,6 +1362,7 @@ public:
       data_ps.depth_bounds = depth_bounds_emulated;
       data_ps.late_tests = false;
       data_ps.conservative = conservative;
+      data_ps.quad_lines = quad_lines && ref_ps.PixelShader.Barycentrics;
       data_ps.coarse_shading = false;
       // the primitive's shading rate, from the stage before the rasterizer: a domain or mesh shader has none
       data_ps.shading_rate_varying = sm50_shader_t(shader_gs)      ? ref_gs.ShadingRateOutput
@@ -1420,6 +1426,7 @@ public:
       in->ps = ps_func;
       in->clip_distance_varyings = clips;
       in->quad_lines = quad_lines;
+      in->barycentrics = ps_func && ref_ps.PixelShader.Barycentrics;
       in->strip_cut = pDesc->IBStripCutValue;
       in->primitive = pDesc->PrimitiveTopologyType;
       in->conservative = conservative;
@@ -1448,6 +1455,7 @@ public:
         link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.triangles - 1) / link.triangles;
         link.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
         link.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
+        link.barycentrics = pixel_shader && ref_ps.PixelShader.Barycentrics;
       }
       // the amplification shader asks for a conservative mesh shader's slices
       SM50_SHADER_MESH_SHADER_DATA amplified = link;
@@ -1516,6 +1524,7 @@ public:
       pso_tess.conservative = conservative;
       pso_tess.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
       pso_tess.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
+      pso_tess.barycentrics = conservative && pixel_shader && ref_ps.PixelShader.Barycentrics;
       pso_tess.next = &clip_data;
       mesh_info.fragment_function = ps_func.handle;
       mesh_info.rasterization_enabled = true;
@@ -1765,6 +1774,10 @@ CreateGraphicsPipelineState(
   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
   if (HRESULT hr = PipelineKey(*pDesc, pso->library_key, depth_bounds, AS, MS, depth_stencil2); FAILED(hr))
     return hr;
+  PipelineStateStream stream{.desc_graphics = *pDesc, .desc_as = AS, .desc_ms = MS, .depth_bounds = depth_bounds};
+  if (depth_stencil2)
+    stream.depth_stencil2 = *depth_stencil2;
+  pso->borderless = Borderless(pDevice, stream);
   if (cached)
     pso->cached_shaders = *cached;
   pso->depth_bounds = depth_bounds && pDevice->GetMTLDevice().supportsFamily(WMTGPUFamilyApple10);
@@ -1774,6 +1787,52 @@ CreateGraphicsPipelineState(
     return hr;
   return pso->QueryInterface(riid, ppPipelineState);
 };
+
+std::shared_ptr<const PipelineStateStream>
+Borderless(MTLD3D12Device *device, const PipelineStateStream &stream) {
+  if (device->custom_borders)
+    return {};
+  struct Owned : PipelineStateStream {
+    std::deque<std::string> bytes;
+    std::vector<D3D12_SO_DECLARATION_ENTRY> outputs;
+    std::vector<UINT> strides;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    Com<ID3D12RootSignature> signature;
+  };
+  auto owned = std::make_shared<Owned>();
+  static_cast<PipelineStateStream &>(*owned) = stream;
+  auto keep = [&](const void *data, size_t size) { return owned->bytes.emplace_back((const char *)data, size).data(); };
+  auto &cs = owned->desc_cs;
+  auto &graphics = owned->desc_graphics;
+  for (auto code : {&cs.CS, &graphics.VS, &graphics.PS, &graphics.DS, &graphics.HS, &graphics.GS, &owned->desc_as,
+                    &owned->desc_ms})
+    if (code->pShaderBytecode)
+      code->pShaderBytecode = keep(code->pShaderBytecode, code->BytecodeLength);
+  cs.CachedPSO = graphics.CachedPSO = {};
+  owned->signature = cs.pRootSignature ? cs.pRootSignature : graphics.pRootSignature;
+  auto &so = graphics.StreamOutput;
+  owned->outputs.assign(so.pSODeclaration, so.pSODeclaration + so.NumEntries);
+  for (auto &output : owned->outputs)
+    if (output.SemanticName)
+      output.SemanticName = keep(output.SemanticName, strlen(output.SemanticName) + 1);
+  so.pSODeclaration = owned->outputs.data();
+  owned->strides.assign(so.pBufferStrides, so.pBufferStrides + so.NumStrides);
+  so.pBufferStrides = owned->strides.data();
+  auto &layout = graphics.InputLayout;
+  owned->elements.assign(layout.pInputElementDescs, layout.pInputElementDescs + layout.NumElements);
+  for (auto &element : owned->elements)
+    element.SemanticName = keep(element.SemanticName, strlen(element.SemanticName) + 1);
+  layout.pInputElementDescs = owned->elements.data();
+  return owned;
+}
+
+ID3D12PipelineState *
+MTLD3D12PipelineState::Bordered(MTLD3D12Device *Device) {
+  std::lock_guard<mullion::mutex> lock(shader_mutex);
+  if (!bordered && FAILED(borderless->Create(Device, __uuidof(ID3D12PipelineState), (void **)&bordered)))
+    ERR("pipeline ", name, ": the variant that emulates custom borders failed");
+  return bordered.ptr();
+}
 
 HRESULT
 PipelineStateStream::Key(Sha1Digest &key) const {

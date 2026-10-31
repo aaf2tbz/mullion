@@ -475,10 +475,12 @@ public:
 
   llvm::Value *
   DecodeSamplerBias(llvm::Value *Metadata) {
-    return ir.CreateFMul(
+    auto Bias = ir.CreateFMul(
         ir.CreateSIToFP(ir.CreateTrunc(Metadata, ir.getInt16Ty()), air.getFloatTy()),
         llvm::ConstantFP::get(air.getFloatTy(), std::ldexp(1.0, -SM50_SAMPLER_METADATA_LOD_FRACTION_BITS))
     );
+    SamplerBiases[Bias] = Metadata;
+    return Bias;
   }
 
   // the resource's min-LOD clamp, raised by a shader clamp or applied to an explicit LOD (D3D11.3 5.8.2)
@@ -499,13 +501,24 @@ public:
   // a sample whose LOD comes from its quad's derivatives, with `Bias` and `MinLOD`, of `Reference` when it compares.
   // Metal biases the footprint's minor axis before an anisotropic filter clamps the footprint's ratio, which can undo
   // the bias; D3D biases the LOD of the clamped footprint ("biasedLOD = output.LOD + MipLODBias", D3D11.3 7.18.11).
-  // so a pixel shader's sample of a 2D texture through an anisotropic sampler with a bias scales its gradients
-  // instead, which keeps the ratio. `OwnBias`: the instruction adds a bias of its own, which may differ within the
-  // quad, so the sampler alone takes the branch
+  // so a pixel shader's sample of a 2D texture through a sampler that may be anisotropic scales its gradients
+  // instead, which keeps the ratio; without anisotropy that is the biased LOD too, so one sample serves every sampler
+  // a static sampler's anisotropy and bias, known when the pipeline is made (SamplerDescriptor), by its metadata, and
+  // the metadata each bias DecodeSamplerBias made was read from, which a sample may add its own to
+  struct KnownSampler {
+    bool Anisotropic, Biased;
+  };
+  std::map<llvm::Value *, KnownSampler> KnownSamplers;
+  std::map<llvm::Value *, llvm::Value *> SamplerBiases;
+  void
+  NoteSampler(const SamplerDescriptor &Descriptor) {
+    if (Descriptor.Anisotropic && Descriptor.Biased)
+      KnownSamplers[Descriptor.Metadata] = {*Descriptor.Anisotropic, *Descriptor.Biased};
+  }
+
   std::pair<llvm::Value *, llvm::Value *> SampleImplicit(
       const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
-      llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD,
-      bool OwnBias
+      llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD
   );
 
   // a sample's texels and status, where Metal's own are wrong: a reserved texture a shader can write reports no
@@ -548,7 +561,8 @@ public:
     return ir.CreateFMul(Gradient, Ty ? ir.CreateVectorSplat(Ty->getNumElements(), Scale) : Scale);
   }
 
-  llvm::Value *LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Value *Row, int Component = -1);
+  llvm::Value *
+  LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Value *Row, int Component = -1, mask_t Dwords = kMaskAll);
 
   // a D3D texel address (texel coordinates, then the array slice) as Metal's position and array index. texel
   // buffers are addressed inside their view. a position past the view, or at a `Level` below the view's min-LOD

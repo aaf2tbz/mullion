@@ -76,11 +76,18 @@ struct BufferViewDescriptor {
 
 class Buffer;
 
+// Metal's texture buffers hold at most 2^28 texels (Metal feature set tables, "maximum texture buffer width", which
+// no API reports). a wider allocation's view is windows of that width, one every kTextureBufferStep texels: a view
+// no longer than the width less the step lies whole in the window its first texel is in (Buffer::view_)
+constexpr uint64_t kTextureBufferWidth = 1ull << 28, kTextureBufferStep = kTextureBufferWidth / 2;
+
 struct BufferView {
   WMT::Reference<WMT::Texture> texture;
   uint64_t gpu_resource_id;
   uint64_t suballocation_texel;
   MULLION_RESOURCE_RESIDENCY_STATE residency{};
+  // the windows after this one, of an allocation wider than kTextureBufferWidth texels
+  std::vector<std::unique_ptr<BufferView>> windows;
 
   BufferView(WMT::Reference<WMT::Texture> &&texture, uint64_t gpu_resource_id, uint64_t suballocation_texel) :
       texture(std::move(texture)),
@@ -221,6 +228,8 @@ public:
 
   BufferView const &view_(BufferViewKey key); 
   BufferView const &view_(BufferViewKey key, BufferAllocation *allocation);
+  // the window that holds a view whose first texel is `texel`, and that texel's index in it
+  std::pair<BufferView &, uint64_t> view_(BufferViewKey key, BufferAllocation *allocation, uint64_t texel);
 
   MULLION_RESOURCE_RESIDENCY_STATE &residency(BufferViewKey key);
   MULLION_RESOURCE_RESIDENCY_STATE &residency(BufferViewKey key, BufferAllocation *allocation);
@@ -236,6 +245,7 @@ public:
 
 private:
   void prepareAllocationViews(BufferAllocation *allocation);
+  BufferView &cachedView(BufferViewKey key, BufferAllocation *allocation);
 
   uint64_t length_;
 
@@ -244,7 +254,7 @@ private:
   std::atomic<uint32_t> refcount_ = {0u};
 
   small_vector<BufferViewDescriptor, 1> viewDescriptors_;
-  mullion::mutex mutex_;
+  mullion::shared_mutex mutex_;
   WMT::Device device_;
 };
 

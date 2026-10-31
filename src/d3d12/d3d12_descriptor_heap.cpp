@@ -280,9 +280,9 @@ public:
     if (mapped_argument_buffer_) { 
       auto &gpu_storage = mapped_argument_buffer_[Index];
       if (UAVBuffer) {
-        auto &buffer_view = UAVBuffer->view_(View);
+        auto [buffer_view, first] = UAVBuffer->view_(View, UAVBuffer->current(), Slice.firstElement);
         gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
-        gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
+        gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | first;
         gpu_storage.UAVTexelBuffer.padding[0] = UAVBuffer->current()->gpuAddress();
       } else {
         gpu_storage.UAVTexelBuffer.resource_id = 0;
@@ -327,9 +327,9 @@ public:
     if (mapped_argument_buffer_) { 
       auto &gpu_storage = mapped_argument_buffer_[Index];
       if (Buffer) {
-        auto &buffer_view = Buffer->view_(View);
+        auto [buffer_view, first] = Buffer->view_(View, Buffer->current(), Slice.firstElement);
         gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
-        gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
+        gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | first;
       } else {
         gpu_storage.UAVTexelBuffer.resource_id = 0;
         gpu_storage.UAVTexelBuffer.metadata = 0;
@@ -667,6 +667,8 @@ public:
   
     WMTSamplerInfo info;
     bool custom = PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, *pDesc);
+    if (custom)
+      device_->custom_borders = true;
     auto sampler =
         Sampler::createSampler(device_->GetMTLDevice(), info, pDesc->MipLODBias, custom ? pDesc->BorderColor : nullptr);
 

@@ -292,9 +292,10 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   encoder_last = nullptr;
   encoder_count_ = 0;
 
+  // the pool keeps only what the last use made, so it grows with a use and never past it
+  icb_pool_.clear();
   for (auto &used : icb_)
-    if (icb_pool_.size() < kICBPoolMax)
-      icb_pool_.emplace(used.key, std::move(used));
+    icb_pool_.emplace(used.key, std::move(used));
   icb_.clear();
   sparse_clear_texels_.clear();
   visibility_.clear();
@@ -714,9 +715,10 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeTexture(
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeTexelBuffer(
-    uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags
+    uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags, uint32_t &first
 ) {
-  auto &dst_ = buffer->view_(viewId);
+  auto [dst_, texel] = buffer->view_(viewId, buffer->current(), first);
+  first = texel;
   auto &settexbuf = ctx.EncodeComputeCommand<wmtcmd_compute_settexture>();
   settexbuf.type = WMTComputeCommandSetTexture;
   settexbuf.texture = dst_.texture;

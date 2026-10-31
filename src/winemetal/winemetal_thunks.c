@@ -4,7 +4,6 @@
 #define WINEMETAL_API
 #endif
 
-#include <stdio.h>
 #include "winemetal_thunks.h"
 #include <wineunixlib.h>
 #include "assert.h"
@@ -74,7 +73,9 @@ enum { kFlightRecords = 4096 };
 struct flight_ring {
   struct flight_ring *next;
   DWORD owner;
-  int64_t written;
+  // `dumped`: the count the dump holding flight_dump_lock read and copies to, so that what threads write meanwhile
+  // cannot take the room it counted for another ring's records
+  int64_t written, dumped;
   struct WMTFlightEntry entries[kFlightRecords];
 };
 static struct flight_ring *flight_rings;
@@ -100,8 +101,6 @@ flight_ticks(void) {
 #endif
 }
 static const void *flight_exception_site;
-// the registers of a thread whose exception dumps, four to a record (x86_64 and ARM64EC)
-static const void *flight_registers_site[4];
 
 WINEMETAL_API const void *
 WMTFlightSite(const char *format) {
@@ -158,15 +157,15 @@ WMTFlightDump(const char *reason) {
   uint64_t count = 0, overwritten = 0;
   struct flight_ring *rings = __atomic_load_n(&flight_rings, __ATOMIC_ACQUIRE), *ring;
   for (ring = rings; ring; ring = ring->next)
-    count += flight_kept(__atomic_load_n(&ring->written, __ATOMIC_ACQUIRE));
+    count += flight_kept(ring->dumped = __atomic_load_n(&ring->written, __ATOMIC_ACQUIRE));
   struct WMTFlightEntry *entries =
       count ? VirtualAlloc(NULL, count * sizeof(*entries), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : NULL;
   if (count && !entries)
     count = 0;
   uint64_t at = 0;
   for (ring = rings; ring && at < count; ring = ring->next) {
-    int64_t written = __atomic_load_n(&ring->written, __ATOMIC_ACQUIRE), kept = flight_kept(written);
-    for (int64_t i = written - kept; i < written && at < count; i++)
+    int64_t written = ring->dumped, kept = flight_kept(written);
+    for (int64_t i = written - kept; i < written; i++)
       entries[at++] = ring->entries[i % kFlightRecords];
     overwritten += written - kept;
   }
@@ -202,87 +201,6 @@ WMTFlightDump(const char *reason) {
   ReleaseSRWLockExclusive(&flight_dump_lock);
 }
 
-// the dump's heading: what fits of `text` after what it has. a heading has no commas (it ends at the first)
-static void
-reason_append(char *reason, size_t size, const char *text) {
-  size_t used = strlen(reason), more = strlen(text);
-  if (used + more < size)
-    memcpy(reason + used, text, more + 1);
-}
-
-static void
-reason_hex(char *reason, size_t size, uint64_t value) {
-  char text[19] = "0x", digits[16];
-  int count = 0;
-  do
-    digits[count++] = "0123456789abcdef"[value & 15];
-  while ((value >>= 4) && count < 16);
-  for (int i = 0; i < count; i++)
-    text[2 + i] = digits[count - 1 - i];
-  text[2 + count] = 0;
-  reason_append(reason, size, text);
-}
-
-// "<module>+<offset>" of an address in a loaded module; FALSE when no module holds it
-static BOOL
-reason_module(char *reason, size_t size, const void *address) {
-  HMODULE module;
-  char path[MAX_PATH];
-  // the first 64 KB never hold code, and a null address would name the executable
-  if ((uintptr_t)address < 0x10000)
-    return FALSE;
-  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          address, &module))
-    return FALSE;
-  DWORD length = GetModuleFileNameA(module, path, sizeof(path));
-  if (!length || length >= sizeof(path))
-    return FALSE;
-  reason_append(reason, size, strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path);
-  reason_append(reason, size, "+");
-  reason_hex(reason, size, (uintptr_t)address - (uintptr_t)module);
-  return TRUE;
-}
-
-// the dump's heading: "exception in <module>+<offset>", as the records give only an address and a module the loader
-// relocated could be any of them. code no module holds (a JIT's, an unpacker's) is named by its memory, and by the
-// modules of the return addresses on its stack, which say who called into it
-static void
-flight_exception_reason(char *reason, size_t size, const void *address, const CONTEXT *context) {
-  MEMORY_BASIC_INFORMATION memory;
-  strcpy(reason, "exception in ");
-  if (reason_module(reason, size, address))
-    return;
-  if (!VirtualQuery(address, &memory, sizeof(memory))) {
-    strcpy(reason, "exception");
-    return;
-  }
-  reason_append(reason, size, "memory ");
-  reason_hex(reason, size, (uintptr_t)memory.AllocationBase);
-  reason_append(reason, size, "+");
-  reason_hex(reason, size, (uintptr_t)address - (uintptr_t)memory.AllocationBase);
-  reason_append(reason, size, " type ");
-  reason_hex(reason, size, memory.Type);
-  reason_append(reason, size, " protect ");
-  reason_hex(reason, size, memory.Protect);
-#if defined(__x86_64__) || defined(__arm64ec__)
-  MEMORY_BASIC_INFORMATION stack;
-  if (!VirtualQuery((const void *)context->Rsp, &stack, sizeof(stack)) || stack.State != MEM_COMMIT)
-    return;
-  const uint64_t *at = (const uint64_t *)(context->Rsp & ~7ull);
-  const uint64_t *end = (const uint64_t *)((uintptr_t)stack.BaseAddress + stack.RegionSize);
-  if (end - at > 8192)
-    end = at + 8192;
-  for (int found = 0; at < end && found < 8; at++) {
-    size_t used = strlen(reason);
-    reason_append(reason, size, " from ");
-    if (reason_module(reason, size, (const void *)(uintptr_t)*at))
-      found++;
-    else
-      reason[used] = 0;
-  }
-#endif
-}
-
 // the exceptions that end a process unless it catches them: the first dumps the records before its handlers run
 static LONG CALLBACK
 flight_exception(EXCEPTION_POINTERS *pointers) {
@@ -302,19 +220,8 @@ flight_exception(EXCEPTION_POINTERS *pointers) {
   case EXCEPTION_STACK_OVERFLOW:
   case EXCEPTION_INT_DIVIDE_BY_ZERO:
   case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-    if (!InterlockedExchange(&dumped, 1)) {
-#if defined(__x86_64__) || defined(__arm64ec__)
-      // the faulting thread's registers: what pointer it held when it faulted
-      const CONTEXT *context = pointers->ContextRecord;
-      WMTFlightRecord(flight_registers_site[0], context->Rip, context->Rsp, context->Rbp, context->Rax);
-      WMTFlightRecord(flight_registers_site[1], context->Rbx, context->Rcx, context->Rdx, context->Rsi);
-      WMTFlightRecord(flight_registers_site[2], context->Rdi, context->R8, context->R9, context->R10);
-      WMTFlightRecord(flight_registers_site[3], context->R11, context->R12, context->R13, context->R14);
-#endif
-      char reason[1024];
-      flight_exception_reason(reason, sizeof(reason), record->ExceptionAddress, pointers->ContextRecord);
-      WMTFlightDump(reason);
-    }
+    if (!InterlockedExchange(&dumped, 1))
+      WMTFlightDump("exception");
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -330,10 +237,6 @@ wmt_flight_main(DWORD reason, BOOL exiting) {
     flight_started = flight_ticks();
     flight_started_qpc = started.QuadPart;
     flight_exception_site = WMTFlightSite("exception %#llx at %#llx, information %#llx %#llx");
-    flight_registers_site[0] = WMTFlightSite("registers rip %#llx rsp %#llx rbp %#llx rax %#llx");
-    flight_registers_site[1] = WMTFlightSite("registers rbx %#llx rcx %#llx rdx %#llx rsi %#llx");
-    flight_registers_site[2] = WMTFlightSite("registers rdi %#llx r8 %#llx r9 %#llx r10 %#llx");
-    flight_registers_site[3] = WMTFlightSite("registers r11 %#llx r12 %#llx r13 %#llx r14 %#llx");
     AddVectoredExceptionHandler(1, flight_exception);
     break;
   case DLL_THREAD_DETACH: {
@@ -1489,6 +1392,15 @@ MTLDevice_supports32BitMSAA(obj_handle_t device) {
   return params.ret;
 }
 
+WINEMETAL_API bool
+MTLDevice_supportsShaderBarycentricCoordinates(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupportsShaderBarycentrics, &params);
+  return params.ret;
+}
+
 WINEMETAL_API uint64_t
 MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device) {
   struct unixcall_generic_obj_uint64_ret params;
@@ -1923,39 +1835,13 @@ WMTDiagWrite(const char *directory, const char *lines, uint64_t length) {
 }
 
 WINEMETAL_API bool
-WMTTraceWrite(const char *lines, uint64_t length) {
-  static char directory[MAX_PATH], executable[3 * MAX_PATH], categories[256];
-  static INIT_ONCE named = INIT_ONCE_STATIC_INIT;
-  BOOL pending;
-  if (InitOnceBeginInitialize(&named, 0, &pending, NULL) && pending) {
-    if (GetEnvironmentVariableA("MULLION_TRACE_DIR", directory, sizeof(directory)) >= sizeof(directory))
-      directory[0] = 0;
-    // MULLION_TRACE_<CATEGORY> as the bridge reads them: name=value, comma-separated
-    static const char *const names[] = {"SHADER", "PRESENT", "MEMORY", "RESOURCE", "SYNC", "GPU", "CPU", "API", "PASS"};
-    for (unsigned i = 0, used = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-      char variable[32], value[16];
-      snprintf(variable, sizeof(variable), "MULLION_TRACE_%s", names[i]);
-      DWORD length = GetEnvironmentVariableA(variable, value, sizeof(value));
-      if (!length || length >= sizeof(value))
-        continue;
-      int written = snprintf(categories + used, sizeof(categories) - used, "%s%s=%s", used ? "," : "", names[i], value);
-      if (written > 0 && used + written < sizeof(categories))
-        used += written;
-    }
-    WCHAR path[MAX_PATH];
-    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
-    WCHAR *name = path + length;
-    while (name > path && name[-1] != '\\' && name[-1] != '/')
-      name--;
-    WideCharToMultiByte(CP_UTF8, 0, name, -1, executable, sizeof(executable), NULL, NULL);
-    InitOnceComplete(&named, 0, NULL);
-  }
+WMTTraceWrite(const char *directory, const char *lines, uint64_t length, bool encoder_errors, bool memory_samples) {
   struct unixcall_wmttrace_write params;
   WMT_MEMPTR_SET(params.directory, directory);
-  WMT_MEMPTR_SET(params.executable, executable);
-  WMT_MEMPTR_SET(params.categories, categories);
   WMT_MEMPTR_SET(params.lines, lines);
   params.length = length;
+  params.encoder_errors = encoder_errors;
+  params.memory_samples = memory_samples;
   params.ret = 0;
   UNIX_CALL(WMTUnixTraceWrite, &params);
   return params.ret;
@@ -2092,4 +1978,10 @@ WINEMETAL_API void
 MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value) {
   struct unixcall_mtl4_event p = {.queue = buffer, .event = event, .value = value};
   UNIX_CALL(WMTUnixMetal4WaitEvent, &p);
+}
+
+WINEMETAL_API void
+MTL4CommandBuffer_orderAliases(obj_handle_t buffer) {
+  struct unixcall_generic_obj_noret p = {.handle = buffer};
+  UNIX_CALL(WMTUnixMetal4OrderAliases, &p);
 }

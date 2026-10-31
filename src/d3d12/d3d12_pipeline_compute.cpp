@@ -29,6 +29,8 @@ namespace mullion {
 
 class MTLD3D12ComputePipelineStateImpl : public MTLD3D12PipelineObject<MTLD3D12ComputePipelineState> {
 
+  // held for the pipeline's life, as a graphics pipeline holds its shaders
+  SM50Shader shader_cs;
   MTL_SHADER_REFLECTION ref_cs;
 
 public:
@@ -40,15 +42,13 @@ public:
   HRESULT
   Initialize(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc) {
     auto start = device_->NamesPasses() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    SM50Shader shader_cs;
-
     SM50_SHADER_ROOT_SIGNATURE_DATA rootsig{};
     rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
     rootsig.bytecode_length = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
     rootsig.next = nullptr;
 
     SM50_SHADER_COMMON_DATA common;
-    common.flags = device_->GetShaderFlags();
+    common.flags = SM50_SHADER_FLAG(device_->GetShaderFlags() | (borderless ? SM50_SHADER_FLAG_NO_CUSTOM_BORDER : 0));
     common.type = SM50_SHADER_COMMON;
     common.metal_version = device_->GetMetalVersion();
     common.simd_width = device_->GetSIMDWidth();
@@ -149,6 +149,7 @@ CreateComputePipelineState(
   auto pso = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
   if (HRESULT hr = PipelineKey(*pDesc, pso->library_key); FAILED(hr))
     return hr;
+  pso->borderless = Borderless(pDevice, {.desc_cs = *pDesc});
   if (cached)
     pso->cached_shaders = *cached;
   HRESULT hr = pso->Initialize(&desc);

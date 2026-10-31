@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 82
+#define AIRCONV_VERSION 90
 
 #ifdef __cplusplus
 #include <string>
@@ -155,6 +155,8 @@ struct MTL_PIXEL_SHADER_REFLECTION {
   /* the shader runs for each pixel or sample whatever the shading rate: it runs per sample, outputs depth or stencil
      reference, or evaluates its inputs where it chooses */
   uint32_t FineShading;
+  /* the shader reads barycentrics (SV_Barycentrics) */
+  uint32_t Barycentrics;
 };
 
 struct MTL_SHADER_REFLECTION {
@@ -314,6 +316,7 @@ struct SM50_SHADER_MESH_SHADER_DATA {
   uint32_t slices;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
+  bool barycentrics;
 };
 
 /* a DXIL library compiles one function at a time: its ray tracing shader `name`, as a visible function of a ray
@@ -380,6 +383,7 @@ SM50StreamOutputScratch(uint64_t groups, uint32_t invocations) {
 enum SM50_SHADER_METAL_VERSION {
   SM50_SHADER_METAL_310 = 310,
   SM50_SHADER_METAL_320 = 320,
+  SM50_SHADER_METAL_400 = 400,
   SM50_SHADER_METAL_MAX = 0xffffffff,
 };
 
@@ -454,6 +458,8 @@ enum SM50_SHADER_FLAG {
   /* a group sync does not make globallycoherent memory visible to other groups (before Apple9): in shaders whose
      groups work together, each group sync takes a device-scope fence */
   SM50_SHADER_FLAG_COHERENT_GROUP_SYNC = 1 << 5,
+  /* no sampler has a border color Metal lacks (SM50_SAMPLER_BORDER): samples leave out the custom border's emulation */
+  SM50_SHADER_FLAG_NO_CUSTOM_BORDER = 1 << 6,
 };
 
 struct SM50_SHADER_COMMON_DATA {
@@ -519,6 +525,9 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   bool coarse_shading;
   /* the primitive's rate, the varying of the stage before (MTL_SHADER_REFLECTION's ShadingRateOutput), or 0 */
   uint32_t shading_rate_varying;
+  /* lines reach the rasterizer as quadrilaterals (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's quad_lines), whose
+     barycentrics are SM50_BARYCENTRIC_ROWS */
+  bool quad_lines;
 };
 
 /* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the corners
@@ -530,6 +539,10 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
    center, at the centroid, at the sample and where it evaluates them. the grown triangle's points have a w of 1, so
    what Metal interpolates is linear in the window: their inputs are what is, an input over w, the points' own 1/w */
 #define SM50_CONSERVATIVE_RCP_W 4
+/* what a mesh stage whose triangles are not the primitive's (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's quad_lines)
+   passes a pixel shader that reads barycentrics: each point's weights of the primitive's corners times its 1/w, then
+   the weights, floats named "mullion_barycentrics0" to 5, which Metal interpolates linearly in the window */
+#define SM50_BARYCENTRIC_ROWS 6
 /* what a conservative rasterizer's mesh stage reads: the viewports by viewport array index (x, y, width, height), then
    whether the pipeline clips depth and whether its front faces are counterclockwise (1 or 0) */
 struct SM50_CONSERVATIVE_VIEWPORTS {
@@ -653,6 +666,9 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
   /* the lines passed on are quadrilaterals (D3D11.3 3.4.5): two counterclockwise triangles, which the pipeline
      draws with no culling, no depth bias, solid fill and counterclockwise front faces, as lines are drawn */
   bool quad_lines;
+  /* the pixel shader reads barycentrics, which quadrilaterals and conservative triangles pass on as
+     SM50_BARYCENTRIC_ROWS */
+  bool barycentrics;
   /* passing triangles through, conservative rasterization: each is one Metal triangle around it, its attributes
      extrapolated as the pixel shader interpolates them (MTL_PIXEL_SHADER_REFLECTION's FlatInputs,
      NoPerspectiveInputs), and it gives the pixel shader the polygon to test pixels against. the viewports are at
@@ -680,6 +696,7 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA {
   bool conservative;
   uint32_t flat_inputs;
   uint32_t noperspective_inputs;
+  bool barycentrics;
 };
 
 /* the libraries whose functions a library's shader may call: those of its state object */

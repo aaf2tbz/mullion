@@ -3,8 +3,8 @@
 # family 9
 --- a/src/winemetal/unix/winemetal_unix.c
 +++ b/src/winemetal/unix/winemetal_unix.c
-@@ -4257,10 +4257,6 @@
-     MullionMetal4Buffer *owner = (MullionMetal4Buffer *)p->buffer;
+@@ -4576,10 +4576,6 @@
+       [owner closeCompute];
      if (p->kind != WMTMetal4Render && owner->compute) {
        MullionMetal4Encoder *state = owner->compute;
 -      [(id<MTL4ComputeCommandEncoder>)state->encoder

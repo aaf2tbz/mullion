@@ -46,14 +46,41 @@ namespace mullion {
 namespace sdk {
 constexpr auto D3D_ROOT_SIGNATURE_VERSION_1_2 = (D3D_ROOT_SIGNATURE_VERSION)3;
 constexpr auto D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE = (D3D12_BARRIER_LAYOUT)31;
+constexpr UINT D3D12_FEATURE_D3D12_OPTIONS19 = 48;
+constexpr UINT D3D12_FEATURE_D3D12_OPTIONS20 = 49;
 constexpr UINT D3D12_FEATURE_PREDICATION = 50;
 constexpr UINT D3D12_FEATURE_HARDWARE_COPY = 52;
+constexpr UINT D3D12_FEATURE_D3D12_OPTIONS21 = 53;
 constexpr UINT D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT = 54;
 constexpr UINT D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE = 56;
 constexpr UINT D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED = 57;
 constexpr UINT D3D12_FEATURE_SHADER_CACHE_ABI_SUPPORT = 61;
 constexpr UINT D3D12_FEATURE_BARRIER_LAYOUT = 64;
 constexpr UINT D3D12_FEATURE_D3D12_OPTIONS22 = 65;
+
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS19 {
+  BOOL MismatchingOutputDimensionsSupported;
+  UINT SupportedSampleCountsWithNoOutputs;
+  BOOL PointSamplingAddressesNeverRoundUp;
+  BOOL RasterizerDesc2Supported;
+  BOOL NarrowQuadrilateralLinesSupported;
+  BOOL AnisoFilterWithPointMipSupported;
+  UINT MaxSamplerDescriptorHeapSize;
+  UINT MaxSamplerDescriptorHeapSizeWithStaticSamplers;
+  UINT MaxViewDescriptorHeapSize;
+  BOOL ComputeOnlyCustomHeapSupported;
+};
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS20 {
+  BOOL ComputeOnlyWriteWatchSupported;
+  UINT RecreateAtTier; // D3D12_RECREATE_AT_TIER
+};
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS21 {
+  UINT WorkGraphsTier;      // D3D12_WORK_GRAPHS_TIER
+  UINT ExecuteIndirectTier; // D3D12_EXECUTE_INDIRECT_TIER
+  BOOL SampleCmpGradientAndBiasSupported;
+  BOOL ExtendedCommandInfoSupported;
+};
+constexpr UINT D3D12_EXECUTE_INDIRECT_TIER_1_0 = 10;
 
 struct D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE { BOOL Supported; };
 struct D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED { BOOL Supported; };
@@ -429,7 +456,10 @@ public:
 
   SM50_SHADER_METAL_VERSION
   GetMetalVersion() {
-    static_assert(SM50_SHADER_METAL_310 == uint32_t(WMTMetal310) && SM50_SHADER_METAL_320 == uint32_t(WMTMetal320));
+    static_assert(
+        SM50_SHADER_METAL_310 == uint32_t(WMTMetal310) && SM50_SHADER_METAL_320 == uint32_t(WMTMetal320) &&
+        SM50_SHADER_METAL_400 == uint32_t(WMTMetal400)
+    );
     return SM50_SHADER_METAL_VERSION(ShaderMetalVersion(GetMTLDevice()));
   }
 
@@ -546,6 +576,9 @@ public:
       return FAIL(DXGI_ERROR_DEVICE_REMOVED);
     if (pDesc->Flags)
       WARN("CreateCommandQueue: flags ignored: ", pDesc->Flags);
+    // a priority CheckFeatureSupport reports unsupported (D3D12_FEATURE_COMMAND_QUEUE_PRIORITY)
+    if (pDesc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME)
+      return FAIL(E_INVALIDARG);
     return mullion::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
   };
 
@@ -556,11 +589,13 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
+    InitReturnPtr(ppPipelineState);
     return mullion::CreateGraphicsPipelineState(this, pDesc, riid, ppPipelineState);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
+    InitReturnPtr(ppPipelineState);
     return mullion::CreateComputePipelineState(this, pDesc, riid, ppPipelineState);
   };
 
@@ -743,8 +778,8 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16 *>(pFeatureData);
-      out->GPUUploadHeapSupported = FALSE;    // TODO(d3d12): gpu upload heap
-      out->DynamicDepthBiasSupported = FALSE; // TODO(d3d12): ID3D12GraphicsCommandList9::RSSetDepthBias
+      out->GPUUploadHeapSupported = TRUE;
+      out->DynamicDepthBiasSupported = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS2: {
@@ -753,7 +788,9 @@ public:
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(pFeatureData);
       // Metal's on Apple10, the pixel shader's elsewhere (d3d12_command_list.cpp, DepthBoundsSamples)
       out->DepthBoundsTestSupported = TRUE;
-      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      // every Apple GPU family places samples where a render pass says (Metal feature set tables), one pattern for
+      // all pixels
+      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
@@ -761,10 +798,15 @@ public:
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(pFeatureData);
       out->CastingFullyTypedFormatSupported = TRUE;
-      out->BarycentricsSupported = FALSE;
+      // Metal 4's shading language reads barycentrics and inputs at each vertex (SM50_SHADER_METAL_400)
+      out->BarycentricsSupported = GetMTLDevice().supportsFamily(WMTGPUFamilyMetal4) &&
+                                   GetMTLDevice().supportsShaderBarycentricCoordinates();
       out->CopyQueueTimestampQueriesSupported = FALSE;
       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
-      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+      // a list's own copies, after the work before them whatever the marker mode (WriteImmediate); bundles record none
+      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
+                                              D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
+                                              D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -994,8 +1036,57 @@ public:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS15>(pFeatureData, DataSize);
     case D3D12_FEATURE_D3D12_OPTIONS17:
       return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS17>(pFeatureData, DataSize);
-    case D3D12_FEATURE_D3D12_OPTIONS18:
-      return NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS18>(pFeatureData, DataSize);
+    case D3D12_FEATURE_D3D12_OPTIONS18: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18))
+        return FAIL(E_INVALIDARG);
+      // tier 0: BeginRenderPass binds and clears its surfaces as the runtime does for drivers without render passes
+      reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS18 *>(pFeatureData)->RenderPassesValid = TRUE;
+      return S_OK;
+    }
+    // titles ask for these (Onimusha: Way of the Sword, dttdrv/mullion#69), and so does D3DX12's CD3DX12FeatureSupport
+    // when it starts (DirectX-Headers, d3dx12_check_feature_support.h). they are answered with what a driver without
+    // the features reports (DirectX-Specs, VulkanOn12): SupportedSampleCountsWithNoOutputs "will report a value of 1,
+    // indicating simple-sampled only, for drivers that do not support the feature", and older drivers' heap limits
+    case sdk::D3D12_FEATURE_D3D12_OPTIONS19: {
+      if (DataSize != sizeof(sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS19))
+        return FAIL(E_INVALIDARG);
+      auto out = reinterpret_cast<sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS19 *>(pFeatureData);
+      *out = {};
+      // a pass with no targets rasterizes one sample until its pipelines agree with it on more
+      out->SupportedSampleCountsWithNoOutputs = 0x1;
+      out->MaxSamplerDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+      out->MaxSamplerDescriptorHeapSizeWithStaticSamplers = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+      // "For old drivers reporting D3D12_BINDING_TIER_3, requests for heaps larger than 1,000,000 will still be sent
+      // to the driver" (VulkanOn12), and D3DX12 gives the tier 1 limit's name to the value
+      out->MaxViewDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1;
+      return S_OK;
+    }
+    case sdk::D3D12_FEATURE_D3D12_OPTIONS20:
+      return NotSupported<sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS20>(pFeatureData, DataSize);
+    case sdk::D3D12_FEATURE_D3D12_OPTIONS21: {
+      if (DataSize != sizeof(sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS21))
+        return FAIL(E_INVALIDARG);
+      // no work graphs, and command signatures have tier 1.0's arguments (no incrementing constant)
+      *reinterpret_cast<sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS21 *>(pFeatureData) = {
+          0, sdk::D3D12_EXECUTE_INDIRECT_TIER_1_0, FALSE, FALSE
+      };
+      return S_OK;
+    }
+    // normal and high are given, and a high-priority queue runs as the others do (as vkd3d-proton's does). global
+    // realtime is not, and CreateCommandQueue refuses it: "Requests to create a global realtime command queue won't
+    // silently downgrade the priority when it can't be supported; the request succeeds or fails as-is"
+    // (D3D12_COMMAND_QUEUE_PRIORITY). only the queue types Mullion makes have a priority
+    case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
+        return FAIL(E_INVALIDARG);
+      auto out = reinterpret_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY *>(pFeatureData);
+      auto type = out->CommandListType;
+      out->PriorityForTypeIsSupported =
+          (type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+           type == D3D12_COMMAND_LIST_TYPE_COPY) &&
+          (out->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL || out->Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+      return S_OK;
+    }
     case D3D12_FEATURE_EXISTING_HEAPS:
       return NotSupported<D3D12_FEATURE_DATA_EXISTING_HEAPS>(pFeatureData, DataSize);
     case D3D12_FEATURE_CROSS_NODE:
@@ -1216,7 +1307,9 @@ public:
       __ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
       __ret->MemoryPoolPreference = advertise_numa_ ? D3D12_MEMORY_POOL_L1 : D3D12_MEMORY_POOL_L0;
       break;
+    // a GPU upload heap's are an upload heap's on a UMA adapter (D3D12 GPU Upload Heaps)
     case D3D12_HEAP_TYPE_UPLOAD:
+    case sdk::D3D12_HEAP_TYPE_GPU_UPLOAD:
       __ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
       __ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
       break;
@@ -1301,9 +1394,17 @@ public:
       return hr;
     D3D12_RESOURCE_ALLOCATION_INFO info;
     GetResourceAllocationInfo(&info, 0, 1, pDesc);
-    if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment ||
-        info.SizeInBytes > heap_desc.SizeInBytes || Offset > heap_desc.SizeInBytes - info.SizeInBytes)
+    // "HeapOffset plus the resource size must be smaller than or equal to the heap size" (CreatePlacedResource), and a
+    // buffer's size is its width, though its allocation size is given in 64KB (vkd3d-proton checks the width too):
+    // Starfield places a small one at the start of a heap of one page it imported (#32)
+    UINT64 needed = pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? pDesc->Width : info.SizeInBytes;
+    if (heap_desc.Alignment < info.Alignment || Offset % info.Alignment || needed > heap_desc.SizeInBytes ||
+        Offset > heap_desc.SizeInBytes - needed) {
+      WARN("CreatePlacedResource: ", needed, " bytes at alignment ", info.Alignment, " placed at ", Offset,
+           " of a heap of ", heap_desc.SizeInBytes, " at alignment ", heap_desc.Alignment, " (dimension ",
+           pDesc->Dimension, ", format ", pDesc->Format, ", alignment ", pDesc->Alignment, ")");
       return FAIL(E_INVALIDARG);
+    }
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -1619,6 +1720,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc, REFIID riid, void **ppPipelineState) {
+    InitReturnPtr(ppPipelineState);
     PipelineStateStream desc;
     if (HRESULT hr = desc.Parse(pDesc); FAILED(hr))
       return hr;
@@ -2012,7 +2114,7 @@ public:
         if (FAILED(ValidateResourceDescs(desc, &heap)))
           goto invalid;
         if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
-          DEBUG("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.\n");
+          WARN("GetResourceAllocationInfo: alignment ", desc->Alignment, " of a buffer");
           goto invalid;
         }
         resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -2021,7 +2123,9 @@ public:
       } else {
         WMTTextureInfo texture_info{};
         if (FAILED(PopulateWMTTextureInfo(this, texture_info, *desc))) {
-          DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
+          WARN("GetResourceAllocationInfo: texture of dimension ", desc->Dimension, ", format ", desc->Format, ", ",
+               desc->Width, "x", desc->Height, "x", desc->DepthOrArraySize, ", ", desc->MipLevels, " levels, ",
+               desc->SampleDesc.Count, " samples, layout ", desc->Layout, ", flags ", desc->Flags, " is refused");
           goto invalid;
         }
         MTL_DXGI_FORMAT_DESC format;
@@ -2040,6 +2144,14 @@ public:
                                    : desc->SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                                 : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         resource_info.Alignment = std::max(resource_info.Alignment, requested_alignment);
+        // an alignment D3D12 has: "Alignment may be one of 0, 4KB, 64KB, or 4MB" (D3D12_RESOURCE_DESC), the next one
+        // up from Metal's, which can lie between them where 4KB was asked for
+        if (resource_info.Alignment > D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
+            resource_info.Alignment < D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+          resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        else if (resource_info.Alignment > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+                 resource_info.Alignment < D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+          resource_info.Alignment = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
       }
 
       resource_info.SizeInBytes = align(resource_info.SizeInBytes, resource_info.Alignment);
@@ -2237,6 +2349,12 @@ public:
     auto &to = sparse_buffer_mappings_.at(dst->gpuAddress());
     for (auto &range : ranges)
       memmove(&to[range.destination_tile], &from[range.first_tile], range.tile_count * sizeof(from[0]));
+  }
+
+  bool
+  HasSparseBuffers() {
+    std::shared_lock<mullion::shared_mutex> lock(va_lock_);
+    return !sparse_buffer_mappings_.empty();
   }
 
   std::vector<uint64_t>

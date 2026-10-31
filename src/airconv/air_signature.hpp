@@ -518,6 +518,13 @@ struct InputFragmentStageIn {
   MSLScalerOrVectorType type;
   Interpolation interpolation;
   bool pull_mode;
+  // a flat input the shader also reads at each vertex of the primitive (Metal 4's vertex_value<T>)
+  bool vertex_value = false;
+};
+
+// the pixel's barycentric coordinates in the primitive, which Metal gives at the center only
+struct InputBarycentricCoord {
+  bool perspective;
 };
 
 struct InputVertexID {};
@@ -629,7 +636,7 @@ using FunctionInput = template_concat_t<
     /* fragment */
     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
     InputFrontFacing, InputPosition, InputSampleIndex, //
-    InputFragmentStageIn, InputInputCoverage, InputRenderTarget,
+    InputFragmentStageIn, InputInputCoverage, InputRenderTarget, InputBarycentricCoord,
     /* object & mesh */
     InputPayload, InputMeshGridProperties, InputMesh,
     /* kernel */

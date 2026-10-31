@@ -694,6 +694,12 @@ struct WMTStencilAttachmentInfo {
   uint8_t clear_stencil;
 };
 
+// a sample's position in sixteenths of a pixel from its center, as D3D12_SAMPLE_POSITION's
+struct WMTSamplePosition {
+  int8_t x;
+  int8_t y;
+};
+
 struct WMTRenderPassInfo {
   struct WMTColorAttachmentInfo colors[8];
   struct WMTDepthAttachmentInfo depth;
@@ -702,8 +708,11 @@ struct WMTRenderPassInfo {
   uint8_t render_target_array_length;
   uint8_t tile_width;
   uint8_t tile_height;
-  // the samples placed at the pixel center, for targets of the center pattern; 0 keeps Metal's, the standard pattern
-  uint8_t center_samples;
+  // the samples placed at sample_positions, for targets of the center pattern (all at the center) or of positions an
+  // application programs; 0 keeps Metal's, the standard pattern
+  uint8_t programmed_samples;
+  // as many as SetSamplePositions takes
+  struct WMTSamplePosition sample_positions[16];
   uint32_t render_target_height;
   uint32_t render_target_width;
   obj_handle_t visibility_buffer;
@@ -1763,6 +1772,8 @@ WINEMETAL_API bool MTLDevice_supports32BitFloatFiltering(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supports32BitMSAA(obj_handle_t device);
 
+WINEMETAL_API bool MTLDevice_supportsShaderBarycentricCoordinates(obj_handle_t device);
+
 WINEMETAL_API uint64_t MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supportsTextureSampleCount(obj_handle_t device, uint8_t sample_count);
@@ -2077,7 +2088,8 @@ WINEMETAL_API void WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *p
 enum WMTMetalVersion : uint32_t {
   WMTMetal310 = 310,
   WMTMetal320 = 320,
-  WMTMetalVersionMax = WMTMetal320,
+  WMTMetal400 = 400,
+  WMTMetalVersionMax = WMTMetal400,
 };
 
 WINEMETAL_API obj_handle_t MTLDevice_newBinaryArchive(obj_handle_t device, const char *url, obj_handle_t *err_out);
@@ -2469,15 +2481,17 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixMetal4NewBuffer, WMTUnixMetal4Encoder,
        WMTUnixMetal4Commands, WMTUnixMetal4EndEncoder, WMTUnixMetal4Commit, WMTUnixMetal4Feedback, WMTUnixMetal4Wait,
        WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
-       WMTUnixTraceWrite, WMTUnixCallCount };
+       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
 WINEMETAL_API uint32_t WMTDiagWrite(const char *directory, const char *lines, uint64_t length);
-// MULLION_TRACE_<CATEGORY> (docs/tracing.md): appends lines to the process's trace log, mullion.log in MULLION_TRACE_DIR or else
-// ~/Library/Logs/Mullion/<executable>/; the first call of a process keeps the last one's log as mullion.prev.log
-// and starts the log with a header. false when the log cannot be written
-WINEMETAL_API bool WMTTraceWrite(const char *lines, uint64_t length);
+// MULLION_TRACE_<CATEGORY> (docs/tracing.md): appends lines to the process's trace log, mullion.log in `directory` (a
+// macOS path, the one the first call names); the first call keeps the last process's log as mullion.prev.log and starts
+// the log with a header. each call also says what the categories turn on in the bridge: command buffers that report
+// their encoders' status (MULLION_TRACE_GPU=heavy) and the memory sampler. false when the log cannot be written
+WINEMETAL_API bool WMTTraceWrite(const char *directory, const char *lines, uint64_t length, bool encoder_errors,
+                                 bool memory_samples);
 // MULLION_DIAG=profile: each bridge call's count and time in QueryPerformanceCounter ticks, by code, since the last
 // totals were taken; the bridge times calls once WMTDiagTimeCalls was called
 struct WMTDiagCall {
@@ -2549,5 +2563,8 @@ WINEMETAL_API uint64_t MTLDevice_queryTimestampFrequency(obj_handle_t device);
 WINEMETAL_API void MTL4CommandBuffer_present(obj_handle_t buffer, obj_handle_t drawable, double after);
 
 WINEMETAL_API void MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value);
+// the buffer's next encoder begins with a barrier, against all the queue's work before it, that makes memory reached
+// through aliased addresses consistent: a reserved buffer's tiles and a placed resource over the same heap memory
+WINEMETAL_API void MTL4CommandBuffer_orderAliases(obj_handle_t buffer);
 
 #endif
