@@ -1868,6 +1868,13 @@ WINEMETAL_API void MTLCommandBuffer_encodeSpatialScale(
     obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
 );
 
+/* MetalFX for Metal 4 command buffers (MTL4FXSpatialScaler): 0 where the device has none */
+WINEMETAL_API obj_handle_t MTLDevice_newSpatialScaler4(obj_handle_t device, const struct WMTFXSpatialScalerInfo *info);
+
+WINEMETAL_API void MTL4CommandBuffer_encodeSpatialScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
+);
+
 WINEMETAL_API obj_handle_t NSString_string(const char *data, enum WMTStringEncoding encoding);
 
 WINEMETAL_API obj_handle_t NSString_alloc_init(const char *data, enum WMTStringEncoding encoding);
@@ -2514,6 +2521,7 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
        WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases, WMTUnixMetal4WaitGPU,
        WMTUnixBootstrapKeep, WMTUnixDeviceSupportsSamplerReduction, WMTUnixCommandBufferWaitSignal,
+       WMTUnixDeviceNewSpatialScaler4, WMTUnixMetal4SpatialScale,
        WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
