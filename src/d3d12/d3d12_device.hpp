@@ -27,6 +27,8 @@
 #include "mullion_buffer.hpp"
 #include "mullion_command.hpp"
 #include "mullion_diag.hpp"
+#include "util_env.hpp"
+#include "config/config.hpp"
 #include "mullion_fence.hpp"
 #include "mullion_format.hpp"
 #include "mullion_info.hpp"
@@ -634,7 +636,11 @@ public:
     }
     void
     Give(Pooled &&pooled) {
-      if (!pooled.icb || pooled.capacity > kCommands)
+      // MULLION_D3D12_ICB_DEVICE_POOL=0, or d3d12.icbDevicePool = False in mullion.conf: what an allocator does not
+      // keep goes back to Metal, as before the pool
+      static const bool enabled = env::getEnvVar("MULLION_D3D12_ICB_DEVICE_POOL") != "0" &&
+                                  Config::getInstance().getOption<bool>("d3d12.icbDevicePool", true);
+      if (!enabled || !pooled.icb || pooled.capacity > kCommands)
         return;
       std::lock_guard lock(mutex);
       commands += pooled.capacity;
