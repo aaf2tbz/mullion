@@ -581,11 +581,15 @@ CompileFunctionMSC(
   // (IRRaytracingAccelerationStructureGPUHeader), where Mullion's acceleration structures are laid out otherwise
   // (DxilConstants.h, ShaderFeatureInfo_Raytracing_Tier_1_1)
   constexpr uint64_t RaytracingTier11 = 0x100000;
+  // as do wave operations: the converter ends the process on a 64-bit one ("Unsupported 64bit wave op") instead of
+  // refusing it, and its WaveMatch compares floats by value, so a NaN lane leaves itself out of its own match
+  // (ShaderFeatureInfo_WaveOps)
+  constexpr uint64_t WaveOps = 0x4000;
   uint64_t features = 0;
   auto part = parser.FindNextMatchingBlob((microsoft::DXBCFourCC)MAKEFOURCC('S', 'F', 'I', '0'));
   if (part != DXBC_BLOB_NOT_FOUND && parser.GetBlobSize(part) >= sizeof(features))
     memcpy(&features, parser.GetBlob(part), sizeof(features));
-  if (features & RaytracingTier11)
+  if (features & (RaytracingTier11 | WaveOps))
     return {};
   Sha1HashState h;
   auto hash = [&](const auto &...values) { (h.update(values), ...); };
