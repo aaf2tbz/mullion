@@ -166,21 +166,6 @@ struct unixcall_mtltexture_newtextureview {
   uint64_t gpu_resource_id;
 };
 
-struct unixcall_msc_identity {
-  uint64_t ret;
-};
-
-struct unixcall_msc_convert {
-  struct WMTMemoryPointer dxil;
-  uint64_t dxil_size;
-  struct WMTMemoryPointer parameters;
-  uint32_t count;
-  uint32_t error_size;
-  struct WMTMemoryPointer entry_point;
-  struct WMTMemoryPointer error;
-  obj_handle_t ret_data;
-};
-
 struct unixcall_mtldevice_newlibrary {
   obj_handle_t device;
   obj_handle_t data;

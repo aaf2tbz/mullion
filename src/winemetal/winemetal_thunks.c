@@ -586,34 +586,6 @@ MTLDevice_minimumLinearTextureAlignmentForPixelFormat(obj_handle_t device, enum 
   return params.ret;
 }
 
-WINEMETAL_API uint64_t
-WMTMSCIdentity(void) {
-  struct unixcall_msc_identity params = {0};
-  UNIX_CALL(WMTUnixMSCIdentity, &params);
-  return params.ret;
-}
-
-WINEMETAL_API obj_handle_t
-WMTMSCConvert(
-    const void *dxil, uint64_t dxil_size, const struct WMTMSCRootParameter *parameters, uint32_t count,
-    const char *entry_point, char *error, uint32_t error_size
-) {
-  struct unixcall_msc_convert params;
-  params.dxil.ptr = (void *)dxil;
-  params.dxil_size = dxil_size;
-  params.parameters.ptr = (void *)parameters;
-  params.count = count;
-  params.entry_point.ptr = (void *)entry_point;
-  params.error.ptr = error;
-  params.error_size = error_size;
-  params.ret_data = 0;
-#if defined(__i386__)
-  params.dxil.high_part = params.parameters.high_part = params.entry_point.high_part = params.error.high_part = 0;
-#endif
-  UNIX_CALL(WMTUnixMSCConvert, &params);
-  return params.ret_data;
-}
-
 WINEMETAL_API obj_handle_t
 MTLDevice_newLibrary(
     obj_handle_t device, obj_handle_t data, obj_handle_t *err_out

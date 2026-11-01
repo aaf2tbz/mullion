@@ -76,13 +76,6 @@ WMT::Reference<WMT::Function> CompileFunction(
         &compile
 );
 
-// the function `name` of a DXIL shader that Metal Shader Converter converts against a root signature it can lay out
-// (MTLD3D12RootSignature::MSCCompatible), cached as CompileFunction's are; null where it cannot or refuses
-WMT::Reference<WMT::Function> CompileFunctionMSC(
-    MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, D3D12_SHADER_BYTECODE shader,
-    MTLD3D12RootSignature *root_signature, const char *name
-);
-
 struct PipelineStateStream {
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc_cs{};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc_graphics{};

@@ -427,11 +427,6 @@ public:
   // a local root signature's, in a buffer of its own: its shaders have no argument for them, and are compiled with
   // their GPU address
   uint64_t StaticSamplersAddress = 0;
-  // the parameters as Metal Shader Converter takes them, where its top-level argument buffer lays them out as the root
-  // arguments do: root constants and descriptors only, no static samplers or directly indexed heaps, and no block of
-  // an odd number of constants right before another (it packs constants to 4 bytes, the root arguments to 8)
-  bool MSCCompatible = false;
-  std::vector<WMTMSCRootParameter> MSCParameters;
 };
 
 class MTLD3D12StateObject : public ID3D12StateObject {
@@ -595,19 +590,12 @@ public:
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
 };
 
-// where Metal Shader Converter's kernels read their top-level argument buffer (kIRArgumentBufferBindPoint), which
-// Mullion's own compute kernels leave free
-constexpr uint8_t kMSCArgumentBufferIndex = 2;
-
 class MTLD3D12ComputePipelineState : public MTLD3D12PipelineState {
 public:
   WMT::Reference<WMT::ComputePipelineState> pso;
   WMTSize threadgroup_size;
   // see MTL_SHADER_REFLECTION::GroupsWorkTogether and DeviceAtomics64
   bool groups_work_together = false;
-  // its kernel is Metal Shader Converter's (MULLION_MSC=1), which reads the root arguments as its top-level argument
-  // buffer, at kIRArgumentBufferBindPoint
-  bool msc = false;
 };
 
 // timestamp queries sample the GPU's clock into counter sample buffers. Metal makes few of them, with few samples

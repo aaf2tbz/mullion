@@ -567,8 +567,6 @@ public:
         if (UpdateRootArguments) {
           source << "cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
           source << "cmd.set_kernel_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
-          // and for a kernel of Metal Shader Converter's, its top-level argument buffer
-          source << "cmd.set_kernel_buffer(rootsig_qwords, " << unsigned(kMSCArgumentBufferIndex) << ");\n";
         }
         source << "cmd.concurrent_dispatch_threadgroups(arg.dispatch, command_data.tgsize);\n";
         source << "}\n";

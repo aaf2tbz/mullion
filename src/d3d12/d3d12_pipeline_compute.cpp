@@ -21,7 +21,6 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline.hpp"
 #include "log/log.hpp"
-#include "util_env.hpp"
 #include <array>
 #include <limits>
 #include <map>
@@ -68,26 +67,16 @@ public:
     auto metal = device_->GetMTLDevice();
     auto args = (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common;
     HRESULT status = E_FAIL;
-    static const bool msc_wanted = env::getEnvVar("MULLION_MSC") == "1";
-    WMT::Reference<WMT::Function> cs_func;
-    if (msc_wanted && !groups_work_together)
-      cs_func = CompileFunctionMSC(
-          device_, this, pDesc->CS, static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature), "cs_main"
-      );
-    msc = bool(cs_func);
-    if (!cs_func)
-      cs_func = CompileFunction(
-          device_, this, std::array{pDesc->CS}, args, "cs_main", [&](auto args, auto name, auto bitcode, auto error) {
-            auto result = SM50Compile(shader_cs, args, name, bitcode, error);
-            if (result)
-              status = E_INVALIDARG;
-            return result;
-          }
-      );
+    auto cs_func = CompileFunction(
+        device_, this, std::array{pDesc->CS}, args, "cs_main", [&](auto args, auto name, auto bitcode, auto error) {
+          auto result = SM50Compile(shader_cs, args, name, bitcode, error);
+          if (result)
+            status = E_INVALIDARG;
+          return result;
+        }
+    );
     if (!cs_func)
       return status;
-    if (msc)
-      Logger::info(str::format("compute pipeline ", name, ": Metal Shader Converter's kernel"));
     WMT::Reference<WMT::Error> err;
 
     // PSO

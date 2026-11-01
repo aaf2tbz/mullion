@@ -19,8 +19,6 @@
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
-#include <sys/stat.h>
-#include "metal_irconverter/metal_irconverter.h"
 
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
@@ -5520,145 +5518,6 @@ _MTL4CommandBuffer_encoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
-/* Metal Shader Converter (libmetalirconverter.dylib), which MetalSharp Wine ships unmodified in its lib folder (two
-   folders above this library's, lib/mullion/aarch64-unix or lib/wine/aarch64-unix), or where Apple's installer puts
-   it. loaded on first use */
-#define MSC_FUNCTIONS(F)                                                                                              \
-  F(IRRootSignatureCreateFromDescriptor) F(IRRootSignatureDestroy) F(IRCompilerCreate) F(IRCompilerDestroy)           \
-  F(IRCompilerSetGlobalRootSignature) F(IRCompilerSetCompatibilityFlags) F(IRCompilerSetEntryPointName)              \
-  F(IRCompilerAllocCompileAndLink) F(IRObjectCreateFromDXIL) F(IRObjectDestroy) F(IRObjectGetMetalIRShaderStage)     \
-  F(IRObjectGetMetalLibBinary) F(IRMetalLibBinaryCreate) F(IRMetalLibBinaryDestroy) F(IRMetalLibGetBytecodeSize)    \
-  F(IRMetalLibGetBytecode) F(IRErrorGetCode) F(IRErrorGetPayload) F(IRErrorDestroy)
-static struct {
-#define MSC_DECLARE(name) __typeof__(&name) name;
-  MSC_FUNCTIONS(MSC_DECLARE)
-#undef MSC_DECLARE
-  uint64_t identity;
-} msc;
-static pthread_once_t msc_once = PTHREAD_ONCE_INIT;
-
-static void
-msc_load(void) {
-  char paths[2][PATH_MAX];
-  unsigned count = 0;
-  Dl_info info;
-  if (dladdr((const void *)msc_load, &info) && info.dli_fname) {
-    char *slash;
-    snprintf(paths[count], PATH_MAX, "%s", info.dli_fname);
-    for (int up = 0; up < 2 && (slash = strrchr(paths[count], '/')); up++)
-      *slash = 0;
-    if ((slash = strrchr(paths[count], '/'))) {
-      slash[1] = 0;
-      strlcat(paths[count], "libmetalirconverter.dylib", PATH_MAX);
-      count++;
-    }
-  }
-  snprintf(paths[count++], PATH_MAX, "/usr/local/lib/libmetalirconverter.dylib");
-  for (unsigned i = 0; i < count; i++) {
-    struct stat st;
-    void *lib = stat(paths[i], &st) ? NULL : dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
-    if (!lib)
-      continue;
-    bool complete = true;
-#define MSC_LOAD(name) complete = (msc.name = (__typeof__(msc.name))dlsym(lib, #name)) && complete;
-    MSC_FUNCTIONS(MSC_LOAD)
-#undef MSC_LOAD
-    if (!complete) {
-      memset(&msc, 0, sizeof(msc));
-      dlclose(lib);
-      continue;
-    }
-    msc.identity = ((uint64_t)st.st_size << 32) ^ (uint64_t)st.st_mtimespec.tv_sec ^ ((uint64_t)st.st_ino << 17) ^ 1;
-    return;
-  }
-}
-
-static NTSTATUS
-_WMTMSCIdentity(void *obj) {
-  struct unixcall_msc_identity *params = obj;
-  pthread_once(&msc_once, msc_load);
-  params->ret = msc.identity;
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-_WMTMSCConvert(void *obj) {
-  struct unixcall_msc_convert *params = obj;
-  char *error = params->error.ptr;
-  const struct WMTMSCRootParameter *given = params->parameters.ptr;
-  pthread_once(&msc_once, msc_load);
-  params->ret_data = 0;
-  if (!msc.identity) {
-    snprintf(error, params->error_size, "Metal Shader Converter is not installed");
-    return STATUS_SUCCESS;
-  }
-  IRRootParameter1 *parameters = calloc(params->count ? params->count : 1, sizeof(*parameters));
-  for (uint32_t i = 0; i < params->count; i++) {
-    parameters[i].ParameterType = (IRRootParameterType)given[i].type;
-    parameters[i].ShaderVisibility = (IRShaderVisibility)given[i].visibility;
-    if (given[i].type == IRRootParameterType32BitConstants)
-      parameters[i].Constants = (IRRootConstants){given[i].shader_register, given[i].register_space, given[i].value};
-    else
-      parameters[i].Descriptor = (IRRootDescriptor1){given[i].shader_register, given[i].register_space,
-                                                     (IRRootDescriptorFlags)given[i].value};
-  }
-  IRVersionedRootSignatureDescriptor desc = {0};
-  desc.version = IRRootSignatureVersion_1_1;
-  desc.desc_1_1.NumParameters = params->count;
-  desc.desc_1_1.pParameters = parameters;
-  IRError *ir_error = NULL;
-  IRRootSignature *root = msc.IRRootSignatureCreateFromDescriptor(&desc, &ir_error);
-  IRCompiler *compiler = NULL;
-  IRObject *dxil = NULL, *converted = NULL;
-  IRMetalLibBinary *metallib = NULL;
-  const char *step = "creating the root signature";
-  if (root) {
-    compiler = msc.IRCompilerCreate();
-    msc.IRCompilerSetGlobalRootSignature(compiler, root);
-    // NaN and infinity keep D3D's results, as airconv's fast math keeps them
-    msc.IRCompilerSetCompatibilityFlags(compiler, IRCompatibilityFlagDisableNanInfOptimization);
-    msc.IRCompilerSetEntryPointName(compiler, params->entry_point.ptr);
-    step = "reading the DXIL";
-    dxil = msc.IRObjectCreateFromDXIL(params->dxil.ptr, params->dxil_size, IRBytecodeOwnershipNone);
-  }
-  if (dxil) {
-    step = "converting the DXIL";
-    converted = msc.IRCompilerAllocCompileAndLink(compiler, NULL, dxil, &ir_error);
-  }
-  if (converted) {
-    step = "taking the metallib";
-    IRShaderStage stage = msc.IRObjectGetMetalIRShaderStage(converted);
-    metallib = msc.IRMetalLibBinaryCreate();
-    if (msc.IRObjectGetMetalLibBinary(converted, stage, metallib)) {
-      size_t size = msc.IRMetalLibGetBytecodeSize(metallib);
-      uint8_t *bytes = malloc(size);
-      if (bytes) {
-        msc.IRMetalLibGetBytecode(metallib, bytes);
-        params->ret_data = (obj_handle_t)dispatch_data_create(bytes, size, NULL, DISPATCH_DATA_DESTRUCTOR_FREE);
-      }
-    }
-  }
-  if (!params->ret_data) {
-    const char *payload = ir_error ? (const char *)msc.IRErrorGetPayload(ir_error) : NULL;
-    snprintf(error, params->error_size, "Metal Shader Converter failed %s%s%s", step, payload ? ": " : "",
-             payload ? payload : "");
-  }
-  if (ir_error)
-    msc.IRErrorDestroy(ir_error);
-  if (metallib)
-    msc.IRMetalLibBinaryDestroy(metallib);
-  if (converted)
-    msc.IRObjectDestroy(converted);
-  if (dxil)
-    msc.IRObjectDestroy(dxil);
-  if (compiler)
-    msc.IRCompilerDestroy(compiler);
-  if (root)
-    msc.IRRootSignatureDestroy(root);
-  free(parameters);
-  return STATUS_SUCCESS;
-}
-
 static NTSTATUS
 _MTL4CommandBuffer_orderAliases(void *obj) {
   struct unixcall_generic_obj_uint64_noret *p = obj;
@@ -7058,8 +6917,6 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4CommandBuffer_encodeTemporalScale,
     &_MTLDevice_newDenoisedScaler,
     &_MTLCommandBuffer_encodeDenoisedScale,
-    &_WMTMSCIdentity,
-    &_WMTMSCConvert,
 };
 
 #ifndef MULLION_NATIVE
@@ -7269,8 +7126,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4CommandBuffer_encodeTemporalScale,
     &_MTLDevice_newDenoisedScaler,
     &_MTLCommandBuffer_encodeDenoisedScale,
-    &_WMTMSCIdentity,
-    &_WMTMSCConvert,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

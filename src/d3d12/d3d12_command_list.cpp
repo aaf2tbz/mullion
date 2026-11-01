@@ -1974,9 +1974,6 @@ public:
       cmd_setpso.pso = pso_compute_->pso;
       cmd_setpso.threadgroup_size = pso_compute_->threadgroup_size;
       dirty_state_.clr(DirtyState::ComputePipelineState);
-      // the root arguments go to Metal Shader Converter's binding too, which the kernels before may not have had
-      if (pso_compute_->msc)
-        dirty_state_.set(DirtyState::ComputeRootArguments);
       if (Logger::logLevel() == LogLevel::Trace)
         TRACE("pass ", allocator_->encoder_current->id, ": compute pipeline ", pso_compute_->name);
       if (device_->NamesPasses())
@@ -1997,13 +1994,6 @@ public:
         cmd_argbuf.buffer = allocator_->gpu_heap_buffer_;
         cmd_argbuf.offset = Offset;
         cmd_argbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
-        if (pso_compute_ && pso_compute_->msc) {
-          auto &cmd_tlab = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
-          cmd_tlab.type = WMTComputeCommandSetBuffer;
-          cmd_tlab.buffer = allocator_->gpu_heap_buffer_;
-          cmd_tlab.offset = Offset;
-          cmd_tlab.index = kMSCArgumentBufferIndex;
-        }
       }
       dirty_state_.clr(DirtyState::ComputeRootArguments);
     }

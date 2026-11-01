@@ -437,27 +437,6 @@ PipelineKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key, boo
   return GetPipelineKey(Desc, Key, DepthBounds, AS, MS, DepthStencil2);
 }
 
-// what `produce` makes of a shader its converter refused, which the caches keep so that it is not tried again: four bytes
-// no metallib starts with ("MTLB")
-static constexpr char kRefusal[4] = {'N', 'O', 'N', 'E'};
-
-static WMT::Reference<WMT::DispatchData>
-Refusal() {
-  return WMT::MakeDispatchData((void *)kRefusal, sizeof(kRefusal));
-}
-
-static bool
-Refused(const WMT::Reference<WMT::DispatchData> &data) {
-  char bytes[sizeof(kRefusal)];
-  return data.getBytes(nullptr, 0) == sizeof(kRefusal) && data.getBytes(bytes, sizeof(bytes)) == sizeof(bytes) &&
-         !memcmp(bytes, kRefusal, sizeof(bytes));
-}
-
-static WMT::Reference<WMT::Function> CachedFunction(
-    MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, Sha1Digest key, const char *name,
-    const std::function<WMT::Reference<WMT::DispatchData>()> &produce
-);
-
 WMT::Reference<WMT::Function>
 CompileFunction(
     MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, std::span<const D3D12_SHADER_BYTECODE> shaders,
@@ -549,84 +528,7 @@ CompileFunction(
       return {};
     }
   }
-  return CachedFunction(device, pipeline, h.final(), name, [&]() -> WMT::Reference<WMT::DispatchData> {
-    SM50ShaderBitcode bitcode;
-    SM50Error sm50_error;
-    if (compile(arguments, name, &bitcode, &sm50_error)) {
-      ERR("Failed to compile ", name, ": ", SM50GetErrorMessageString(sm50_error));
-      for (auto shader : shaders)
-        MTLD3D12PipelineState::DumpShaders({shader});
-      return {};
-    }
-    SM50_COMPILED_BITCODE compiled;
-    SM50GetCompiledBitcode(bitcode, &compiled);
-    return WMT::MakeDispatchData(compiled.Data, compiled.Size);
-  });
-}
-
-WMT::Reference<WMT::Function>
-CompileFunctionMSC(
-    MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, D3D12_SHADER_BYTECODE shader,
-    MTLD3D12RootSignature *root_signature, const char *name
-) {
-  auto identity = WMTMSCIdentity();
-  if (!identity || !root_signature->MSCCompatible)
-    return {};
-  // the converter takes DXIL only; DXBC stays with airconv
-  microsoft::CDXBCParser parser;
-  if (FAILED(parser.ReadDXBC(shader.pShaderBytecode, shader.BytecodeLength)) ||
-      parser.FindNextMatchingBlob((microsoft::DXBCFourCC)MAKEFOURCC('D', 'X', 'I', 'L')) == DXBC_BLOB_NOT_FOUND)
-    return {};
-  // and ray queries stay too: the converter reads an acceleration structure's root SRV as its own header
-  // (IRRaytracingAccelerationStructureGPUHeader), where Mullion's acceleration structures are laid out otherwise
-  // (DxilConstants.h, ShaderFeatureInfo_Raytracing_Tier_1_1)
-  constexpr uint64_t RaytracingTier11 = 0x100000;
-  // as do wave operations: the converter ends the process on a 64-bit one ("Unsupported 64bit wave op") instead of
-  // refusing it, and its WaveMatch compares floats by value, so a NaN lane leaves itself out of its own match
-  // (ShaderFeatureInfo_WaveOps)
-  constexpr uint64_t WaveOps = 0x4000;
-  uint64_t features = 0;
-  auto part = parser.FindNextMatchingBlob((microsoft::DXBCFourCC)MAKEFOURCC('S', 'F', 'I', '0'));
-  if (part != DXBC_BLOB_NOT_FOUND && parser.GetBlobSize(part) >= sizeof(features))
-    memcpy(&features, parser.GetBlob(part), sizeof(features));
-  if (features & (RaytracingTier11 | WaveOps))
-    return {};
-  Sha1HashState h;
-  auto hash = [&](const auto &...values) { (h.update(values), ...); };
-  auto bytes = [&](const void *data, size_t size) {
-    h.update(uint64_t(size));
-    if (size)
-      h.update(data, size);
-  };
-  // the converter's own identity in place of AIRCONV_VERSION: a new libmetalirconverter converts again
-  bytes("d3d12-msc", strlen("d3d12-msc"));
-  hash(identity, device->GetMTLDevice().registryID());
-  bytes(name, strlen(name));
-  bytes(shader.pShaderBytecode, shader.BytecodeLength);
-  hash(uint64_t(root_signature->MSCParameters.size()));
-  for (auto &[type, reg, space, value, visibility] : root_signature->MSCParameters)
-    hash(type, reg, space, value, visibility);
-  return CachedFunction(device, pipeline, h.final(), name, [&]() -> WMT::Reference<WMT::DispatchData> {
-    char error[512] = "";
-    auto &parameters = root_signature->MSCParameters;
-    WMT::Reference<WMT::DispatchData> data(WMTMSCConvert(
-        shader.pShaderBytecode, shader.BytecodeLength, parameters.data(), parameters.size(), name, error, sizeof(error)
-    ));
-    if (data)
-      return data;
-    WARN("Metal Shader Converter refused ", name, ": ", error);
-    return Refusal();
-  });
-}
-
-// the function of `key` from the pipeline's shaders, the shader cache, or else what `produce` makes, which goes to
-// both; conversions of one key wait for the one in progress. null where it fails or its converter refused the shader
-// (Refusal), which is kept too
-static WMT::Reference<WMT::Function>
-CachedFunction(
-    MTLD3D12Device *device, MTLD3D12PipelineState *pipeline, Sha1Digest key, const char *name,
-    const std::function<WMT::Reference<WMT::DispatchData>()> &produce
-) {
+  auto key = h.final();
   WMT::Reference<WMT::DispatchData> stored;
   {
     std::lock_guard lock(pipeline->shader_mutex);
@@ -634,8 +536,6 @@ CachedFunction(
       stored = found->second;
   }
   if (stored) {
-    if (Refused(stored))
-      return {};
     WMT::Reference<WMT::Error> error;
     auto library = device->GetMTLDevice().newLibrary(stored, error);
     auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{};
@@ -645,7 +545,7 @@ CachedFunction(
     return function;
   }
   auto &cache = ShaderCache::getInstance(WMTMetalVersion(device->GetMetalVersion()));
-  bool enabled = false, refused = false;
+  bool enabled = false;
   WMT::Reference<WMT::Error> error;
   auto cached = [&]() -> WMT::Reference<WMT::Function> {
     WMT::Reference<WMT::DispatchData> data;
@@ -653,11 +553,7 @@ CachedFunction(
       enabled = true;
       data = reader->get(key);
     }
-    if (data && Refused(data)) {
-      refused = true;
-      std::lock_guard lock(pipeline->shader_mutex);
-      pipeline->cached_shaders.emplace(key, data);
-    } else if (data) {
+    if (data) {
       auto library = device->GetMTLDevice().newLibrary(data, error);
       if (auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{}) {
         std::lock_guard lock(pipeline->shader_mutex);
@@ -669,7 +565,7 @@ CachedFunction(
     }
     return {};
   };
-  if (auto function = cached(); function || refused)
+  if (auto function = cached())
     return function;
   static mullion::mutex pending_mutex;
   static mullion::condition_variable completed;
@@ -693,19 +589,20 @@ CachedFunction(
       pending.insert(key);
       conversion.emplace(key);
     }
-    if (auto function = cached(); function || refused)
+    if (auto function = cached())
       return function;
   }
-  auto data = produce();
-  if (!data)
-    return {};
-  if (Refused(data)) {
-    if (auto writer = cache.getWriter())
-      writer->set(key, data);
-    std::lock_guard lock(pipeline->shader_mutex);
-    pipeline->cached_shaders.emplace(key, data);
+  SM50ShaderBitcode bitcode;
+  SM50Error sm50_error;
+  if (compile(arguments, name, &bitcode, &sm50_error)) {
+    ERR("Failed to compile ", name, ": ", SM50GetErrorMessageString(sm50_error));
+    for (auto shader : shaders)
+      MTLD3D12PipelineState::DumpShaders({shader});
     return {};
   }
+  SM50_COMPILED_BITCODE compiled;
+  SM50GetCompiledBitcode(bitcode, &compiled);
+  auto data = WMT::MakeDispatchData(compiled.Data, compiled.Size);
   auto library = device->GetMTLDevice().newLibrary(data, error);
   auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{};
   if (!function) {

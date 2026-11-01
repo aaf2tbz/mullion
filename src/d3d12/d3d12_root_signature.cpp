@@ -605,33 +605,6 @@ public:
       }
     }
 
-    MSCCompatible = !desc.NumStaticSamplers &&
-                    !(desc.Flags & (D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE |
-                                    D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
-                                    D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED));
-    for (unsigned i = 0; MSCCompatible && i < desc.NumParameters; i++) {
-      auto &parameter = desc.pParameters[i];
-      if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-        MSCCompatible = false;
-        break;
-      }
-      bool constants = parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      if (constants && (parameter.Constants.Num32BitValues & 1) && i + 1 < desc.NumParameters &&
-          desc.pParameters[i + 1].ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-        MSCCompatible = false;
-        break;
-      }
-      MSCParameters.push_back(
-          {uint32_t(parameter.ParameterType),
-           constants ? parameter.Constants.ShaderRegister : parameter.Descriptor.ShaderRegister,
-           constants ? parameter.Constants.RegisterSpace : parameter.Descriptor.RegisterSpace,
-           constants ? parameter.Constants.Num32BitValues : uint32_t(parameter.Descriptor.Flags),
-           uint32_t(parameter.ShaderVisibility)}
-      );
-    }
-    if (!MSCCompatible)
-      MSCParameters.clear();
-
     auto [offsets, total_qwords] = CalculateRootSignatureQwordOffsets(desc);
     qword_offsets_ = offsets;
     /* after the parameters, in the order the shader compiler declares them (dxbc_binding_rootsig.cpp) */
