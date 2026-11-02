@@ -3140,7 +3140,9 @@ convert_dxil(
           auto lod = llvm::air::sample_level{min_lod(tex, bias)};
           residency_level = lod.lod;
           read = [&, lod](Value *s, Value *ref) {
-            return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, lod)
+            return ref ? dxbc.SampleCompareLevelZero(
+                             *tex.texture, s, smp.sampler->Metadata, coord, array, offset, ref, lod.lod
+                         )
                        : air.CreateSample(texture, handle, s, coord, array, offset, lod);
           };
           break;

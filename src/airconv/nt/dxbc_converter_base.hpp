@@ -527,6 +527,11 @@ public:
       const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
       llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD
   );
+  // sample_c_lz: Reference is CompareReference's, Level the LOD it samples at
+  std::pair<llvm::Value *, llvm::Value *> SampleCompareLevelZero(
+      const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
+      llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Level
+  );
 
   // how a sample chooses its LOD (D3D11.3 7.18.11): an explicit `Level`, gradients, or its quad's derivatives in a
   // pixel shader, with `Bias` the sampler's and the sample's own together; then the view's and the sample's `MinLOD`

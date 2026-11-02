@@ -2139,9 +2139,9 @@ Converter::operator()(const InstSampleCompare &sample) {
   }
 
   auto Read = [&](llvm::Value *S) {
-    return sample.level_zero ? air.CreateSampleCmp(
-                                   Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, Reference, sample.offsets,
-                                   sample_level{ClampMinLOD(Tex->Metadata, Sampler->Bias)}
+    return sample.level_zero ? SampleCompareLevelZero(
+                                   *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, Reference,
+                                   ClampMinLOD(Tex->Metadata, Sampler->Bias)
                                )
                              : SampleImplicit(
                                    *Tex, S, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, Reference,
@@ -2415,7 +2415,11 @@ Converter::SampleImplicit(
   }
   auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
                                  (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
+  // an anisotropic sampler read with no bias, its own and the sample's together, reads Metal's own LOD as a static one
+  // does above: the gradients carry only the bias (BiasGradient), so without one they are the quad's own
   auto Isotropic = ir.CreateICmpULE(Anisotropy, ir.getInt64(1));
+  if (Bias)
+    Isotropic = ir.CreateOr(Isotropic, ir.CreateFCmpOEQ(Bias, llvm::ConstantFP::get(Bias->getType(), 0.0)));
   if (auto Known = dyn_cast<ConstantInt>(Isotropic); Known && Known->isOne())
     return Biased();
   auto Gradients = [&] {
@@ -2430,8 +2434,8 @@ Converter::SampleImplicit(
   }();
   if (!Selects || isa<Constant>(Isotropic))
     return Gradients();
-  // what a descriptor's sampler is is known only when the shader runs, from its metadata: one that is not anisotropic
-  // reads Metal's own LOD too, at several times the gradients' speed (#32: 2.23 against 8.29 ms on an M1 Max). the
+  // what a descriptor's sampler is is known only when the shader runs, from its metadata: one that is not anisotropic,
+  // or is read with no bias, reads Metal's own LOD too, at several times the gradients' speed (#32: 2.23 against 8.29 ms on an M1 Max). the
   // whole quad takes one side, as the derivatives an implicit sample takes are its quad's and a lane's sampler need not
   // be its quad's others' (NonUniformResourceIndex). MergeSampleBranchesPass joins the branches of a sampler's samples
   // that follow each other
@@ -2466,6 +2470,84 @@ Converter::SampleImplicit(
     Value->addIncoming(Read.first, Block);
     Residency->addIncoming(Read.second, Block);
   }
+  return {Value, Residency};
+}
+
+std::pair<llvm::Value *, llvm::Value *>
+Converter::SampleCompareLevelZero(
+    const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
+    llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Level
+) {
+  using namespace llvm;
+  using namespace llvm::air;
+  auto Hardware = [&] {
+    return air.CreateSampleCmp(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Reference, Offset, sample_level{Level});
+  };
+  if (Tex.Logical != Texture::depth2d && Tex.Logical != Texture::depth2d_array)
+    return Hardware();
+  // a comparison takes a denormal texel as its sign's zero (D3D11.3 22.4.3), where Metal orders it. CompareReference
+  // moves a zero reference beside the denormals for the functions that pass less or greater as they pass equal, but
+  // Equal and NotEqual have no such reference: with a zero one, the first mip's four texels the sample filters are
+  // compared here, as a gather compares them (Gather), and filtered as the sampler filters a magnified texture
+  auto Function = ir.CreateTrunc(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_COMPARE), ir.getInt32Ty());
+  Function = ir.CreateAnd(Function, ir.getInt32(7));
+  auto Exactly = ir.CreateAnd(
+      ir.CreateAnd(
+          ir.CreateFCmpOEQ(Reference, ConstantFP::get(air.getFloatTy(), 0)),
+          ir.CreateOr(ir.CreateICmpEQ(Function, ir.getInt32(2)), ir.CreateICmpEQ(Function, ir.getInt32(5)))
+      ),
+      ir.CreateFCmpOLE(Level, ConstantFP::get(air.getFloatTy(), 0))
+  );
+  auto Head = ir.GetInsertBlock();
+  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
+  if (auto Branch = Head->getTerminator())
+    Branch->eraseFromParent();
+  auto Exact = llvm::BasicBlock::Create(ctx.llvm, "compare_zero_reference", Head->getParent(), Tail);
+  auto Native = llvm::BasicBlock::Create(ctx.llvm, "sample_compare", Head->getParent(), Tail);
+  ir.SetInsertPoint(Head);
+  ir.CreateCondBr(Exactly, Exact, Native);
+
+  ir.SetInsertPoint(Exact);
+  auto [Texels, Status] = air.CreateGather(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, Offset, ir.getInt32(0));
+  // a gather's texels are (u0, v1), (u1, v1), (u1, v0) and (u0, v0) about the point a quarter texel each way
+  Value *Passed[4];
+  for (unsigned i = 0; i < 4; i++)
+    Passed[i] = SamplerCompare(
+        SamplerMetadata, ConstantFP::get(air.getFloatTy(), 0), air.getDenormToZero(ir.CreateExtractElement(Texels, i))
+    );
+  auto Size = air.CreateConvertToFloat(
+      ir.CreateShuffleVector(TextureDimensions(Tex, ir.getInt32(0)), {0, 1}), Signedness::Unsigned
+  );
+  auto Texel = ir.CreateFSub(ir.CreateFMul(Coord, Size), ConstantFP::get(Coord->getType(), 0.5));
+  auto Fraction = ir.CreateFSub(Texel, air.CreateFPUnOp(AIRBuilder::floor, Texel));
+  auto FX = ir.CreateExtractElement(Fraction, uint64_t(0)), FY = ir.CreateExtractElement(Fraction, uint64_t(1));
+  auto Lerp = [&](Value *A, Value *B, Value *T) { return ir.CreateFAdd(A, ir.CreateFMul(ir.CreateFSub(B, A), T)); };
+  auto Linear = Lerp(Lerp(Passed[3], Passed[2], FX), Lerp(Passed[0], Passed[1], FX), FY);
+  // a point sample reads the texel the coordinate is in: the second of a pair past its middle
+  auto Half = ConstantFP::get(air.getFloatTy(), 0.5);
+  auto Right = ir.CreateFCmpOGE(FX, Half), Up = ir.CreateFCmpOGE(FY, Half);
+  auto Point = ir.CreateSelect(Up, ir.CreateSelect(Right, Passed[1], Passed[0]), ir.CreateSelect(Right, Passed[2], Passed[3]));
+  auto Magnified = ir.CreateICmpNE(ir.CreateAnd(SamplerMetadata, ir.getInt64(1ull << SM50_SAMPLER_METADATA_MAG_LINEAR)), ir.getInt64(0));
+  auto Filtered = ir.CreateSelect(Magnified, Linear, Point);
+  // an unbound resource returns 0 (D3D11.3 22.4.3), and has no width
+  auto Width = air.CreateTextureQuery(Tex.Texture, Tex.Handle, Texture::width, ir.getInt32(0));
+  Filtered = ir.CreateSelect(ir.CreateICmpEQ(Width, ir.getInt32(0)), ConstantFP::get(air.getFloatTy(), 0), Filtered);
+  ir.CreateBr(Tail);
+
+  ir.SetInsertPoint(Native);
+  auto Compared = Hardware();
+  ir.CreateBr(Tail);
+
+  ir.SetInsertPoint(Tail, Tail->begin());
+  auto Value = ir.CreatePHI(Compared.first->getType(), 2), Residency = ir.CreatePHI(Compared.second->getType(), 2);
+  auto Result = Compared.first->getType()->isVectorTy()
+                    ? ir.CreateVectorSplat(cast<FixedVectorType>(Compared.first->getType())->getNumElements(), Filtered)
+                    : Filtered;
+  Value->addIncoming(Result, Exact);
+  Value->addIncoming(Compared.first, Native);
+  Residency->addIncoming(Status, Exact);
+  Residency->addIncoming(Compared.second, Native);
   return {Value, Residency};
 }
 
