@@ -103,6 +103,8 @@ flight_ticks(void) {
 static const void *flight_exception_site;
 // the registers of a thread whose exception dumps, four to a record (x86_64 and ARM64EC)
 static const void *flight_registers_site[4];
+// flight_exception, registered while the DLL is loaded
+static void *flight_handler;
 
 WINEMETAL_API const void *
 WMTFlightSite(const char *format) {
@@ -335,7 +337,7 @@ wmt_flight_main(DWORD reason, BOOL exiting) {
     flight_registers_site[1] = WMTFlightSite("registers rbx %#llx rcx %#llx rdx %#llx rsi %#llx");
     flight_registers_site[2] = WMTFlightSite("registers rdi %#llx r8 %#llx r9 %#llx r10 %#llx");
     flight_registers_site[3] = WMTFlightSite("registers r11 %#llx r12 %#llx r13 %#llx r14 %#llx");
-    AddVectoredExceptionHandler(1, flight_exception);
+    flight_handler = AddVectoredExceptionHandler(1, flight_exception);
     break;
   case DLL_THREAD_DETACH: {
     struct flight_ring *ring = TlsGetValue(flight_slot);
@@ -348,6 +350,17 @@ wmt_flight_main(DWORD reason, BOOL exiting) {
     DWORD length = GetEnvironmentVariableA("MULLION_FLIGHT", mode, sizeof(mode));
     if (exiting && (flight_dumps || (length < sizeof(mode) && !strcmp(mode, "exit"))))
       WMTFlightDump("exit");
+    // unloaded while the process goes on (a launcher that loads D3D only to read the GPU's details, the Rockstar
+    // Games Launcher among them): the handler must go with the DLL, or the next exception calls into freed memory,
+    // faults there, and faults again in each fault until the thread's stack runs out
+    if (!exiting) {
+      if (flight_handler)
+        RemoveVectoredExceptionHandler(flight_handler);
+      flight_handler = NULL;
+      if (flight_slot != TLS_OUT_OF_INDEXES)
+        TlsFree(flight_slot);
+      flight_slot = TLS_OUT_OF_INDEXES;
+    }
     break;
   }
   }
