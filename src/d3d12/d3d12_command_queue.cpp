@@ -662,7 +662,7 @@ private:
     // MULLION_D3D12_GPU_ERRORS: the passes with indirect commands and where their resolvers keep their largest numbers
     std::vector<std::pair<std::string, const RenderEncoderData::Most *>> most{};
     // how many encoders of each kind it has, and whether it presents: what a report of one that does not complete says
-    std::array<uint16_t, size_t(EncoderType::AccelerationStructure) + 1> encoders{};
+    std::array<uint16_t, kEncoderTypes> encoders{};
     bool presents = false;
     // Metal 3: the buffer signals its slot's event after its work (EventWait); and whether what the completion thread
     // reads of it needs Metal to have completed it, not only the GPU its work (a dumped frame reads its status)
@@ -1781,9 +1781,9 @@ public:
       }
     };
     // lists whose every pass encodes on any thread, as many as follow each other: their passes, and what they cost.
-    // not with what keeps state of a slot's own (profiles, GPU records, debug groups, encoder counts)
+    // not with what keeps state of a slot's own (profiles, GPU records, encoder counts)
     std::vector<std::pair<EncoderData *, uint64_t>> passes;
-    bool parallel = EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
+    bool parallel = EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate &&
                     !diag::trace_encoders;
     for (size_t i = 0; i < recorded.size();) {
       size_t j = i;
@@ -2149,12 +2149,19 @@ public:
     // the parts the encoding threads have yet to finish, under the lock
     unsigned left = parts - 1;
     std::atomic<bool> lost = false;
+    // the application's events open on each part's command buffer: the first part's are the slot's, and each later
+    // part's become the slot's with its command buffer
+    std::vector<diag::DebugGroups> groups(parts);
     auto part = [&](unsigned k) {
       InflightCommandBuffer unused;
       WMTSampleBufferAttachmentInfo unsampled{};
-      for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++)
+      auto &open = k ? groups[k] : scope.inflight->groups;
+      for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++) {
+        if (diag::events)
+          open.Enter(buffers[k], queue_events_ + (passes[i].first->event_path ? passes[i].first->event_path : ""));
         if (!EncodePass(buffers[k], passes[i].first, unsampled, sparse_mappings, unused, nullptr, syncs[i]))
           lost = true;
+      }
     };
     {
       std::lock_guard<mullion::mutex> lock(encode_mutex_);
@@ -2185,6 +2192,7 @@ public:
       if (k + 1 < parts) {
         scope.End();
         scope.Start(std::move(buffers[k + 1]));
+        scope.inflight->groups = std::move(groups[k + 1]);
       }
     }
     return !lost;
@@ -2468,8 +2476,9 @@ public:
                           cmdbuf = inflight.cmdbuf, desc, footprint, row, number, path]() mutable {
       if (present)
         present();
-      if (cmdbuf.status() != WMTCommandBufferStatusCompleted) {
-        ERR("D3D12 frame failed: ", path, ": GPU work did not complete");
+      // Metal 4's completion comes when the GPU is done, before the status does (SettleFeedback): only an error fails
+      if (cmdbuf.status() == WMTCommandBufferStatusError) {
+        ERR("D3D12 frame failed: ", path, ": GPU work failed");
         return;
       }
       std::ofstream file(str::topath(path.c_str()).c_str(), std::ios::binary);

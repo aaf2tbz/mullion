@@ -2441,9 +2441,11 @@ convert_dxbc_vertex_for_geometry_shader(
   if (!binding_map)
     return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
 
-  uint32_t payload_idx = mesh_only ? ~0u : func_signature.DefineInput(
-      air::InputPayload{.size = direct ? uint32_t(SM50_STREAM_OUTPUT_DIRECT_PAYLOAD_SIZE) : uint32_t(SM50_GEOMETRY_PAYLOAD_SIZE)}
-  );
+  uint32_t payload_idx =
+      mesh_only ? ~0u
+                : func_signature.DefineInput(air::InputPayload{
+                      .size = direct ? uint32_t(SM50_STREAM_OUTPUT_DIRECT_PAYLOAD_SIZE) : uint32_t(SM50_GEOMETRY_PAYLOAD_SIZE)
+                  });
   // (warp_size, 1, 1)
   uint32_t thread_id_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
   // (warp_count, instance_count, 1)

@@ -468,7 +468,8 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, culls,
-             cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+             cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull] =
+          *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
       hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, culls, cull_depth, blend,
            bounds, late, conservative, coarse, rate, quads, hull);
       break;
@@ -913,7 +914,7 @@ struct Group {
   // it does not test)
   WMT::Reference<WMT::Function>
   CompileTestFragment(bool conservative, bool depth, bool bounds, uint32_t sample_mask, uint32_t culls, bool cull_depth) {
-    // and a clamped one where it may discard by cull distance
+    // and a clamped depth where it may discard by cull distance
     depth |= conservative || (culls && cull_depth);
     bool masked = bounds || sample_mask != ~0u;
     auto corners = std::to_string(SM50_CONSERVATIVE_CORNERS);
@@ -1255,6 +1256,8 @@ public:
     depth_bias = pDesc->RasterizerState.DepthBias;
     scole_scale = pDesc->RasterizerState.SlopeScaledDepthBias;
     depth_bias_clamp = pDesc->RasterizerState.DepthBiasClamp;
+    unbiased = !pDesc->GS.BytecodeLength && (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT ||
+                                             pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
     winding = pDesc->RasterizerState.FrontCounterClockwise ? WMTWindingCounterClockwise : WMTWindingClockwise;
     forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
   }

@@ -41,6 +41,8 @@ enum class EncoderType {
   // MetalFX (IMTLD3D12CommandListExt)
   Upscale,
 };
+// how many kinds there are: the last one's number and one
+constexpr size_t kEncoderTypes = size_t(EncoderType::Upscale) + 1;
 
 class MTLD3D12QueryHeap;
 
@@ -197,6 +199,15 @@ struct ResolveEncoderData : EncoderData {
 struct PredicateEncoderData : EncoderData {
   const uint32_t *skips;
   EncoderData *end;
+};
+
+// MetalFX temporal upscaling (`temporal`), or temporal denoised upscaling (`denoised`, its inputs in `denoise`)
+struct UpscaleEncoderData : EncoderData {
+  Rc<TemporalScaler> temporal;
+  Rc<DenoisedScaler> denoised;
+  WMT::Texture color, output, depth, motion, exposure;
+  WMTFXTemporalScalerProps props;
+  WMTFXDenoisedScaleArgs denoise;
 };
 
 // a command on acceleration structures that cannot be recorded when the application records it: a deserializing
