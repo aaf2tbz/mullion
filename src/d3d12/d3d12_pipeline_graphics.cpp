@@ -544,7 +544,33 @@ CompileFunction(
           library ? "no such function" : error.description().getUTF8String());
     return function;
   }
+  // pipelines of the same shaders share their functions: one Metal library and one copy of its AIR for each key,
+  // whatever number of pipelines are made of it. an engine's pipeline precompile makes tens of thousands of pipelines
+  // of far fewer shaders, which held a library and a copy each and took more memory than the machine had
+  struct Shared {
+    WMT::Reference<WMT::Function> function;
+    WMT::Reference<WMT::DispatchData> data;
+  };
+  static mullion::mutex shared_mutex;
+  static std::unordered_map<Sha1Digest, Shared> shared_functions;
+  // only with the shader cache, which already makes one conversion of a key: without it every pipeline converts its
+  // own (MULLION_SHADER_CACHE=0, d3d12_shadercache)
   auto &cache = ShaderCache::getInstance(WMTMetalVersion(device->GetMetalVersion()));
+  const bool sharing = static_cast<bool>(cache.getReader());
+  if (sharing) {
+    std::lock_guard lock(shared_mutex);
+    if (auto found = shared_functions.find(key); found != shared_functions.end()) {
+      std::lock_guard pipeline_lock(pipeline->shader_mutex);
+      pipeline->cached_shaders.emplace(key, found->second.data);
+      return found->second.function;
+    }
+  }
+  auto share = [&](const WMT::Reference<WMT::Function> &function, const WMT::Reference<WMT::DispatchData> &data) {
+    if (!sharing)
+      return;
+    std::lock_guard lock(shared_mutex);
+    shared_functions.emplace(key, Shared{function, data});
+  };
   bool enabled = false;
   WMT::Reference<WMT::Error> error;
   auto cached = [&]() -> WMT::Reference<WMT::Function> {
@@ -556,8 +582,11 @@ CompileFunction(
     if (data) {
       auto library = device->GetMTLDevice().newLibrary(data, error);
       if (auto function = library ? library.newFunction(name) : WMT::Reference<WMT::Function>{}) {
-        std::lock_guard lock(pipeline->shader_mutex);
-        pipeline->cached_shaders.emplace(key, data);
+        {
+          std::lock_guard lock(pipeline->shader_mutex);
+          pipeline->cached_shaders.emplace(key, data);
+        }
+        share(function, data);
         return function;
       }
       if (auto writer = cache.getWriter())
@@ -615,6 +644,7 @@ CompileFunction(
     std::lock_guard lock(pipeline->shader_mutex);
     pipeline->cached_shaders.emplace(key, data);
   }
+  share(function, data);
   return function;
 }
 
@@ -2016,11 +2046,36 @@ CreateGraphicsPipelineState(
   return pso->QueryInterface(riid, ppPipelineState);
 };
 
+// a shader's bytecode kept for a pipeline's later variants (Borderless), one copy for every pipeline of the same shader
+// while one holds it: an engine's pipeline precompile makes tens of thousands of pipelines of far fewer shaders
+static std::shared_ptr<const std::string>
+KeepShader(const void *data, size_t size) {
+  static mullion::mutex mutex;
+  static std::unordered_map<size_t, std::vector<std::weak_ptr<const std::string>>> kept;
+  std::string_view bytes((const char *)data, size);
+  auto hash = std::hash<std::string_view>{}(bytes);
+  std::lock_guard lock(mutex);
+  auto &same = kept[hash];
+  std::shared_ptr<const std::string> found;
+  std::erase_if(same, [&](auto &weak) {
+    auto shader = weak.lock();
+    if (shader && !found && *shader == bytes)
+      found = shader;
+    return !shader;
+  });
+  if (!found) {
+    found = std::make_shared<const std::string>(bytes);
+    same.push_back(found);
+  }
+  return found;
+}
+
 std::shared_ptr<const PipelineStateStream>
 Borderless(MTLD3D12Device *device, const PipelineStateStream &stream) {
   if (device->custom_borders)
     return {};
   struct Owned : PipelineStateStream {
+    std::vector<std::shared_ptr<const std::string>> shaders;
     std::deque<std::string> bytes;
     std::vector<D3D12_SO_DECLARATION_ENTRY> outputs;
     std::vector<UINT> strides;
@@ -2035,7 +2090,8 @@ Borderless(MTLD3D12Device *device, const PipelineStateStream &stream) {
   for (auto code : {&cs.CS, &graphics.VS, &graphics.PS, &graphics.DS, &graphics.HS, &graphics.GS, &owned->desc_as,
                     &owned->desc_ms})
     if (code->pShaderBytecode)
-      code->pShaderBytecode = keep(code->pShaderBytecode, code->BytecodeLength);
+      code->pShaderBytecode =
+          owned->shaders.emplace_back(KeepShader(code->pShaderBytecode, code->BytecodeLength))->data();
   cs.CachedPSO = graphics.CachedPSO = {};
   owned->signature = cs.pRootSignature ? cs.pRootSignature : graphics.pRootSignature;
   auto &so = graphics.StreamOutput;
