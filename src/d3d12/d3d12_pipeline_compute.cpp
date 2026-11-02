@@ -20,6 +20,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline.hpp"
+#include "d3d12_deferred_pipeline.hpp"
 #include "d3d12_pipeline_archive.hpp"
 #include "log/log.hpp"
 #include <array>
@@ -38,6 +39,13 @@ public:
   MTLD3D12ComputePipelineStateImpl(MTLD3D12Device *pDevice) :
       MTLD3D12PipelineObject<MTLD3D12ComputePipelineState>(pDevice) {
     IsComputePipelineState = 1;
+  }
+
+  // a compile of its Metal pipeline that has not begun is dropped, and one under way finished, before the pipeline
+  // goes
+  ~MTLD3D12ComputePipelineStateImpl() {
+    if (deferred)
+      deferred->Cancel();
   }
 
   HRESULT
@@ -87,8 +95,18 @@ public:
       info.compute_function = cs_func;
       info.support_indirect_command_buffers = true;
 
-      pso = PipelineArchive::Get(metal, device_->GetMetalVersion()).MakeCompute(metal, info, err);
-      if (!pso) {
+      if (DeferredPipeline::Enabled()) {
+        // Metal's compile of it on a compile thread (DeferredPipeline), as a graphics pipeline's; a failure there
+        // leaves `pso` null, and the dispatches of it are dropped. it holds the pipeline by pointer: the pipeline's
+        // destructor drops or finishes it (Cancel)
+        deferred = std::make_shared<DeferredPipeline>([self = this, info, cs_func]() {
+          WMT::Reference<WMT::Error> error;
+          auto metal = self->device_->GetMTLDevice();
+          if (!(self->pso = PipelineArchive::Get(metal, self->device_->GetMetalVersion()).MakeCompute(metal, info, error)))
+            ERR("Failed to create compute PSO of shader ", self->name, ": ", error.description().getUTF8String());
+        });
+        DeferredPipeline::Queue(deferred);
+      } else if (!(pso = PipelineArchive::Get(metal, device_->GetMetalVersion()).MakeCompute(metal, info, err))) {
         ERR("Failed to create compute PSO of shader ", name, ": ", err.description().getUTF8String());
         DumpShaders({pDesc->CS});
         return E_FAIL;
