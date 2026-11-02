@@ -246,6 +246,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::atomic<bool> closed;
     bool cancelled = false;
     std::vector<std::pair<WMT::Reference<MetalCommandBuffer>, uint64_t *>> buffers;
+    std::pair<WMT::Reference<WMT::SharedEvent>, uint64_t> gpu_wait;
     // the device, whose residency set changes are committed before each command buffer
     MTLD3D12Device *device = nullptr;
 
@@ -265,6 +266,27 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       closed.notify_all();
     }
 
+    // Metal 4: the Signal the Wait is for is committed on another queue, so the command buffers it holds are
+    // committed now behind a GPU wait for that queue's work, the first of them, or the next, carrying it
+    void
+    OpenOnGpu(WMT::Reference<WMT::SharedEvent> event, uint64_t value) {
+      std::lock_guard<mullion::mutex> lock(mutex);
+      if (!closed)
+        return;
+      gpu_wait = {std::move(event), value};
+      for (auto &[buffer, committed] : std::exchange(buffers, {}))
+        Run(buffer, committed);
+      closed = false;
+      closed.notify_all();
+    }
+
+    // whether the next command buffer carries a GPU wait
+    bool
+    WaitsOnGpu() {
+      std::lock_guard<mullion::mutex> lock(mutex);
+      return gpu_wait.first;
+    }
+
   private:
     void
     Run(MetalCommandBuffer buffer, uint64_t *committed) {
@@ -280,6 +302,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if constexpr (Metal4)
         if (!buffer)
           return;
+      if constexpr (Metal4)
+        if (auto [event, value] = std::exchange(gpu_wait, {}); event)
+          buffer.encodeWaitForEvent(event, value);
       if (committed)
         *committed = diag::Now();
       if (device)
@@ -2250,6 +2275,10 @@ public:
       std::lock_guard<mullion::mutex> lock(mutex_commit_);
       if (ends_since_signal_)
         ends_between_signals_ = std::exchange(ends_since_signal_, 0);
+      // the fence's value is the GPU's once this queue's last command buffer completes, if it is committed
+      if constexpr (Metal4)
+        if (GpuQueueWait() && !gate_->closed && inflight_cmdbuf_seq_)
+          fence->SignalsOnGpu({completion_event_, inflight_cmdbuf_seq_ - 1, Value});
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
         FLIGHT_HEAVY(Sync, "fence %p reaches %llu", fence.ptr(), Value);
@@ -2263,12 +2292,29 @@ public:
     return S_OK;
   };
 
+  // MULLION_D3D12_GPU_QUEUE_WAIT (on unless 0): a Wait for a value another queue's committed Signal brings waits on
+  // the GPU (Metal 4)
+  static bool
+  GpuQueueWait() {
+    static const bool enabled = env::getEnvVar("MULLION_D3D12_GPU_QUEUE_WAIT") != "0";
+    return enabled;
+  }
+
   HRESULT STDMETHODCALLTYPE
   Wait(ID3D12Fence *pFence, UINT64 Value) {
     auto gate = std::make_shared<Gate>();
     gate->device = device_;
     gate->closed = true;
     static_cast<MTLD3D12Fence *>(pFence)->completion->Expect(Value, [gate] { gate->Open(); });
+    // a Signal another queue commits brings the value: its work is waited for on the GPU, which takes no longer than
+    // the work, where the gate waits for the CPU to hear of its completion too (Metal 4)
+    if constexpr (Metal4)
+      if (GpuQueueWait())
+        static_cast<MTLD3D12Fence *>(pFence)->ExpectGpu(Value, [this, pFence, Value, gate](auto &signal) {
+          if (trace::Heavy(trace::Sync))
+            TRACE_IN(Sync, "queue ", this, ": Wait for fence ", pFence, " at ", Value, " waits on the GPU");
+          gate->OpenOnGpu(signal.event, signal.event_value);
+        });
     auto work = [this, gate] {
       gate_->closed.wait(true);
       {
@@ -2279,8 +2325,9 @@ public:
         gate_ = gate;
         held_changed_.notify_all();
       }
-      // a Signal follows the last command buffer: an empty one is behind the gate for one with no work before it
-      if (gate->closed)
+      // a Signal follows the last command buffer: an empty one is behind the gate for one with no work before it, and
+      // carries a GPU wait the gate has for the next one
+      if (gate->closed || gate->WaitsOnGpu())
         StartCommitting();
     };
     Trace("Wait for fence ", pFence, " at ", Value, gate->closed ? ", which holds the queue" : ", which it has had");

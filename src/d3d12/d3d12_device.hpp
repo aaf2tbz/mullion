@@ -395,12 +395,60 @@ private:
 class MTLD3D12Fence : public ID3D12Fence1 {
 public:
   std::shared_ptr<Reached> completion = std::make_shared<Reached>();
+
+  // a queue's Signal whose work is committed to the GPU (Metal 4): the fence reaches `value` once the queue's
+  // `event` reaches `event_value`, which another queue's Wait waits for on the GPU instead of holding its work
+  struct GpuSignal {
+    WMT::Reference<WMT::SharedEvent> event;
+    uint64_t event_value, value;
+  };
+  void
+  SignalsOnGpu(GpuSignal signal) {
+    std::vector<std::function<void(const GpuSignal &)>> ready;
+    {
+      std::lock_guard lock(gpu_signals_mutex_);
+      auto reached = completion->value.load();
+      std::erase_if(gpu_signals_, [&](auto &kept) { return kept.value <= reached; });
+      for (auto &[value, then] : std::exchange(gpu_waiting_, {}))
+        if (value <= signal.value)
+          ready.push_back(std::move(then));
+        else if (value > reached)
+          gpu_waiting_.emplace_back(value, std::move(then));
+      gpu_signals_.push_back(signal);
+    }
+    for (auto &then : ready)
+      then(signal);
+  }
+  // `then` is called with the first committed Signal that brings the fence to `value`, now or once there is one,
+  // unless the fence reaches it first
+  void
+  ExpectGpu(uint64_t value, std::function<void(const GpuSignal &)> then) {
+    std::optional<GpuSignal> found;
+    {
+      std::lock_guard lock(gpu_signals_mutex_);
+      for (auto &signal : gpu_signals_)
+        if (signal.value >= value) {
+          found = signal;
+          break;
+        }
+      if (!found)
+        gpu_waiting_.emplace_back(value, std::move(then));
+    }
+    if (found)
+      then(*found);
+  }
+
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
   // the fence's value from now on, which a shared fence also gives the devices it is shared with
   virtual void Signaled(uint64_t value) = 0;
   // a new handle that shares the fence (ID3D12Device::CreateSharedHandle); E_INVALIDARG for a fence that is not shared
   virtual HRESULT CreateSharedHandle(const SECURITY_ATTRIBUTES *attributes, const WCHAR *name, HANDLE *handle) = 0;
+
+private:
+  mullion::mutex gpu_signals_mutex_;
+  std::vector<GpuSignal> gpu_signals_;
+  std::vector<std::pair<uint64_t, std::function<void(const GpuSignal &)>>> gpu_waiting_;
 };
 
 class MTLD3D12RootSignature : public ID3D12RootSignature {
