@@ -759,6 +759,10 @@ class FXSpatialScaler : public Object {
 public:
 };
 
+class FXDenoisedScaler : public Object {
+public:
+};
+
 class LogContainer : public Object {
 public:
   std::vector<Object>
@@ -819,6 +823,11 @@ public:
   void
   waitUntilCompleted() {
     return MTLCommandBuffer_waitUntilCompleted(handle);
+  }
+
+  void
+  waitUntilSignaled(SharedEvent event, uint64_t value) {
+    MTLCommandBuffer_waitUntilSignaled(handle, event.handle, value);
   }
 
   WMTCommandBufferStatus
@@ -914,6 +923,11 @@ public:
   }
 
   void
+  encodeDenoisedScale(FXDenoisedScaler scaler, const WMTFXDenoisedScaleArgs &args) {
+    MTLCommandBuffer_encodeDenoisedScale(handle, scaler, &args, false);
+  }
+
+  void
   encodeTemporalScale(
       FXTemporalScaler scaler, Texture color, Texture output, Texture depth, Texture motion, Texture exposure,
       Fence fence, const WMTFXTemporalScalerProps &props
@@ -999,8 +1013,8 @@ public:
     MTL4CommandBuffer_waitForEvent(handle, event, value);
   }
   void
-  orderAliases() {
-    MTL4CommandBuffer_orderAliases(handle);
+  orderAliases(bool inside = false) {
+    MTL4CommandBuffer_orderAliases(handle, inside);
   }
   void
   commit() {
@@ -1009,6 +1023,10 @@ public:
   void
   waitUntilCompleted() {
     MTL4CommandBuffer_waitUntilCompleted(handle);
+  }
+  void
+  waitForGPU() {
+    MTL4CommandBuffer_waitForGPU(handle);
   }
   WMTMetal4Feedback
   feedback() {
@@ -1069,6 +1087,21 @@ public:
   void
   presentDrawableAfterMinimumDuration(MetalDrawable drawable, double after) {
     MTL4CommandBuffer_present(handle, drawable, after);
+  }
+  void
+  encodeSpatialScale(FXSpatialScaler scaler, Texture color, Texture output, Fence fence) {
+    MTL4CommandBuffer_encodeSpatialScale(handle, scaler, color, output, fence);
+  }
+  void
+  encodeTemporalScale(
+      FXTemporalScaler scaler, Texture color, Texture output, Texture depth, Texture motion, Texture exposure,
+      Fence fence, const WMTFXTemporalScalerProps &props
+  ) {
+    MTL4CommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+  }
+  void
+  encodeDenoisedScale(FXDenoisedScaler scaler, const WMTFXDenoisedScaleArgs &args) {
+    MTLCommandBuffer_encodeDenoisedScale(handle, scaler, &args, true);
   }
 };
 
@@ -1387,6 +1420,11 @@ public:
     return MTLDevice_supportsShaderBarycentricCoordinates(handle);
   }
 
+  bool
+  supportsSamplerReduction() {
+    return MTLDevice_supportsSamplerReduction(handle);
+  }
+
   uint64_t
   maxArgumentBufferSamplerCount() {
     return MTLDevice_maxArgumentBufferSamplerCount(handle);
@@ -1412,6 +1450,23 @@ public:
     return Reference<FXSpatialScaler>(MTLDevice_newSpatialScaler(handle, &info));
   }
 
+  // a scaler Metal 4 command buffers encode (MTL4FXSpatialScaler); empty where the device has none
+  Reference<FXSpatialScaler>
+  newSpatialScaler4(const WMTFXSpatialScalerInfo &info) {
+    return Reference<FXSpatialScaler>(MTLDevice_newSpatialScaler4(handle, &info));
+  }
+
+  Reference<FXTemporalScaler>
+  newTemporalScaler4(const WMTFXTemporalScalerInfo &info) {
+    return Reference<FXTemporalScaler>(MTLDevice_newTemporalScaler4(handle, &info));
+  }
+
+  // empty where the device has none (before macOS 26, or without MetalFX denoising)
+  Reference<FXDenoisedScaler>
+  newDenoisedScaler(const WMTFXDenoisedScalerInfo &info, bool metal4) {
+    return Reference<FXDenoisedScaler>(MTLDevice_newDenoisedScaler(handle, &info, metal4));
+  }
+
   Reference<BinaryArchive>
   newBinaryArchive(const char *url, Reference<Error> &error) {
     return Reference<BinaryArchive>(MTLDevice_newBinaryArchive(handle, url, error.out()));
@@ -1425,6 +1480,11 @@ public:
   bool
   supportsFXTemporalScaler() {
     return MTLDevice_supportsFXTemporalScaler(handle);
+  }
+
+  bool
+  supportsFXDenoisedScaler(bool metal4) {
+    return MTLDevice_supportsFXDenoisedScaler(handle, metal4);
   }
 
   void
@@ -1686,5 +1746,27 @@ InitializeTileRenderPipelineInfo(WMTTileRenderPipelineInfo &info) {
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
 }
+
+// the hold a successful WMTBootstrapLookUp took on a shared name: the object made from the looked-up port keeps the
+// name (keep, while that object surely lives), or the hold is dropped when this goes
+class SharedNameHold {
+  std::string name_;
+  bool held_ = true;
+
+public:
+  explicit SharedNameHold(std::string name) : name_(std::move(name)) {}
+  SharedNameHold(const SharedNameHold &) = delete;
+  SharedNameHold &operator=(const SharedNameHold &) = delete;
+  ~SharedNameHold() {
+    keep(NULL_OBJECT_HANDLE);
+  }
+
+  void
+  keep(obj_handle_t object) {
+    if (held_)
+      WMTBootstrapKeep(name_.c_str(), object);
+    held_ = false;
+  }
+};
 
 } // namespace WMT

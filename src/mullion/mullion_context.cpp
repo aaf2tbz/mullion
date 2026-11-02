@@ -57,6 +57,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
   dummy_sampler_info_.lod_max_clamp = FLT_MAX;
   dummy_sampler_info_.max_anisotroy = 1;
   dummy_sampler_info_.lod_average = false;
+  dummy_sampler_info_.reduction_mode = WMTSamplerReductionModeWeightedAverage;
   dummy_sampler_ = device.newSamplerState(dummy_sampler_info_);
   dummy_cbuffer_host_ = wsi::aligned_malloc(65536, MULLION_PAGE_SIZE);
   dummy_cbuffer_info_.length = 65536;
@@ -1261,7 +1262,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         unsigned draws = 0, geometry = 0, tessellation = 0;
         for (auto cmd = reinterpret_cast<const wmtcmd_base *>(&data->cmd_head); cmd;
              cmd = reinterpret_cast<const wmtcmd_base *>(cmd->next.ptr)) {
-          geometry += cmd->type >= WMTRenderCommandMullionGeometryDraw && cmd->type <= WMTRenderCommandMullionGeometryDrawIndexedIndirect;
+          geometry += (cmd->type >= WMTRenderCommandMullionGeometryDraw && cmd->type <= WMTRenderCommandMullionGeometryDrawIndexedIndirect) ||
+                      cmd->type == WMTRenderCommandMullionMeshDraw;
           tessellation += cmd->type >= WMTRenderCommandMullionTessellationMeshDraw &&
                           cmd->type <= WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect;
           draws += cmd->type >= WMTRenderCommandDraw && cmd->type <= WMTRenderCommandDrawMeshThreadgroupsIndirect;

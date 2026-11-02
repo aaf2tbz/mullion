@@ -21,6 +21,7 @@
 #include "d3d11_device.hpp"
 #include "d3d11_state_object.hpp"
 #include "mullion_sampler.hpp"
+#include "airconv_public.h"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_state_object.hpp"
 #include <bit>
@@ -340,9 +341,12 @@ public:
       if (attachment_desc.pixel_format != WMTPixelFormatInvalid)
         blend[rt] = ShaderBlend(attachment_desc, renderTarget, logic);
     }
-    // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
-    info->alpha_to_coverage_enabled =
-        desc_.AlphaToCoverageEnable && !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info->colors[0].pixel_format)));
+    // Metal takes no alpha-to-coverage with an integer target 0, and takes it from the color the fragment function
+    // returns, which a target 0 the pixel shader blends itself (ShaderBlend) has blended: the pixel shader makes the
+    // coverage then
+    info->alpha_to_coverage_enabled = desc_.AlphaToCoverageEnable &&
+                                      !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info->colors[0].pixel_format))) &&
+                                      !blend[0].blend;
     return blend;
   }
 
@@ -774,7 +778,14 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
   info.support_argument_buffers = true;
   info.normalized_coords = true;
 
-  auto sampler = Sampler::createSampler(device->GetMTLDevice(), info, desc.MipLODBias);
+  // a minimum or maximum filter reduces the texels its filter weights above zero (D3D11.3 5.9.4.5.6)
+  auto reduction = D3D11_DECODE_FILTER_REDUCTION(desc.Filter);
+  auto sampler = Sampler::createSampler(
+      device->GetMTLDevice(), info, desc.MipLODBias, nullptr,
+      reduction == D3D11_FILTER_REDUCTION_TYPE_MINIMUM   ? SM50_SAMPLER_REDUCTION_MINIMUM
+      : reduction == D3D11_FILTER_REDUCTION_TYPE_MAXIMUM ? SM50_SAMPLER_REDUCTION_MAXIMUM
+                                                         : SM50_SAMPLER_REDUCTION_NONE
+  );
 
   if (!sampler) {
     ERR("CreateSamplerState: failed to create sampler");

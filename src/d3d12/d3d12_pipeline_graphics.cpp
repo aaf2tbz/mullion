@@ -22,12 +22,14 @@
 #include "mullion_stream_output.hpp"
 #include "mullion_shader_cache.hpp"
 #include "tessellation_limits.hpp"
+#include "util_env.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "sha1/sha1_util.hpp"
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/DXBCUtils.h"
 #include "util_env.hpp"
+#include <bit>
 #include <span>
 #include <fstream>
 #include <mutex>
@@ -156,6 +158,54 @@ constexpr WMTColorWriteMask kColorWriteMaskMap[] = {
     // 1111
     WMTColorWriteMaskAlpha | WMTColorWriteMaskBlue | WMTColorWriteMaskRed | WMTColorWriteMaskGreen,
 };
+
+// the scalar varyings a pixel shader takes from the stage before it, of the 124 Metal passes (its input signature: what
+// is neither generated nor the position)
+static uint32_t
+PixelShaderVaryings(const D3D12_SHADER_BYTECODE &PS) {
+  using namespace microsoft;
+  CSignatureParser parser;
+  if (!PS.pShaderBytecode || FAILED(DXBCGetInputSignature(PS.pShaderBytecode, &parser)))
+    return 0;
+  const D3D11_SIGNATURE_PARAMETER *parameters;
+  uint32_t scalars = 0, count = parser.GetParameters(&parameters);
+  for (uint32_t i = 0; i < count; i++)
+    switch (parameters[i].SystemValue) {
+    case D3D10_SB_NAME_UNDEFINED:
+    case D3D10_SB_NAME_CLIP_DISTANCE:
+    case D3D10_SB_NAME_CULL_DISTANCE:
+      scalars += std::popcount(uint32_t(parameters[i].Mask));
+      break;
+    default:
+      break;
+    }
+  return scalars;
+}
+
+// the scalar varyings a vertex shader gives the stage after it: four for each register of its output signature that is
+// not a system value other than a clip or cull distance (airconv defines every component of such a register), or 128
+// when the signature cannot be read
+static uint32_t
+VertexShaderVaryings(const D3D12_SHADER_BYTECODE &VS) {
+  using namespace microsoft;
+  CSignatureParser parser;
+  if (!VS.pShaderBytecode || FAILED(DXBCGetOutputSignature(VS.pShaderBytecode, &parser)))
+    return 128;
+  const D3D11_SIGNATURE_PARAMETER *parameters;
+  uint32_t registers = 0, count = parser.GetParameters(&parameters);
+  for (uint32_t i = 0; i < count; i++)
+    switch (parameters[i].SystemValue) {
+    case D3D10_SB_NAME_UNDEFINED:
+    case D3D10_SB_NAME_CLIP_DISTANCE:
+    case D3D10_SB_NAME_CULL_DISTANCE:
+      if (parameters[i].Register < 32)
+        registers |= 1u << parameters[i].Register;
+      break;
+    default:
+      break;
+    }
+  return 4 * std::popcount(registers);
+}
 
 HRESULT
 ExtractMTLInputLayoutElements(
@@ -416,10 +466,11 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
-      auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds,
-             late, conservative, coarse, rate, quads] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
-      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, blend, bounds, late,
-           conservative, coarse, rate, quads);
+      auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, culls,
+             cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull] =
+          *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+      hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, culls, cull_depth, blend,
+           bounds, late, conservative, coarse, rate, quads, hull);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -432,14 +483,15 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
-      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, quads, barycentrics, conservative, flat,
-             noperspective] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
-      hash(strip, cut, index, primitive, pass, statistics, clips, quads, barycentrics, conservative, flat, noperspective);
+      auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, culls, quads, barycentrics, conservative,
+             flat, noperspective, mesh_only, hull, inner] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
+      hash(strip, cut, index, primitive, pass, statistics, clips, culls, quads, barycentrics, conservative, flat,
+           noperspective, mesh_only, hull, inner);
       break;
     }
     case SM50_SHADER_GS_PASS_THROUGH: {
       auto &data = *(SM50_SHADER_GS_PASS_THROUGH_DATA *)arg;
-      hash(data.DataEncoded, data.RasterizationDisabled, data.ClipDistanceVaryings);
+      hash(data.DataEncoded, data.RasterizationDisabled, data.ClipDistanceVaryings, data.CullDistanceVaryings);
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
@@ -459,8 +511,8 @@ CompileFunction(
       break;
     }
     case SM50_SHADER_STREAM_OUTPUT: {
-      auto &[next, type, count, elements, strides, rasterized, counting] = *(SM50_SHADER_STREAM_OUTPUT_DATA *)arg;
-      hash(count, strides, rasterized, counting);
+      auto &[next, type, count, elements, strides, rasterized, counting, single_pass] = *(SM50_SHADER_STREAM_OUTPUT_DATA *)arg;
+      hash(count, strides, rasterized, counting, single_pass);
       // offsets count preceding elements of each slot, including gaps (D3D11.3 14.3)
       for (uint32_t i = 0; i < count; i++)
         hash(elements[i].reg_id, elements[i].component, elements[i].stream, elements[i].output_slot);
@@ -577,7 +629,7 @@ protected:
   struct PipelineDescriptor {
     std::variant<WMTRenderPipelineInfo, WMTMeshRenderPipelineInfo> info;
     std::vector<WMT::Reference<WMT::Function>> functions;
-    std::unordered_map<uint32_t, WMT::Reference<WMT::RenderPipelineState>> variants;
+    std::unordered_map<uint64_t, WMT::Reference<WMT::RenderPipelineState>> variants;
     // the geometry shader that counts pipeline statistics, made when first used
     std::function<WMT::Reference<WMT::Function>()> statistics_geometry_shader;
     WMT::Reference<WMT::Function> statistics_gs;
@@ -588,7 +640,8 @@ protected:
   // after it (an occlusion query and the depth bounds test of a GPU without one), of coarse pixels (variable rate
   // shading), or blending only the targets a pass binds, as Metal refuses a pipeline whose shader reads a target it has
   // no format for
-  std::function<WMT::Reference<WMT::Function>(bool statistics, bool late, bool coarse, uint32_t blends)> pixel_shader_;
+  std::function<WMT::Reference<WMT::Function>(bool statistics, bool late, bool coarse, uint32_t blends, bool depth)>
+      pixel_shader_;
   std::unordered_map<uint32_t, WMT::Reference<WMT::Function>> pixel_shaders_;
   // the targets the pixel shader blends itself (ShaderBlend)
   uint32_t blend_mask_ = 0;
@@ -637,10 +690,11 @@ protected:
     WMT::Reference<WMT::Function> ps;
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut;
     uint32_t primitive; // D3D10_SB_PRIMITIVE of the topology type
-    bool clip_distance_varyings;
+    bool clip_distance_varyings, cull_distance_varyings;
     bool quad_lines, barycentrics;
-    // conservative rasterization, and how the pixel shader interpolates its inputs
-    bool conservative;
+    // conservative rasterization, of the hull of a triangle's pixels where it can, and how the pixel shader
+    // interpolates its inputs
+    bool conservative, conservative_hull, conservative_inner;
     uint32_t flat_inputs, noperspective_inputs;
   };
   std::shared_ptr<GeometryInputs> topology_inputs_;
@@ -669,7 +723,7 @@ protected:
   static SM50_SHADER_PSO_GEOMETRY_SHADER_DATA
   GeometryArguments(
       GeometryInputs &in, SM50_SHADER_STREAM_OUTPUT_DATA &so, bool strip, bool counting, uint32_t primitive,
-      bool pass_through, bool statistics
+      bool pass_through, bool statistics, bool single = false
   ) {
     SM50_SHADER_PSO_GEOMETRY_SHADER_DATA pso_gs{};
     pso_gs.type = SM50_SHADER_PSO_GEOMETRY_SHADER;
@@ -680,13 +734,17 @@ protected:
     pso_gs.pass_through = pass_through && !counting;
     pso_gs.pipeline_statistics = statistics;
     pso_gs.clip_distance_varyings = in.clip_distance_varyings;
+    pso_gs.cull_distance_varyings = in.cull_distance_varyings && pso_gs.pass_through;
     pso_gs.quad_lines = in.quad_lines && pass_through && !counting;
     pso_gs.conservative = in.conservative && !counting && (!in.gs.empty() || pass_through);
+    pso_gs.conservative_hull = pso_gs.conservative && in.conservative_hull && in.gs.empty();
+    pso_gs.conservative_inner = in.conservative_inner;
     pso_gs.barycentrics = in.barycentrics && (pso_gs.quad_lines || pso_gs.conservative);
     pso_gs.flat_inputs = in.flat_inputs;
     pso_gs.noperspective_inputs = in.noperspective_inputs;
     so = in.so;
     so.counting = counting;
+    so.single_pass = single && !counting;
     so.elements = in.so_elements.data();
     so.next = &in.common;
     pso_gs.next = in.stream_output ? (void *)&so : (void *)&in.common;
@@ -714,7 +772,8 @@ protected:
   WMT::Reference<WMT::RenderPipelineState>
   GeometryVariant(
       const std::shared_ptr<GeometryInputs> &inputs, sm50_shader_t shader_vs, sm50_shader_t shader_gs,
-      D3D12_SHADER_BYTECODE GS, bool strip, bool counting, uint32_t primitive, bool pass_through, HRESULT &status
+      D3D12_SHADER_BYTECODE GS, bool strip, bool counting, uint32_t primitive, bool pass_through, HRESULT &status,
+      bool single = false, bool mesh_only = false
   ) {
     status = E_FAIL;
     auto &in = *inputs;
@@ -722,7 +781,8 @@ protected:
     WMT::Reference<WMT::Error> err;
     D3D12_SHADER_BYTECODE VS{in.vs.data(), in.vs.size()};
     SM50_SHADER_STREAM_OUTPUT_DATA so;
-    auto pso_gs = GeometryArguments(in, so, strip, counting, primitive, pass_through, false);
+    auto pso_gs = GeometryArguments(in, so, strip, counting, primitive, pass_through, false, single);
+    pso_gs.mesh_only = mesh_only;
     in.ia_layout.elements = in.elements.data();
     in.ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_VIEW;
     in.ia_layout.next = &pso_gs;
@@ -738,14 +798,15 @@ protected:
     );
     if (!vs_func)
       return variant;
-    auto gs_func = GeometryFunction(in, shader_vs, shader_gs, GS, pso_gs, status);
+    // a mesh function alone needs no other
+    auto gs_func = mesh_only ? vs_func : GeometryFunction(in, shader_vs, shader_gs, GS, pso_gs, status);
     if (!gs_func)
       return variant;
     // a pipeline statistics query's variant counts in the geometry shader as well
     std::function<WMT::Reference<WMT::Function>()> statistics;
     if (shader_gs && !counting) {
       statistics_geometry_ = true;
-      statistics = [this, inputs, strip, primitive, pass_through] {
+      statistics = [this, inputs, strip, primitive, pass_through, single] {
         auto &in = *inputs;
         D3D12_SHADER_BYTECODE VS{in.vs.data(), in.vs.size()}, GS{in.gs.data(), in.gs.size()};
         SM50Shader shader_vs, shader_gs;
@@ -754,18 +815,21 @@ protected:
             FAILED(InitializeShader(device_, GS, &shader_gs, &reflection)))
           return WMT::Reference<WMT::Function>{};
         SM50_SHADER_STREAM_OUTPUT_DATA so;
-        auto pso_gs = GeometryArguments(in, so, strip, false, primitive, pass_through, true);
+        auto pso_gs = GeometryArguments(in, so, strip, false, primitive, pass_through, true, single);
         HRESULT status;
         return GeometryFunction(in, shader_vs, shader_gs, GS, pso_gs, status);
       };
     }
     auto info = in.info;
-    info.object_function = vs_func.handle;
+    info.object_function = mesh_only ? obj_handle_t{} : vs_func.handle;
     info.mesh_function = gs_func.handle;
     bool rasterized = (shader_gs || pass_through) && !counting && (!in.stream_output || so.rasterized_stream != ~0u);
     info.fragment_function = rasterized ? in.ps.handle : obj_handle_t{};
     info.rasterization_enabled = rasterized;
-    info.payload_memory_length = SM50_GEOMETRY_PAYLOAD_SIZE;
+    info.payload_memory_length = mesh_only ? 0
+                                 : !counting && SM50StreamOutputDirect(single, !!shader_gs, pass_through)
+                                     ? SM50_STREAM_OUTPUT_DIRECT_PAYLOAD_SIZE
+                                     : SM50_GEOMETRY_PAYLOAD_SIZE;
     if (!(variant = CreatePipeline(info, err, std::move(statistics)))) {
       ERR("Failed to create geometry PSO of shaders ", name, ": ", err.description().getUTF8String());
       DumpShaders({VS, GS});
@@ -800,22 +864,48 @@ struct Group {
 
   // a fragment function for a pipeline without a pixel shader that does what a pixel shader would: discards the pixels
   // whose squares miss the polygon the mesh stage passes on in SM50_CONSERVATIVE_VARYINGS, as airconv's conservative
-  // pixel shaders do, writing their depth; and of no sample in the depth bounds of a GPU without the test, keeping the
-  // samples that are, as SM50_SHADER_PSO_PIXEL_SHADER_DATA's depth_bounds does
+  // pixel shaders do, writing their depth; of no sample in the depth bounds of a GPU without the test, keeping the
+  // samples that are, as SM50_SHADER_PSO_PIXEL_SHADER_DATA's depth_bounds does; keeps the samples of the pipeline's
+  // sample mask, which Metal's pipelines do not have, as SM50_SHADER_PSO_PIXEL_SHADER_DATA's sample_mask does; and
+  // discards those of a primitive `culls` cull distances cull, as its cull_distances does (SM50_CULL_VARYING), then
+  // writing the depth where the pipeline clamps it (`cull_depth`, as cull_depth does). the device keeps one of each
   WMT::Reference<WMT::Function>
-  TestFragment(bool conservative, bool bounds) {
+  TestFragment(bool conservative, bool depth, bool bounds, uint32_t sample_mask, uint32_t culls, bool cull_depth) {
+    std::lock_guard<mullion::mutex> lock(device_->test_fragments_mutex);
+    auto &function = device_->test_fragments[{conservative, depth, bounds, sample_mask, culls, cull_depth}];
+    if (!function)
+      function = CompileTestFragment(conservative, depth, bounds, sample_mask, culls, cull_depth);
+    return function;
+  }
+
+  // `depth`: it writes the depth, as a conservative rasterizer's that may discard does (a hull's too, whose pixels
+  // it does not test)
+  WMT::Reference<WMT::Function>
+  CompileTestFragment(bool conservative, bool depth, bool bounds, uint32_t sample_mask, uint32_t culls, bool cull_depth) {
+    // and a clamped depth where it may discard by cull distance
+    depth |= conservative || (culls && cull_depth);
+    bool masked = bounds || sample_mask != ~0u;
     auto corners = std::to_string(SM50_CONSERVATIVE_CORNERS);
     std::string source = "#include <metal_stdlib>\nusing namespace metal;\nstruct In {\n  float4 position [[position]];\n";
     for (uint32_t i = 0; conservative && i < SM50_CONSERVATIVE_VARYINGS; i++)
       source += "  float v" + std::to_string(i) + " [[user(mullion_conservative" + std::to_string(i) + "), flat]];\n";
+    for (uint32_t i = 0; i < culls; i++)
+      source += "  float cull" + std::to_string(i) + " [[user(" SM50_CULL_VARYING + std::to_string(i) + "), center_no_perspective]];\n";
     source += "};\nstruct Out {\n";
-    source += conservative ? "  float z [[depth(any)]];\n" : "";
-    source += bounds ? "  uint samples [[sample_mask]];\n" : "";
-    source += "};\nfragment Out test_fragment(In in [[stage_in]]";
+    source += depth ? "  float z [[depth(any)]];\n" : "";
+    source += masked ? "  uint samples [[sample_mask]];\n" : "";
+    // a function of no outputs, which only discards, returns nothing
+    bool outputs = depth || masked;
+    std::string ret = outputs ? "  return out;\n" : "  return;\n";
+    source += std::string("};\nfragment ") + (outputs ? "Out" : "void") + " test_fragment(In in [[stage_in]]";
     if (bounds)
       source += ", constant uint2 &bounds [[buffer(" + std::to_string(SM50_BINDING_INDEX_DEPTH_BOUNDS) +
                 ")]], device const uchar *samples [[buffer(" + std::to_string(SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES) + ")]]";
-    source += ") {\n  Out out;\n";
+    source += outputs ? ") {\n  Out out;\n" : ") {\n";
+    for (uint32_t i = 0; i < culls; i++) {
+      auto v = "in.cull" + std::to_string(i);
+      source += "  if (" + v + " == 0 && dfdx(" + v + ") == 0 && dfdy(" + v + ") == 0) {\n    discard_fragment();\n  " + ret + "  }\n";
+    }
     if (conservative) {
       source += "  float2 v[] = {";
       for (uint32_t k = 0; k < SM50_CONSERVATIVE_CORNERS; k++)
@@ -837,15 +927,16 @@ struct Group {
   }
   if (outside)
     discard_fragment();
-  out.z = in.position.z;
 )";
     }
-    if (bounds)
-      source += R"(  out.samples = bounds.x ? samples[uint(in.position.y) * bounds.y + uint(in.position.x)] : ~0u;
-  if (!out.samples)
-    discard_fragment();
-)";
-    source += "  return out;\n}\n";
+    if (depth)
+      source += "  out.z = in.position.z;\n";
+    if (masked)
+      source += "  out.samples = " +
+                std::string(bounds ? "(bounds.x ? samples[uint(in.position.y) * bounds.y + uint(in.position.x)] : ~0u)"
+                                   : "~0u") +
+                " & " + std::to_string(sample_mask) + "u;\n  if (!out.samples)\n    discard_fragment();\n";
+    source += ret + "}\n";
     WMT::Reference<WMT::Error> err;
     auto library = device_->GetMTLDevice().newLibraryWithSource(source, err);
     if (!library) {
@@ -971,6 +1062,18 @@ public:
         info.depth_pixel_format = format_desc.PixelFormat;
       if (dsv_flags & 2)
         info.stencil_pixel_format = format_desc.PixelFormat;
+    } else if (auto &ds = pDesc->DepthStencilState;
+               !pDesc->RasterizerState.ForcedSampleCount &&
+               ((ds.DepthEnable && (ds.DepthFunc != D3D12_COMPARISON_FUNC_ALWAYS ||
+                                    ds.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO || ds.StencilEnable)) ||
+                ds.StencilEnable || depth_bounds || depth_bounds_emulated)) {
+      // D3D12 asks for the bound view's format, but titles that test depth or stencil without one rely on drivers
+      // testing the view bound (vkd3d-proton keeps it: "A workaround for SottR, which creates pipelines with
+      // DSV_UNKNOWN, but still insists on using a depth buffer", libs/vkd3d/state.c). a test of ALWAYS that writes
+      // nothing, with no stencil test, is off, as there. a forced sample count rasterizes with no view and no depth
+      // test (D3D11.3 3.5.6.2), so such a pipeline keeps the view out as before
+      dsv_mask = 3;
+      dsv_any_format = true;
     }
 
     if constexpr (std::is_same_v<RenderPipelineInfo, WMTRenderPipelineInfo>) {
@@ -1005,9 +1108,12 @@ public:
     info.support_indirect_command_buffers = std::is_same_v<RenderPipelineInfo, WMTRenderPipelineInfo> ||
                                             device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple9);
 
-    // Metal takes no alpha-to-coverage with an integer target 0, where the pixel shader makes the coverage
+    // Metal takes no alpha-to-coverage with an integer target 0, and takes it from the color the fragment function
+    // returns, which a target 0 the pixel shader blends itself (ShaderBlend) has blended: the pixel shader makes the
+    // coverage then
     info.alpha_to_coverage_enabled = pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
-                                     !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info.colors[0].pixel_format)));
+                                     !IsIntegerFormat(WMTPixelFormat(ORIGINAL_FORMAT(info.colors[0].pixel_format))) &&
+                                     !blend[0].blend;
     for (unsigned i = 0; i < std::size(blend); i++)
       blend_mask_ |= uint32_t(blend[i].blend) << i;
     shader_blend = blend_mask_;
@@ -1111,6 +1217,8 @@ public:
     depth_bias = pDesc->RasterizerState.DepthBias;
     scole_scale = pDesc->RasterizerState.SlopeScaledDepthBias;
     depth_bias_clamp = pDesc->RasterizerState.DepthBiasClamp;
+    unbiased = !pDesc->GS.BytecodeLength && (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT ||
+                                             pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
     winding = pDesc->RasterizerState.FrontCounterClockwise ? WMTWindingCounterClockwise : WMTWindingClockwise;
     forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
   }
@@ -1191,6 +1299,11 @@ public:
     Name({pDesc->VS, pDesc->HS, pDesc->DS, pDesc->GS, pDesc->PS, MS, AS});
 
     if (mesh_shader) {
+      // an amplification shader builds its payload in place (airconv's direct payload); MULLION_D3D12_FAST_MESH=0, read
+      // once, keeps the copy DispatchMesh made before, for A/B runs. the flag is in the shader cache's key
+      static const bool fast_mesh = env::getEnvVar("MULLION_D3D12_FAST_MESH") != "0";
+      if (!fast_mesh)
+        common.flags = SM50_SHADER_FLAG(common.flags | SM50_SHADER_FLAG_STAGED_PAYLOAD);
       if (FAILED(hr = InitializeShader(device_, MS, &shader_ms, &ref_ms)) ||
           (AS.pShaderBytecode && FAILED(hr = InitializeShader(device_, AS, &shader_as, &ref_as))))
         return hr;
@@ -1225,9 +1338,13 @@ public:
                                       : pDesc->StreamOutput.RasterizedStream;
       so_data.next = &common;
     }
+    // the alpha-to-coverage state and the cull distances read the pixel shader's reflection
+    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->PS, &shader_ps, &ref_ps)))
+      return hr;
     // a vertex shader's cull distances discard whole primitives (D3D11.3 15.4.2), which Metal can only by primitive:
-    // the mesh stage passes the vertex shader's primitives on, less those. it also rasterizes what stream output
-    // without a geometry shader streams out of the object stage
+    // the mesh stage passes the vertex shader's primitives on, less those, unless the pixel shader discards their
+    // pixels (`culls`, below). it also rasterizes what stream output without a geometry shader streams out of the
+    // object stage
     vertex_registers = mesh_shader ? 0 : ref_vs.NumOutputElement;
     bool plain = !mesh_shader && !tessellation && !pDesc->GS.pShaderBytecode;
     // conservative rasterization dilates a vertex shader's triangles in the mesh stage, which passes them on
@@ -1265,21 +1382,58 @@ public:
       });
       conservative = false;
     }
+    // the pixel shader can discard the pixels of a triangle a cull distance culls instead, before anything else it does
+    // (SM50_CULL_VARYING), the vertex shader drawn as usual: not a pixel shader whose depth and stencil tests come first,
+    // which a discard leaves done, not lines, points or wireframe, which rasterize one edge of a triangle without its
+    // third vertex, and not where the varyings, those the vertex shader writes or those the pixel shader reads, would be
+    // more than Metal passes. a discard costs an opaque pipeline the
+    // GPU's removal of hidden surfaces (2 to 3 times the GPU time of 10 to 20 layers drawn back to front, many times
+    // that with blending, where the mesh stage costs 10-20% more), so by default only a pipeline that has lost it
+    // already culls in its pixel shader: one whose pixel shader may discard, writes depth or uses UAVs, and blends no
+    // target. MULLION_D3D12_PIXEL_CULL=all culls in the pixel shader wherever it can, 0 nowhere
+    static const std::string pixel_culls = env::getEnvVar("MULLION_D3D12_PIXEL_CULL");
+    bool blends = false;
+    for (unsigned i = 0; i < pDesc->NumRenderTargets && i < 8; i++) {
+      auto &target = pDesc->BlendState.RenderTarget[pDesc->BlendState.IndependentBlendEnable ? i : 0];
+      blends |= target.BlendEnable || target.LogicOpEnable;
+    }
+    bool prefer_mesh = !pDesc->PS.pShaderBytecode ||
+                                (!ref_ps.PixelShader.Discards && !ref_ps.PixelShader.DepthOutput && !ref_ps.UAVSlotMask) ||
+                                blends || pDesc->BlendState.AlphaToCoverageEnable;
+    uint32_t culls = pixel_culls != "0" && (pixel_culls == "all" || !prefer_mesh) && plain &&
+                             ref_vs.CullDistances && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+                             pDesc->RasterizerState.FillMode == D3D12_FILL_MODE_SOLID && !stream_output &&
+                             !conservative && !(pDesc->PS.pShaderBytecode && ref_ps.PixelShader.EarlyTests) &&
+                             PixelShaderVaryings(pDesc->PS) + ref_vs.ClipDistances + ref_vs.CullDistances <= 124 &&
+                             VertexShaderVaryings(pDesc->VS) + ref_vs.ClipDistances + ref_vs.CullDistances <= 124
+                         ? ref_vs.CullDistances
+                         : 0;
     // and passes lines on as quadrilaterals (D3D11.3 15.14.1, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
     bool quad_lines =
         plain && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE && pDesc->RasterizerState.MultisampleEnable;
     bool pass_through = plain && pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
-                        (ref_vs.CullDistances || (stream_output && so_data.rasterized_stream == 0) || quad_lines ||
+                        ((ref_vs.CullDistances && !culls) || (stream_output && so_data.rasterized_stream == 0) || quad_lines ||
                          conservative);
     geometry_shader |= pass_through;
+    // a mesh stage that runs a shader of the pipeline's reads its root arguments; the vertex shader's primitives passed
+    // on alone read none (mesh_only below runs the vertex shader there too)
+    mesh_reads_root_arguments = mesh_shader || tessellation || pDesc->GS.pShaderBytecode;
     mesh_instances = sm50_shader_t(shader_gs) ? gs_instances : pass_through;
     adjacency = plain && (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
                           pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
     patches = plain && stream_output && pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     bool mesh = tessellation || geometry_shader || mesh_shader;
-    // the alpha-to-coverage state reads the pixel shader's reflection
-    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->PS, &shader_ps, &ref_ps)))
-      return hr;
+    // a vertex shader's triangles at one raster sample, which Metal rasterizes at the pixel's center: the mesh stage
+    // passes on the hull of the pixels each touches, and the pixel shader tests none of them (and so discards
+    // none, which keeps Metal's hidden surface removal). a pixel shader that reads its inputs at each vertex needs the
+    // three corners as Metal's primitive. MULLION_CONSERVATIVE_HULL=0 grows one triangle and tests its pixels instead
+    static const bool hull_allowed = [] {
+      auto value = getenv("MULLION_CONSERVATIVE_HULL");
+      return !value || strcmp(value, "0");
+    }();
+    conservative_hull = hull_allowed && conservative && pass_through && pDesc->SampleDesc.Count <= 1 &&
+                        pDesc->RasterizerState.ForcedSampleCount <= 1 &&
+                        !(pDesc->PS.pShaderBytecode && ref_ps.PixelShader.VertexValues);
     // a pixel shader whose runs are seen tests the last pre-raster stage's clip distances itself (D3D11.3 15.4.1),
     // where Metal would cut the primitive and run a pixel on the cut once for each piece. a geometry shader after
     // tessellation still clips in Metal, and so does a conservative rasterizer's grown triangle, whose varyings are
@@ -1294,6 +1448,7 @@ public:
     clip_data.type = SM50_SHADER_GS_PASS_THROUGH;
     clip_data.DataEncoded = ~0u;
     clip_data.ClipDistanceVaryings = clips;
+    clip_data.CullDistanceVaryings = culls;
     clip_data.next = &common;
     uses_uav = (mesh_shader ? ref_ms.UAVSlotMask | (AS.pShaderBytecode ? ref_as.UAVSlotMask : 0) : ref_vs.UAVSlotMask) ||
                (tessellation && (ref_hs.UAVSlotMask || ref_ds.UAVSlotMask)) ||
@@ -1333,6 +1488,11 @@ public:
                          : InitializePSO(pDesc, info, dual_source_blending, blend)))
       return hr;
 
+    // the sample mask selects output samples, which rendering with UAVs alone has none of (D3D11.3 3.5.6.4)
+    bool attached = pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN ||
+                    std::any_of(pDesc->RTVFormats, pDesc->RTVFormats + pDesc->NumRenderTargets,
+                                [](auto format) { return format != DXGI_FORMAT_UNKNOWN; });
+    uint32_t sample_mask = attached ? pDesc->SampleMask : ~0u;
     if (pDesc->PS.pShaderBytecode) {
       auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
 
@@ -1343,11 +1503,7 @@ public:
       data_ps.disable_depth_output =
           (mesh ? mesh_info.depth_pixel_format : info.depth_pixel_format) == WMTPixelFormatInvalid;
       data_ps.unorm_output_reg_mask = 0;
-      // the sample mask selects output samples, which rendering with UAVs alone has none of (D3D11.3 3.5.6.4)
-      bool attached = pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN ||
-                      std::any_of(pDesc->RTVFormats, pDesc->RTVFormats + pDesc->NumRenderTargets,
-                                  [](auto format) { return format != DXGI_FORMAT_UNKNOWN; });
-      data_ps.sample_mask = attached ? pDesc->SampleMask : ~0u;
+      data_ps.sample_mask = sample_mask;
       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
       data_ps.next = &common;
       data_ps.pipeline_statistics = false;
@@ -1356,12 +1512,15 @@ public:
       // one sample rasterizes at the pixel center, and the targets' samples with it (D3D11.3 3.5.6.2)
       data_ps.single_raster_sample = attached && pDesc->RasterizerState.ForcedSampleCount == 1;
       data_ps.clip_distances = clips;
+      data_ps.cull_distances = culls;
+      data_ps.cull_depth = culls && !pDesc->RasterizerState.DepthClipEnable;
       std::copy(std::begin(blend), std::end(blend), data_ps.blend);
       data_ps.centered_samples =
           data_ps.single_raster_sample || pDesc->SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN;
       data_ps.depth_bounds = depth_bounds_emulated;
       data_ps.late_tests = false;
       data_ps.conservative = conservative;
+      data_ps.conservative_hull = conservative_hull;
       data_ps.quad_lines = quad_lines && ref_ps.PixelShader.Barycentrics;
       data_ps.coarse_shading = false;
       // the primitive's shading rate, from the stage before the rasterizer: a domain or mesh shader has none
@@ -1383,7 +1542,7 @@ public:
       pixel_shader_ =
           [this, code = std::string((const char *)pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength),
            signature = Com<ID3D12RootSignature>(pDesc->pRootSignature), data_ps, common,
-           ps_name](bool statistics, bool late, bool coarse, uint32_t blends) mutable {
+           ps_name](bool statistics, bool late, bool coarse, uint32_t blends, bool depth) mutable {
             D3D12_SHADER_BYTECODE bytecode{code.data(), code.size()};
             SM50Shader shader;
             MTL_SHADER_REFLECTION reflection;
@@ -1393,13 +1552,17 @@ public:
             data.pipeline_statistics = statistics;
             data.late_tests = late;
             data.coarse_shading = coarse;
+            // Metal refuses a pipeline whose shader outputs depth without a depth format: the shader's depth is kept
+            // only for a variant that has one (RenderTargets)
+            data.disable_depth_output &= !depth;
             for (unsigned i = 0; i < std::size(data.blend); i++)
               if (!(blends >> i & 1))
                 data.blend[i] = {};
             data.next = &common;
             SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
             auto arguments = RootSignature(rootsig, signature.ptr(), &data);
-            auto name = ps_name + "_" + std::to_string(blends | statistics << 8 | late << 9 | coarse << 10);
+            auto name =
+                ps_name + "_" + std::to_string(blends | statistics << 8 | late << 9 | coarse << 10 | depth << 11);
             return CompileFunction(device_, this, std::span(&bytecode, 1), arguments, name.c_str(),
                                    [&shader](auto args, auto name, auto bitcode, auto error) {
                                      return SM50Compile(shader, args, name, bitcode, error);
@@ -1407,8 +1570,18 @@ public:
           };
     }
 
-    // without a pixel shader, one that only does the tests a pixel shader would
-    if ((conservative || depth_bounds_emulated) && !ps_func && !(ps_func = TestFragment(conservative, depth_bounds_emulated)))
+    // without a pixel shader, one that only does the tests a pixel shader would, and keeps the samples of a sample
+    // mask that leaves some of the rasterizer's out (D3D11.3 17.17: "SampleMask is always applied")
+    auto raster_samples = mesh ? mesh_info.raster_sample_count : info.raster_sample_count;
+    uint32_t all_samples = raster_samples >= 32 ? ~0u : (1u << raster_samples) - 1;
+    if ((sample_mask & all_samples) == all_samples)
+      sample_mask = ~0u;
+    // a hull's that tests the depth bounds or keeps a sample mask discards, so it writes the depth as a conservative
+    // pixel shader that discards does
+    if (((conservative && !conservative_hull) || depth_bounds_emulated || sample_mask != ~0u || culls) && !ps_func &&
+        !(ps_func = TestFragment(conservative && !conservative_hull, conservative, depth_bounds_emulated, sample_mask, culls,
+                                 culls && !pDesc->RasterizerState.DepthClipEnable &&
+                                     pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN)))
       return E_FAIL;
 
     auto geometry_inputs = [&] {
@@ -1425,11 +1598,14 @@ public:
       in->common = common;
       in->ps = ps_func;
       in->clip_distance_varyings = clips;
+      in->cull_distance_varyings = culls;
       in->quad_lines = quad_lines;
       in->barycentrics = ps_func && ref_ps.PixelShader.Barycentrics;
       in->strip_cut = pDesc->IBStripCutValue;
       in->primitive = pDesc->PrimitiveTopologyType;
       in->conservative = conservative;
+      in->conservative_hull = conservative_hull;
+      in->conservative_inner = ps_func && ref_ps.PixelShader.InnerCoverage;
       in->flat_inputs = ps_func ? ref_ps.PixelShader.FlatInputs : 0;
       in->noperspective_inputs = ps_func ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
       WMT::InitializeMeshRenderPipelineInfo(in->info);
@@ -1446,11 +1622,13 @@ public:
         SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
         return function(shader, code, root_signature(rootsig, args), name, linked);
       };
-      // the mesh shader names its outputs as the pixel shader's inputs
+      // the mesh shader names its outputs as the pixel shader's inputs, and without an amplification shader runs
+      // DispatchMesh's grid itself (in parts, past Metal's limit)
       SM50_SHADER_MESH_SHADER_DATA link{&common, SM50_SHADER_MESH_SHADER, pDesc->PS.pShaderBytecode};
+      link.amplified = AS.pShaderBytecode;
+      object_stage = AS.pShaderBytecode || conservative;
       if (conservative) {
         link.conservative = true;
-        link.amplified = AS.pShaderBytecode;
         link.triangles = ref_ms.MeshConservativeTriangles;
         link.slices = (std::max(ref_ms.MeshMaxPrimitives, 1u) + link.triangles - 1) / link.triangles;
         link.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
@@ -1479,23 +1657,46 @@ public:
         DumpShaders({AS, MS, pDesc->PS});
         return E_FAIL;
       }
+      mesh_grid_limit = pso.maxTotalThreadgroupsPerMeshGrid();
     } else if (geometry_shader) {
       // a strip's primitives share vertices, so strips and lists each have their pipeline
       auto inputs = geometry_inputs();
       if (!inputs)
         return FAIL(E_FAIL);
       // D3D12_PRIMITIVE_TOPOLOGY_TYPE's point, line and triangle are D3D10_SB_PRIMITIVE's
-      auto variant = [&](bool strip, bool counting = false) {
+      // stream output in one pass where each object threadgroup's primitives follow from its place: no index cuts
+      // a strip, and a geometry shader, if any, emits the same each time
+      static const bool one_pass = env::getEnvVar("MULLION_D3D12_FAST_STREAM_OUTPUT") != "0";
+      rasterless = one_pass && stream_output && so_data.rasterized_stream == ~0u;
+      auto input = sm50_shader_t(shader_gs) ? ref_gs.GeometryShader.Primitive : uint32_t(pDesc->PrimitiveTopologyType);
+      bool fixed = one_pass && stream_output && !patches && (!sm50_shader_t(shader_gs) || ref_gs.GeometryShader.FixedEmits);
+      so_single = SM50StreamOutputSinglePass(input, false, false, fixed);
+      so_single_strip =
+          SM50StreamOutputSinglePass(input, true, pDesc->IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, fixed);
+      auto variant = [&](bool strip, bool counting = false, bool mesh_only = false) {
         return GeometryVariant(
-            inputs, shader_vs, shader_gs, pDesc->GS, strip, counting, pDesc->PrimitiveTopologyType, pass_through, hr
+            inputs, shader_vs, shader_gs, pDesc->GS, strip, counting, pDesc->PrimitiveTopologyType, pass_through, hr,
+            strip ? so_single_strip : so_single, mesh_only
         );
       };
       bool strips = sm50_shader_t(shader_gs) ? ref_gs.GeometryShader.Primitive != D3D_PRIMITIVE_POINT
                               : pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
-      if (!patches && (!(pso = variant(false)) || (strips && !(pso_strip = variant(true)))))
+      // lists of triangles a vertex shader's cull distances pass through: a mesh function alone runs the vertex shader
+      // and passes them on, with no object stage before it, which costs about as much as the triangles themselves
+      // (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's mesh_only). strips keep the object stage, as do stream output,
+      // conservative rasterization, quadrilateral lines and geometry shaders. MULLION_D3D12_CULL_MESH_ONLY=0 keeps it
+      // everywhere
+      static const bool mesh_only_lists = env::getEnvVar("MULLION_D3D12_CULL_MESH_ONLY") != "0";
+      mesh_only = mesh_only_lists && pass_through && !sm50_shader_t(shader_gs) && ref_vs.CullDistances &&
+                  pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && !stream_output &&
+                  !conservative && !quad_lines;
+      mesh_reads_root_arguments |= mesh_only;
+      if (!patches && (!(pso = variant(false, false, mesh_only)) || (strips && !(pso_strip = variant(true)))))
         return hr;
+      // a one-pass variant has no counting pass
       if (!patches && stream_output &&
-          (!(so_count = variant(false, true)) || (strips && !(so_count_strip = variant(true, true)))))
+          ((!so_single && !(so_count = variant(false, true))) ||
+           (strips && !so_single_strip && !(so_count_strip = variant(true, true)))))
         return hr;
       if (adjacency || patches)
         topology_inputs_ = inputs;
@@ -1639,16 +1840,20 @@ public:
 
   WMT::RenderPipelineState
   RenderTargets(
-      WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar, bool Statistics, bool Occluded, bool Coarse
+      WMT::RenderPipelineState Pipeline, uint32_t Mask, uint32_t DSVPlanar, bool Statistics, bool Occluded, bool Coarse,
+      WMTPixelFormat DSVFormat
   ) override {
     Mask &= rtv_mask;
     DSVPlanar &= dsv_mask;
+    // a pipeline of any depth stencil format is made without one, which a pass without a view keeps
+    bool any_format = dsv_any_format && DSVPlanar;
     Statistics &= pixel_shader || statistics_geometry_;
     Coarse &= pixel_shader && coarse_shading;
     // a pixel shader's discard of the depth bounds test takes its samples out of an occlusion query only before the
     // depth and stencil tests
     bool late = Occluded && depth_bounds_emulated && pixel_shader;
-    if (!Pipeline || (!Statistics && !late && !Coarse && Mask == rtv_mask && DSVPlanar == dsv_mask))
+    if (!Pipeline ||
+        (!Statistics && !late && !Coarse && Mask == rtv_mask && (dsv_any_format ? !DSVPlanar : DSVPlanar == dsv_mask)))
       return Pipeline;
     std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
     auto described = pipeline_descriptors_.find(Pipeline.handle);
@@ -1659,7 +1864,8 @@ public:
     auto key = Mask | (DSVPlanar << D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) |
                (uint32_t(Statistics) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 2)) |
                (uint32_t(late) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 3)) |
-               (uint32_t(Coarse) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 4));
+               (uint32_t(Coarse) << (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 4)) |
+               (uint64_t(any_format ? DSVFormat : WMTPixelFormatInvalid) << 32);
     auto found = descriptor.variants.find(key);
     if (found != descriptor.variants.end())
       return found->second;
@@ -1669,10 +1875,13 @@ public:
     auto pipeline = std::visit(
         [&](auto info) {
           // a pipeline without a pixel shader may have the depth bounds test's fragment function, which has no variants
+          // a pipeline of any depth stencil format was converted without the depth its shader outputs, which a
+          // variant with the view's depth keeps
+          bool depth = any_format && (DSVPlanar & 1) && ref_ps.PixelShader.DepthOutput;
           if (auto blends = blend_mask_ & Mask;
-              pixel_shader && (Statistics || late || Coarse || blends != blend_mask_)) {
-            auto &ps = pixel_shaders_[blends | Statistics << 8 | late << 9 | Coarse << 10];
-            if (!ps && !(ps = pixel_shader_(Statistics, late, Coarse, blends)))
+              pixel_shader && (Statistics || late || Coarse || blends != blend_mask_ || depth)) {
+            auto &ps = pixel_shaders_[blends | Statistics << 8 | late << 9 | Coarse << 10 | depth << 11];
+            if (!ps && !(ps = pixel_shader_(Statistics, late, Coarse, blends, depth)))
               return WMT::Reference<WMT::RenderPipelineState>{};
             info.fragment_function = ps;
           }
@@ -1688,8 +1897,12 @@ public:
               info.colors[i] = {.pixel_format = WMTPixelFormatInvalid};
           if (!(DSVPlanar & 1))
             info.depth_pixel_format = WMTPixelFormatInvalid;
+          else if (any_format)
+            info.depth_pixel_format = DSVFormat;
           if (!(DSVPlanar & 2))
             info.stencil_pixel_format = WMTPixelFormatInvalid;
+          else if (any_format)
+            info.stencil_pixel_format = DSVFormat;
           return device_->GetMTLDevice().newRenderPipelineState(info, error);
         },
         descriptor.info

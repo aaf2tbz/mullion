@@ -502,23 +502,49 @@ public:
   // Metal biases the footprint's minor axis before an anisotropic filter clamps the footprint's ratio, which can undo
   // the bias; D3D biases the LOD of the clamped footprint ("biasedLOD = output.LOD + MipLODBias", D3D11.3 7.18.11).
   // so a pixel shader's sample of a 2D texture through a sampler that may be anisotropic scales its gradients
-  // instead, which keeps the ratio; without anisotropy that is the biased LOD too, so one sample serves every sampler
-  // a static sampler's anisotropy and bias, known when the pipeline is made (SamplerDescriptor), by its metadata, and
-  // the metadata each bias DecodeSamplerBias made was read from, which a sample may add its own to
+  // instead, which keeps the ratio, and one through a sampler that is not keeps Metal's LOD and bias. a static
+  // sampler's anisotropy and bias are known when the pipeline is made (SamplerDescriptor): KnownSamplers holds them by
+  // the sampler's metadata, and SamplerBiases the metadata each bias DecodeSamplerBias made was read from, which a
+  // sample may add its own to. a descriptor's sampler is known only from its metadata, and its quad branches on it
   struct KnownSampler {
     bool Anisotropic, Biased;
   };
   std::map<llvm::Value *, KnownSampler> KnownSamplers;
   std::map<llvm::Value *, llvm::Value *> SamplerBiases;
+  // a static sampler's reduction, known when the pipeline is made, by its metadata: whether it is a minimum or
+  // maximum filter (MinMaxFilter)
+  std::map<llvm::Value *, bool> KnownReductions;
   void
   NoteSampler(const SamplerDescriptor &Descriptor) {
     if (Descriptor.Anisotropic && Descriptor.Biased)
       KnownSamplers[Descriptor.Metadata] = {*Descriptor.Anisotropic, *Descriptor.Biased};
+    if (Descriptor.Reduces)
+      KnownReductions[Descriptor.Metadata] = *Descriptor.Reduces;
   }
 
   std::pair<llvm::Value *, llvm::Value *> SampleImplicit(
       const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *SamplerMetadata, llvm::Value *Coord,
       llvm::Value *ArrayIndex, const int32_t Offset[3], llvm::Value *Reference, llvm::Value *Bias, llvm::Value *MinLOD
+  );
+
+  // how a sample chooses its LOD (D3D11.3 7.18.11): an explicit `Level`, gradients, or its quad's derivatives in a
+  // pixel shader, with `Bias` the sampler's and the sample's own together; then the view's and the sample's `MinLOD`
+  struct Footprint {
+    llvm::Value *Level = nullptr; // before the sampler's bias and clamps
+    llvm::Value *DDX = nullptr, *DDY = nullptr;
+    llvm::Value *Bias = nullptr;
+    llvm::Value *MinLOD = nullptr;
+  };
+
+  // `Filtered`, the value and status of a sample, with D3D's minimum and maximum filters: "fetches the same set of
+  // texels that a normal texture filter would fetch, but ... returns the min() or max() of the texels fetched, on a
+  // per-component basis", and a texel the filter weights 0 "still do[es] not contribute" (D3D11.3 5.9.4.5.6). Metal's
+  // samplers average where the metadata asks for a reduction (SM50_SAMPLER_REDUCTION), so those samples read the
+  // texels themselves. a static sampler that does not reduce costs nothing; any other sampler costs a branch
+  std::pair<llvm::Value *, llvm::Value *> MinMaxFilter(
+      const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *Border, llvm::Value *SamplerMetadata,
+      llvm::Value *Coord, llvm::Value *ArrayIndex, const int32_t Offset[3], const Footprint &Footprint,
+      std::pair<llvm::Value *, llvm::Value *> Filtered
   );
 
   // a sample's texels and status, where Metal's own are wrong: a reserved texture a shader can write reports no
@@ -563,6 +589,8 @@ public:
 
   llvm::Value *
   LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Value *Row, int Component = -1, mask_t Dwords = kMaskAll);
+  // a row of zeros in the shader's constant memory, which constant buffer reads past the bound size read instead
+  llvm::GlobalVariable *ZeroRow();
 
   // a D3D texel address (texel coordinates, then the array slice) as Metal's position and array index. texel
   // buffers are addressed inside their view. a position past the view, or at a `Level` below the view's min-LOD
@@ -574,6 +602,8 @@ public:
   llvm::Value *ConvertToHalfTowardZero(llvm::Value *Value);
 
   llvm::Value *FirstBit(IntegerUnaryOp Op, llvm::Value *Value);
+  // frc and DXIL's Frc: the value less its floor (D3D11.3 22.10.7), NaN for an infinity or a NaN
+  llvm::Value *Fraction(llvm::Value *Value);
   llvm::Value *SinCos(llvm::air::AIRBuilder::FPUnOp Op, llvm::Value *Value);
   // `Used`: the components the caller takes of the texel
   std::pair<llvm::Value *, llvm::Value *> ReadTexel(
@@ -678,11 +708,23 @@ public:
   llvm::Value *ClampArrayIndex(llvm::Value *ShaderValue, llvm::Value *Metadata);
 
 
-  // `Domain`: quad, triangle or isoline. `Capacity`: the workloads `DataPtr` has room for. `TessFactors`: the
-  // inside's, then the edges'; an isoline's density, then its detail
+  // `Domain`: quad, triangle or isoline. `Capacity`: the workloads `DataPtr` has room for. `GroupsPtr`: where
+  // groups of workloads of at most `GroupLimit` vertices begin (null and 0: no groups). `TessFactors`: the inside's,
+  // then the edges'; an isoline's density, then its detail
   void HullGenerateWorkload(
       const char *Domain, llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, uint32_t Capacity,
-      TessellatorPartitioning Partitioning, llvm::ArrayRef<llvm::Value *> TessFactors
+      llvm::Value *GroupsPtr, uint32_t GroupLimit, TessellatorPartitioning Partitioning,
+      llvm::ArrayRef<llvm::Value *> TessFactors
+  );
+
+  // a mesh threadgroup's group of workloads, `First` to `End`: its vertex `ThreadIndex`'s domain location, whether
+  // the group has it, and whether every thread of the SIMD group has one; and its primitives, which all its threads
+  // make together, `Lane` being each one's
+  std::tuple<llvm::Value *, llvm::Value *, llvm::Value *>
+  DomainGetGroupLocation(llvm::Value *First, llvm::Value *End, llvm::Value *ThreadIndex, llvm::Value *DataPtr);
+  void DomainGenerateGroup(
+      llvm::Value *First, llvm::Value *End, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive,
+      llvm::Value *Behind, llvm::Value *Lane
   );
 
   llvm::Value *DomainGetPatchIndex(llvm::Value *WorkloadIndex, llvm::Value *DataPtr);

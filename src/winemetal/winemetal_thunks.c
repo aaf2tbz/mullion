@@ -1146,13 +1146,14 @@ MTLSharedEvent_signalValue(obj_handle_t event, uint64_t value) {
 
 WINEMETAL_API void
 MTLSharedEvent_setWin32EventAtValue(
-    obj_handle_t event, obj_handle_t shared_event_listener, void *nt_event_handle, uint64_t at_value
+    obj_handle_t event, obj_handle_t shared_event_listener, void *nt_event_handle, uint64_t at_value, bool reference
 ) {
   struct unixcall_mtlsharedevent_setevent params;
   params.shared_event = event;
   params.shared_event_listener = shared_event_listener;
   params.event_handle = (obj_handle_t)PtrToUInt64(nt_event_handle);
   params.value = at_value;
+  params.reference = reference;
   UNIX_CALL(104, &params);
 }
 
@@ -1308,8 +1309,9 @@ MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info) {
 }
 
 WINEMETAL_API bool
-WMTBootstrapRegister(const char *name, mach_port_t mach_port) {
-  struct unixcall_bootstrap params;
+WMTBootstrapRegister(const char *name, obj_handle_t object, mach_port_t mach_port) {
+  struct unixcall_bootstrap params = {};
+  params.object = object;
   strncpy(params.name, name, sizeof(params.name) - 1);
   params.name[sizeof(params.name) - 1] = '\0';
   params.mach_port = mach_port;
@@ -1319,7 +1321,8 @@ WMTBootstrapRegister(const char *name, mach_port_t mach_port) {
 
 WINEMETAL_API bool
 WMTBootstrapLookUp(const char *name, mach_port_t *mach_port) {
-  struct unixcall_bootstrap params;
+  struct unixcall_bootstrap params = {};
+  params.object = 0;
   strncpy(params.name, name, sizeof(params.name) - 1);
   params.name[sizeof(params.name) - 1] = '\0';
   params.mach_port = 0;
@@ -1398,6 +1401,25 @@ MTLDevice_supportsShaderBarycentricCoordinates(obj_handle_t device) {
   params.handle = device;
   params.ret = 0;
   UNIX_CALL(WMTUnixDeviceSupportsShaderBarycentrics, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsFXDenoisedScaler(obj_handle_t device, bool metal4) {
+  struct unixcall_generic_obj_uint64_uint64_ret params;
+  params.handle = device;
+  params.arg = metal4;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupportsFXDenoisedScaler, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsSamplerReduction(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupportsSamplerReduction, &params);
   return params.ret;
 }
 
@@ -1956,6 +1978,10 @@ WINEMETAL_API void
 MTL4CommandBuffer_waitUntilCompleted(obj_handle_t buffer) {
   UNIX_CALL(WMTUnixMetal4Wait, &buffer);
 }
+WINEMETAL_API void
+MTL4CommandBuffer_waitForGPU(obj_handle_t buffer) {
+  UNIX_CALL(WMTUnixMetal4WaitGPU, &buffer);
+}
 WINEMETAL_API obj_handle_t
 MTL4CounterHeap_new(obj_handle_t device, uint64_t count) {
   struct unixcall_generic_obj_uint64_obj_ret p = {.handle = device, .arg = count};
@@ -1981,7 +2007,95 @@ MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t
 }
 
 WINEMETAL_API void
-MTL4CommandBuffer_orderAliases(obj_handle_t buffer) {
-  struct unixcall_generic_obj_noret p = {.handle = buffer};
+MTL4CommandBuffer_orderAliases(obj_handle_t buffer, bool inside) {
+  struct unixcall_generic_obj_uint64_noret p = {.handle = buffer, .arg = inside};
   UNIX_CALL(WMTUnixMetal4OrderAliases, &p);
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newSpatialScaler4(obj_handle_t device, const struct WMTFXSpatialScalerInfo *info) {
+  struct unixcall_mtldevice_newfxspatialscaler params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = NULL_OBJECT_HANDLE;
+  UNIX_CALL(WMTUnixDeviceNewSpatialScaler4, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTL4CommandBuffer_encodeSpatialScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
+) {
+  struct unixcall_mtlcommandbuffer_spatial_scale params;
+  params.cmdbuf = cmdbuf;
+  params.scaler = scaler;
+  params.color = color;
+  params.output = output;
+  params.fence = fence;
+  UNIX_CALL(WMTUnixMetal4SpatialScale, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newTemporalScaler4(obj_handle_t device, const struct WMTFXTemporalScalerInfo *info) {
+  struct unixcall_mtldevice_newfxtemporalscaler params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = NULL_OBJECT_HANDLE;
+  UNIX_CALL(WMTUnixDeviceNewTemporalScaler4, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTL4CommandBuffer_encodeTemporalScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t depth,
+    obj_handle_t motion, obj_handle_t exposure, obj_handle_t fence, const struct WMTFXTemporalScalerProps *props
+) {
+  struct unixcall_mtlcommandbuffer_temporal_scale params;
+  params.cmdbuf = cmdbuf;
+  params.scaler = scaler;
+  params.color = color;
+  params.output = output;
+  params.depth = depth;
+  params.motion = motion;
+  params.exposure = exposure;
+  params.fence = fence;
+  WMT_MEMPTR_SET(params.props, props);
+  UNIX_CALL(WMTUnixMetal4TemporalScale, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newDenoisedScaler(obj_handle_t device, const struct WMTFXDenoisedScalerInfo *info, bool metal4) {
+  struct unixcall_mtldevice_newfxdenoisedscaler params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = NULL_OBJECT_HANDLE;
+  params.metal4 = metal4;
+  UNIX_CALL(WMTUnixDeviceNewDenoisedScaler, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_encodeDenoisedScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, const struct WMTFXDenoisedScaleArgs *args, bool metal4
+) {
+  struct unixcall_mtlcommandbuffer_denoised_scale params;
+  params.cmdbuf = cmdbuf;
+  params.scaler = scaler;
+  WMT_MEMPTR_SET(params.args, args);
+  params.metal4 = metal4;
+  UNIX_CALL(WMTUnixCommandBufferDenoisedScale, &params);
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_waitUntilSignaled(obj_handle_t cmdbuf, obj_handle_t event, uint64_t value) {
+  struct unixcall_generic_obj_obj_uint64_noret params = {.handle = cmdbuf, .arg0 = event, .arg1 = value};
+  UNIX_CALL(WMTUnixCommandBufferWaitSignal, &params);
+}
+
+WINEMETAL_API void
+WMTBootstrapKeep(const char *name, obj_handle_t object) {
+  struct unixcall_bootstrap params = {.object = object};
+  strncpy(params.name, name, sizeof(params.name) - 1);
+  params.name[sizeof(params.name) - 1] = '\0';
+  UNIX_CALL(WMTUnixBootstrapKeep, &params);
 }

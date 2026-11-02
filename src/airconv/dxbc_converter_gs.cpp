@@ -52,6 +52,54 @@ get_vertex_primitive_count_in_warp(D3D10_SB_PRIMITIVE primitive, bool strip, uin
   return {warp.vertices, warp.primitives, per_primitive};
 }
 
+std::optional<std::array<uint32_t, 4>>
+fixed_stream_primitives(const SM50ShaderInternal *pShaderInternal) {
+  uint32_t per_primitive = pShaderInternal->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ? 3
+                           : pShaderInternal->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_LINESTRIP   ? 2
+                                                                                                         : 1;
+  // per stream, the primitives completed and the vertices of the strip so far, as the shader's emits count them; and
+  // the vertices emitted, which past the declared most leave what becomes of the rest to the converter
+  std::array<uint32_t, 4> primitives{}, strip{};
+  uint32_t emitted = 0;
+  bool fixed = true;
+  std::vector<const BasicBlock *> seen;
+  for (auto block = pShaderInternal->entry(); block;) {
+    // a block reached again loops
+    if (std::ranges::find(seen, block) != seen.end())
+      return {};
+    seen.push_back(block);
+    block->instructions.for_each(patterns{
+        [&](const InstEmit &emit) {
+          emitted++;
+          if (emit.stream >= 4)
+            return;
+          if (++strip[emit.stream] >= per_primitive)
+            primitives[emit.stream]++;
+        },
+        [&](const InstCut &cut) {
+          if (cut.stream < 4)
+            strip[cut.stream] = 0;
+        },
+        [](const auto &) {},
+    });
+    const BasicBlock *next = nullptr;
+    std::visit(
+        patterns{
+            [&](const BasicBlockUnconditionalBranch &branch) { next = branch.target; },
+            [](const BasicBlockReturn &) {},
+            [&](const auto &) { fixed = false; },
+        },
+        block->target
+    );
+    if (!fixed)
+      return {};
+    block = const_cast<BasicBlock *>(next);
+  }
+  if (emitted > pShaderInternal->gs_max_vertex_output)
+    return {};
+  return primitives;
+}
+
 // SM50_STREAM_OUTPUT_TARGETS, and where a draw's scratch area keeps what (airconv_public.h)
 static llvm::StructType *
 stream_output_targets_type(llvm::LLVMContext &context, air::AirType &types) {
@@ -141,11 +189,13 @@ stream_output_input(air::FunctionSignatureBuilder &signature, llvm::LLVMContext 
 // a w of 1, so what Metal interpolates over them is linear in the window: an input over w and the plane's 1/w
 // (SM50_CONSERVATIVE_RCP_W), from the corners' homogeneous barycentrics there, which hold behind the eye too. a polygon
 // of no area takes the first corner's inputs and faces back ("degenerate triangles must be considered back facing",
-// D3D12 conservative rasterization)
+// D3D12 conservative rasterization). with `hull` (one raster sample) Metal rasterizes instead the polygon grown by the
+// square, SM50_CONSERVATIVE_HULL_POINTS points whose pixels are just those the polygon touches, which the pixel shader
+// need not test; without `weigh` it leaves the points in hull_points for conservative_weigh
 ConservativeTriangle
 conservative_triangle(
     llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, air::AirType &types, pvalue const (&clip)[3],
-    pvalue viewports, pvalue viewport_index
+    pvalue viewports, pvalue viewport_index, bool hull, bool weigh
 ) {
   using llvm::air::AIRBuilder;
   ConservativeTriangle out;
@@ -158,6 +208,10 @@ conservative_triangle(
   auto min = [&](pvalue a, pvalue b) { return air.CreateFPBinOp(AIRBuilder::fmin, a, b, false); };
   auto max = [&](pvalue a, pvalue b) { return air.CreateFPBinOp(AIRBuilder::fmax, a, b, false); };
   auto abs = [&](pvalue a) { return air.CreateFPUnOp(AIRBuilder::fabs, a, false); };
+  // an index past the last viewport selects the first (D3D11.3 15.8.1)
+  viewport_index = builder.CreateSelect(
+      builder.CreateICmpULT(viewport_index, builder.getInt32(SM50_VIEWPORTS)), viewport_index, builder.getInt32(0)
+  );
   auto viewport = builder.CreateLoad(types._float4, builder.CreateGEP(types._float4, viewports, {viewport_index}));
   auto state = builder.CreateLoad(
       types._float4,
@@ -204,10 +258,6 @@ conservative_triangle(
     return {add(at(viewport, 0), mul(add(x, f(1)), mul(at(viewport, 2), f(0.5)))),
             add(at(viewport, 1), mul(sub(f(1), y), mul(at(viewport, 3), f(0.5))))};
   };
-  auto ndc = [&](pvalue x, pvalue y) -> std::array<pvalue, 2> {
-    return {sub(div(sub(x, at(viewport, 0)), mul(at(viewport, 2), f(0.5))), f(1)),
-            sub(f(1), div(sub(y, at(viewport, 1)), mul(at(viewport, 3), f(0.5))))};
-  };
   // twice the signed area, positive turning clockwise in the window
   auto area = [&](auto &points, size_t n) {
     pvalue sum = f(0);
@@ -241,86 +291,195 @@ conservative_triangle(
   }
   auto det = add(add(mul(column[0][0], row[0][0]), mul(column[0][1], row[0][1])), mul(column[0][2], row[0][2]));
   auto degenerate = builder.CreateOr(builder.CreateFCmpOEQ(polygon_area, f(0)), builder.CreateFCmpOEQ(det, f(0)));
-  // the triangle's edges moved out by the square, where its corners are before the eye
-  const double grow = 1 + 1.0 / 64;
-  std::array<pvalue, 2> corner[3];
-  pvalue before = builder.getTrue();
-  for (uint32_t k = 0; k < 3; k++) {
-    before = builder.CreateAnd(before, builder.CreateFCmpOGT(at(clip[k], 3), f(eye)));
-    corner[k] = window(div(at(clip[k], 0), at(clip[k], 3)), div(at(clip[k], 1), at(clip[k], 3)));
-  }
-  auto inward = builder.CreateSelect(builder.CreateFCmpOGT(polygon_area, f(0)), f(1), f(-1));
-  pvalue nx[3], ny[3], c[3];
-  for (uint32_t i = 0; i < 3; i++) {
-    auto &a = corner[i], &b = corner[(i + 1) % 3];
-    nx[i] = mul(sub(a[1], b[1]), inward), ny[i] = mul(sub(b[0], a[0]), inward);
-    c[i] = sub(add(mul(nx[i], a[0]), mul(ny[i], a[1])), mul(add(abs(nx[i]), abs(ny[i])), f(grow)));
-  }
-  std::array<pvalue, 2> moved[3];
-  for (uint32_t k = 0; k < 3; k++) {
-    uint32_t a = (k + 2) % 3, b = k; // the edges into and out of corner k
-    auto d = sub(mul(nx[a], ny[b]), mul(ny[a], nx[b]));
-    moved[k] = {div(sub(mul(c[a], ny[b]), mul(c[b], ny[a])), d), div(sub(mul(nx[a], c[b]), mul(nx[b], c[a])), d)};
-  }
-  // the box around the polygon, as much larger, and the half of the box twice its size that has it
-  pvalue low[2], high[2];
-  for (uint32_t axis = 0; axis < 2; axis++) {
-    low[axis] = high[axis] = out.window[0][axis];
-    for (uint32_t k = 1; k < SM50_CONSERVATIVE_CORNERS; k++)
-      low[axis] = min(low[axis], out.window[k][axis]), high[axis] = max(high[axis], out.window[k][axis]);
-    low[axis] = sub(low[axis], f(grow)), high[axis] = add(high[axis], f(grow));
-  }
-  auto width = sub(high[0], low[0]), height = sub(high[1], low[1]);
-  std::array<pvalue, 2> box[3] = {
-      {low[0], low[1]}, {add(low[0], mul(width, f(2))), low[1]}, {low[0], add(low[1], mul(height, f(2)))}
-  };
-  auto use_moved = builder.CreateAnd(
-      builder.CreateAnd(before, builder.CreateNot(degenerate)),
-      builder.CreateFCmpOLE(abs(area(moved, 3)), mul(mul(width, height), f(4)))
-  );
-  // the box's half turns clockwise; it turns as the polygon does, or back where it is degenerate
+  // the box's half and the hull turn clockwise as the polygon does, or back where it is degenerate
   auto clockwise = builder.CreateSelect(degenerate, counterclockwise, builder.CreateFCmpOGT(polygon_area, f(0)));
-  for (uint32_t u = 0; u < 3; u++) {
-    uint32_t mirrored = u ? 3 - u : 0;
-    pvalue point[2];
-    for (uint32_t axis = 0; axis < 2; axis++)
-      point[axis] = builder.CreateSelect(
-          use_moved, moved[u][axis], builder.CreateSelect(clockwise, box[u][axis], box[mirrored][axis])
-      );
-    auto [x, y] = ndc(point[0], point[1]);
-    // in floats the window barycentrics sum to about 1, so what is blended is divided by their sum: a constant
-    // input stays exact
-    pvalue weight[3], linear[3], rcp_w = f(0), z = f(0), sum = f(0);
-    for (uint32_t j = 0; j < 3; j++) {
-      weight[j] = div(add(add(mul(row[j][0], x), mul(row[j][1], y)), row[j][2]), det);
-      linear[j] = mul(weight[j], at(clip[j], 3));
-      rcp_w = add(rcp_w, weight[j]);
-      z = add(z, mul(weight[j], at(clip[j], 2)));
-      sum = add(sum, linear[j]);
+  std::vector<std::array<pvalue, 2>> points;
+  if (hull) {
+    // the pixels whose squares the polygon touches: the polygon grown by the square (its Minkowski sum), whose
+    // corners are the polygon's, each moved to the square's corners between its edges' outward normals. a 256th of a
+    // pixel more than half, the uncertainty tier 2 has room for, takes the squares that only touch it; as the corners
+    // are snapped to a 256th, so are the hull's. walked with the polygon's area positive, the normals turn through
+    // the square's quadrants once, so the polygon's n corners and the square's 4 make n + 4 points, some repeated: a
+    // corner repeated, or an edge along an axis, adds a point of its own again. a segment's two ends turn half a
+    // turn each, and a point all of it at its first corner
+    const double half = 0.5 + 1.0 / 256;
+    const uint32_t n = SM50_CONSERVATIVE_CORNERS;
+    auto positive = builder.CreateFCmpOGE(polygon_area, f(0));
+    std::array<pvalue, 2> corner[n];
+    for (uint32_t k = 0; k < n; k++)
+      for (uint32_t axis = 0; axis < 2; axis++)
+        corner[k][axis] = builder.CreateSelect(positive, out.window[k][axis], out.window[(n - k) % n][axis]);
+    // the square's corners by quadrant of the normals they lie along, turning as the normals do
+    const double square[4][2] = {{half, half}, {-half, half}, {-half, -half}, {half, -half}};
+    // each edge's quadrant; an edge of no length (a repeated corner) takes the one before it with a length, so its
+    // corner adds no turn
+    auto i32 = [&](uint32_t v) { return builder.getInt32(v); };
+    pvalue own[n], none[n], quadrant[n], carried = i32(0);
+    for (uint32_t k = 0; k < n; k++) {
+      auto &a = corner[k], &b = corner[(k + 1) % n];
+      auto dx = sub(b[0], a[0]), dy = sub(b[1], a[1]);
+      // the outward normal (dy, -dx)
+      auto right = builder.CreateFCmpOGE(dy, f(0)), up = builder.CreateFCmpOGE(builder.CreateFNeg(dx), f(0));
+      own[k] = builder.CreateSelect(right, builder.CreateSelect(up, i32(0), i32(3)), builder.CreateSelect(up, i32(1), i32(2)));
+      none[k] = builder.CreateAnd(builder.CreateFCmpOEQ(dx, f(0)), builder.CreateFCmpOEQ(dy, f(0)));
+      carried = builder.CreateSelect(none[k], carried, own[k]);
     }
-    for (uint32_t j = 0; j < 3; j++) {
-      auto first = f(j == 0 ? 1.0 : 0.0);
-      out.over_w[u][j] = builder.CreateSelect(degenerate, first, weight[j]);
-      out.linear[u][j] = builder.CreateSelect(degenerate, first, linear[j]);
+    for (uint32_t k = 0; k < n; k++)
+      carried = quadrant[k] = builder.CreateSelect(none[k], carried, own[k]);
+    // corner k (between edges k - 1 and k) takes the square's corners from its incoming edge's quadrant on: one more
+    // than the quadrants the normal turns there
+    pvalue first[n], start[n + 1], turned = i32(0);
+    start[0] = i32(0);
+    for (uint32_t k = 0; k < n; k++) {
+      first[k] = quadrant[(k + n - 1) % n];
+      auto turns = builder.CreateAnd(builder.CreateSub(quadrant[k], first[k]), i32(3));
+      turned = builder.CreateAdd(turned, turns);
+      start[k + 1] = builder.CreateAdd(start[k], builder.CreateAdd(turns, i32(1)));
     }
-    out.sum[u] = builder.CreateSelect(degenerate, f(1), sum);
-    out.rcp_w[u] = builder.CreateSelect(degenerate, f(1), div(rcp_w, sum));
-    pvalue position = llvm::UndefValue::get(types._float4);
-    position = builder.CreateInsertElement(position, x, uint64_t(0));
-    position = builder.CreateInsertElement(position, y, uint64_t(1));
-    position = builder.CreateInsertElement(position, builder.CreateSelect(degenerate, first_depth, div(z, sum)), uint64_t(2));
-    out.position[u] = builder.CreateInsertElement(position, f(1), uint64_t(3));
+    // a point (or a polygon of no edges' turn) takes the whole square at its first corner
+    auto whole = builder.CreateICmpEQ(turned, i32(0));
+    for (uint32_t k = 1; k <= n; k++)
+      start[k] = builder.CreateSelect(whole, builder.CreateAdd(start[k], i32(4)), start[k]);
+    for (uint32_t v = 0; v < SM50_CONSERVATIVE_HULL_POINTS; v++) {
+      // the corner whose points v is among, and which of them
+      pvalue at[2] = {corner[0][0], corner[0][1]}, from = first[0], begin = i32(0);
+      for (uint32_t k = 1; k < n; k++) {
+        auto past = builder.CreateICmpUGE(i32(v), start[k]);
+        at[0] = builder.CreateSelect(past, corner[k][0], at[0]), at[1] = builder.CreateSelect(past, corner[k][1], at[1]);
+        from = builder.CreateSelect(past, first[k], from), begin = builder.CreateSelect(past, start[k], begin);
+      }
+      auto q = builder.CreateAnd(builder.CreateAdd(from, builder.CreateSub(i32(v), begin)), i32(3));
+      pvalue offset[2] = {f(square[0][0]), f(square[0][1])};
+      for (uint32_t c = 1; c < 4; c++) {
+        auto is = builder.CreateICmpEQ(q, i32(c));
+        offset[0] = builder.CreateSelect(is, f(square[c][0]), offset[0]);
+        offset[1] = builder.CreateSelect(is, f(square[c][1]), offset[1]);
+      }
+      points.push_back({add(at[0], offset[0]), add(at[1], offset[1])});
+    }
+    // turning as the polygon does, or back where it is degenerate: the other way round from the first point
+    auto turned_points = points;
+    for (uint32_t v = 1; v < SM50_CONSERVATIVE_HULL_POINTS; v++)
+      for (uint32_t axis = 0; axis < 2; axis++)
+        points[v][axis] = builder.CreateSelect(
+            clockwise, turned_points[v][axis], turned_points[SM50_CONSERVATIVE_HULL_POINTS - v][axis]
+        );
+  } else {
+    // the triangle's edges moved out by the square, where its corners are before the eye
+    const double grow = 1 + 1.0 / 64;
+    std::array<pvalue, 2> corner[3];
+    pvalue before = builder.getTrue();
+    for (uint32_t k = 0; k < 3; k++) {
+      before = builder.CreateAnd(before, builder.CreateFCmpOGT(at(clip[k], 3), f(eye)));
+      corner[k] = window(div(at(clip[k], 0), at(clip[k], 3)), div(at(clip[k], 1), at(clip[k], 3)));
+    }
+    auto inward = builder.CreateSelect(builder.CreateFCmpOGT(polygon_area, f(0)), f(1), f(-1));
+    pvalue nx[3], ny[3], c[3];
+    for (uint32_t i = 0; i < 3; i++) {
+      auto &a = corner[i], &b = corner[(i + 1) % 3];
+      nx[i] = mul(sub(a[1], b[1]), inward), ny[i] = mul(sub(b[0], a[0]), inward);
+      c[i] = sub(add(mul(nx[i], a[0]), mul(ny[i], a[1])), mul(add(abs(nx[i]), abs(ny[i])), f(grow)));
+    }
+    std::array<pvalue, 2> moved[3];
+    for (uint32_t k = 0; k < 3; k++) {
+      uint32_t a = (k + 2) % 3, b = k; // the edges into and out of corner k
+      auto d = sub(mul(nx[a], ny[b]), mul(ny[a], nx[b]));
+      moved[k] = {div(sub(mul(c[a], ny[b]), mul(c[b], ny[a])), d), div(sub(mul(nx[a], c[b]), mul(nx[b], c[a])), d)};
+    }
+    // the box around the polygon, as much larger, and the half of the box twice its size that has it
+    pvalue low[2], high[2];
+    for (uint32_t axis = 0; axis < 2; axis++) {
+      low[axis] = high[axis] = out.window[0][axis];
+      for (uint32_t k = 1; k < SM50_CONSERVATIVE_CORNERS; k++)
+        low[axis] = min(low[axis], out.window[k][axis]), high[axis] = max(high[axis], out.window[k][axis]);
+      low[axis] = sub(low[axis], f(grow)), high[axis] = add(high[axis], f(grow));
+    }
+    auto width = sub(high[0], low[0]), height = sub(high[1], low[1]);
+    std::array<pvalue, 2> box[3] = {
+        {low[0], low[1]}, {add(low[0], mul(width, f(2))), low[1]}, {low[0], add(low[1], mul(height, f(2)))}
+    };
+    auto use_moved = builder.CreateAnd(
+        builder.CreateAnd(before, builder.CreateNot(degenerate)),
+        builder.CreateFCmpOLE(abs(area(moved, 3)), mul(mul(width, height), f(4)))
+    );
+    for (uint32_t u = 0; u < 3; u++) {
+      uint32_t mirrored = u ? 3 - u : 0;
+      std::array<pvalue, 2> point;
+      for (uint32_t axis = 0; axis < 2; axis++)
+        point[axis] = builder.CreateSelect(
+            use_moved, moved[u][axis], builder.CreateSelect(clockwise, box[u][axis], box[mirrored][axis])
+        );
+      points.push_back(point);
+    }
   }
+  // what weighs a point of the window: the matrix's rows, the corners and the viewport
+  for (uint32_t j = 0; j < 3; j++) {
+    out.corners[j] = clip[j];
+    for (uint32_t c = 0; c < 3; c++)
+      out.row[j][c] = row[j][c];
+  }
+  out.det = det, out.degenerate = degenerate, out.first_depth = first_depth, out.viewport = viewport;
+  out.hull_points = points;
+  out.points = 0;
+  if (!hull || weigh)
+    for (auto &point : points)
+      conservative_weigh(builder, air, out, point);
   return out;
+}
+
+// the point of a conservative triangle at `point` of the window: its weights of the corners, the plane's 1/w there and
+// its position, as the triangle's next point
+void
+conservative_weigh(
+    llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, ConservativeTriangle &out, const std::array<pvalue, 2> &point
+) {
+  auto f = [&](double v) { return air.getFloat(v); };
+  auto at = [&](pvalue v, uint32_t i) { return builder.CreateExtractElement(v, i); };
+  auto add = [&](pvalue a, pvalue b) { return builder.CreateFAdd(a, b); };
+  auto sub = [&](pvalue a, pvalue b) { return builder.CreateFSub(a, b); };
+  auto mul = [&](pvalue a, pvalue b) { return builder.CreateFMul(a, b); };
+  auto div = [&](pvalue a, pvalue b) { return builder.CreateFDiv(a, b); };
+  auto &viewport = out.viewport, &det = out.det, &degenerate = out.degenerate, &first_depth = out.first_depth;
+  auto &row = out.row;
+  auto &clip = out.corners;
+  auto ndc = [&](pvalue x, pvalue y) -> std::array<pvalue, 2> {
+    return {sub(div(sub(x, at(viewport, 0)), mul(at(viewport, 2), f(0.5))), f(1)),
+            sub(f(1), div(sub(y, at(viewport, 1)), mul(at(viewport, 3), f(0.5))))};
+  };
+  uint32_t u = out.points++;
+  auto [x, y] = ndc(point[0], point[1]);
+  // in floats the window barycentrics sum to about 1, so what is blended is divided by their sum: a constant
+  // input stays exact
+  pvalue weight[3], linear[3], rcp_w = f(0), z = f(0), sum = f(0);
+  for (uint32_t j = 0; j < 3; j++) {
+    weight[j] = div(add(add(mul(row[j][0], x), mul(row[j][1], y)), row[j][2]), det);
+    linear[j] = mul(weight[j], at(clip[j], 3));
+    rcp_w = add(rcp_w, weight[j]);
+    z = add(z, mul(weight[j], at(clip[j], 2)));
+    sum = add(sum, linear[j]);
+  }
+  for (uint32_t j = 0; j < 3; j++) {
+    auto first = f(j == 0 ? 1.0 : 0.0);
+    out.over_w[u][j] = builder.CreateSelect(degenerate, first, weight[j]);
+    out.linear[u][j] = builder.CreateSelect(degenerate, first, linear[j]);
+  }
+  out.sum[u] = builder.CreateSelect(degenerate, f(1), sum);
+  out.rcp_w[u] = builder.CreateSelect(degenerate, f(1), div(rcp_w, sum));
+  pvalue position = llvm::UndefValue::get(llvm::FixedVectorType::get(builder.getFloatTy(), 4));
+  position = builder.CreateInsertElement(position, x, uint64_t(0));
+  position = builder.CreateInsertElement(position, y, uint64_t(1));
+  position = builder.CreateInsertElement(position, builder.CreateSelect(degenerate, first_depth, div(z, sum)), uint64_t(2));
+  out.position[u] = builder.CreateInsertElement(position, f(1), uint64_t(3));
+
 }
 
 void
 conservative_varyings(
     llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at,
-    bool barycentrics
+    bool barycentrics, bool window
 ) {
   auto &builder = air.builder;
-  for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+  for (uint32_t i = 0; window && i < SM50_CONSERVATIVE_VARYINGS; i++)
     air.CreateSetMeshVertexData(vertex, builder.getInt32(at + i), triangle.window[i / 2][i % 2]);
   for (uint32_t i = 0; i < SM50_CONSERVATIVE_RCP_W; i++)
     air.CreateSetMeshVertexData(vertex, builder.getInt32(at + SM50_CONSERVATIVE_VARYINGS + i), triangle.rcp_w[u]);
@@ -334,9 +493,9 @@ conservative_varyings(
 }
 
 void
-define_conservative_varyings(air::FunctionSignatureBuilder &signature, uint32_t at, bool barycentrics) {
+define_conservative_varyings(air::FunctionSignatureBuilder &signature, uint32_t at, bool barycentrics, bool window) {
   constexpr uint32_t own = SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W;
-  for (uint32_t i = 0; i < own + (barycentrics ? SM50_BARYCENTRIC_ROWS : 0); i++)
+  for (uint32_t i = window ? 0 : SM50_CONSERVATIVE_VARYINGS; i < own + (barycentrics ? SM50_BARYCENTRIC_ROWS : 0); i++)
     signature.DefineMeshVertexOutput(air::OutputMeshData{
         .user = i < own ? "mullion_conservative" + std::to_string(i) : "mullion_barycentrics" + std::to_string(i - own),
         .type = air::msl_float,
@@ -499,9 +658,14 @@ convert_dxbc_geometry_shader(
                       topology == air::MeshOutputTopology::Triangle &&
                       max_vertex_out >= 3;
   uint32_t triangles = conservative ? max_vertex_out - 2 : 0;
+  // a Metal mesh has at most 256 vertices. a geometry shader may declare more where its vertices are smaller than a
+  // position, its output being 1024 scalars at most (D3D11.3 13.3), as one that only streams out: stream output takes
+  // all its vertices, the rasterizer the first 256
+  constexpr uint32_t mesh_vertex_limit = 256;
+  uint32_t mesh_vertices = std::min<uint32_t>(max_vertex_out, mesh_vertex_limit);
   // it's intended to declare a bit more max primitive count
   auto mesh_idx = func_signature.DefineInput(air::InputMesh{
-      conservative ? 3 * triangles : (uint32_t)max_vertex_out, conservative ? triangles : (uint32_t)max_vertex_out, topology
+      conservative ? 3 * triangles : mesh_vertices, conservative ? triangles : mesh_vertices, topology
   });
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
   // a tessellated draw's mesh threadgroups have the domain stage's threads, of which the first does the work
@@ -612,6 +776,13 @@ convert_dxbc_geometry_shader(
   builder.CreateStore(zero_const, vertex_offset);
   auto primitive_count = builder.CreateAlloca(types._int, nullptr, "primitive_count");
   builder.CreateStore(zero_const, primitive_count);
+  // the emits so far, on every stream, and those to the rasterized stream where the mesh has fewer vertices than the
+  // shader declares
+  auto emits = builder.CreateAlloca(types._int, nullptr, "emits");
+  builder.CreateStore(zero_const, emits);
+  llvm::Value *rasterized_emits = nullptr;
+  if (mesh_vertices < (uint32_t)max_vertex_out)
+    builder.CreateStore(zero_const, rasterized_emits = builder.CreateAlloca(types._int, nullptr, "rasterized_emits"));
 
   auto mesh_ptr = function->getArg(mesh_idx);
 
@@ -875,7 +1046,6 @@ convert_dxbc_geometry_shader(
         viewport_index = builder.CreateExtractElement(
             builder.CreateLoad(types._int4, ring_at(slot[0], viewport_reg)), uint64_t(viewport_component)
         );
-      viewport_index = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport_index, builder.getInt32(15), false);
       auto triangle = conservative_triangle(builder, air, types, clip, function->getArg(viewports_idx), viewport_index);
       auto primitive = builder.CreateLoad(types._int, emitted);
       builder.CreateStore(builder.CreateAdd(primitive, one_const), emitted);
@@ -1026,8 +1196,13 @@ convert_dxbc_geometry_shader(
     });
     rejoin(next);
   };
-  // stream output sees every stream, the rasterizer only its own
+  // stream output sees every stream, the rasterizer only its own. every emit counts towards maxvertexcount, whatever
+  // its stream, and one past it is dropped: "Hardware must enforce the limit above by stopping writes" (D3D11.3 13.3),
+  // so it is in neither stream output, the statistics nor the mesh
   resource_map.call_emit = [&](uint32_t stream) -> IREffect {
+    auto emitted = builder.CreateLoad(types._int, emits);
+    builder.CreateStore(builder.CreateAdd(emitted, one_const), emits);
+    auto after_emit = guard(builder.CreateICmpULT(emitted, builder.getInt32(max_vertex_out)));
     if (statistics && stream < 4) {
       auto length = builder.CreateAdd(builder.CreateLoad(types._int, strip_length[stream]), one_const);
       builder.CreateStore(length, strip_length[stream]);
@@ -1038,8 +1213,16 @@ convert_dxbc_geometry_shader(
     }
     if (so && stream < 4)
       so_emit(stream);
-    if (stream == rasterized_stream)
+    if (stream == rasterized_stream && rasterized_emits) {
+      auto drawn = builder.CreateLoad(types._int, rasterized_emits);
+      builder.CreateStore(builder.CreateAdd(drawn, one_const), rasterized_emits);
+      auto after_mesh = guard(builder.CreateICmpULT(drawn, builder.getInt32(mesh_vertices)));
       co_yield mesh_emit();
+      rejoin(after_mesh);
+    } else if (stream == rasterized_stream) {
+      co_yield mesh_emit();
+    }
+    rejoin(after_emit);
     co_return {};
   };
   resource_map.call_cut = [&](uint32_t stream) -> IREffect {
@@ -1149,16 +1332,31 @@ convert_dxbc_geometry_shader(
       }
       // its first primitive: those of the object threadgroups before (the object stage summed them) and of this
       // group's invocations before this one
-      auto from = builder.CreateMul(so_warp, builder.getInt32(warp_primitive_count * pShaderInternal->gs_instance_count));
-      auto head = builder.GetInsertBlock();
-      auto loop = llvm::BasicBlock::Create(context, "so_prefix", function, active_);
-      auto done = llvm::BasicBlock::Create(context, "so_prefixed", function, active_);
       auto before = builder.CreateLoad(
           types._long, builder.CreateBitCast(
                            builder.CreateConstInBoundsGEP1_32(types._int, payload, kPayloadStreamOutputBase + 2 * s),
                            types._long->getPointerTo(payload->getType()->getPointerAddressSpace())
                        )
       );
+      // in one pass every invocation of the group's whole primitives, the first ones, completes the same
+      if (so->single_pass) {
+        auto fixed = fixed_stream_primitives(pShaderInternal);
+        if (!fixed)
+          return llvm::make_error<UnsupportedFeature>("one-pass stream output of a geometry shader whose emits vary");
+        auto instances = builder.getInt32(pShaderInternal->gs_instance_count);
+        auto whole = air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, valid_primitive_mask);
+        auto invocation = builder.CreateSelect(
+            builder.CreateICmpULT(primitive_id_in_warp, whole),
+            builder.CreateAdd(builder.CreateMul(primitive_id_in_warp, instances), resource_map.gs_instance_id),
+            builder.CreateMul(whole, instances)
+        );
+        so_base[s] = builder.CreateAdd(before, builder.CreateMul(i64(invocation), builder.getInt64((*fixed)[s])));
+        continue;
+      }
+      auto from = builder.CreateMul(so_warp, builder.getInt32(warp_primitive_count * pShaderInternal->gs_instance_count));
+      auto head = builder.GetInsertBlock();
+      auto loop = llvm::BasicBlock::Create(context, "so_prefix", function, active_);
+      auto done = llvm::BasicBlock::Create(context, "so_prefixed", function, active_);
       builder.CreateCondBr(builder.CreateICmpULT(from, so_invocation), loop, done);
       builder.SetInsertPoint(loop);
       auto j = builder.CreatePHI(types._int, 2), sum = builder.CreatePHI(types._int, 2);
@@ -1490,11 +1688,14 @@ convert_dxbc_geometry_shader(
   return llvm::Error::success();
 }
 
-// the mesh stage of a pipeline with stream output and no geometry shader, which gets no threadgroups
+// the mesh stage of a pipeline with stream output and no geometry shader, which gets no threadgroups: its payload is
+// the object stage's (SM50StreamOutputDirect)
 llvm::Error
-convert_null_geometry_shader(const char *name, llvm::LLVMContext &context, llvm::Module &module) {
+convert_null_geometry_shader(const char *name, llvm::LLVMContext &context, llvm::Module &module, bool direct) {
   air::FunctionSignatureBuilder func_signature;
-  func_signature.DefineInput(air::InputPayload{.size = SM50_GEOMETRY_PAYLOAD_SIZE});
+  func_signature.DefineInput(
+      air::InputPayload{.size = direct ? uint32_t(SM50_STREAM_OUTPUT_DIRECT_PAYLOAD_SIZE) : uint32_t(SM50_GEOMETRY_PAYLOAD_SIZE)}
+  );
   func_signature.DefineInput(air::InputMesh{1, 1, air::MeshOutputTopology::Point});
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
   llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
@@ -1573,7 +1774,10 @@ convert_pass_through_geometry_shader(
   // (D3D11.3 3.4.5): what Metal's own lines are not. conservative rasterization of triangles: each the triangle
   // conservative_triangle makes of it
   bool quads = pso_data->quad_lines && own.count == 2, conservative = pso_data->conservative && own.count == 3;
-  uint32_t corners = quads ? 4 : own.count, primitives = quads ? 2 : 1;
+  // or of one raster sample, the fan of its hull, whose vertices all take the first corner's flat inputs
+  bool hull = conservative && pso_data->conservative_hull;
+  uint32_t corners = quads ? 4 : hull ? SM50_CONSERVATIVE_HULL_POINTS : own.count,
+           primitives = quads ? 2 : hull ? SM50_CONSERVATIVE_HULL_POINTS - 2 : 1;
   func_signature.DefineInput(air::InputMesh{
       corners, primitives,
       quads || own.count == 3 ? air::MeshOutputTopology::Triangle
@@ -1581,6 +1785,9 @@ convert_pass_through_geometry_shader(
                               : air::MeshOutputTopology::Point
   });
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+  // a hull's points and triangles are shared among the threadgroup's threads, however many the draw gives it
+  uint32_t thread_idx = hull ? func_signature.DefineInput(air::InputThreadPositionInThreadgroup{}) : ~0u,
+           threads_idx = hull ? func_signature.DefineInput(air::InputThreadsPerThreadgroup{}) : ~0u;
   func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveID{});
   // what the vertex shader outputs, as the mesh's: the position, the layer and viewport its first vertex chooses,
   // and its other registers as varyings
@@ -1633,6 +1840,14 @@ convert_pass_through_geometry_shader(
     func_signature.DefineMeshVertexOutput(air::OutputMeshData{
         .user = "mullion_barycentrics" + std::to_string(i), .type = air::msl_float, .index = rows_at + i
     });
+  // the cull distances as the pixel shader of a pipeline that culls in it takes them (SM50_CULL_VARYING), after
+  // everything else
+  uint32_t culls_at = rows_at + (rows ? SM50_BARYCENTRIC_ROWS : 0) + (conservative ? SM50_CONSERVATIVE_VARYINGS + SM50_CONSERVATIVE_RCP_W + SM50_BARYCENTRIC_ROWS : 0);
+  bool cull_varyings = pso_data->cull_distance_varyings;
+  for (uint32_t i = 0; cull_varyings && i < pVertexStage->cull_distance_scalars.size(); i++)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = cull_varying_name(i), .type = air::msl_float, .index = culls_at + i}
+    );
   if (pVertexStage->cull_distance_scalars.size() || conservative)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
@@ -1651,7 +1866,7 @@ convert_pass_through_geometry_shader(
         .arg_name = "viewports",
         .raster_order_group = {}
     });
-    define_conservative_varyings(func_signature, conservative_at, pso_data->barycentrics);
+    define_conservative_varyings(func_signature, conservative_at, pso_data->barycentrics, !hull || pso_data->conservative_inner);
   }
 
   auto raster_scale = DefineRasterScale(func_signature);
@@ -1682,7 +1897,7 @@ convert_pass_through_geometry_shader(
   auto primitive_id = builder.CreateAdd(
       word(kPayloadPrimitivesBefore), air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, builder.CreateAnd(valid, below))
   );
-  for (uint32_t i = 0; i < primitives; i++)
+  for (uint32_t i = 0; !hull && i < primitives; i++)
     air.CreateSetMeshPrimitiveID(builder.getInt32(i), primitive_id);
   auto odd = strip_parity(builder, air, valid, lane, word(kPayloadStripOffset));
   uint32_t registers = pVertexStage->max_output_register;
@@ -1749,21 +1964,22 @@ convert_pass_through_geometry_shader(
   }
   // what of each of the primitive's corners each of a triangle's vertices has: its own corner's, or for a conservative
   // rasterizer's triangle what conservative_triangle finds there
-  pvalue over_w[3][3], window_linear[3][3], grown[3] = {};
+  pvalue over_w[SM50_CONSERVATIVE_HULL_POINTS][3], window_linear[SM50_CONSERVATIVE_HULL_POINTS][3],
+      grown[SM50_CONSERVATIVE_HULL_POINTS] = {};
   for (uint32_t u = 0; u < own.count; u++)
     for (uint32_t k = 0; k < 3; k++)
       over_w[u][k] = window_linear[u][k] = air.getFloat(u == k ? 1.0 : 0.0);
   std::optional<ConservativeTriangle> triangle;
   if (conservative && clip[0]) {
-    triangle = conservative_triangle(builder, air, types, clip, function->getArg(viewports_idx), viewport());
-    for (uint32_t u = 0; u < own.count; u++) {
+    triangle = conservative_triangle(builder, air, types, clip, function->getArg(viewports_idx), viewport(), hull, !hull);
+    for (uint32_t u = 0; u < triangle->points; u++) {
       for (uint32_t k = 0; k < 3; k++)
         over_w[u][k] = triangle->over_w[u][k], window_linear[u][k] = triangle->linear[u][k];
       grown[u] = triangle->position[u];
     }
   }
   // vertex j's value of what the corners have, `bits` reads them
-  auto blend = [&](pvalue(&parts)[3][3], uint32_t j, auto &&bits) {
+  auto blend = [&](pvalue(&parts)[SM50_CONSERVATIVE_HULL_POINTS][3], uint32_t j, auto &&bits) {
     pvalue value = nullptr;
     for (uint32_t k = 0; k < 3; k++) {
       auto part = builder.CreateFMul(parts[j][k], real(bits(k)));
@@ -1772,9 +1988,8 @@ convert_pass_through_geometry_shader(
     return builder.CreateFDiv(value, triangle->sum[j]);
   };
   // a quadrilateral's corners are its ends' to either side, the first end's two then the second's
-  for (uint32_t u = 0; u < corners; u++) {
-    auto vertex = builder.getInt32(u);
-    uint32_t corner = quads ? u / 2 : u;
+  auto emit = [&](pvalue vertex, uint32_t u) {
+    uint32_t corner = quads ? u / 2 : hull ? 0 : u;
     if (clip[corner]) {
       pvalue position = triangle ? grown[u] : clip[corner];
       if (half_width) {
@@ -1808,26 +2023,33 @@ convert_pass_through_geometry_shader(
         air.CreateSetMeshClipDistance(vertex, builder.getInt32(distance.index()), value);
     }
     if (triangle)
-      conservative_varyings(air, *triangle, u, vertex, conservative_at, pso_data->barycentrics);
+      conservative_varyings(
+          air, *triangle, u, vertex, conservative_at, pso_data->barycentrics, !hull || pso_data->conservative_inner
+      );
     for (uint32_t i = 0; rows && clip[corner] && i < SM50_BARYCENTRIC_ROWS; i++) {
       auto rcp_w = builder.CreateFDiv(air.getFloat(1), builder.CreateExtractElement(clip[corner], 3));
       auto weight = i % 3 != corner ? air.getFloat(0) : i < 3 ? rcp_w : air.getFloat(1);
       air.CreateSetMeshVertexData(vertex, builder.getInt32(rows_at + i), weight);
     }
+    for (uint32_t i = 0; cull_varyings && i < pVertexStage->cull_distance_scalars.size(); i++) {
+      auto &d = pVertexStage->cull_distance_scalars[i];
+      auto in_front = builder.CreateFCmpOGE(real(component(corner, d.reg, d.component)), air.getFloat(0));
+      air.CreateSetMeshVertexData(
+          vertex, builder.getInt32(culls_at + i), builder.CreateSelect(in_front, air.getFloat(1), air.getFloat(0))
+      );
+    }
     if (own.count == 1)
       air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
-  }
-  // the normal turns the line a quarter clockwise on the screen, so (a+, b+, a-) and (a-, b+, b-) run
-  // counterclockwise, and each starts at the first end, whose constant attributes are the line's (D3D11.3 8.14)
-  static constexpr uint32_t quad_indices[] = {0, 2, 1, 1, 2, 3};
-  for (uint32_t i = 0; i < (quads ? std::size(quad_indices) : own.count); i++)
-    air.CreateSetMeshIndex(builder.getInt32(i), builder.getInt32(quads ? quad_indices[i] : i));
-  for (uint32_t i = 0; i < primitives; i++) {
+  };
+  for (uint32_t u = 0; !hull && u < corners; u++)
+    emit(builder.getInt32(u), u);
+  // the primitive's layer and viewport, the first vertex's
+  auto primitive_outputs = [&](pvalue i) {
     if (auto layer = chosen(D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX))
-      air.CreateSetMeshRenderTargetArrayIndex(builder.getInt32(i), layer);
+      air.CreateSetMeshRenderTargetArrayIndex(i, layer);
     if (auto viewport = chosen(D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX))
-      air.CreateSetMeshViewportArrayIndex(builder.getInt32(i), viewport);
-  }
+      air.CreateSetMeshViewportArrayIndex(i, viewport);
+  };
   // culled by a distance that every vertex is behind: negative, or NaN
   pvalue culled = triangle ? triangle->culled : builder.getFalse();
   for (auto &distance : pVertexStage->cull_distance_scalars) {
@@ -1838,10 +2060,62 @@ convert_pass_through_geometry_shader(
       );
     culled = builder.CreateOr(culled, behind);
   }
+  if (hull && triangle) {
+    // each thread the points from its own on, one threadgroup's width apart, and the fan's triangles of the same
+    // numbers: (0, k + 1, k + 2) from the first point, those of the points repeated where the hull has fewer having no
+    // area
+    auto first_k = builder.CreateExtractElement(function->getArg(thread_idx), uint64_t(0));
+    auto step = builder.CreateExtractElement(function->getArg(threads_idx), uint64_t(0));
+    auto head = builder.GetInsertBlock();
+    auto loop = llvm::BasicBlock::Create(context, "hull_point", function, done);
+    auto fan = llvm::BasicBlock::Create(context, "hull_triangle", function, done);
+    auto next = llvm::BasicBlock::Create(context, "hull_next", function, done);
+    auto after = llvm::BasicBlock::Create(context, "hull_after", function, done);
+    builder.CreateCondBr(builder.CreateICmpULT(first_k, builder.getInt32(corners)), loop, after);
+    builder.SetInsertPoint(loop);
+    auto k = builder.CreatePHI(types._int, 2);
+    k->addIncoming(first_k, head);
+    std::array<pvalue, 2> point = triangle->hull_points[0];
+    for (uint32_t v = 1; v < corners; v++) {
+      auto is = builder.CreateICmpEQ(k, builder.getInt32(v));
+      for (uint32_t axis = 0; axis < 2; axis++)
+        point[axis] = builder.CreateSelect(is, triangle->hull_points[v][axis], point[axis]);
+    }
+    auto whole = *triangle;
+    triangle->points = 0;
+    conservative_weigh(builder, air, *triangle, point);
+    for (uint32_t j = 0; j < 3; j++)
+      over_w[0][j] = triangle->over_w[0][j], window_linear[0][j] = triangle->linear[0][j];
+    grown[0] = triangle->position[0];
+    emit(k, 0);
+    *triangle = whole;
+    builder.CreateCondBr(builder.CreateICmpULT(k, builder.getInt32(primitives)), fan, next);
+    builder.SetInsertPoint(fan);
+    auto base = builder.CreateMul(k, builder.getInt32(3));
+    air.CreateSetMeshIndex(base, builder.getInt32(0));
+    air.CreateSetMeshIndex(builder.CreateAdd(base, builder.getInt32(1)), builder.CreateAdd(k, builder.getInt32(1)));
+    air.CreateSetMeshIndex(builder.CreateAdd(base, builder.getInt32(2)), builder.CreateAdd(k, builder.getInt32(2)));
+    air.CreateSetMeshPrimitiveID(k, primitive_id);
+    primitive_outputs(k);
+    air.CreateSetMeshPrimitiveCulled(k, culled);
+    builder.CreateBr(next);
+    builder.SetInsertPoint(next);
+    auto k_next = builder.CreateAdd(k, step);
+    k->addIncoming(k_next, next);
+    builder.CreateCondBr(builder.CreateICmpULT(k_next, builder.getInt32(corners)), loop, after);
+    builder.SetInsertPoint(after);
+  }
+  // the normal turns the line a quarter clockwise on the screen, so (a+, b+, a-) and (a-, b+, b-) run
+  // counterclockwise, and each starts at the first end, whose constant attributes are the line's (D3D11.3 8.14)
+  static constexpr uint32_t quad_indices[] = {0, 2, 1, 1, 2, 3};
+  for (uint32_t i = 0; !hull && i < (quads ? std::size(quad_indices) : own.count); i++)
+    air.CreateSetMeshIndex(builder.getInt32(i), builder.getInt32(quads ? quad_indices[i] : i));
+  for (uint32_t i = 0; !hull && i < primitives; i++)
+    primitive_outputs(builder.getInt32(i));
   if (pVertexStage->cull_distance_scalars.size() || conservative)
-    for (uint32_t i = 0; i < primitives; i++)
+    for (uint32_t i = 0; !hull && i < primitives; i++)
       air.CreateSetMeshPrimitiveCulled(builder.getInt32(i), culled);
-  builder.CreateStore(builder.getInt32(primitives), count);
+  builder.CreateStore(builder.getInt32(hull && !triangle ? 0 : primitives), count);
   builder.CreateBr(done);
 
   builder.SetInsertPoint(done);
@@ -1969,6 +2243,123 @@ stream_out_primitives(
   return llvm::Error::success();
 }
 
+// one-pass stream output without a geometry shader or a rasterizer (SM50StreamOutputDirect), by the thread that ran
+// the vertex at `position` of its instance, its output registers in `outputs`: it writes the vertex wherever it is one
+// of a whole primitive's, the `whole` of the instance's, at `before` (those of the instances before) plus the
+// primitive's place. a strip's vertex is in up to as many primitives as a primitive has vertices, those of its object
+// threadgroup (from `first`, `primitives` of them), odd triangles as (n, n + 2, n + 1). with `last` (one thread of the
+// draw) it moves the filled sizes on by what the draw wrote, `total` the draw's primitives
+static llvm::Error
+stream_out_vertex(
+    llvm::IRBuilder<> &builder, air::AirType &types, SM50_SHADER_STREAM_OUTPUT_DATA *so, pvalue targets,
+    D3D10_SB_PRIMITIVE primitive, bool strip, pvalue outputs, uint32_t registers, pvalue position, pvalue before,
+    pvalue first, uint32_t primitives, pvalue whole, pvalue last, pvalue total
+) {
+  auto &context = builder.getContext();
+  auto own = own_vertices(primitive);
+  uint32_t per_primitive = own.count;
+  if (!per_primitive || own.first || per_primitive != vertices_per_primitive(primitive))
+    return llvm::make_error<UnsupportedFeature>("direct stream output of a primitive with adjacency or of a patch");
+  auto function = builder.GetInsertBlock()->getParent();
+  auto targets_type = stream_output_targets_type(context, types);
+  auto field = [&](uint32_t f, int32_t i = -1) {
+    auto ptr = builder.CreateStructGEP(targets_type, targets, f);
+    if (i >= 0)
+      ptr = builder.CreateConstInBoundsGEP2_32(targets_type->getElementType(f), ptr, 0, i);
+    return builder.CreateLoad(i < 0 ? targets_type->getElementType(f) : types._long, ptr);
+  };
+  auto device = [&](llvm::Type *ty, pvalue address) {
+    return builder.CreateIntToPtr(address, ty->getPointerTo((uint32_t)air::AddressSpace::device));
+  };
+  auto when = [&](pvalue cond, auto then) {
+    auto yes = llvm::BasicBlock::Create(context, "so_yes", function), no = llvm::BasicBlock::Create(context, "so_no", function);
+    builder.CreateCondBr(cond, yes, no);
+    builder.SetInsertPoint(yes);
+    then();
+    builder.CreateBr(no);
+    builder.SetInsertPoint(no);
+  };
+  uint32_t slots = 0;
+  for (uint32_t i = 0; i < so->num_elements; i++)
+    slots |= 1u << so->elements[i].output_slot;
+  // the filled sizes as the draw started (stream_output_snapshot), and the primitives that fit in every buffer
+  auto snapshots = device(types._long, field(3));
+  pvalue snapshot[4], limit = builder.getInt64(~0ull);
+  for (uint32_t b = 0; b < 4; b++) {
+    snapshot[b] = builder.CreateLoad(types._long, builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
+    if (!(slots & (1u << b)))
+      continue;
+    auto size = field(1, b);
+    auto room = builder.CreateSub(size, builder.CreateSelect(builder.CreateICmpULT(snapshot[b], size), snapshot[b], size));
+    auto fit = builder.CreateUDiv(room, builder.getInt64(uint64_t(per_primitive) * so->strides[b]));
+    fit = builder.CreateSelect(builder.CreateICmpEQ(field(0, b), builder.getInt64(0)), builder.getInt64(0), fit);
+    limit = builder.CreateSelect(builder.CreateICmpULT(fit, limit), fit, limit);
+  }
+  auto i64 = [&](pvalue v) { return builder.CreateZExt(v, types._long); };
+  // vertex `j` of the instance's primitive `t`
+  auto write = [&](pvalue t, uint32_t j) {
+    auto g = builder.CreateAdd(before, i64(t));
+    when(builder.CreateICmpULT(g, limit), [&] {
+      auto vertex = builder.CreateAdd(builder.CreateMul(g, builder.getInt64(per_primitive)), builder.getInt64(j));
+      for (uint32_t i = 0; i < so->num_elements; i++) {
+        auto &e = so->elements[i];
+        if (e.reg_id == ~0u || e.stream)
+          continue;
+        auto value = builder.CreateLoad(
+            types._int, builder.CreateGEP(
+                            llvm::ArrayType::get(types._int4, registers), outputs,
+                            {builder.getInt32(0), builder.getInt32(e.reg_id), builder.getInt32(e.component)}
+                        )
+        );
+        builder.CreateStore(value, device(types._int, builder.CreateAdd(
+                                                         builder.CreateAdd(field(0, e.output_slot), snapshot[e.output_slot]),
+                                                         builder.CreateAdd(builder.CreateMul(vertex, builder.getInt64(so->strides[e.output_slot])), builder.getInt64(e.offset))
+                                                     )));
+      }
+    });
+  };
+  auto one = builder.getInt32(1);
+  if (!strip) {
+    auto t = builder.CreateUDiv(position, builder.getInt32(per_primitive));
+    auto j = builder.CreateURem(position, builder.getInt32(per_primitive));
+    when(builder.CreateICmpULT(i64(t), whole), [&] {
+      for (uint32_t k = 0; k < per_primitive; k++)
+        when(builder.CreateICmpEQ(j, builder.getInt32(k)), [&] { write(t, k); });
+    });
+  } else {
+    auto end = builder.CreateAdd(first, builder.getInt32(primitives));
+    for (uint32_t j = 0; j < per_primitive; j++)
+      for (uint32_t odd = 0; odd < (per_primitive == 3 && j ? 2u : 1u); odd++) {
+        // the vertex's place in the primitive: (n, n + 1 + odd, n + 2 - odd)
+        uint32_t at = per_primitive == 3 && j ? (j == 1 ? 1 + odd : 2 - odd) : j;
+        auto t = builder.CreateSub(position, builder.getInt32(at));
+        pvalue mine = builder.CreateAnd(
+            builder.CreateAnd(builder.CreateICmpUGE(position, builder.getInt32(at)), builder.CreateICmpUGE(t, first)),
+            builder.CreateAnd(builder.CreateICmpULT(t, end), builder.CreateICmpULT(i64(t), whole))
+        );
+        if (per_primitive == 3 && j)
+          mine = builder.CreateAnd(mine, builder.CreateICmpEQ(builder.CreateAnd(t, one), builder.getInt32(odd)));
+        when(mine, [&] { write(t, j); });
+      }
+  }
+  when(last, [&] {
+    auto written = builder.CreateSelect(builder.CreateICmpULT(total, limit), total, limit);
+    add_stream_output_statistics(builder, types, field(6, 0), written, total);
+    for (uint32_t b = 0; b < 4; b++)
+      if (slots & (1u << b))
+        when(builder.CreateICmpNE(field(2, b), builder.getInt64(0)), [&] {
+          builder.CreateStore(
+              builder.CreateTrunc(
+                  builder.CreateAdd(snapshot[b], builder.CreateMul(written, builder.getInt64(uint64_t(per_primitive) * so->strides[b]))),
+                  types._int
+              ),
+              device(types._int, field(2, b))
+          );
+        });
+  });
+  return llvm::Error::success();
+}
+
 llvm::Error
 convert_dxbc_vertex_for_geometry_shader(
     const SM50ShaderInternal *pShaderInternal, const char *name, const SM50ShaderInternal *pGeometryStage,
@@ -2007,7 +2398,16 @@ convert_dxbc_vertex_for_geometry_shader(
   // stream output's second pass starts each object threadgroup's primitives after those of every one before it
   SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
   args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pArgs, &so);
+  // a mesh function alone, without an object stage (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's mesh_only): a threadgroup
+  // runs the warp's vertices into threadgroup memory and passes its triangles on itself
+  bool mesh_only = pass_through && pso_data->mesh_only;
+  if (mesh_only && (is_strip || input_primitive != D3D10_SB_PRIMITIVE_TRIANGLE || so || pso_data->quad_lines ||
+                    pso_data->conservative))
+    return llvm::make_error<UnsupportedFeature>("a mesh stage alone takes lists of triangles only");
   bool so_base = so && !so->counting;
+  // in one pass without a geometry shader or a rasterizer each thread streams its own vertex out, kept to itself:
+  // nothing goes to the payload (SM50StreamOutputDirect)
+  bool direct = so_base && SM50StreamOutputDirect(so->single_pass, pGeometryStage != nullptr, pass_through);
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
   // with an index buffer view (D3D12), whether the draw has indices is known only at run time
   bool index_view = ia_layout && ia_layout->index_buffer_format == SM50_INDEX_BUFFER_FORMAT_VIEW;
@@ -2041,13 +2441,76 @@ convert_dxbc_vertex_for_geometry_shader(
   if (!binding_map)
     return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
 
-  uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = SM50_GEOMETRY_PAYLOAD_SIZE});
+  uint32_t payload_idx =
+      mesh_only ? ~0u
+                : func_signature.DefineInput(air::InputPayload{
+                      .size = direct ? uint32_t(SM50_STREAM_OUTPUT_DIRECT_PAYLOAD_SIZE) : uint32_t(SM50_GEOMETRY_PAYLOAD_SIZE)
+                  });
   // (warp_size, 1, 1)
   uint32_t thread_id_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
   // (warp_count, instance_count, 1)
   // warp_count = ceil(index_count / warp_size)
   uint32_t tg_id_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
-  func_signature.DefineInput(air::InputMeshGridProperties{});
+  if (!mesh_only)
+    func_signature.DefineInput(air::InputMeshGridProperties{});
+  // the mesh stage alone outputs the warp's triangles as the pass-through mesh stage does
+  // (convert_pass_through_geometry_shader): the position, the varyings, the clip distances, and the primitive's ID,
+  // layer and viewport
+  struct MeshVarying {
+    uint32_t reg, component, index;
+    bool integer;
+  };
+  std::vector<MeshVarying> mesh_varyings;
+  uint32_t mesh_clip_at = 0;
+  bool mesh_clip_varyings = mesh_only && pso_data->clip_distance_varyings;
+  if (mesh_only) {
+    auto [vertices, primitives, per_primitive] = get_vertex_primitive_count_in_warp(
+        input_primitive, false, pShaderInternal->max_output_register
+    );
+    func_signature.DefineInput(air::InputMesh{primitives * 3, primitives, air::MeshOutputTopology::Triangle});
+    func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveID{});
+    uint32_t declared = 0;
+    for (auto &element : pShaderInternal->output_signature) {
+      switch (element.systemValue()) {
+      case D3D10_SB_NAME_POSITION:
+        func_signature.DefineMeshVertexOutput(air::OutputPosition{.type = air::msl_float4});
+        continue;
+      case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX:
+        func_signature.DefineMeshPrimitiveOutput(air::OutputRenderTargetArrayIndex{});
+        continue;
+      case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX:
+        func_signature.DefineMeshPrimitiveOutput(air::OutputViewportArrayIndex{});
+        continue;
+      case D3D10_SB_NAME_UNDEFINED:
+      case D3D10_SB_NAME_CLIP_DISTANCE:
+      case D3D10_SB_NAME_CULL_DISTANCE:
+      case D3D12_SB_NAME_SHADING_RATE:
+        break;
+      default:
+        continue;
+      }
+      if (std::exchange(declared, declared | 1u << element.reg()) >> element.reg() & 1)
+        continue;
+      auto component_types = pShaderInternal->register_types(element.reg(), element.componentType());
+      for (uint32_t c = 0; c < 4; c++) {
+        uint32_t index = mesh_varyings.size();
+        mesh_varyings.push_back({element.reg(), c, index, component_types[c] != RegisterComponentType::Float});
+        func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+            .user = varying_name(element.reg(), c), .type = varying_type(component_types[c]), .index = index
+        });
+      }
+    }
+    mesh_clip_at = mesh_varyings.size();
+    for (uint32_t i = 0; mesh_clip_varyings && i < pShaderInternal->clip_distance_scalars.size(); i++)
+      func_signature.DefineMeshVertexOutput(
+          air::OutputMeshData{.user = clip_varying_name(i), .type = air::msl_float, .index = mesh_clip_at + i}
+      );
+    if (!mesh_clip_varyings && pShaderInternal->clip_distance_scalars.size())
+      func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
+      );
+  }
+  // the stage before the rasterizer scales the positions it writes (llvm::air::AIRBuilder::RasterScale)
+  uint32_t mesh_raster_scale = mesh_only ? DefineRasterScale(func_signature) : ~0u;
   uint32_t draw_argument_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
       .buffer_size = {},
       .location_index = SM50_BINDING_INDEX_DRAW_ARGUMENTS,
@@ -2114,7 +2577,9 @@ convert_dxbc_vertex_for_geometry_shader(
   auto dispatch = llvm::BasicBlock::Create(context, "dispatch", function);
   auto return_ = llvm::BasicBlock::Create(context, "return", function);
 
-  auto payload = function->getArg(payload_idx);
+  auto payload = mesh_only ? nullptr : function->getArg(payload_idx);
+  if (mesh_only)
+    air.RasterScale = function->getArg(mesh_raster_scale);
   auto thread_position_in_group = function->getArg(thread_id_idx);
   auto warp_vertex_id = builder.CreateExtractElement(thread_position_in_group, (uint32_t)0);
 
@@ -2161,26 +2626,54 @@ convert_dxbc_vertex_for_geometry_shader(
         "a primitive whose vertices' output registers do not fit an object threadgroup's payload"
     );
 
-  auto payload_output_ptr = builder.CreateConstInBoundsGEP1_32(
+  // the mesh stage alone keeps the warp's vertices' output registers in threadgroup memory
+  llvm::GlobalVariable *mesh_vertices = nullptr;
+  if (mesh_only) {
+    auto registers = llvm::ArrayType::get(types._int4, max_output_register);
+    mesh_vertices = new llvm::GlobalVariable(
+        module, llvm::ArrayType::get(registers, warp_vertex_count), false, llvm::GlobalValue::InternalLinkage,
+        llvm::UndefValue::get(llvm::ArrayType::get(registers, warp_vertex_count)), "mesh_vertices", nullptr,
+        llvm::GlobalValue::NotThreadLocal, (uint32_t)air::AddressSpace::threadgroup
+    );
+    resource_map.output.ptr_int4 = builder.CreateGEP(
+        mesh_vertices->getValueType(), mesh_vertices, {builder.getInt32(0), warp_vertex_id}
+    );
+    resource_map.output.ptr_float4 = builder.CreateBitCast(
+        resource_map.output.ptr_int4,
+        llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo((uint32_t)air::AddressSpace::threadgroup)
+    );
+  }
+  auto payload_output_ptr = mesh_only ? nullptr : builder.CreateConstInBoundsGEP1_32(
       types._int, payload, 4
   );
 
-  resource_map.output.ptr_int4 = builder.CreateBitCast(
-      payload_output_ptr,
-      llvm::ArrayType::get(types._int4, max_output_register)->getPointerTo((uint32_t)air::AddressSpace::object_data)
-  );
-  resource_map.output.ptr_int4 = builder.CreateGEP(
-      resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_int4,
-      {warp_vertex_id}
-  );
-  resource_map.output.ptr_float4 = builder.CreateBitCast(
-      payload_output_ptr,
-      llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo((uint32_t)air::AddressSpace::object_data)
-  );
-  resource_map.output.ptr_float4 = builder.CreateGEP(
-      resource_map.output.ptr_float4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_float4,
-      {warp_vertex_id}
-  );
+  pvalue direct_outputs = nullptr;
+  if (direct) {
+    // as a vertex shader's (convert_dxbc_vertex_shader)
+    direct_outputs = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register));
+    builder.CreateStore(llvm::ConstantAggregateZero::get(llvm::ArrayType::get(types._int4, max_output_register)), direct_outputs);
+    resource_map.output.ptr_int4 = direct_outputs;
+    resource_map.output.ptr_float4 = builder.CreateBitCast(
+        direct_outputs, llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo()
+    );
+  } else if (!mesh_only) {
+    resource_map.output.ptr_int4 = builder.CreateBitCast(
+        payload_output_ptr,
+        llvm::ArrayType::get(types._int4, max_output_register)->getPointerTo((uint32_t)air::AddressSpace::object_data)
+    );
+    resource_map.output.ptr_int4 = builder.CreateGEP(
+        resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_int4,
+        {warp_vertex_id}
+    );
+    resource_map.output.ptr_float4 = builder.CreateBitCast(
+        payload_output_ptr,
+        llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo((uint32_t)air::AddressSpace::object_data)
+    );
+    resource_map.output.ptr_float4 = builder.CreateGEP(
+        resource_map.output.ptr_float4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_float4,
+        {warp_vertex_id}
+    );
+  }
 
   resource_map.output_element_count = max_output_register;
 
@@ -2302,8 +2795,23 @@ convert_dxbc_vertex_for_geometry_shader(
     strip_offset = builder.CreateSub(group_start, simd("air.simd_max.u.i32", cut_ends));
   }
 
+  // in one pass, an instance's whole primitives without cuts: those of every `vertex_per_primitive` vertices of a
+  // list, and of each vertex of a strip from its last's on; the group's come after those of the instances before
+  // it, and of its instance's groups before it
+  pvalue single_whole = nullptr, single_before = nullptr;
+  if (so_base && so->single_pass) {
+    if (cuts || assembled)
+      return llvm::make_error<UnsupportedFeature>("one-pass stream output of strips that may be cut, or are assembled");
+    auto count = builder.CreateZExt(vertex_count, types._long);
+    auto reach = builder.getInt64(vertex_per_primitive - 1);
+    single_whole = strip ? builder.CreateSelect(builder.CreateICmpUGT(count, reach), builder.CreateSub(count, reach), builder.getInt64(0))
+                         : builder.CreateUDiv(count, builder.getInt64(vertex_per_primitive));
+    single_before = builder.CreateMul(builder.CreateZExt(instance_id, types._long), single_whole);
+  }
+
   // explicit initialization
-  air.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::And, valid_vertex_mask, builder.getInt32(0));
+  if (!direct)
+    air.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::And, valid_vertex_mask, builder.getInt32(0));
 
   if (assembled) {
     // a triangle strip with adjacency (D3D11.3 functional spec, 8.15): triangle n of a strip leads at its index 2n and
@@ -2369,9 +2877,10 @@ convert_dxbc_vertex_for_geometry_shader(
 
   builder.SetInsertPoint(active);
 
-  air.CreateAtomicRMW(
-      llvm::AtomicRMWInst::BinOp::Or, valid_vertex_mask, builder.CreateShl(builder.getInt32(1), warp_vertex_id)
-  );
+  if (!direct)
+    air.CreateAtomicRMW(
+        llvm::AtomicRMWInst::BinOp::Or, valid_vertex_mask, builder.CreateShl(builder.getInt32(1), warp_vertex_id)
+    );
 
   resource_map.base_vertex_id = is_indexed_draw ? shifted(3) : builder.CreateExtractValue(draw_arguments, 2);
   resource_map.instance_id = instance_id;
@@ -2398,16 +2907,69 @@ convert_dxbc_vertex_for_geometry_shader(
     return err;
   }
 
+  if (direct) {
+    // the thread streams its vertex out, and the draw's last group's first thread, which every draw's last group
+    // runs, moves the filled sizes on
+    auto targets_type = stream_output_targets_type(context, types);
+    auto targets = function->getArg(so_idx);
+    auto field = [&](uint32_t f) {
+      return builder.CreateLoad(targets_type->getElementType(f), builder.CreateStructGEP(targets_type, targets, f));
+    };
+    auto warps = field(4), instances = field(5);
+    auto group = builder.CreateAdd(builder.CreateMul(instance_id, warps), warp_id);
+    auto last = builder.CreateAnd(
+        builder.CreateICmpEQ(warp_vertex_id, builder.getInt32(0)),
+        builder.CreateICmpEQ(builder.CreateAdd(group, builder.getInt32(1)), builder.CreateMul(warps, instances))
+    );
+    if (auto err = stream_out_vertex(
+            builder, types, so, targets, input_primitive, strip, direct_outputs, max_output_register,
+            builder.CreateAdd(group_start, warp_vertex_id), single_before,
+            builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count)), warp_primitive_count, single_whole, last,
+            builder.CreateMul(builder.CreateZExt(instances, types._long), single_whole)
+        ))
+      return err;
+  }
+
   builder.CreateBr(will_dispatch);
 
   builder.SetInsertPoint(will_dispatch);
+
+  // the group starts no mesh threadgroups, and passes nothing on
+  if (direct) {
+    builder.CreateCondBr(builder.CreateICmpEQ(warp_vertex_id, builder.getInt32(0)), dispatch, return_);
+    builder.SetInsertPoint(dispatch);
+    air.CreateSetMeshProperties(air.getInt3(0, 0, 1));
+    builder.CreateBr(return_);
+    builder.SetInsertPoint(return_);
+    builder.CreateRetVoid();
+    module.getOrInsertNamedMetadata("air.object")->addOperand(function_metadata);
+    return llvm::Error::success();
+  }
 
   air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
 
   // the primitives each stream had before this object threadgroup: the group's threads sum the totals of the blocks
   // before its block, then of its block's groups before it, in turn, then over the SIMD group
   pvalue so_before[4] = {};
-  if (so_base) {
+  if (so_base && so->single_pass) {
+    // in one pass, the group's place gives them (single_before). each of the geometry shader's invocations completes
+    // the same on a stream, and without one each primitive is one
+    std::array<uint32_t, 4> per_invocation = {1, 0, 0, 0};
+    if (pGeometryStage) {
+      auto fixed = fixed_stream_primitives(pGeometryStage);
+      if (!fixed)
+        return llvm::make_error<UnsupportedFeature>("one-pass stream output of a geometry shader whose emits vary");
+      per_invocation = *fixed;
+    }
+    // a predicated draw's count is zeroed after its groups were counted
+    auto from = builder.CreateMul(builder.CreateZExt(warp_id, types._long), builder.getInt64(warp_primitive_count));
+    auto primitives = builder.CreateAdd(
+        single_before, builder.CreateSelect(builder.CreateICmpULT(from, single_whole), from, single_whole)
+    );
+    auto invocations = builder.CreateMul(primitives, builder.getInt64(pGeometryStage ? pGeometryStage->gs_instance_count : 1));
+    for (uint32_t s = 0; s < 4; s++)
+      so_before[s] = builder.CreateMul(invocations, builder.getInt64(per_invocation[s]));
+  } else if (so_base) {
     auto targets_type = stream_output_targets_type(context, types);
     auto targets = function->getArg(so_idx);
     auto field = [&](uint32_t f) {
@@ -2537,6 +3099,99 @@ convert_dxbc_vertex_for_geometry_shader(
                 stream_output_targets_type(context, types), function->getArg(so_idx), 4))), warp_id),
             so_before[0], strip_offset))
       return err;
+  }
+
+  if (mesh_only) {
+    // each of the group's first threads passes one of its triangles on, compacted after those before it that are
+    // valid and that no cull distance culls (D3D11.3 15.4.2: every vertex behind one, negative or NaN), its ID counting
+    // every primitive before it in the draw's instance (8.17)
+    auto is_lane = builder.CreateICmpULT(warp_vertex_id, builder.getInt32(warp_primitive_count));
+    auto lane = builder.CreateSelect(is_lane, warp_vertex_id, builder.getInt32(0));
+    auto component = [&](pvalue vertex, uint32_t reg, uint32_t c) {
+      return builder.CreateLoad(
+          types._int, builder.CreateGEP(
+                          mesh_vertices->getValueType(), mesh_vertices,
+                          {builder.getInt32(0), vertex, builder.getInt32(reg), builder.getInt32(c)}
+                      )
+      );
+    };
+    auto real = [&](pvalue bits) { return builder.CreateBitCast(bits, types._float); };
+    auto corner = [&](uint32_t k) { return builder.CreateAdd(builder.CreateMul(lane, builder.getInt32(3)), builder.getInt32(k)); };
+    auto one = builder.getInt32(1);
+    pvalue keep = builder.CreateAnd(
+        is_lane, builder.CreateICmpNE(builder.CreateAnd(builder.CreateLShr(valid_primitive_mask, lane), one), builder.getInt32(0))
+    );
+    for (auto &distance : pShaderInternal->cull_distance_scalars) {
+      pvalue behind = builder.getTrue();
+      for (uint32_t k = 0; k < 3; k++)
+        behind = builder.CreateAnd(
+            behind, builder.CreateFCmpULT(real(component(corner(k), distance.reg, distance.component)), air.getFloat(0))
+        );
+      keep = builder.CreateAnd(keep, builder.CreateNot(behind));
+    }
+    auto ballot = builder.CreateTrunc(
+        builder.CreateCall(
+            module.getOrInsertFunction(
+                "air.simd_ballot.i64", llvm::FunctionType::get(builder.getInt64Ty(), {builder.getInt1Ty()}, false),
+                llvm::AttributeList::get(context, {{~0U, llvm::Attribute::get(context, llvm::Attribute::Convergent)}})
+            ),
+            {keep}
+        ),
+        types._int
+    );
+    auto below = builder.CreateSub(builder.CreateShl(one, lane), one);
+    air.CreateSetMeshPrimitiveCount(air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, ballot));
+    auto emit = llvm::BasicBlock::Create(context, "mesh_emit", function);
+    builder.CreateCondBr(keep, emit, return_);
+    builder.SetInsertPoint(emit);
+    auto slot = air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, builder.CreateAnd(ballot, below));
+    air.CreateSetMeshPrimitiveID(
+        slot, builder.CreateAdd(
+                  primitives_before,
+                  air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, builder.CreateAnd(valid_primitive_mask, below))
+              )
+    );
+    // the first vertex chooses the primitive's layer and viewport (D3D11.3 15.8.1), an out-of-range viewport being 0
+    for (auto &element : pShaderInternal->output_signature) {
+      auto name = element.systemValue();
+      if (name != D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX && name != D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
+        continue;
+      auto value = component(corner(0), element.reg(), std::countr_zero(element.mask()));
+      if (name == D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX)
+        air.CreateSetMeshRenderTargetArrayIndex(slot, value);
+      else
+        air.CreateSetMeshViewportArrayIndex(slot, value);
+    }
+    for (uint32_t k = 0; k < 3; k++) {
+      auto vertex = builder.CreateAdd(builder.CreateMul(slot, builder.getInt32(3)), builder.getInt32(k));
+      auto from = corner(k);
+      for (auto &element : pShaderInternal->output_signature) {
+        if (element.systemValue() != D3D10_SB_NAME_POSITION)
+          continue;
+        pvalue position = llvm::UndefValue::get(types._float4);
+        for (uint32_t c = 0; c < 4; c++)
+          position = builder.CreateInsertElement(position, real(component(from, element.reg(), c)), c);
+        air.CreateSetMeshPosition(vertex, position);
+      }
+      for (auto &v : mesh_varyings) {
+        auto value = component(from, v.reg, v.component);
+        air.CreateSetMeshVertexData(vertex, builder.getInt32(v.index), v.integer ? value : real(value));
+      }
+      for (auto distance : llvm::enumerate(pShaderInternal->clip_distance_scalars)) {
+        auto value = real(component(from, distance.value().reg, distance.value().component));
+        if (mesh_clip_varyings)
+          air.CreateSetMeshVertexData(vertex, builder.getInt32(mesh_clip_at + distance.index()), value);
+        else
+          air.CreateSetMeshClipDistance(vertex, builder.getInt32(distance.index()), value);
+      }
+      air.CreateSetMeshIndex(vertex, vertex);
+    }
+    builder.CreateBr(return_);
+    builder.SetInsertPoint(return_);
+    builder.CreateRetVoid();
+    dispatch->eraseFromParent();
+    module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
+    return llvm::Error::success();
   }
 
   builder.CreateCondBr(

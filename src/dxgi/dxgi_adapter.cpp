@@ -48,23 +48,7 @@ LUID GetAdapterLuid(WMT::Device device) {
 class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
 public:
   MTLDXGIAdapter(WMT::Device device, IDXGIFactory *factory, Config &config)
-      : device_(device), adapter_luid_(GetAdapterLuid(device)), factory_(factory), options_(config) {
-    D3DKMT_OPENADAPTERFROMLUID open = {};
-    open.AdapterLuid = adapter_luid_;
-    if (D3DKMTOpenAdapterFromLuid(&open))
-      WARN("Failed to open D3DKMT adapter");
-    else
-      local_kmt_ = open.hAdapter;
-  };
-
-  ~MTLDXGIAdapter() {
-    if (local_kmt_) {
-      D3DKMT_CLOSEADAPTER close = {};
-      close.hAdapter = local_kmt_;
-      if (D3DKMTCloseAdapter(&close))
-        WARN("Failed to close D3DKMT adapter");
-    }
-  }
+      : device_(device), adapter_luid_(GetAdapterLuid(device)), factory_(factory), options_(config) {};
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
@@ -199,8 +183,7 @@ public:
     pDesc->SubSysId = 0;
     pDesc->Revision = 0;
     // as much of it as a SIZE_T holds, which in a 32-bit process is less than there is
-    pDesc->DedicatedVideoMemory =
-        std::min<uint64_t>(device_.recommendedMaxWorkingSetSize(), std::numeric_limits<SIZE_T>::max());
+    pDesc->DedicatedVideoMemory = std::min<uint64_t>(DeviceMemory(), std::numeric_limits<SIZE_T>::max());
     pDesc->DedicatedSystemMemory = 0;
     // the memory is unified (D3D12_FEATURE_DATA_ARCHITECTURE1::UMA), and applications size an integrated GPU's by its
     // shared system memory, as Windows drivers of integrated GPUs report most of theirs: Unity's D3D12 device filter
@@ -262,6 +245,13 @@ public:
   void STDMETHODCALLTYPE
   UnregisterHardwareContentProtectionTeardownStatus(DWORD cookie) override {}
 
+  // what Metal recommends the device's working set be, or less where the configuration says
+  uint64_t
+  DeviceMemory() {
+    uint64_t memory = device_.recommendedMaxWorkingSetSize();
+    return options_.maxDeviceMemory ? std::min(memory, options_.maxDeviceMemory) : memory;
+  }
+
   HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(
       UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
       DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo) override {
@@ -275,7 +265,7 @@ public:
     // unified memory is all local (D3D12_MEMORY_POOL, Remarks): the other group has nothing. Windows drivers let
     // half of a group be reserved
     bool local = MemorySegmentGroup == DXGI_MEMORY_SEGMENT_GROUP_LOCAL;
-    pVideoMemoryInfo->Budget = local ? device_.recommendedMaxWorkingSetSize() : 0;
+    pVideoMemoryInfo->Budget = local ? DeviceMemory() : 0;
     pVideoMemoryInfo->CurrentUsage = local ? device_.currentAllocatedSize() : 0;
     pVideoMemoryInfo->AvailableForReservation = pVideoMemoryInfo->Budget / 2;
     // MULLION_TRACE_MEMORY=heavy: every query; a game polls it each frame
@@ -316,11 +306,9 @@ public:
   }
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() final { return device_; }
-  D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
 
 private:
   WMT::Reference<WMT::Device> device_;
-  D3DKMT_HANDLE local_kmt_ = 0;
   const LUID adapter_luid_;
   Com<IDXGIFactory> factory_;
   DxgiOptions options_;

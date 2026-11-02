@@ -23,10 +23,18 @@ CaptureState::CaptureState() {
   }
 }
 
+CaptureState::~CaptureState() {
+  if (stopping_.joinable())
+    stopping_.join();
+}
+
 void
 CaptureState::frame(WMT::Device device, uint64_t frame) {
   switch (getNextAction(frame)) {
   case NextAction::StartCapture: {
+    // Metal takes one capture at a time
+    if (stopping_.joinable())
+      stopping_.join();
     WMTCaptureInfo info;
     info.capture_object = device;
     info.destination = WMTCaptureDestinationGPUTraceDocument;
@@ -47,7 +55,8 @@ CaptureState::frame(WMT::Device device, uint64_t frame) {
     break;
   }
   case NextAction::StopCapture:
-    WMT::CaptureManager::sharedCaptureManager().stopCapture();
+    // Metal's stop waits for the device's work, which can wait for what the calling thread submits next
+    stopping_ = mullion::thread([] { WMT::CaptureManager::sharedCaptureManager().stopCapture(); });
     break;
   case NextAction::Nothing:
     if (shouldCaptureNextFrame())

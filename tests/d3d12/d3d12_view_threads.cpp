@@ -3,7 +3,9 @@
 // eight threads make views of one texture at once, each of its own mip and slice, into descriptors of their own; a
 // dispatch then reads every descriptor, and each must give its subresource's value. a texture whose views two
 // threads add at once must neither lose nor repeat one, which would give later descriptors another subresource's view.
-// many fresh textures, as the window is small.
+// many fresh textures, as the window is small. then eight threads make typed views of one fresh buffer at once, each
+// of every format in turn, which adds views the buffer did not have, and last of a format of its own at an element of
+// its own: each must read that element's first component.
 // https://learn.microsoft.com/en-us/windows/win32/direct3d12/creating-descriptors
 #include "d3d12_test.hpp"
 #include <thread>
@@ -13,6 +15,14 @@ Texture2DArray<uint> views[64] : register(t0);
 RWStructuredBuffer<uint> read : register(u0);
 [numthreads(64, 1, 1)] void cs(uint i : SV_DispatchThreadID) {
   read[i] = views[NonUniformResourceIndex(i)].Load(int4(0, 0, 0, 0));
+}
+)";
+
+static const char buffer_hlsl[] = R"(
+Buffer<uint> views[8] : register(t0);
+RWStructuredBuffer<uint> read : register(u0);
+[numthreads(8, 1, 1)] void cs(uint i : SV_DispatchThreadID) {
+  read[i] = views[NonUniformResourceIndex(i)].Load(0);
 }
 )";
 
@@ -127,6 +137,74 @@ main(int argc, char **argv) {
       for (UINT mip = 0; mip < mips; mip++)
         expect(got[slice * mips + mip] == value(mip, slice), "the view of mip %u, slice %u reads %08x, want %08x", mip,
                slice, got[slice * mips + mip], value(mip, slice));
+    readback->Unmap(0, nullptr);
+  }
+
+  // a format per thread, each a view the buffer does not have yet; thread t's view starts at element t + 1, so no two
+  // read the same bytes
+  const struct {
+    DXGI_FORMAT format;
+    UINT bytes, bits;
+  } formats[] = {{DXGI_FORMAT_R8_UINT, 1, 8},        {DXGI_FORMAT_R16_UINT, 2, 16},
+                 {DXGI_FORMAT_R32_UINT, 4, 32},      {DXGI_FORMAT_R8G8_UINT, 2, 8},
+                 {DXGI_FORMAT_R16G16_UINT, 4, 16},   {DXGI_FORMAT_R32G32_UINT, 8, 32},
+                 {DXGI_FORMAT_R8G8B8A8_UINT, 4, 8},  {DXGI_FORMAT_R16G16B16A16_UINT, 8, 16}};
+  static_assert(std::size(formats) == threads);
+  auto buffer_code = compiler.compile(buffer_hlsl, "cs", "cs");
+  if (!expect(!buffer_code.empty(), "the buffer shader does not compile"))
+    return verdict();
+  pso_desc.CS = bytecode(buffer_code);
+  ComPtr<ID3D12PipelineState> buffer_pso;
+  CHECK(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&buffer_pso)));
+  constexpr UINT buffers = 512, bytes = 256;
+  auto byte = [](UINT at) { return BYTE(at * 37 + 11); };
+  for (UINT round = 0; round < buffers; round++) {
+    step("buffer %u", round);
+    auto source = buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!expect(!!source, "the buffer is refused"))
+      return verdict();
+    BYTE *filled;
+    CHECK(source->Map(0, nullptr, (void **)&filled));
+    for (UINT at = 0; at < bytes; at++)
+      filled[at] = byte(at);
+    source->Unmap(0, nullptr);
+    std::vector<std::thread> makers;
+    for (UINT t = 0; t < threads; t++)
+      // every format in turn, its own last, so each thread adds views while the others read theirs
+      makers.emplace_back([&, t] {
+        for (UINT k = 1; k <= threads; k++) {
+          D3D12_SHADER_RESOURCE_VIEW_DESC view{formats[(t + k) % threads].format, D3D12_SRV_DIMENSION_BUFFER,
+                                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+          view.Buffer = {t + 1, 1};
+          auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+          cpu.ptr += t * increment;
+          device->CreateShaderResourceView(source.Get(), &view, cpu);
+        }
+      });
+    for (auto &maker : makers)
+      maker.join();
+    CHECK(forget(readback.Get()));
+    CHECK(allocator->Reset());
+    CHECK(list->Reset(allocator.Get(), buffer_pso.Get()));
+    ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootUnorderedAccessView(1, read->GetGPUVirtualAddress());
+    list->Dispatch(1, 1, 1);
+    transition(list.Get(), read.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyResource(readback.Get(), read.Get());
+    transition(list.Get(), read.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    CHECK(submit(device.Get(), queue.Get(), list.Get()));
+    UINT *got;
+    CHECK(readback->Map(0, nullptr, (void **)&got));
+    for (UINT t = 0; t < threads; t++) {
+      // the first component of element t + 1, little-endian
+      UINT want = 0, at = (t + 1) * formats[t].bytes;
+      for (UINT b = 0; b < formats[t].bits / 8; b++)
+        want |= UINT(byte(at + b)) << 8 * b;
+      expect(got[t] == want, "the view of format %u reads %08x, want %08x", formats[t].format, got[t], want);
+    }
     readback->Unmap(0, nullptr);
   }
 

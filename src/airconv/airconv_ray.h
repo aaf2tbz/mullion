@@ -13,7 +13,7 @@ typedef uint32_t sm50_ray_dword;
 
 /* a ray tracing pipeline's visible function table: the runtime's functions, then shaders, each at the slot the
    device gave it, so that a shader identifier means the same in every state object that has the shader. a shader
-   calls the runtime through its slots (TraceRay, ReportHit, CallShader) */
+   calls the runtime's functions (TraceRay, ReportHit, CallShader) by name, which every pipeline links */
 enum SM50_RAY_FUNCTION {
   SM50_RAY_FUNCTION_NONE,
   SM50_RAY_FUNCTION_TRACE,
@@ -41,6 +41,9 @@ struct SM50_RAY_DISPATCH {
   sm50_ray_qword callable_stride;
   sm50_ray_dword dimensions[3];
   sm50_ray_dword pipeline_flags; /* ray flags every TraceRay of the pipeline has (D3D12_RAYTRACING_PIPELINE_FLAGS) */
+  /* the device's lock table, after the header of the structure of nothing, for shaders with no global root
+     signature, whose root arguments have none */
+  sm50_ray_qword atomic_locks;
 };
 
 /* TraceRay's arguments but the payload, in the order DXIL has them */

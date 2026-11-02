@@ -24,6 +24,7 @@
 #include "d3d12_acceleration_structure.hpp"
 #include "d3d12_command_allocator.hpp"
 #include "d3d12_device.hpp"
+#include "mullion_scaler.hpp"
 #include "d3d12_pageable.hpp"
 #include "dxgi_interfaces.h"
 #include "log/log.hpp"
@@ -91,10 +92,33 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   WMT::Reference<WMT::SharedEvent> completion_event_;
   // Metal 3: an aliasing barrier's command buffer signals it, and the next waits for it (CommittingScope::OrderAliases)
   WMT::Reference<WMT::SharedEvent> alias_event_;
+  // Metal 3, MULLION_D3D12_METAL3_EVENT_WAIT (on unless 0): a command buffer the CPU is likely to wait for signals its
+  // slot's event with its sequence number after its work, and the completion thread waits for that, not for Metal to
+  // call the buffer completed, which comes later (CommandBufferWaitingThread). an event of each slot's own: a value of
+  // the slot's is the one buffer's, whatever order the queue's buffers end in. a signal costs the GPU some 17 us
+  // (tests/native/completion_signal), so not every buffer has one: one that presents, and the one a Signal is
+  // predicted to follow, as many command buffers after the last Signal as there were between the two before it
+  // (a frame's submissions repeat). any other is waited for as before, so a wrong guess costs time, not order
+  std::array<WMT::Reference<WMT::SharedEvent>, kCommandQueueSize> slot_events_;
+  // under mutex_commit_: command buffers ended since the last Signal, and how many there were before it
+  uint64_t ends_since_signal_ = 0, ends_between_signals_ = 0;
+  static bool
+  EventWait() {
+    static const bool event = env::getEnvVar("MULLION_D3D12_METAL3_EVENT_WAIT") != "0";
+    return !Metal4 && event;
+  }
   uint64_t alias_value_ = 0;
   // Metal 4: the next command buffer's first encoder orders aliased memory too, for a barrier its command buffer ended
   // before an encoder could
   bool order_aliases_ = false;
+  // MULLION_D3D12_ALIASES_INSIDE (on unless 0), Metal 4: an aliasing barrier between work of the buffer's one compute
+  // encoder, which began with the last, is a barrier inside it (MTL4CommandBuffer_orderAliases), and is encoded on any
+  // thread (Parallel). otherwise the next encoder begins with a barrier against all the queue's work before it
+  static bool
+  AliasesInside() {
+    static const bool inside = env::getEnvVar("MULLION_D3D12_ALIASES_INSIDE") != "0";
+    return Metal4 && inside;
+  }
   WMT::Reference<WMT::Fence> fence_;
   // the clock of the timestamps the queue's work writes: Metal 3 samples nanoseconds, a Metal 4 counter heap ticks
   // (MTLDevice.h queryTimestampFrequency: "the frequency of the GPU timestamp in ticks per second")
@@ -249,7 +273,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       // a removed device runs nothing more (D3D12: work submitted to one is dropped): after a GPU hang or fault the
       // application goes on submitting until it sees the removal, and each command buffer can hang the GPU again,
       // which stalls the whole system's graphics. one never committed is retired as a cancelled one is
-      if (device && FAILED(device->GetDeviceRemovedReason())) {
+      if (device && FAILED(device->RemovedReason())) {
         FLIGHT("command buffer %#llx is dropped: the device is removed", buffer.handle);
         return;
       }
@@ -332,6 +356,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return !static_cast<const RenderEncoderData *>(pass)->omitted;
     case EncoderType::ComputeParts:
       return !static_cast<const ComputePartsEncoderData *>(pass)->indirect;
+    // a flag of the command buffer's, which EncodeParallel carries to the next where it ends one
+    case EncoderType::Settle:
+      return AliasesInside();
     default:
       return false;
     }
@@ -432,9 +459,53 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   };
   std::vector<Unresolved> unresolved_;
 
-  // the process's queues, for MULLION_TRACE_RESOURCE: what each has on the GPU when a tile mapping is made
+  // the process's queues, for MULLION_TRACE_RESOURCE: what each has on the GPU when a tile mapping is made, and for
+  // GetDeviceRemovedReason, which reads their command buffers' feedback (SettleCommandQueueFeedback)
   static inline mullion::mutex queues_mutex_;
   static inline std::vector<MTLD3D12CommandQueueImpl *> queues_;
+
+  // command buffers whose work the GPU has finished, and whose fences are signalled, with Metal's feedback still to
+  // come (the status, an error and GPU times: Metal 4's commit feedback handler gives them some milliseconds after the
+  // queue's event, Metal 3's completed status comes after the slot's event): its sequence number with each. an error
+  // read in one removes the device, as one read before the fences would have
+  mullion::mutex feedback_mutex_;
+  std::vector<std::pair<WMT::Reference<MetalCommandBuffer>, uint64_t>> unsettled_;
+
+  // reads what feedback has come, all of it when `wait`
+  void
+  SettleFeedback(bool wait) {
+    std::lock_guard lock(feedback_mutex_);
+    std::erase_if(unsettled_, [&](auto &unsettled) {
+      auto &[cmdbuf, seq] = unsettled;
+      if (wait)
+        cmdbuf.waitUntilCompleted();
+      auto status = cmdbuf.status();
+      if (status <= WMTCommandBufferStatusScheduled)
+        return false;
+      if (status == WMTCommandBufferStatusError) {
+        bool first = SUCCEEDED(device_->RemovedReason());
+        auto line = str::format(first ? "Device error: " : "", "queue ", this, ", command buffer ", seq,
+                                first ? ": " : " fails too: ", cmdbuf.error().description().getUTF8String());
+        if (first)
+          ERR(line);
+        else
+          TRACE_IN(Gpu, line);
+        device_->LoseDevice();
+      }
+      return true;
+    });
+  }
+
+public:
+  static void
+  SettleAll(MTLD3D12Device *device) {
+    std::lock_guard<mullion::mutex> lock(queues_mutex_);
+    for (auto queue : queues_)
+      if (queue->device_ == device)
+        queue->SettleFeedback(true);
+  }
+
+private:
 
   std::string
   QueuesInFlight() {
@@ -468,7 +539,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (!scope.Settle())
         return;
       // nothing more reaches the GPU of a removed device (Gate::Run)
-      if (FAILED(device_->GetDeviceRemovedReason()))
+      if (FAILED(device_->RemovedReason()))
         return;
       // the heaps it maps from must be resident by now, as for a command buffer
       device_->CommitResidency();
@@ -566,8 +637,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // MULLION_D3D12_GPU_ERRORS: the passes with indirect commands and where their resolvers keep their largest numbers
     std::vector<std::pair<std::string, const RenderEncoderData::Most *>> most{};
     // how many encoders of each kind it has, and whether it presents: what a report of one that does not complete says
-    std::array<uint16_t, size_t(EncoderType::AccelerationStructure) + 1> encoders{};
+    std::array<uint16_t, kEncoderTypes> encoders{};
     bool presents = false;
+    // Metal 3: the buffer signals its slot's event after its work (EventWait); and whether what the completion thread
+    // reads of it needs Metal to have completed it, not only the GPU its work (a dumped frame reads its status)
+    bool signals = false, settles = false;
     diag::DebugGroups groups{};
     std::array<uint32_t, WMTMetal4AccelerationStructure + 1> physical{};
   };
@@ -657,6 +731,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
     uint64_t internal_seq = 1;
     for (;;) {
+      // what feedback has come, without waiting for more: the next command buffer's completion is not held behind it.
+      // what is still to come is read at the next one, or by GetDeviceRemovedReason, which waits for it
+      if (Metal4 || EventWait())
+        SettleFeedback(false);
       inflight_cmdbuf_seq_.wait(internal_seq, std::memory_order_acquire);
       if (inflight_cmdbuf_stop_.load() == internal_seq)
         break;
@@ -679,10 +757,18 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       Trace("waits for command buffer ", internal_seq);
       Watched(internal_seq);
+      // Metal 4: the queue's event says the work is done; its feedback may come later, and only what reads it now
+      // waits for it here: the profile, for its GPU times, and a dumped frame, for its status
+      // Metal 3: the slot's event likewise, unless what is read now needs Metal to have completed the buffer: the
+      // profile's GPU times, its counter samples (resolveCounterRange), or a dumped frame's status
       if constexpr (Metal4)
-        inflight.cmdbuf.waitUntilCompleted();
-      else if (profile_ || inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
-        inflight.cmdbuf.waitUntilCompleted();
+        profile_ || inflight.settles ? inflight.cmdbuf.waitUntilCompleted() : inflight.cmdbuf.waitForGPU();
+      else if (inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
+        if (profile_ || !inflight.signals || inflight.samples || inflight.settles)
+          inflight.cmdbuf.waitUntilCompleted();
+        else
+          inflight.cmdbuf.waitUntilSignaled(slot_events_[internal_seq % kCommandQueueSize], internal_seq);
+      }
       auto completed = profile_ ? diag::Now() : 0;
       Watched(0);
       Trace("command buffer ", internal_seq, " completed");
@@ -691,10 +777,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       device_->CheckAtomicLocks();
       if (record_totals_)
         CompareGPURecords(inflight.records, record_totals_);
-      if (inflight.cmdbuf.status() == WMTCommandBufferStatusError) {
+      // read once: Metal may fail the buffer between two reads, and an error neither the report below nor the list of
+      // buffers whose status is to come sees would be lost
+      const auto status = inflight.cmdbuf.status();
+      if (status == WMTCommandBufferStatusError) {
         // the first says why; Metal fails what follows a fault of the process's too. MULLION_TRACE_GPU has them all:
         // one Metal calls an innocent victim of a GPU recovery leaves the one at fault to another command buffer
-        bool first = SUCCEEDED(device_->GetDeviceRemovedReason());
+        bool first = SUCCEEDED(device_->RemovedReason());
         if (first || trace::On(trace::Gpu)) {
           auto report = [&](const std::string &line) {
             if (first)
@@ -792,7 +881,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       sample(inflight.sampled.size());
       uint32_t omitted[2] = {};
-      if (inflight.cmdbuf.status() == WMTCommandBufferStatusCompleted)
+      if (status != WMTCommandBufferStatusError)
         for (auto &[buffer, words, scratch] : inflight.omitted)
           for (auto word : words)
             omitted[scratch] = std::max(omitted[scratch], word);
@@ -804,6 +893,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         }
         ERR("Stream output from an indirect command needed ", omitted[1], " bytes of scratch, more than it had: the "
             "command was not run, and lists recorded from now on have that much");
+      }
+      if (status <= WMTCommandBufferStatusScheduled) {
+        std::lock_guard lock(feedback_mutex_);
+        unsettled_.emplace_back(inflight.cmdbuf, internal_seq);
       }
       for (auto &allocator : inflight.allocators)
         if (allocator)
@@ -865,6 +958,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     WMT::Reference<MetalCommandBuffer>
     End() {
       auto ended = inflight->cmdbuf;
+      if constexpr (!Metal4)
+        if (EventWait() && (++queue->ends_since_signal_ == queue->ends_between_signals_ || inflight->presents)) {
+          // last, after all the buffer's work; the slot is the sequence number's until it retires
+          auto seq = queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
+          ended.encodeSignalEvent(queue->slot_events_[seq % kCommandQueueSize], seq);
+          inflight->signals = true;
+        }
       if (diag::events)
         inflight->groups.Enter(ended, {});
       if (diag::trace_encoders) {
@@ -901,7 +1001,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     void
     OrderAliases() {
       if constexpr (Metal4) {
-        inflight->cmdbuf.orderAliases();
+        inflight->cmdbuf.orderAliases(AliasesInside());
         // and again at each command buffer after it, until a pass has taken it: one that ends first, or that is only a
         // queue's wait, has no encoder to begin with the barrier
         queue->order_aliases_ = true;
@@ -1033,6 +1133,10 @@ public:
       alias_event_ = metal_device.newSharedEvent();
       if (!alias_event_)
         return E_OUTOFMEMORY;
+      if (EventWait())
+        for (auto &event : slot_events_)
+          if (!(event = metal_device.newSharedEvent()))
+            return E_OUTOFMEMORY;
     }
     if (!queue_)
       return FAIL(E_FAIL);
@@ -1489,6 +1593,34 @@ public:
             encoder.endEncoding();
           break;
         }
+        case EncoderType::Upscale: {
+          // MetalFX after all the work before it, and the work after it after MetalFX: an encoder that waits for
+          // the queue's fences updates the scaler's, which MetalFX waits for and updates, and one that waits for that
+          // updates the queue's (as the D3D11 context's scaler boundaries)
+          auto data = static_cast<UpscaleEncoderData *>(current);
+          WMT::Fence scaler_fence = data->temporal ? data->temporal->fence() : data->denoised->fence();
+          if (diag::trace_encoders)
+            scope.inflight->physical[WMTMetal4Blit] += 2;
+          auto begin = cmdbuf.blitCommandEncoder();
+          WaitAll([&](WMT::Fence fence) { begin.waitForFence(fence); });
+          begin.updateFence(scaler_fence);
+          begin.endEncoding();
+          if (data->temporal) {
+            cmdbuf.encodeTemporalScale(
+                data->temporal->scaler(), data->color, data->output, data->depth, data->motion, data->exposure,
+                scaler_fence, data->props
+            );
+          } else {
+            auto args = data->denoise;
+            args.fence = scaler_fence.handle;
+            cmdbuf.encodeDenoisedScale(data->denoised->scaler(), args);
+          }
+          auto end = cmdbuf.blitCommandEncoder();
+          end.waitForFence(scaler_fence);
+          end.updateFence(WMT::Fence(fence_));
+          end.endEncoding();
+          break;
+        }
         case EncoderType::ResolveTimestamps: {
           auto data = static_cast<ResolveTimestampsData *>(current);
           if (data->readback) {
@@ -1624,9 +1756,9 @@ public:
       }
     };
     // lists whose every pass encodes on any thread, as many as follow each other: their passes, and what they cost.
-    // not with what keeps state of a slot's own (profiles, GPU records, debug groups, encoder counts)
+    // not with what keeps state of a slot's own (profiles, GPU records, encoder counts)
     std::vector<std::pair<EncoderData *, uint64_t>> passes;
-    bool parallel = EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate && !diag::events &&
+    bool parallel = EncodeThreads() > 1 && !profile_ && !record_totals_ && !isolate &&
                     !diag::trace_encoders;
     for (size_t i = 0; i < recorded.size();) {
       size_t j = i;
@@ -1657,10 +1789,12 @@ public:
   };
 
   // encodes a pass of draws, copies, dispatches or a resolve into `cmdbuf`: it needs nothing of the queue's but its
-  // fences (`sync`), so the encoding threads run it too (EncodeParallel). false when the device is lost
+  // fences (`sync`), so the encoding threads run it too (EncodeParallel). `attachment` is the caller's: a Metal 4 pass
+  // may start with the sample the pass before it ended with, which the bridge writes into it. false when the device
+  // is lost
   bool
   EncodePass(
-      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo attachment,
+      MetalCommandBuffer cmdbuf, EncoderData *current, WMTSampleBufferAttachmentInfo &attachment,
       WMT::Buffer sparse_mappings, InflightCommandBuffer &inflight, const GPUListRecords *records, const PassSync &sync
   ) {
     auto wait = [&](auto &encoder) { encoder.waitForFences(sync.waits, sync.wait_count); };
@@ -1921,6 +2055,11 @@ public:
 
       break;
     }
+    case EncoderType::Settle:
+      // the encoding threads' aliasing barriers (Parallel); the queue's are the scope's (OrderAliases)
+      if constexpr (Metal4)
+        cmdbuf.orderAliases(true);
+      break;
     default:
       break;
     }
@@ -1955,12 +2094,24 @@ public:
       syncs.push_back(NextSync(pass));
     std::vector<WMT::Reference<MetalCommandBuffer>> buffers(parts);
     buffers[0] = scope.inflight->cmdbuf;
+    // whether each part begins after an aliasing barrier that no encoder has taken yet: one a part ends with is the
+    // next part's, as OrderAliases carries it to the next command buffer. the last's is the queue's after them
+    std::vector<bool> carried(parts + 1);
+    carried[0] = order_aliases_;
+    for (unsigned k = 0; k < parts; k++) {
+      carried[k + 1] = carried[k];
+      for (auto i = bounds[k]; i < bounds[k + 1]; i++)
+        if (passes[i].first->type == EncoderType::Settle)
+          carried[k + 1] = true;
+        else if (passes[i].first->type != EncoderType::Null)
+          carried[k + 1] = false;
+    }
     // a part's command buffer is the slot's after the one before, which commits it next
     for (unsigned k = 1; k < parts; k++) {
       if constexpr (Metal4) {
         buffers[k] = NewCommandBuffer(inflight_cmdbuf_seq_.load(std::memory_order_relaxed) + k);
         // each part's encoders run apart from the first part's, so each orders aliased memory itself
-        if (order_aliases_ && buffers[k])
+        if ((order_aliases_ || carried[k]) && buffers[k])
           buffers[k].orderAliases();
       } else {
         buffers[k] = queue_.commandBuffer();
@@ -1973,11 +2124,19 @@ public:
     // the parts the encoding threads have yet to finish, under the lock
     unsigned left = parts - 1;
     std::atomic<bool> lost = false;
+    // the application's events open on each part's command buffer: the first part's are the slot's, and each later
+    // part's become the slot's with its command buffer
+    std::vector<diag::DebugGroups> groups(parts);
     auto part = [&](unsigned k) {
       InflightCommandBuffer unused;
-      for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++)
-        if (!EncodePass(buffers[k], passes[i].first, {}, sparse_mappings, unused, nullptr, syncs[i]))
+      WMTSampleBufferAttachmentInfo unsampled{};
+      auto &open = k ? groups[k] : scope.inflight->groups;
+      for (auto i = bounds[k]; i < bounds[k + 1] && !lost; i++) {
+        if (diag::events)
+          open.Enter(buffers[k], queue_events_ + (passes[i].first->event_path ? passes[i].first->event_path : ""));
+        if (!EncodePass(buffers[k], passes[i].first, unsampled, sparse_mappings, unused, nullptr, syncs[i]))
           lost = true;
+      }
     };
     {
       std::lock_guard<mullion::mutex> lock(encode_mutex_);
@@ -2002,12 +2161,13 @@ public:
     for (unsigned k = 0; k < parts; k++) {
       for (auto i = bounds[k]; i < bounds[k + 1]; i++)
         scope.inflight->encoders[size_t(passes[i].first->type)]++;
-      order_aliases_ = false;
+      order_aliases_ = carried[k + 1];
       if (sparse_mappings)
         scope.inflight->sparse_mappings = sparse_mappings;
       if (k + 1 < parts) {
         scope.End();
         scope.Start(std::move(buffers[k + 1]));
+        scope.inflight->groups = std::move(groups[k + 1]);
       }
     }
     return !lost;
@@ -2096,6 +2256,8 @@ public:
     auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
       // after a submission another thread is in the middle of
       std::lock_guard<mullion::mutex> lock(mutex_commit_);
+      if (ends_since_signal_)
+        ends_between_signals_ = std::exchange(ends_since_signal_, 0);
       retired_.Expect(inflight_cmdbuf_seq_ - 1, [this, fence, Value] {
         Trace("fence ", fence.ptr(), " reaches ", Value);
         FLIGHT_HEAVY(Sync, "fence %p reaches %llu", fence.ptr(), Value);
@@ -2184,7 +2346,7 @@ public:
   Present(
       IUnknown *swapchain, Presenter *presenter, ID3D12Resource *backbuffer, TextureViewKey view,
       HANDLE hLantecyWaitable, double after, uint64_t id, uint64_t number, ID3D12Resource *previous,
-      std::vector<PresentCopy> copies
+      std::vector<PresentCopy> copies, SpatialScaler *scaler, WMT::Texture upscaled
   ) override {
     if (device_->NamesPasses()) {
       std::chrono::steady_clock::time_point unset;
@@ -2193,11 +2355,17 @@ public:
     auto state = presenter->synchronizeLayerProperties();
     if (Holding() &&
         Hold([this, swapchain = Com(swapchain), presenter, backbuffer = Com(backbuffer), view, hLantecyWaitable, after,
-              id, number, state, previous = Com(previous), copies] {
-          Commit(presenter, backbuffer.ptr(), view, state, hLantecyWaitable, after, id, number, previous.ptr(), copies);
+              id, number, state, previous = Com(previous), copies, scaler = Rc(scaler),
+              upscaled = WMT::Reference<WMT::Texture>(upscaled)] {
+          Commit(
+              presenter, backbuffer.ptr(), view, state, hLantecyWaitable, after, id, number, previous.ptr(), copies,
+              scaler.ptr(), upscaled
+          );
         }))
       return S_OK;
-    return Commit(presenter, backbuffer, view, state, hLantecyWaitable, after, id, number, previous, copies);
+    return Commit(
+        presenter, backbuffer, view, state, hLantecyWaitable, after, id, number, previous, copies, scaler, upscaled
+    );
   }
 
   void
@@ -2261,8 +2429,9 @@ public:
                           cmdbuf = inflight.cmdbuf, desc, footprint, row, number, path]() mutable {
       if (present)
         present();
-      if (cmdbuf.status() != WMTCommandBufferStatusCompleted) {
-        ERR("D3D12 frame failed: ", path, ": GPU work did not complete");
+      // Metal 4's completion comes when the GPU is done, before the status does (SettleFeedback): only an error fails
+      if (cmdbuf.status() == WMTCommandBufferStatusError) {
+        ERR("D3D12 frame failed: ", path, ": GPU work failed");
         return;
       }
       std::ofstream file(str::topath(path.c_str()).c_str(), std::ios::binary);
@@ -2282,7 +2451,7 @@ public:
   Commit(
       Presenter *presenter, ID3D12Resource *backbuffer, TextureViewKey shown, const Presenter::PresentState &state,
       HANDLE hLantecyWaitable, double after, uint64_t id, uint64_t number, ID3D12Resource *previous,
-      const std::vector<PresentCopy> &copies
+      const std::vector<PresentCopy> &copies, SpatialScaler *scaler, WMT::Texture upscaled
   ) {
     Trace("Present");
     FLIGHT_HEAVY(Present, "queue %p: Present %llu", this, number);
@@ -2290,7 +2459,7 @@ public:
     auto &cmdbuf = scope.inflight->cmdbuf;
     if constexpr (Metal4)
       if (!cmdbuf)
-        return device_->GetDeviceRemovedReason();
+        return device_->RemovedReason();
     if (profile_)
       diag::Frame(device_->GetMTLDevice(), profile_->id, inflight_cmdbuf_seq_.load());
 
@@ -2320,11 +2489,25 @@ public:
       }
     }
 
+    // MetalFX: the shown view, upscaled after all the work before it, and presented from `upscaled` once the scaler
+    // is done (as the D3D11 swap chain does)
+    WMT::Texture source = g->texture->view(shown).texture;
+    if (scaler && upscaled) {
+      auto begin = cmdbuf.blitCommandEncoder();
+      WaitAll([&](WMT::Fence fence) { begin.waitForFence(fence); });
+      begin.updateFence(scaler->fence());
+      begin.endEncoding();
+      cmdbuf.encodeSpatialScale(scaler->scaler(), source, upscaled, scaler->fence());
+      source = upscaled;
+    }
+
     unsigned present_encoders = 0;
     auto drawable = presenter->encodeCommands(
-        MetalCommandBuffer(cmdbuf), g->texture->view(shown).texture, state,
+        MetalCommandBuffer(cmdbuf), source, state,
         [&](auto encoder) {
           WaitAll([&](WMT::Fence fence) { encoder.waitForFence(fence, WMTRenderStageFragment); });
+          if (scaler && upscaled)
+            encoder.waitForFence(scaler->fence(), WMTRenderStageFragment);
         },
         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }, inflight_cmdbuf_seq_.load(),
         diag::trace_encoders ? &present_encoders : nullptr
@@ -2340,8 +2523,10 @@ public:
       cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
     else
       cmdbuf.presentDrawable(drawable);
-    if (!dump_frames.empty())
+    if (!dump_frames.empty()) {
       DumpFrame(backbuffer, *scope.inflight, id, number);
+      scope.inflight->settles = true;
+    }
     scope.inflight->semaphore = hLantecyWaitable;
     scope.inflight->presents = true;
     // the work after this present is frame number + 1
@@ -2350,6 +2535,12 @@ public:
     return S_OK;
   }
 };
+
+void
+SettleCommandQueueFeedback(MTLD3D12Device *pDevice) {
+  MTLD3D12CommandQueueImpl<true>::SettleAll(pDevice);
+  MTLD3D12CommandQueueImpl<false>::SettleAll(pDevice);
+}
 
 HRESULT
 CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue) {

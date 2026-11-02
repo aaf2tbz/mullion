@@ -6,8 +6,10 @@
 #include "rc/util_rc.hpp"
 #include "thread.hpp"
 #include "winemetal.h"
+#include "wsi_platform.hpp"
 #include <atomic>
 #include <deque>
+#include <memory>
 
 namespace mullion {
 
@@ -83,6 +85,11 @@ public:
 
   PresentState synchronizeLayerProperties();
 
+  // where a MetalFX scaler upscales `input` to: the layer's size on screen, in pixels, so a frame is shown at the
+  // display's (in fullscreen) or the window's resolution. false while the layer has no size, or one smaller than the
+  // input (the caller upscales by its factor then)
+  bool upscaleOutputSize(uint32_t input_width, uint32_t input_height, uint32_t &width, uint32_t &height);
+
   // how later frames are put on the target (the swap chain's settings)
   void
   changePresentation(const MullionPresentation &presentation) {
@@ -116,6 +123,7 @@ private:
   WMT::MetalLayer layer_;
   InternalCommandLibrary &lib_;
   WMTLayerProps layer_props_;
+  double native_contents_scale_ = 1.0;
   uint32_t sample_count_;
   WMTColorSpace colorspace_ = WMTColorSpaceSRGB;
   WMTHDRMetadata hdr_metadata_;
@@ -135,8 +143,9 @@ private:
   HWND window_;
   WMT::Reference<WMT::Texture> window_target_;
   struct WindowFrame {
+    // placed here: a 32-bit process reads no memory Metal allocates
+    std::unique_ptr<void, void (*)(void *)> pixels{nullptr, wsi::aligned_free};
     WMT::Reference<WMT::Buffer> buffer;
-    void *pixels;
     uint32_t width, height;
     uint64_t number;
   };

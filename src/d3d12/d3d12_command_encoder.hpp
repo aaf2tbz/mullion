@@ -19,6 +19,7 @@
 #pragma once
 
 #include "mullion_texture.hpp"
+#include "mullion_scaler.hpp"
 #include <cstdint>
 
 namespace mullion {
@@ -37,7 +38,11 @@ enum class EncoderType {
   Settle,
   ComputeParts,
   AccelerationStructure,
+  // MetalFX (IMTLD3D12CommandListExt)
+  Upscale,
 };
+// how many kinds there are: the last one's number and one
+constexpr size_t kEncoderTypes = size_t(EncoderType::Upscale) + 1;
 
 class MTLD3D12QueryHeap;
 
@@ -114,6 +119,10 @@ struct RenderEncoderData : EncoderData {
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;
+  // a pass without attachments begun by a draw that rasterizes nothing (MTLD3D12GraphicsPipelineState's rasterless),
+  // a pixel in size: one that is 16384 by 16384 costs the GPU most of a millisecond. a draw that rasterizes begins
+  // another
+  bool rasterless = false;
   wmtcmd_render_nop cmd_head{WMTRenderCommandNop};
   wmtcmd_base *cmd_tail = (wmtcmd_base *)&cmd_head;
   // compute commands that run before the pass: the resolvers of its indirect commands, whose commands it then runs
@@ -190,6 +199,15 @@ struct ResolveEncoderData : EncoderData {
 struct PredicateEncoderData : EncoderData {
   const uint32_t *skips;
   EncoderData *end;
+};
+
+// MetalFX temporal upscaling (`temporal`), or temporal denoised upscaling (`denoised`, its inputs in `denoise`)
+struct UpscaleEncoderData : EncoderData {
+  Rc<TemporalScaler> temporal;
+  Rc<DenoisedScaler> denoised;
+  WMT::Texture color, output, depth, motion, exposure;
+  WMTFXTemporalScalerProps props;
+  WMTFXDenoisedScaleArgs denoise;
 };
 
 // a command on acceleration structures that cannot be recorded when the application records it: a deserializing

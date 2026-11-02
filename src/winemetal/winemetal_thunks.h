@@ -280,6 +280,20 @@ struct unixcall_mtlcommandbuffer_spatial_scale {
   obj_handle_t fence;
 };
 
+struct unixcall_mtldevice_newfxdenoisedscaler {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+  bool metal4;
+};
+
+struct unixcall_mtlcommandbuffer_denoised_scale {
+  obj_handle_t cmdbuf;
+  obj_handle_t scaler;
+  struct WMTConstMemoryPointer args;
+  bool metal4;
+};
+
 struct unixcall_nsstring_string {
   struct WMTConstMemoryPointer buffer_ptr;
   enum WMTStringEncoding encoding;
@@ -350,6 +364,7 @@ struct unixcall_mtlsharedevent_setevent {
   obj_handle_t event_handle;
   obj_handle_t shared_event_listener;
   uint64_t value;
+  uint64_t reference;
 };
 
 struct unixcall_mtlsharedevent_createmachport {
@@ -408,6 +423,7 @@ struct unixcall_setmetalcachepath {
 };
 
 struct unixcall_bootstrap {
+  obj_handle_t object;
   char name[128];
   uint32_t mach_port;
   uint32_t reserved;

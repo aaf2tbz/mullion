@@ -19,10 +19,15 @@
 #include "dxbc_converter_base.hpp"
 #include "../dxbc_converter.hpp"
 #include "air_builder.hpp"
+#include "../transforms/merge_sample_branches.hpp"
+#include <cstring>
+#include "../transforms/merge_minmax_branches.hpp"
+#include <format>
 #include <limits>
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -83,21 +88,43 @@ Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
 llvm::Value *
 Converter::LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Value *Row, int Component, mask_t Dwords) {
   auto TyIntVec4 = air.getIntTy(4);
-  llvm::Value *InBounds = nullptr;
-  // rows past the bound buffer's size read 0 (D3D11.3 7.5); root CBVs carry no size
-  if (Buffer.Metadata) {
-    InBounds = ir.CreateICmpULT(Row, ir.CreateTrunc(ir.CreateLShr(Buffer.Metadata, 4), air.getIntTy()));
-    Row = ir.CreateSelect(InBounds, Row, ir.getInt32(0));
+  auto RowPointer = ir.CreateGEP(TyIntVec4, Buffer.Pointer, Row);
+  // rows past the bound buffer's size read 0 (D3D11.3 7.5); root CBVs carry no size. such a row's address is a row of
+  // zeros in the shader's own constant memory: Apple's compiler keeps a constant row's load a uniform load when only
+  // its address is chosen, where choosing the value it loaded (or the row) made each load the threads' own, about 25
+  // times the GPU time of a shader that reads hundreds of constant rows (tests/perf cbv_rows, dttdrv/mullion#32).
+  // MULLION_AIRCONV_SKIP=cbuffer-bounds leaves the check out, to measure what it costs (it is in the shader cache's key)
+  static const bool skip = [] {
+    auto names = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    return names && strstr(names, "cbuffer-bounds");
+  }();
+  if (Buffer.Metadata && !skip) {
+    auto InBounds = ir.CreateICmpULT(Row, ir.CreateTrunc(ir.CreateLShr(Buffer.Metadata, 4), air.getIntTy()));
+    RowPointer = ir.CreateSelect(InBounds, RowPointer, ZeroRow());
   }
   auto Load = [&](unsigned Dword) -> llvm::Value * {
-    return ir.CreateLoad(air.getIntTy(), ir.CreateGEP(TyIntVec4, Buffer.Pointer, {Row, ir.getInt32(Dword)}));
+    return ir.CreateLoad(air.getIntTy(), ir.CreateGEP(TyIntVec4, RowPointer, {ir.getInt32(0), ir.getInt32(Dword)}));
   };
   // a row's dwords load one by one, only those read: a vector load reads all four, and costs the shader more
   llvm::Value *Value = Component >= 0 ? Load(Component) : llvm::PoisonValue::get(TyIntVec4);
   for (unsigned i = 0; Component < 0 && i < 4; i++)
     if (Dwords & (1 << i))
       Value = ir.CreateInsertElement(Value, Load(i), i);
-  return InBounds ? ir.CreateSelect(InBounds, Value, llvm::Constant::getNullValue(Value->getType())) : Value;
+  return Value;
+}
+
+llvm::GlobalVariable *
+Converter::ZeroRow() {
+  auto &M = *ir.GetInsertBlock()->getModule();
+  if (auto Zero = M.getGlobalVariable("mullion.zero_row", true))
+    return Zero;
+  auto TyIntVec4 = air.getIntTy(4);
+  auto Zero = new llvm::GlobalVariable(
+      M, TyIntVec4, true, llvm::GlobalValue::InternalLinkage, llvm::Constant::getNullValue(TyIntVec4),
+      "mullion.zero_row", nullptr, llvm::GlobalValue::NotThreadLocal, 2
+  );
+  Zero->setAlignment(llvm::Align(16));
+  return Zero;
 }
 
 llvm::Value *
@@ -928,19 +955,9 @@ Converter::operator()(const InstFloatUnaryOp &unary) {
   case FloatUnaryOp::Sqrt:
     Value = air.CreateFPUnOp(AIRBuilder::sqrt, Value);
     break;
-  // D3D11.3 22.10.7 requires NaN for infinities and NaNs; integer selection survives fast math's cancellation
-  case FloatUnaryOp::Fraction: {
-    auto Scalar = Value->getType()->getScalarType();
-    auto Bits = ir.CreateBitCast(Value, Value->getType()->getWithNewType(ir.getIntNTy(Scalar->getScalarSizeInBits())));
-    auto Inf = llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt();
-    auto NonFinite = ir.CreateICmpEQ(ir.CreateAnd(Bits, Inf), llvm::ConstantInt::get(Bits->getType(), Inf));
-    auto Fraction = ir.CreateBitCast(air.CreateFPUnOp(AIRBuilder::fract, Value), Bits->getType());
-    auto NaN = llvm::APFloat::getQNaN(Scalar->getFltSemantics()).bitcastToAPInt();
-    Value = ir.CreateBitCast(
-        ir.CreateSelect(NonFinite, llvm::ConstantInt::get(Bits->getType(), NaN), Fraction), Value->getType()
-    );
+  case FloatUnaryOp::Fraction:
+    Value = Fraction(Value);
     break;
-  }
   case FloatUnaryOp::RoundNearestEven:
     Value = air.CreateFPUnOp(AIRBuilder::rint, Value);
     break;
@@ -1047,6 +1064,35 @@ Converter::FirstBit(IntegerUnaryOp Op, llvm::Value *Value) {
   // a count of the operand's whole width, or more, says no bit was found
   auto Bits = Value->getType()->getScalarSizeInBits();
   return MaxIfInMask(llvm::maskTrailingOnes<uint64_t>(Bits) - (Bits - 1), Value);
+}
+
+llvm::Value *
+Converter::Fraction(llvm::Value *Value) {
+  // D3D's own definition, "dest = src0 - round_ni(src0)" (D3D11.3 22.10.7), as a subtraction that may not assume a
+  // finite operand: an infinity less itself, and a NaN, are NaN, as TableFrc asks. On an Apple M4 it gives, bit for bit,
+  // what Metal's fast fract with a NaN selected for a non-finite operand gives, for every 32-bit and 16-bit input,
+  // without the bit test and the select (4-7% of the perf probe's math shaders). MULLION_AIRCONV_SKIP=frac-floor (in
+  // the shader cache's key) takes the select instead
+  using llvm::air::AIRBuilder;
+  static const bool Select = [] {
+    auto Skip = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    return Skip && strstr(Skip, "frac-floor");
+  }();
+  auto Type = Value->getType();
+  if (!Select) {
+    auto Floor = air.CreateFPUnOp(AIRBuilder::floor, Value, false);
+    llvm::IRBuilder<>::FastMathFlagGuard Strict(ir);
+    ir.clearFastMathFlags();
+    return ir.CreateFSub(Value, Floor);
+  }
+  // integer selection survives fast math's cancellation
+  auto Scalar = Type->getScalarType();
+  auto Bits = ir.CreateBitCast(Value, Type->getWithNewType(ir.getIntNTy(Scalar->getScalarSizeInBits())));
+  auto Inf = llvm::APFloat::getInf(Scalar->getFltSemantics()).bitcastToAPInt();
+  auto NonFinite = ir.CreateICmpEQ(ir.CreateAnd(Bits, Inf), llvm::ConstantInt::get(Bits->getType(), Inf));
+  auto Fraction = ir.CreateBitCast(air.CreateFPUnOp(AIRBuilder::fract, Value), Bits->getType());
+  auto NaN = llvm::APFloat::getQNaN(Scalar->getFltSemantics()).bitcastToAPInt();
+  return ir.CreateBitCast(ir.CreateSelect(NonFinite, llvm::ConstantInt::get(Bits->getType(), NaN), Fraction), Type);
 }
 
 llvm::Value *
@@ -1754,6 +1800,10 @@ Converter::operator()(const InstSample &sample) {
         SamplingResidency(*Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
                           {Value, Residency}, Read, nullptr, Sampler->Bias, MinLODClamp);
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
+  std::tie(Value, Residency) = MinMaxFilter(
+      *Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
+      {.Bias = Sampler->Bias, .MinLOD = MinLODClamp}, {Value, Residency}
+  );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
@@ -1816,8 +1866,8 @@ Converter::operator()(const InstSampleLOD &sample) {
     return;
   }
 
-  llvm::Value *LOD =
-      ClampMinLOD(Tex->Metadata, ir.CreateFAdd(LoadOperand(sample.src_lod, kMaskComponentX), Sampler->Bias));
+  auto Explicit = LoadOperand(sample.src_lod, kMaskComponentX);
+  llvm::Value *LOD = ClampMinLOD(Tex->Metadata, ir.CreateFAdd(Explicit, Sampler->Bias));
 
   auto Read = [&](llvm::Value *S) {
     return air.CreateSample(Tex->Texture, Tex->Handle, S, Coord, ArrayIndex, sample.offsets, sample_level{LOD});
@@ -1827,6 +1877,10 @@ Converter::operator()(const InstSampleLOD &sample) {
     std::tie(Value, Residency) = SamplingResidency(*Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex,
                                                    sample.offsets, {Value, Residency}, Read, LOD);
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
+  std::tie(Value, Residency) = MinMaxFilter(
+      *Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
+      {.Level = Explicit}, {Value, Residency}
+  );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
@@ -1906,6 +1960,10 @@ Converter::operator()(const InstSampleBias &sample) {
         SamplingResidency(*Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
                           {Value, Residency}, Read, nullptr, Bias, MinLODClamp);
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
+  std::tie(Value, Residency) = MinMaxFilter(
+      *Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
+      {.Bias = Bias, .MinLOD = MinLODClamp}, {Value, Residency}
+  );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
@@ -2006,6 +2064,10 @@ Converter::operator()(const InstSampleDerivative &sample) {
         *Tex, SamplerHandle, Sampler->Metadata, Coord, ArrayIndex, sample.offsets, {Value, Residency}, Read, nullptr,
         nullptr, MinLODClamp, BiasGradient(DDX, Sampler->Bias), BiasGradient(DDY, Sampler->Bias));
   Value = CustomBorder(*Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Value, [&](auto S) { return Read(S).first; });
+  std::tie(Value, Residency) = MinMaxFilter(
+      *Tex, SamplerHandle, Sampler->Border, Sampler->Metadata, Coord, ArrayIndex, sample.offsets,
+      {.DDX = DDX, .DDY = DDY, .Bias = Sampler->Bias, .MinLOD = MinLODClamp}, {Value, Residency}
+  );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
@@ -2037,6 +2099,16 @@ Converter::operator()(const InstSampleCompare &sample) {
   llvm::Value *ArrayIndex = nullptr;
 
   switch (Tex->Logical) {
+  case Texture::texture1d:
+    Coord = LoadOperand(sample.src_address, kMaskComponentX);
+    Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    break;
+  case Texture::texture1d_array:
+    Coord = LoadOperand(sample.src_address, kMaskComponentX);
+    Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    ArrayIndex = LoadOperand(sample.src_address, kMaskComponentY);
+    ArrayIndex = ClampArrayIndex(ArrayIndex, Tex->Metadata);
+    break;
   case Texture::depth2d:
     Coord = LoadOperand(sample.src_address, kMaskVecXY);
     break;
@@ -2330,8 +2402,7 @@ Converter::SampleImplicit(
     return Biased();
   // a static sampler is known when the pipeline is made: one that is not anisotropic, or a sample whose only bias is
   // the sampler's own and that is none, reads Metal's own LOD. Metal's gradient sample below costs about twice its
-  // implicit one (the probe's sample scenes on an M4), and a sampler of a descriptor keeps it: what it is is known only
-  // when the shader runs
+  // implicit one (the probe's sample scenes on an M4)
   if (auto Known = KnownSamplers.find(SamplerMetadata); Known != KnownSamplers.end()) {
     auto Own = SamplerBiases.find(Bias);
     if (!Known->second.Anisotropic ||
@@ -2340,11 +2411,425 @@ Converter::SampleImplicit(
   }
   auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
                                  (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
-  if (auto Known = dyn_cast<ConstantInt>(ir.CreateICmpUGT(Anisotropy, ir.getInt64(1))); Known && Known->isZero())
+  auto Isotropic = ir.CreateICmpULE(Anisotropy, ir.getInt64(1));
+  if (auto Known = dyn_cast<ConstantInt>(Isotropic); Known && Known->isOne())
     return Biased();
-  auto DDX = air.CreateDerivative(Coord, false), DDY = air.CreateDerivative(Coord, true);
-  return air.CreateSampleGrad(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, BiasGradient(DDX, Bias),
-                              BiasGradient(DDY, Bias), MinLOD, Offset, Reference);
+  auto Gradients = [&] {
+    auto DDX = air.CreateDerivative(Coord, false), DDY = air.CreateDerivative(Coord, true);
+    return air.CreateSampleGrad(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, BiasGradient(DDX, Bias),
+                                BiasGradient(DDY, Bias), MinLOD, Offset, Reference);
+  };
+  // MULLION_AIRCONV_SKIP=table-sampler-implicit: a sampler not known here always takes the gradients
+  static const bool Selects = [] {
+    auto Skip = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    return !Skip || !strstr(Skip, "table-sampler-implicit");
+  }();
+  if (!Selects || isa<Constant>(Isotropic))
+    return Gradients();
+  // what a descriptor's sampler is is known only when the shader runs, from its metadata: one that is not anisotropic
+  // reads Metal's own LOD too, at several times the gradients' speed (#32: 2.23 against 8.29 ms on an M1 Max). the
+  // whole quad takes one side, as the derivatives an implicit sample takes are its quad's and a lane's sampler need not
+  // be its quad's others' (NonUniformResourceIndex). MergeSampleBranchesPass joins the branches of a sampler's samples
+  // that follow each other
+  auto &Context = air.getContext();
+  auto QuadAll = air.getModule()->getOrInsertFunction(
+      "air.quad_all", FunctionType::get(ir.getInt1Ty(), {ir.getInt1Ty()}, false),
+      AttributeList::get(Context, {{~0U, Attribute::get(Context, Attribute::AttrKind::Convergent)},
+                                   {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                                   {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}})
+  );
+  auto Whole = ir.CreateCall(QuadAll, {Isotropic});
+  Whole->addFnAttr(Attribute::ReadNone);
+  auto Head = ir.GetInsertBlock();
+  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
+  if (auto Branch = Head->getTerminator())
+    Branch->eraseFromParent();
+  auto Own = llvm::BasicBlock::Create(ctx.llvm, "sample_implicit", Head->getParent(), Tail);
+  auto Scaled = llvm::BasicBlock::Create(ctx.llvm, "sample_gradients", Head->getParent(), Tail);
+  ir.SetInsertPoint(Head);
+  ir.CreateCondBr(Whole, Own, Scaled)->setMetadata(llvm::air::SampleBranchMetadata, MDNode::get(Context, {}));
+  ir.SetInsertPoint(Own);
+  auto Implicit = Biased();
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Scaled);
+  auto Gradient = Gradients();
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Tail, Tail->begin());
+  auto Value = ir.CreatePHI(Implicit.first->getType(), 2);
+  auto Residency = ir.CreatePHI(Implicit.second->getType(), 2);
+  for (auto [Block, Read] : {std::pair{Own, Implicit}, std::pair{Scaled, Gradient}}) {
+    Value->addIncoming(Read.first, Block);
+    Residency->addIncoming(Read.second, Block);
+  }
+  return {Value, Residency};
+}
+
+std::pair<llvm::Value *, llvm::Value *>
+Converter::MinMaxFilter(
+    const TextureResourceHandle &Tex, llvm::Value *Sampler, llvm::Value *Border, llvm::Value *SamplerMetadata,
+    llvm::Value *Coord, llvm::Value *ArrayIndex, const int32_t Offset[3], const Footprint &Footprint,
+    std::pair<llvm::Value *, llvm::Value *> Filtered
+) {
+  using namespace llvm;
+  using namespace llvm::air;
+  // MULLION_AIRCONV_SKIP=minmax-filters: every sampler averages, as Metal's do
+  static const bool Emulates = [] {
+    auto Skip = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    return !Skip || !strstr(Skip, "minmax-filters");
+  }();
+  auto &Info = AIRBuilder::getTextureInfo(Tex.Logical);
+  if (!Emulates || !Filtered.first || Tex.Logical == Texture::texture_buffer || Info.is_ms)
+    return Filtered;
+  // a static sampler is known when the pipeline is made. one that reduces still asks its metadata, which says whether
+  // Metal's sampler reduces for it (mullion::Sampler)
+  if (auto Known = KnownReductions.find(SamplerMetadata); Known != KnownReductions.end() && !Known->second)
+    return Filtered;
+  auto Field = [&](unsigned Shift, unsigned Bits) {
+    return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(SamplerMetadata, Shift), ir.getInt32Ty()), (1u << Bits) - 1);
+  };
+  auto Reduction = Field(SM50_SAMPLER_METADATA_REDUCTION, SM50_SAMPLER_METADATA_REDUCTION_BITS);
+  auto Reduces = ir.CreateICmpNE(Reduction, ir.getInt32(SM50_SAMPLER_REDUCTION_NONE));
+  if (auto Known = dyn_cast<ConstantInt>(Reduces); Known && Known->isZero())
+    return Filtered;
+
+  // a pixel shader's implicit LOD comes from its quad's derivatives, so its whole quad takes the branch when any lane
+  // reduces (its sampler need not be its quad's others', NonUniformResourceIndex), and a lane that does not keeps
+  // what it sampled
+  bool Derivatives = !Footprint.Level && !Footprint.DDX && ctx.shader_type == microsoft::D3D10_SB_PIXEL_SHADER;
+  Value *Taken = Reduces;
+  if (Derivatives) {
+    auto &Context = air.getContext();
+    auto QuadAny = air.getModule()->getOrInsertFunction(
+        "air.quad_any", FunctionType::get(ir.getInt1Ty(), {ir.getInt1Ty()}, false),
+        AttributeList::get(
+            Context, {{~0U, Attribute::get(Context, Attribute::AttrKind::Convergent)},
+                      {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                      {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+        )
+    );
+    auto Any = ir.CreateCall(QuadAny, {Reduces});
+    Any->addFnAttr(Attribute::ReadNone);
+    Taken = Any;
+  }
+  auto Head = ir.GetInsertBlock();
+  auto Tail = ir.GetInsertPoint() == Head->end() ? llvm::BasicBlock::Create(ctx.llvm, "", Head->getParent())
+                                                 : SplitBlock(Head, &*ir.GetInsertPoint());
+  if (auto Branch = Head->getTerminator())
+    Branch->eraseFromParent();
+  auto Reduce = llvm::BasicBlock::Create(ctx.llvm, "sample_minmax", Head->getParent(), Tail);
+  ir.SetInsertPoint(Head);
+  // rarely taken; MergeMinMaxBranchesPass joins the branches of samples that follow each other on one condition
+  auto Branch = ir.CreateCondBr(Taken, Reduce, Tail, MDBuilder(ctx.llvm).createBranchWeights(1, 1 << 20));
+  Branch->setMetadata(llvm::air::MinMaxBranchMetadata, MDNode::get(ctx.llvm, {}));
+  ir.SetInsertPoint(Reduce);
+
+  auto Real = [&](double V) { return ConstantFP::get(air.getFloatTy(), V); };
+  auto FMin = [&](Value *A, Value *B) { return air.CreateFPBinOp(AIRBuilder::fmin, A, B); };
+  auto FMax = [&](Value *A, Value *B) { return air.CreateFPBinOp(AIRBuilder::fmax, A, B); };
+  auto Floor = [&](Value *V) { return air.CreateFPUnOp(AIRBuilder::floor, V); };
+  auto Component = [&](Value *V, unsigned i) { return V->getType()->isVectorTy() ? ir.CreateExtractElement(V, i) : V; };
+  // texel addresses and LODs are fixed point with 8 fractional bits, rounded to nearest even (D3D11.3 7.18.7,
+  // 7.18.8, 7.18.10, 3.2.4.1)
+  auto Fixed = [&](Value *V) {
+    return ir.CreateFMul(air.CreateFPUnOp(AIRBuilder::rint, ir.CreateFMul(V, Real(256))), Real(1.0 / 256));
+  };
+  unsigned Dimension = SizeDimension(Tex.Logical);
+  const Texture::Query Sizes[] = {Texture::width, Texture::height, Texture::depth};
+  auto Size = [&](const TextureResourceHandle &T, unsigned Axis, Value *Level) {
+    // a null texture has no texels; its reads give 0 wherever they are
+    return air.CreateIntBinOp(
+        AIRBuilder::max, air.CreateTextureQuery(T.Texture, T.Handle, Sizes[Axis], Level), ir.getInt32(1), false
+    );
+  };
+  auto LastMip = [&](const TextureResourceHandle &T) {
+    auto Mips = air.CreateTextureQuery(T.Texture, T.Handle, Texture::num_mip_levels, ir.getInt32(0));
+    return ir.CreateSub(air.CreateIntBinOp(AIRBuilder::max, Mips, ir.getInt32(1), false), ir.getInt32(1));
+  };
+
+  // the LOD (7.18.11): the explicit one, or the gradients' isotropic one, "log2(max(lengthX,lengthY))" in texels of
+  // the first mip, or the quad's, which Metal measures; then the sampler's bias and clamps (CalculateLOD)
+  auto SamplerBias = DecodeSamplerBias(SamplerMetadata);
+  Value *Level = Footprint.Level;
+  if (!Level) {
+    if (Footprint.DDX) {
+      // a cube's, approximately: the whole gradient over the major axis, in texels of a face
+      Value *FaceScale = nullptr;
+      if (Info.is_cube) {
+        auto Abs = [&](unsigned i) { return air.CreateFPUnOp(AIRBuilder::fabs, ir.CreateExtractElement(Coord, i)); };
+        FaceScale = ir.CreateFDiv(Real(0.5), FMax(FMax(Abs(0), Abs(1)), Abs(2)));
+      }
+      Value *Lengths[2];
+      for (unsigned d = 0; d < 2; d++) {
+        auto Gradient = d ? Footprint.DDY : Footprint.DDX;
+        Value *Sum = Real(0);
+        for (unsigned i = 0; i < (Info.is_cube ? 3 : Dimension); i++) {
+          auto Texels = air.CreateConvertToFloat(Size(Tex, Info.is_cube ? 0 : i, ir.getInt32(0)), Signedness::Unsigned);
+          auto G = ir.CreateFMul(Component(Gradient, i), FaceScale ? ir.CreateFMul(Texels, FaceScale) : Texels);
+          Sum = ir.CreateFAdd(Sum, ir.CreateFMul(G, G));
+        }
+        Lengths[d] = Sum;
+      }
+      Level = ir.CreateFMul(air.CreateFPUnOp(AIRBuilder::log2, FMax(Lengths[0], Lengths[1])), Real(0.5));
+    } else if (Derivatives) {
+      Level = air.CreateCalculateLOD(Tex.Texture, Tex.Handle, Sampler, Coord).second;
+    } else {
+      Level = Real(0);
+    }
+    if (Footprint.Bias)
+      Level = ir.CreateFAdd(Level, ir.CreateFSub(Footprint.Bias, SamplerBias));
+  }
+  Value *LOD = CalculateLOD(Tex, Sampler, SamplerMetadata, Coord, Level).first;
+  if (Footprint.MinLOD)
+    LOD = FMin(FMax(LOD, Footprint.MinLOD), air.CreateConvertToFloat(LastMip(Tex), Signedness::Unsigned));
+  LOD = Fixed(LOD);
+
+  // the texels and their reduction are one function per kind of texture, border and offset, which every sample of
+  // that kind calls: a sample's own code is its LOD and the call
+  bool Custom = Border && !air.noCustomBorder() && Tex.Range;
+  auto Module = air.getModule();
+  auto Texel = Filtered.first->getType();
+  auto Name = std::format(
+      "mullion.minmax.{}.{}.{}{}.{}.{}.{}", unsigned(Tex.Texture.kind), unsigned(Tex.Logical),
+      unsigned(Tex.Texture.sample_type), Custom ? ".border" : "", Offset[0], Offset[1], Offset[2]
+  );
+  auto Reducer = Module->getFunction(Name);
+  if (!Reducer) {
+    llvm::Type *Params[] = {
+        air.getTextureHandleType(Tex.Texture),           air.getSamplerHandleType(), ir.getInt64Ty(), ir.getInt64Ty(),
+        Custom ? Tex.Range->getType() : ir.getInt64Ty(), Coord->getType(),           ir.getInt32Ty(), air.getFloatTy()
+    };
+    Reducer = llvm::Function::Create(
+        FunctionType::get(Texel, Params, false), llvm::GlobalValue::InternalLinkage, Name, Module
+    );
+    // its samples (the border color) are convergent; airconv's pipeline inlines only what is marked to be
+    Reducer->addFnAttr(Attribute::NoInline);
+    Reducer->addFnAttr(Attribute::Convergent);
+    Reducer->addFnAttr(Attribute::NoUnwind);
+    Reducer->addFnAttr(Attribute::WillReturn);
+    Reducer->addFnAttr(Attribute::ReadOnly);
+    IRBuilderBase::InsertPointGuard Guard(ir);
+    ir.SetInsertPoint(llvm::BasicBlock::Create(ctx.llvm, "entry", Reducer));
+    TextureResourceHandle Own = Tex;
+    Own.Handle = Reducer->getArg(0);
+    Own.Range = Custom ? Reducer->getArg(4) : nullptr;
+    Own.Metadata = nullptr;
+    // an unbound texture's answers are dropped where it is called
+    Own.Texture.Unbound = Own.Texture.SingleSample = nullptr;
+    Value *Sampler = Reducer->getArg(1), *Metadata = Reducer->getArg(2), *Border = Reducer->getArg(3);
+    Value *Coord = Reducer->getArg(5), *ArrayIndex = Reducer->getArg(6), *LOD = Reducer->getArg(7);
+    auto Field = [&](unsigned Shift, unsigned Bits) {
+      return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(Metadata, Shift), ir.getInt32Ty()), (1u << Bits) - 1);
+    };
+    auto Last = LastMip(Own);
+
+    // a cube's direction selects a face by its major axis, Z then Y then X on a tie, and its other two components
+    // over the major one place it on the face (7.18.7, 5.3.8)
+    Value *Face = nullptr, *Direction = Coord;
+    if (Info.is_cube) {
+      auto C = [&](unsigned i) { return ir.CreateExtractElement(Direction, i); };
+      auto Abs = [&](unsigned i) { return air.CreateFPUnOp(AIRBuilder::fabs, C(i)); };
+      auto IsZ = ir.CreateAnd(ir.CreateFCmpOGE(Abs(2), Abs(0)), ir.CreateFCmpOGE(Abs(2), Abs(1)));
+      auto IsY = ir.CreateAnd(ir.CreateNot(IsZ), ir.CreateFCmpOGE(Abs(1), Abs(0)));
+      auto Major = ir.CreateSelect(IsZ, C(2), ir.CreateSelect(IsY, C(1), C(0)));
+      auto Positive = ir.CreateFCmpOGE(Major, Real(0));
+      Face = ir.CreateAdd(
+          ir.CreateSelect(IsZ, ir.getInt32(4), ir.CreateSelect(IsY, ir.getInt32(2), ir.getInt32(0))),
+          ir.CreateSelect(Positive, ir.getInt32(0), ir.getInt32(1))
+      );
+      // +X: (-z, -y), -X: (z, -y), +Y: (x, z), -Y: (x, -z), +Z: (x, -y), -Z: (-x, -y)
+      auto Neg = [&](Value *V) { return ir.CreateFNeg(V); };
+      auto S = ir.CreateSelect(
+          IsZ, ir.CreateSelect(Positive, C(0), Neg(C(0))),
+          ir.CreateSelect(IsY, C(0), ir.CreateSelect(Positive, Neg(C(2)), C(2)))
+      );
+      auto T = ir.CreateSelect(IsY, ir.CreateSelect(Positive, C(2), Neg(C(2))), Neg(C(1)));
+      auto Scale = ir.CreateFDiv(Real(0.5), air.CreateFPUnOp(AIRBuilder::fabs, Major));
+      auto Place = [&](Value *V) { return ir.CreateFAdd(ir.CreateFMul(V, Scale), Real(0.5)); };
+      Coord = ir.CreateInsertElement(
+          ir.CreateInsertElement(UndefValue::get(air.getFloatTy(2)), Place(S), uint64_t(0)), Place(T), 1
+      );
+    }
+
+    // the magnification filter where the clamped LOD is 0 or less, else the minification filter (7.18.11); a point
+    // mip filter takes the nearest mip, a linear one the two around the LOD weighted by its fraction (7.18.10)
+    auto Bit = [&](unsigned Shift) { return ir.CreateICmpNE(Field(Shift, 1), ir.getInt32(0)); };
+    auto Linear = ir.CreateSelect(
+        ir.CreateFCmpOLE(LOD, Real(0)), Bit(SM50_SAMPLER_METADATA_MAG_LINEAR), Bit(SM50_SAMPLER_METADATA_MIN_LINEAR)
+    );
+    auto MipLinear = Bit(SM50_SAMPLER_METADATA_MIP_LINEAR);
+    auto First = air.CreateConvertToUnsigned(Floor(ir.CreateSelect(MipLinear, LOD, ir.CreateFAdd(LOD, Real(0.5)))));
+    First = air.CreateIntBinOp(AIRBuilder::min, First, Last, false);
+    std::pair<Value *, Value *> Levels[2] = {
+        {First, ir.getTrue()},
+        {air.CreateIntBinOp(AIRBuilder::min, ir.CreateAdd(First, ir.getInt32(1)), Last, false),
+         ir.CreateAnd(MipLinear, ir.CreateFCmpOGT(ir.CreateFSub(LOD, Floor(LOD)), Real(0)))},
+    };
+
+    // the address mode of each axis (SM50_SAMPLER_ADDRESS); a cube's faces have none (7.18.12), and keep their texels
+    auto Modes = Field(SM50_SAMPLER_METADATA_ADDRESS, 5);
+    Value *AxisModes[3] = {
+        ir.CreateURem(Modes, ir.getInt32(SM50_SAMPLER_ADDRESS_COUNT)),
+        ir.CreateUDiv(Modes, ir.getInt32(SM50_SAMPLER_ADDRESS_COUNT)),
+        Field(SM50_SAMPLER_METADATA_ADDRESS_W, SM50_SAMPLER_METADATA_ADDRESS_W_BITS),
+    };
+    if (Info.is_cube)
+      AxisModes[0] = AxisModes[1] = ir.getInt32(SM50_SAMPLER_ADDRESS_CLAMP);
+
+    // the texels, as Metal reads them, and the border color, Metal's or the sampler's own (SM50_SAMPLER_BORDER)
+    auto PositionTy = air.getTextureRWPositionType(Tex.Texture);
+    Value *Color = nullptr;
+    auto BorderColor = [&]() -> Value * {
+      if (Color)
+        return Color;
+      auto Far = ConstantFP::get(Direction->getType(), -16);
+      int32_t None[3] = {};
+      Color = air.CreateSample(Own.Texture, Own.Handle, Sampler, Far, ArrayIndex, None, sample_level{Real(0)}).first;
+      if (!Custom)
+        return Color;
+      auto From = ir.GetInsertBlock();
+      auto Custom = llvm::BasicBlock::Create(ctx.llvm, "border", Reducer);
+      auto Join = llvm::BasicBlock::Create(ctx.llvm, "", Reducer);
+      ir.CreateCondBr(ir.CreateICmpNE(Border, ir.getInt64(0)), Custom, Join);
+      ir.SetInsertPoint(Custom);
+      // clamped to the format's range (7.18.9.1)
+      auto TyBorder = StructType::get(ctx.llvm, {air.getSamplerHandleType(), ir.getInt64Ty(), air.getFloatTy(4)});
+      auto Ptr = ir.CreateIntToPtr(Border, TyBorder->getPointerTo(2));
+      auto Range =
+          ir.CreateLoad(air.getFloatTy(2), ir.CreatePointerCast(Own.Range, air.getFloatTy(2)->getPointerTo(2)));
+      Value *Value = FMin(
+          FMax(
+              ir.CreateLoad(TyBorder->getElementType(2), ir.CreateStructGEP(TyBorder, Ptr, 2)),
+              ir.CreateVectorSplat(4, ir.CreateExtractElement(Range, uint64_t(0)))
+          ),
+          ir.CreateVectorSplat(4, ir.CreateExtractElement(Range, 1))
+      );
+      if (!Color->getType()->isVectorTy())
+        Value = ir.CreateExtractElement(Value, uint64_t(0));
+      else if (Tex.Texture.sample_type == Texture::sample_int)
+        Value = air.CreateConvertToSigned(Value);
+      else if (Tex.Texture.sample_type == Texture::sample_uint)
+        Value = air.CreateConvertToUnsigned(Value);
+      ir.CreateBr(Join);
+      ir.SetInsertPoint(Join);
+      auto Merged = ir.CreatePHI(Color->getType(), 2);
+      Merged->addIncoming(Color, From);
+      Merged->addIncoming(Value, Custom);
+      return Color = Merged;
+    };
+    bool Integer = Tex.Texture.sample_type != Texture::sample_float;
+    bool Signed = Tex.Texture.sample_type == Texture::sample_int;
+    auto IsMaximum = ir.CreateICmpEQ(
+        Field(SM50_SAMPLER_METADATA_REDUCTION, SM50_SAMPLER_METADATA_REDUCTION_BITS),
+        ir.getInt32(SM50_SAMPLER_REDUCTION_MAXIMUM)
+    );
+    auto Reduced = [&](Value *A, Value *B) -> Value * {
+      if (!Integer)
+        return ir.CreateSelect(IsMaximum, FMax(A, B), FMin(A, B));
+      auto Less = Signed ? ir.CreateICmpSLT(A, B) : ir.CreateICmpULT(A, B);
+      auto Greater = Signed ? ir.CreateICmpSGT(A, B) : ir.CreateICmpUGT(A, B);
+      auto Splat = [&](Value *V) {
+        auto Ty = dyn_cast<FixedVectorType>(Less->getType());
+        return Ty ? ir.CreateVectorSplat(Ty->getNumElements(), V) : V;
+      };
+      return ir.CreateSelect(ir.CreateSelect(Splat(IsMaximum), Greater, Less), A, B);
+    };
+
+    Value *Result = nullptr;
+    for (auto &[Mip, MipKept] : Levels) {
+      // per axis, the two texels around the sample (or the one it is in), each with whether the filter weights it
+      // above 0 and whether its address is the border's (7.18.6, 7.18.7, 7.18.8, 7.18.9)
+      struct Texel {
+        Value *Index, *Kept, *Outside;
+      } Texels[3][2];
+      for (unsigned Axis = 0; Axis < Dimension; Axis++) {
+        auto N = Size(Own, Axis, Mip);
+        auto Mode = AxisModes[Axis];
+        auto Is = [&](SM50_SAMPLER_ADDRESS M) { return ir.CreateICmpEQ(Mode, ir.getInt32(M)); };
+        auto U = ir.CreateExtractElement(Coord, Axis);
+        auto Half = ir.CreateFMul(U, Real(0.5));
+        // the range is reduced before the coordinate is scaled, so one far out keeps its fraction
+        auto Ranged = ir.CreateSelect(
+            Is(SM50_SAMPLER_ADDRESS_REPEAT), ir.CreateFSub(U, Floor(U)),
+            ir.CreateSelect(
+                Is(SM50_SAMPLER_ADDRESS_MIRROR),
+                ir.CreateFMul(ir.CreateFSub(Half, air.CreateFPUnOp(AIRBuilder::trunc, Half)), Real(2)),
+                FMin(FMax(U, Real(-10)), Real(10))
+            )
+        );
+        auto Scaled = ir.CreateFSub(
+            ir.CreateFAdd(
+                ir.CreateFMul(Ranged, air.CreateConvertToFloat(N, Signedness::Unsigned)),
+                Real(Info.is_cube ? 0 : Offset[Axis])
+            ),
+            ir.CreateSelect(Linear, Real(0.5), Real(0))
+        );
+        Scaled = Fixed(Scaled);
+        auto Below = Floor(Scaled);
+        auto Weighted = ir.CreateAnd(Linear, ir.CreateFCmpOGT(ir.CreateFSub(Scaled, Below), Real(0)));
+        auto Left = air.CreateConvertToSigned(Below);
+        auto End = ir.CreateSub(N, ir.getInt32(1));
+        auto Inside = [&](Value *V) {
+          return air.CreateIntBinOp(
+              AIRBuilder::min, air.CreateIntBinOp(AIRBuilder::max, V, ir.getInt32(0), true), End, true
+          );
+        };
+        auto Wrapped = [&](Value *V, Value *Period) {
+          auto R = ir.CreateSRem(V, Period);
+          return ir.CreateSelect(ir.CreateICmpSLT(R, ir.getInt32(0)), ir.CreateAdd(R, Period), R);
+        };
+        for (unsigned k = 0; k < 2; k++) {
+          auto I = ir.CreateAdd(Left, ir.getInt32(k));
+          auto Twice = Wrapped(I, ir.CreateShl(N, 1));
+          Value *ByMode[SM50_SAMPLER_ADDRESS_COUNT] = {
+              Inside(I),
+              Inside(ir.CreateSelect(ir.CreateICmpSLT(I, ir.getInt32(0)), ir.CreateNot(I), I)),
+              Wrapped(I, N),
+              ir.CreateSelect(ir.CreateICmpSLT(Twice, N), Twice, ir.CreateSub(ir.CreateAdd(N, End), Twice)),
+              Inside(I),
+          };
+          Value *Index = ByMode[0];
+          for (unsigned m = 1; m < SM50_SAMPLER_ADDRESS_COUNT; m++)
+            Index = ir.CreateSelect(Is(SM50_SAMPLER_ADDRESS(m)), ByMode[m], Index);
+          Texels[Axis][k] = {
+              Index, k ? Weighted : ir.getTrue(),
+              ir.CreateAnd(Is(SM50_SAMPLER_ADDRESS_BORDER), ir.CreateICmpNE(Inside(I), I))
+          };
+        }
+      }
+      for (unsigned Corner = 0; Corner < (1u << Dimension); Corner++) {
+        Value *Position = Constant::getNullValue(PositionTy);
+        Value *Kept = MipKept, *Outside = ir.getFalse();
+        for (unsigned Axis = 0; Axis < Dimension; Axis++) {
+          auto &T = Texels[Axis][Corner >> Axis & 1];
+          Position = PositionTy->isVectorTy() ? ir.CreateInsertElement(Position, T.Index, Axis) : T.Index;
+          Kept = ir.CreateAnd(Kept, T.Kept);
+          Outside = ir.CreateOr(Outside, T.Outside);
+        }
+        Value *Read = air.CreateRead(Own.Texture, Own.Handle, Position, ArrayIndex, Face, Mip).first;
+        if (!Info.is_cube)
+          Read = ir.CreateSelect(Outside, BorderColor(), Read);
+        // the first texel of the first mip always has weight
+        Result = Result ? ir.CreateSelect(Kept, Reduced(Result, Read), Result) : Read;
+      }
+    }
+    ir.CreateRet(Result);
+  }
+  Value *Result = ir.CreateCall(
+      Reducer, {Tex.Handle, Sampler, SamplerMetadata, Border && Custom ? Border : ir.getInt64(0),
+                Custom ? Tex.Range : (Value *)ir.getInt64(0), Coord, ArrayIndex ? ArrayIndex : ir.getInt32(0), LOD}
+  );
+  if (Tex.Texture.Unbound)
+    Result = ir.CreateSelect(Tex.Texture.Unbound, Constant::getNullValue(Texel), Result);
+  if (Derivatives)
+    Result = ir.CreateSelect(Reduces, Result, Filtered.first);
+  auto From = ir.GetInsertBlock();
+  ir.CreateBr(Tail);
+  ir.SetInsertPoint(Tail, Tail->begin());
+  auto Merged = ir.CreatePHI(Filtered.first->getType(), 2);
+  Merged->addIncoming(Filtered.first, Head);
+  Merged->addIncoming(Result, From);
+  return {Merged, Filtered.second};
 }
 
 std::pair<llvm::Value *, llvm::Value *>
@@ -3121,18 +3606,34 @@ Converter::operator()(const InstCut &Inst) {
 void
 Converter::HullGenerateWorkload(
     const char *Domain, llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, uint32_t Capacity,
-    TessellatorPartitioning Partitioning, llvm::ArrayRef<llvm::Value *> TessFactors
+    llvm::Value *GroupsPtr, uint32_t GroupLimit, TessellatorPartitioning Partitioning,
+    llvm::ArrayRef<llvm::Value *> TessFactors
 ) {
   using namespace llvm;
 
   auto &Context = air.getContext();
-  auto Attrs = AttributeList::get(
-      Context, {{3U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
-                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
-                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
-  );
+  // with groups the workloads are read back too (a workload's edges shared with the one before it)
+  auto Attrs = GroupLimit ? AttributeList::get(
+                                Context, {{5U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
+                                          {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                                          {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+                            )
+                          : AttributeList::get(
+                                Context, {{3U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
+                                          {5U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
+                                          {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                                          {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+                            );
 
-  SmallVector<Value *> Ops{PatchIndex, CountPtr, DataPtr, ir.getInt32(Capacity), ir.getInt32((uint32_t)Partitioning)};
+  SmallVector<Value *> Ops{
+      PatchIndex,
+      CountPtr,
+      DataPtr,
+      ir.getInt32(Capacity),
+      GroupsPtr ? GroupsPtr : llvm::Constant::getNullValue(DataPtr->getType()),
+      ir.getInt32(GroupLimit),
+      ir.getInt32((uint32_t)Partitioning)
+  };
   Ops.append(TessFactors.begin(), TessFactors.end());
   SmallVector<Type *> Tys;
   for (auto Op : Ops)
@@ -3205,6 +3706,68 @@ Converter::DomainGetLocation(llvm::Value *WorkloadIndex, llvm::Value *ThreadInde
       ir.CreateExtractValue(Return, 0ull), ir.CreateIsNotNull(ir.CreateExtractValue(Return, 1)),
       ir.CreateIsNotNull(ir.CreateExtractValue(Return, 2))
   };
+}
+
+std::tuple<llvm::Value *, llvm::Value *, llvm::Value *>
+Converter::DomainGetGroupLocation(llvm::Value *First, llvm::Value *End, llvm::Value *ThreadIndex, llvm::Value *DataPtr) {
+  using namespace llvm;
+
+  auto &Context = air.getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{4U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+                {4U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)}}
+  );
+  SmallVector<Value *> Ops{First, End, ThreadIndex, DataPtr};
+  SmallVector<Type *> Tys;
+  for (auto Op : Ops)
+    Tys.push_back(Op->getType());
+  auto Fn = air.getModule()->getOrInsertFunction(
+      "mullion.get_group_location",
+      llvm::FunctionType::get(
+          llvm::StructType::create(Context, {air.getFloatTy(2), air.getByteTy(), air.getByteTy()}, ""), Tys, false
+      ),
+      Attrs
+  );
+  auto Return = ir.CreateCall(Fn, Ops);
+  return {
+      ir.CreateExtractValue(Return, 0ull), ir.CreateIsNotNull(ir.CreateExtractValue(Return, 1)),
+      ir.CreateIsNotNull(ir.CreateExtractValue(Return, 2))
+  };
+}
+
+void
+Converter::DomainGenerateGroup(
+    llvm::Value *First, llvm::Value *End, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive,
+    llvm::Value *Behind, llvm::Value *Lane
+) {
+  using namespace llvm;
+
+  auto &Context = air.getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{3U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+                {3U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {5U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+  );
+  auto TyBehind = ir.getInt32Ty()->getPointerTo(3);
+  SmallVector<Value *> Ops{
+      First, End, DataPtr, air.getMeshHandle(), Behind ? Behind : llvm::Constant::getNullValue(TyBehind), Lane
+  };
+  SmallVector<Type *> Tys;
+  for (auto Op : Ops)
+    Tys.push_back(Op->getType());
+  const char *Suffix = Primitive == TessellatorOutputPrimitive::point          ? ".point"
+                       : Primitive == TessellatorOutputPrimitive::line         ? ".line"
+                       : Primitive == TessellatorOutputPrimitive::triangle_ccw ? ".triangle_ccw"
+                                                                               : ".triangle";
+  auto Fn = air.getModule()->getOrInsertFunction(
+      std::string("mullion.domain_generate_group") + Suffix, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs
+  );
+  ir.CreateCall(Fn, Ops);
 }
 
 // the domain location of a corner of the workload's primitive, and whether the workload has that primitive

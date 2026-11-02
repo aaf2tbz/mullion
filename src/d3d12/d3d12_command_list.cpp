@@ -27,6 +27,8 @@
 #include <span>
 #include <cmath>
 #include "util_env.hpp"
+#include "d3d12_interfaces.hpp"
+#include "mullion_scaler.hpp"
 
 namespace mullion {
 
@@ -173,6 +175,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {{}};
   // where the pass's viewports' depth ranges and raster scale are in the GPU heap, for indirect commands to bind
   uint64_t depth_ranges_ = 0, raster_scale_ = 0;
+  // what raster_scale_ holds, which the parts of a mesh grid copy (DispatchMesh)
+  uint32_t raster_scale_words_[SM50_RASTER_SCALE_WORDS] = {};
 
   UINT num_scissors;
   D3D12_RECT
@@ -741,6 +745,10 @@ public:
     shading_rate_combiners_[0] = shading_rate_combiners_[1] = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
     shading_rate_image_ = nullptr;
     shading_rate_pass_ = nullptr;
+    // the samples in the bounds were found for another recording's depth and range, in a pass the allocator may give
+    // again
+    depth_bounds_pass_ = nullptr;
+    depth_bounds_stale_ = true;
 
     rootsig_graphics_ = nullptr;
     memset(rootarg_graphics_staging_, 0, sizeof(rootarg_graphics_staging_));
@@ -749,6 +757,7 @@ public:
     memset(rootarg_compute_staging_, 0, sizeof(rootarg_compute_staging_));
 
     memset(vertex_buffers_.data(), 0, sizeof(vertex_buffers_));
+    std::fill(std::begin(so_views_), std::end(so_views_), D3D12_STREAM_OUTPUT_BUFFER_VIEW{});
 
     index_buffer_address = 0;
     index_buffer = {};
@@ -771,6 +780,7 @@ public:
     ResetState(pInitialPipelineState);
     bundle_.clear();
     clears_.clear();
+    markers_.clear();
     plain_pass_ = nullptr;
     overlap_targets_.clear();
     named_.clear();
@@ -815,6 +825,12 @@ public:
       return S_OK;
     }
 
+    if (riid == __uuidof(IMTLD3D12CommandListExt)) {
+      AddRef();
+      *ppvObject = static_cast<IMTLD3D12CommandListExt *>(&upscale_ext_);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D12GraphicsCommandList), riid)) {
       WARN("D3D12GraphicsCommandList: Unknown interface query ", str::format(riid));
     }
@@ -831,6 +847,7 @@ public:
   Close() {
     if (encoder_count < std::numeric_limits<size_t>::max())
       return FAIL(E_FAIL);
+    WriteMarkers();
     SumOcclusion();
     SumStatistics();
     EndPredication();
@@ -1098,7 +1115,8 @@ public:
     if (auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
         allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render &&
         ((dirty_state_.test(DirtyState::ScissorRect) && pass->scissors + count > WMT::kPassRectangles) ||
-         (dirty_state_.test(DirtyState::Viewport) && pass->viewports + count > WMT::kPassRectangles)))
+         (dirty_state_.test(DirtyState::Viewport) && pass->viewports + count > WMT::kPassRectangles) ||
+         (pass->rasterless && !pso_graphics_->rasterless)))
       allocator_->InvalidateCurrentPass();
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
 
@@ -1164,6 +1182,10 @@ public:
         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
         render_target_array_length = std::max(render_target_array_length, AttachmentDesc.RenderTargetArrayLength);
       }
+      if (!effective_rtvs && pso_graphics_->rasterless) {
+        render->rasterless = true;
+        render_target_width = render_target_height = 1;
+      }
       render->render_target_width = render_target_width;
       render->render_target_height = render_target_height;
       render->render_target_array_length = render_target_array_length;
@@ -1194,10 +1216,12 @@ public:
         CountVisibility();
     }
 
+    // the conservative rasterizer's viewports and state, bound again when they or the pipeline change
+    bool conservative_dirty = dirty_state_.test(DirtyState::GraphicsPipelineState) || dirty_state_.test(DirtyState::Viewport);
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       // a pipeline for a topology with adjacency is made here, and may fail
       auto pipeline = Pipeline();
-      if (!pipeline || (pso_graphics_->stream_output && !Pipeline(true)))
+      if (!pipeline || (pso_graphics_->stream_output && !SinglePass() && !Pipeline(true)))
         return DrawCallStatus::Invalid;
       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd_setpso.type = WMTRenderCommandSetPSO;
@@ -1221,9 +1245,11 @@ public:
       cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
       // one by one: libstdc++ assigns no std::array to a std::tuple of references
-      auto [depth_bias, depth_bias_clamp, scole_scale] = depth_bias_.value_or(
-        std::array{pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale}
-      );
+      auto [depth_bias, depth_bias_clamp, scole_scale] =
+          pso_graphics_->unbiased ? std::array<FLOAT, 3>{}
+                                  : depth_bias_.value_or(std::array{
+                                        pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale
+                                    });
       cmd_setrs.depth_bias = depth_bias;
       cmd_setrs.depth_bias_clamp = depth_bias_clamp;
       cmd_setrs.scole_scale = scole_scale;
@@ -1236,19 +1262,26 @@ public:
     // a mesh shader pipeline has an object stage (its amplification shader, if any) and a mesh stage
     bool mesh = pso_graphics_->threads_per_patch || Geometry() || pso_graphics_->mesh_shader;
     bool vertex = !mesh;
+    // the root arguments and static samplers reach the mesh stage where its function reads them
+    // (mesh_reads_root_arguments): not the pass-through mesh stage of a pipeline without a geometry shader
+    bool mesh_reads = mesh && pso_graphics_->mesh_reads_root_arguments;
     auto geometry_buffer = [&](uint64_t Offset, uint8_t Index) {
-      if (mesh) {
+      if (mesh)
         EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, Index);
+      if (mesh_reads)
         EncodeBuffer(WMTRenderCommandSetMeshBuffer, Offset, Index);
-      }
       if (vertex)
         EncodeBuffer(WMTRenderCommandSetVertexBuffer, Offset, Index);
       EncodeBuffer(WMTRenderCommandSetFragmentBuffer, Offset, Index);
     };
     if (dirty_state_.test(DirtyState::VertexBuffer)) {
       auto [Offset, Stride] = PopulateVertexBufferTable(1);
-      if (Stride && mesh)
+      // and the mesh stage, which runs the vertex shader where a list of triangles has it alone (MeshOnly)
+      if (Stride && mesh) {
         EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, SM50_BINDING_INDEX_VERTEX_BUFFER);
+        if (pso_graphics_->mesh_only)
+          EncodeBuffer(WMTRenderCommandSetMeshBuffer, Offset, SM50_BINDING_INDEX_VERTEX_BUFFER);
+      }
       if (Stride && vertex)
         EncodeBuffer(WMTRenderCommandSetVertexBuffer, Offset, SM50_BINDING_INDEX_VERTEX_BUFFER);
       dirty_state_.clr(DirtyState::VertexBuffer);
@@ -1270,7 +1303,7 @@ public:
 
     // a conservative rasterizer's mesh stage grows triangles by pixels of the viewport each chooses, clipping depth
     // as the pipeline does and facing as it does
-    if (pso_graphics_->conservative) {
+    if (pso_graphics_->conservative && conservative_dirty) {
       auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(SM50_CONSERVATIVE_VIEWPORTS), 16);
       auto data = static_cast<SM50_CONSERVATIVE_VIEWPORTS *>(mapped);
       memset(data, 0, sizeof(*data));
@@ -1303,8 +1336,10 @@ public:
       depth_ranges_ = allocator_->gpu_heap_buffer_address_ + ranges_offset;
     }
     if (dirty_state_.test(DirtyState::Viewport)) {
-      auto [scale, scale_offset] = allocator_->AllocateGPUHeap((1 + 2 * SM50_VIEWPORTS) * sizeof(float), alignof(float));
+      auto [scale, scale_offset] = allocator_->AllocateGPUHeap(SM50_RASTER_SCALE_WORDS * sizeof(float), alignof(float));
       *(float *)scale = 1;
+      // a mesh shader's groups from the first (DispatchMesh)
+      std::fill_n((uint32_t *)scale + SM50_RASTER_SCALE_MESH_ORIGIN, 3, 0u);
       // with no viewport set, Metal's covers the pass
       auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
       for (auto i = 0u; i < SM50_VIEWPORTS; i++) {
@@ -1330,6 +1365,7 @@ public:
       EncodeBuffer(WMTRenderCommandSetVertexBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
       EncodeBuffer(WMTRenderCommandSetMeshBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
       raster_scale_ = allocator_->gpu_heap_buffer_address_ + scale_offset;
+      std::copy_n((const uint32_t *)scale, SM50_RASTER_SCALE_WORDS, raster_scale_words_);
       dirty_state_.clr(DirtyState::Viewport);
     }
 
@@ -1580,7 +1616,8 @@ public:
       if (pass->colors[i].attachment)
         mask |= 1u << i;
     return pso_graphics_->RenderTargets(
-        Pipeline, mask, pass->dsv_planar_flags, !active_statistics_.empty(), !active_queries_.empty(), CoarseShading()
+        Pipeline, mask, pass->dsv_planar_flags, !active_statistics_.empty(), !active_queries_.empty(), CoarseShading(),
+        dsv.Texture ? dsv.Texture->pixelFormat(dsv.View) : WMTPixelFormatInvalid
     );
   }
 
@@ -1596,8 +1633,15 @@ public:
     return RenderTargets(pso_graphics_->geometry_shader && strip ? pso_graphics_->pso_strip : pso_graphics_->pso);
   }
 
+  // whether the draw's pipeline is a mesh function alone, which runs the vertex shader in the mesh stage: a list of
+  // triangles passed through (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's mesh_only)
+  bool
+  MeshOnly() {
+    return pso_graphics_->mesh_only && !PassesAdjacency() && !pso_graphics_->patches && !Strip(topology_);
+  }
+
   // a geometry-shader draw runs its vertices in warps of object threadgroups (airconv's layout), which read the draw's
-  // D3D12 arguments and its index buffer view, empty for a draw without indices
+  // D3D12 arguments and its index buffer view, empty for a draw without indices; or of mesh threadgroups (MeshOnly)
   template <typename Arguments>
   void
   EncodeGeometryDraw(const Arguments &Args, uint32_t Count, const D3D12_INDEX_BUFFER_VIEW &View) {
@@ -1625,23 +1669,30 @@ public:
     // the object stage reads the vertex count from the arguments' first word, so a skipped draw has none
     if (predication_region_)
       predicated_.push_back({uint32_t((Offset + sizeof(View)) / 4), reinterpret_cast<const uint32_t *>(&Args)[0], 0});
-    EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, SM50_BINDING_INDEX_INDEX_BUFFER);
-    EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset + sizeof(View), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+    bool mesh_only = MeshOnly();
+    auto stage = mesh_only ? WMTRenderCommandSetMeshBuffer : WMTRenderCommandSetObjectBuffer;
+    EncodeBuffer(stage, Offset, SM50_BINDING_INDEX_INDEX_BUFFER);
+    EncodeBuffer(stage, Offset + sizeof(View), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
     auto draw = [&] {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_mullion_geometry_draw>();
-      cmd.type = WMTRenderCommandMullionGeometryDraw;
+      cmd.type = mesh_only ? WMTRenderCommandMullionMeshDraw : WMTRenderCommandMullionGeometryDraw;
       cmd.draw_arguments_offset = Offset + sizeof(View);
       cmd.warp_count = warps;
       cmd.instance_count = Args.InstanceCount;
       cmd.vertex_per_warp = vertex_per_warp;
       cmd.max_object_threadgroups = *parts;
+      // a conservative hull's points, a thread each
+      cmd.mesh_threads = pso_graphics_->conservative_hull ? SM50_CONSERVATIVE_HULL_POINTS : 1;
     };
     if (!pso_graphics_->stream_output)
       return draw();
     auto targets = StreamOutputTargets();
     uint64_t groups = uint64_t(warps) * Args.InstanceCount;
-    auto [Scratch, ScratchOffset] =
-        allocator_->AllocateGPUHeap(SM50StreamOutputScratch(groups, vertex_per_warp * pso_graphics_->gs_instances), 16);
+    // one pass keeps only the filled sizes
+    bool single = SinglePass();
+    auto [Scratch, ScratchOffset] = allocator_->AllocateGPUHeap(
+        single ? SM50StreamOutputZeroed(0) : SM50StreamOutputScratch(groups, vertex_per_warp * pso_graphics_->gs_instances), 16
+    );
     // a draw whose scratch no heap has room for: the list fails when it is closed
     if (!Scratch)
       return;
@@ -1658,7 +1709,15 @@ public:
       cmd.primitive_type = WMTPrimitiveTypePoint;
       cmd.vertex_count = SM50StreamOutputZeroed(groups) / sizeof(uint32_t);
       cmd.instance_count = 1;
-    });
+    }, single);
+  }
+
+  // whether the draw's stream output runs in one pass (SM50StreamOutputSinglePass): the pipeline's variant for the
+  // topology was made so
+  bool
+  SinglePass() {
+    return !PassesAdjacency() && !pso_graphics_->patches &&
+           (Strip(topology_) ? pso_graphics_->so_single_strip : pso_graphics_->so_single);
   }
 
   // the stream output targets bound, with no scratch area yet
@@ -1678,13 +1737,14 @@ public:
   // invocation's primitives, and after a barrier again, writing them and drawing. its scratch area holds the filled
   // sizes, a total per stream and object threadgroup, and a count per stream and invocation (at most a primitive per
   // vertex). the passes add to all but the counts, which `zero` zeroes first (zero_words), on every execution of the
-  // list, replays included
+  // list, replays included. in one pass (`single`, SM50StreamOutputSinglePass) the draw runs once, after its filled
+  // sizes are copied to its scratch (stream_output_snapshot), which is all the scratch holds
   template <typename Draw, typename Zero>
   void
-  StreamOut(uint64_t TargetsOffset, uint64_t ScratchOffset, Draw draw, Zero zero) {
+  StreamOut(uint64_t TargetsOffset, uint64_t ScratchOffset, Draw draw, Zero zero, bool single = false) {
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, TargetsOffset, SM50_BINDING_INDEX_STREAM_OUTPUT0);
     EncodeBuffer(WMTRenderCommandSetMeshBuffer, TargetsOffset, SM50_BINDING_INDEX_STREAM_OUTPUT0);
-    EncodeBuffer(WMTRenderCommandSetVertexBuffer, ScratchOffset, kCustomBufferArgumentIndex0);
+    EncodeBuffer(WMTRenderCommandSetVertexBuffer, single ? TargetsOffset : ScratchOffset, kCustomBufferArgumentIndex0);
     auto set_pso = [&](WMT::RenderPipelineState pso) {
       auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
@@ -1697,6 +1757,19 @@ public:
       cmd.stages_after = after;
       cmd.stages_before = before;
     };
+    if (single) {
+      set_pso(device_->GetLib().StreamOutputSnapshot());
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
+      cmd = {WMTRenderCommandDraw};
+      cmd.primitive_type = WMTPrimitiveTypePoint;
+      cmd.vertex_count = std::size(so_views_);
+      cmd.instance_count = 1;
+      barrier(WMTRenderStageVertex, WMTRenderStagePreRaster);
+      set_pso(Pipeline());
+      draw();
+      barrier(WMTRenderStagePreRaster, WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
+      return;
+    }
     set_pso(device_->GetLib().ZeroWords());
     zero();
     barrier(WMTRenderStageVertex, WMTRenderStagePreRaster);
@@ -2691,9 +2764,11 @@ public:
     if (pso_graphics_.ptr() == graphics_pso)
       return;
     // tessellation, geometry shaders and stream output bind root arguments to other stages
+    // and a pipeline whose mesh stage reads them, or reads the vertex buffers (mesh_only), to others again
     auto stages = [&](MTLD3D12GraphicsPipelineState *p) {
       bool adjacency = p->adjacency && Adjacency(topology_);
-      return p->threads_per_patch || p->geometry_shader || p->mesh_shader || adjacency;
+      return (p->threads_per_patch || p->geometry_shader || p->mesh_shader || adjacency) |
+             p->mesh_reads_root_arguments << 1 | p->mesh_only << 2;
     };
     if (!pso_graphics_ || stages(pso_graphics_.ptr()) != stages(graphics_pso))
       dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature, DirtyState::VertexBuffer);
@@ -2702,7 +2777,8 @@ public:
       dirty_state_.set(DirtyState::VertexBuffer);
     if (!pso_graphics_ || pso_graphics_->forced_sample_count != graphics_pso->forced_sample_count ||
         ((pso_graphics_->rtv_mask ^ graphics_pso->rtv_mask) & ((1u << num_rtvs) - 1)) ||
-        (dsv.Texture && pso_graphics_->dsv_mask != graphics_pso->dsv_mask))
+        (dsv.Texture && ((pso_graphics_->dsv_mask ^ graphics_pso->dsv_mask) &
+                         DepthStencilPlanarFlags(dsv.Texture->pixelFormat(dsv.View)))))
       allocator_->InvalidateCurrentPass();
     if (graphics_pso->shader_blend)
       dirty_state_.set(DirtyState::BlendFactor);
@@ -2738,7 +2814,7 @@ public:
   // a pass, where draws and dispatches run unordered. one that orders writes a draw made (UAV, render target, depth,
   // stream output) or aliases memory ends the render pass, and the next draw opens one that loads what this one
   // stored. a dispatch writes through UAVs alone and keeps its pass: `dispatched` is a barrier on one, before or after.
-  // true when no later barrier of the call can matter
+  // true when no later barrier of the call can order more; their resources still count (BarrierLeaves, BarrierNames)
   bool
   Order(bool drew, bool dispatched) {
     auto type = allocator_->encoder_current ? allocator_->encoder_current->type : EncoderType::Null;
@@ -2752,6 +2828,7 @@ public:
   }
 
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
+    WriteMarkers();
     OrderingPoint();
     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
                        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
@@ -2769,6 +2846,7 @@ public:
       return;
     }
     barrier_serial_++;
+    bool ordered = false;
     for (auto &barrier : std::span(barriers, Count)) {
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
         clear_joinable_ = false, va_found_ = nullptr;
@@ -2783,19 +2861,19 @@ public:
         BarrierNames(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? barrier.Transition.pResource
                      : barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV      ? barrier.UAV.pResource
                                                                             : nullptr);
+      if (ordered)
+        continue;
       // a UAV barrier orders UAV accesses alone: a render pass whose draws used none keeps going, as a dispatch's would
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && allocator_->encoder_current &&
           allocator_->encoder_current->type == EncoderType::Render &&
           allocator_->encoder_current != uav_draw_pass_) {
-        if (Order(false, true))
-          return;
+        ordered = Order(false, true);
         continue;
       }
       bool other = barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
       auto &states = barrier.Transition;
-      if (Order(other || ((states.StateBefore & draw_writes) && PassWrote(states.pResource)),
-                other || ((states.StateBefore | states.StateAfter) & uav)))
-        return;
+      ordered = Order(other || ((states.StateBefore & draw_writes) && PassWrote(states.pResource)),
+                      other || ((states.StateBefore | states.StateAfter) & uav));
     }
   };
 
@@ -2981,6 +3059,9 @@ public:
 
   void STDMETHODCALLTYPE
   IASetVertexBuffers(UINT StartSlot, UINT Count, const D3D12_VERTEX_BUFFER_VIEW *Views) {
+    // a range past the last slot is invalid, and changes no slot, as in vkd3d-proton
+    if (StartSlot >= vertex_buffers_.size() || Count > vertex_buffers_.size() - StartSlot)
+      return;
     if (Bundled() && Record([=, v = Views ? std::vector(Views, Views + Count) : std::vector<D3D12_VERTEX_BUFFER_VIEW>()](auto *l) { l->IASetVertexBuffers(StartSlot, Count, Views ? v.data() : nullptr); }))
       return;
     if (!Views)
@@ -3047,7 +3128,8 @@ public:
       if (AttachmentDesc.DepthFormat == DXGI_FORMAT_D16_UNORM)
         Depth = std::nextafter(Depth, 1.0f);
     }
-    if (Rects) {
+    // no rectangles clear the whole view, whatever the array is, as vkd3d-proton does
+    if (Rects && RectCount) {
       UsedTexture(AttachmentDesc.Texture);
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
       for (unsigned i = 0; i < RectCount; i++) {
@@ -3098,7 +3180,8 @@ public:
       return;
     auto stored = RenderTargetColor(AttachmentDesc.Format, Color);
     Color = stored.data();
-    if (Rects) {
+    // no rectangles clear the whole view, whatever the array is, as vkd3d-proton does
+    if (Rects && RectCount) {
       UsedTexture(AttachmentDesc.Texture);
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
       for (unsigned i = 0; i < RectCount; i++) {
@@ -3423,6 +3506,10 @@ public:
     }
     active_queries_.push_back({static_cast<MTLD3D12QueryHeap *>(pHeap), Index, (uint32_t)visibility_slots_.size()});
     CountVisibility();
+    // a pipeline that emulates the depth bounds test has a variant for draws an occlusion query counts
+    // (MTLD3D12GraphicsPipelineState::RenderTargets)
+    if (pso_graphics_ && pso_graphics_->depth_bounds_emulated)
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
   };
 
   void STDMETHODCALLTYPE
@@ -3494,6 +3581,8 @@ public:
     occlusion_sums_.push_back({heap, {Index, query->first, count, Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION}});
     active_queries_.erase(query);
     CountVisibility();
+    if (pso_graphics_ && pso_graphics_->depth_bounds_emulated)
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
   };
 
   void STDMETHODCALLTYPE
@@ -3738,8 +3827,12 @@ public:
         allocator_->InvalidateCurrentPass();
       } else if (rays) {
         // each command is a dispatch of the kernel, of the threadgroups the resolver counts for it
-        auto [_, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(IndirectRays), alignof(IndirectRays));
+        auto [records, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(IndirectRays), alignof(IndirectRays));
         cmd->rays = allocator_->gpu_heap_buffer_address_ + at;
+        // the resolver writes the rest of each command's dispatch
+        for (UINT i = 0; i < MaxCommandCount; i++)
+          if (records)
+            static_cast<IndirectRays *>(records)[i].dispatch.atomic_locks = device_->GetAtomicLocks();
         cmd->ray_flags = ray_flags;
         cmd->tgsize_x = device_->GetSIMDWidth();
         for (UINT i = 0; i < MaxCommandCount; i++, at += sizeof(IndirectRays)) {
@@ -3884,6 +3977,11 @@ public:
     // the command's stages read and has the threadgroups the resolver left for it (none past the count)
     auto heap = allocator_->gpu_heap_buffer_address_;
     WMTSize object{cmd->geometry_threads, 1, 1}, mesh{1, 1, 1};
+    // a mesh function alone takes the warps as mesh threadgroups, and what the object stage reads (MeshOnly)
+    bool mesh_only = geometry && MeshOnly();
+    auto stage = mesh_only ? WMTRenderCommandSetMeshBuffer : WMTRenderCommandSetObjectBuffer;
+    if (mesh_only)
+      std::swap(object, mesh);
     if (dispatch_mesh) {
       object = {cmd->object_threads[0], cmd->object_threads[1], cmd->object_threads[2]};
       mesh = {cmd->mesh_threads[0], cmd->mesh_threads[1], cmd->mesh_threads[2]};
@@ -3895,7 +3993,7 @@ public:
     if (!dispatch_mesh && !cmd->threads_per_patch) {
       auto [origin, origin_offset] = allocator_->AllocateGPUHeap(2 * sizeof(uint32_t), 8);
       memset(origin, 0, 2 * sizeof(uint32_t));
-      EncodeBuffer(WMTRenderCommandSetObjectBuffer, origin_offset, SM50_BINDING_INDEX_DRAW_ORIGIN);
+      EncodeBuffer(stage, origin_offset, SM50_BINDING_INDEX_DRAW_ORIGIN);
     }
     for (UINT i = 0; i < MaxCommandCount; i++) {
       auto at = cmd->draws - heap + i * sizeof(IndirectMeshDraw);
@@ -3906,17 +4004,14 @@ public:
       }
       if (!dispatch_mesh) {
         EncodeBuffer(
-            WMTRenderCommandSetObjectBuffer, cmd->vertex_buffer - heap + i * cmd->vertex_argbuf_stride,
-            SM50_BINDING_INDEX_VERTEX_BUFFER
+            stage, cmd->vertex_buffer - heap + i * cmd->vertex_argbuf_stride, SM50_BINDING_INDEX_VERTEX_BUFFER
         );
-        EncodeBuffer(WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, view), SM50_BINDING_INDEX_INDEX_BUFFER);
+        EncodeBuffer(stage, at + offsetof(IndirectMeshDraw, view), SM50_BINDING_INDEX_INDEX_BUFFER);
         if (cmd->threads_per_patch)
           EncodeBuffer(
               WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, control_points), SM50_BINDING_INDEX_PATCH_SIZE
           );
-        EncodeBuffer(
-            WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, arguments), SM50_BINDING_INDEX_DRAW_ARGUMENTS
-        );
+        EncodeBuffer(stage, at + offsetof(IndirectMeshDraw, arguments), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       }
       auto draw = [&] {
         auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
@@ -3936,7 +4031,7 @@ public:
         zero.primitive_type = WMTPrimitiveTypePoint;
         zero.indirect_args_buffer = allocator_->gpu_heap_buffer_;
         zero.indirect_args_offset = at + offsetof(IndirectMeshDraw, zero);
-      });
+      }, SinglePass());
     }
   };
 
@@ -4188,9 +4283,34 @@ public:
           recording_error_ = E_INVALIDARG;
           return;
         }
-    // each value is written in order with the list's other work, whatever the marker mode
-    for (auto &param : std::span(pParams, Count))
+    // a DEFAULT value is written in order with the list's other work. a marker (MARKER_IN, MARKER_OUT: written once
+    // the work before has begun, or has completed) waits for the next barrier, DEFAULT write or Close, which write
+    // the markers waiting together: a title writes thousands a frame (dttdrv/mullion#32: Starfield about 5,000), and
+    // a write of its own ends the pass around it. nothing else reads or writes a marker's buffer before then, as that
+    // needs a barrier out of COPY_DEST, which writing one promotes the buffer to
+    for (UINT i = 0; i < Count; i++) {
+      auto &param = pParams[i];
+      if (pModes && pModes[i] != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT) {
+        markers_.push_back({param.Dest, param.Value});
+        continue;
+      }
+      WriteMarkers();
       WriteImmediate(param.Dest, &param.Value, sizeof(param.Value));
+    }
+  }
+
+  // WriteBufferImmediate's markers that wait, in the order they were given
+  struct Marker {
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+    UINT value;
+  };
+  std::vector<Marker> markers_;
+
+  void
+  WriteMarkers() {
+    for (auto &marker : markers_)
+      WriteImmediate(marker.address, &marker.value, sizeof(marker.value));
+    markers_.clear();
   }
 
   // the buffer and offset a GPU address is in
@@ -4756,6 +4876,7 @@ public:
     };
     if (!BeginRays(dispatch.pipeline_flags))
       return;
+    dispatch.atomic_locks = device_->GetAtomicLocks();
     auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(dispatch), alignof(SM50_RAY_DISPATCH));
     if (allocator_->records_)
       allocator_->RecordGPUHeap(mapped, sizeof(dispatch), "ray dispatch");
@@ -4836,25 +4957,81 @@ public:
       return;
     CountDraw(0, 0);
     // the groups are the amplification shader's, or without one the mesh shader's
-    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
-    cmd.type = WMTRenderCommandDrawMeshThreadgroups;
-    cmd.threadgroup_per_grid = {ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
     auto size = [](const uint32_t threads[3]) { return WMTSize{threads[0], threads[1], threads[2]}; };
-    cmd.object_threadgroup_size = size(pso_graphics_->object_threads);
-    cmd.mesh_threadgroup_size = size(pso_graphics_->mesh_threads);
+    auto draw = [&](UINT x, UINT y, UINT z) {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
+      cmd.type = WMTRenderCommandDrawMeshThreadgroups;
+      cmd.threadgroup_per_grid = {x, y, z};
+      cmd.object_threadgroup_size = size(pso_graphics_->object_threads);
+      cmd.mesh_threadgroup_size = size(pso_graphics_->mesh_threads);
+    };
+    // D3D12 lets a grid have 2^22 groups (Mesh Shader spec, "DispatchMesh API"), Metal's mesh grids fewer (1024
+    // before Apple9, then 2^20 - 1): without an amplification shader, a grid past that runs in boxes of whole slices,
+    // or of whole rows, or of parts of a row, each with its first group in the raster scale's buffer
+    // (SM50_RASTER_SCALE_MESH_ORIGIN). an amplification shader's grid is an object grid, which has no such limit
+    uint64_t limit = pso_graphics_->mesh_grid_limit, x = ThreadGroupCountX, y = ThreadGroupCountY,
+             z = ThreadGroupCountZ;
+    if (pso_graphics_->object_stage || !limit || x * y * z <= limit || !raster_scale_) {
+      draw(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+      return;
+    }
+    uint64_t width = std::min(x, limit), rows = x * y <= limit ? y : std::max<uint64_t>(limit / x, 1),
+             slices = x * y <= limit ? limit / (x * y) : 1;
+    for (uint64_t k = 0; k < z; k += slices)
+      for (uint64_t j = 0; j < y; j += rows)
+        for (uint64_t i = 0; i < x; i += width) {
+          auto [part, offset] = allocator_->AllocateGPUHeap(SM50_RASTER_SCALE_WORDS * sizeof(uint32_t), alignof(uint32_t));
+          if (!part)
+            return;
+          std::copy_n(raster_scale_words_, SM50_RASTER_SCALE_MESH_ORIGIN, (uint32_t *)part);
+          auto origin = (uint32_t *)part + SM50_RASTER_SCALE_MESH_ORIGIN;
+          origin[0] = i, origin[1] = j, origin[2] = k;
+          EncodeBuffer(WMTRenderCommandSetMeshBuffer, offset, SM50_BINDING_INDEX_RASTER_SCALE);
+          draw(std::min(width, x - i), std::min(rows, y - j), std::min(slices, z - k));
+        }
+    // the next draw binds the raster scale again, from the first group
+    dirty_state_.set(DirtyState::Viewport);
   }
 
   // enhanced barriers order work as ResourceBarrier does
   void STDMETHODCALLTYPE
   Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups) {
+    WriteMarkers();
     barrier_serial_++;
     OrderingPoint();
+    // an access to or from NO_ACCESS hands memory from one resource to another that aliases it (Enhanced Barriers,
+    // Resource Aliasing), after which another may take the addresses. once a reserved buffer exists, an access from
+    // NO_ACCESS, which makes a resource the one that uses the memory, is ordered as ResourceBarrier orders an ALIASING
+    // barrier; the access to NO_ACCESS before it needs nothing of its own, as that orders all the work before it
+    bool aliasing = false, activates = false;
+    for (auto &group : std::span(pBarrierGroups, NumBarrierGroups))
+      for (UINT32 i = 0; i < group.NumBarriers; i++) {
+        auto [before, after] =
+            group.Type == D3D12_BARRIER_TYPE_GLOBAL
+                ? std::pair{group.pGlobalBarriers[i].AccessBefore, group.pGlobalBarriers[i].AccessAfter}
+                : group.Type == D3D12_BARRIER_TYPE_TEXTURE
+                      ? std::pair{group.pTextureBarriers[i].AccessBefore, group.pTextureBarriers[i].AccessAfter}
+                      : std::pair{group.pBufferBarriers[i].AccessBefore, group.pBufferBarriers[i].AccessAfter};
+        aliasing |= before == D3D12_BARRIER_ACCESS_NO_ACCESS || after == D3D12_BARRIER_ACCESS_NO_ACCESS;
+        activates |= before == D3D12_BARRIER_ACCESS_NO_ACCESS;
+      }
+    if (aliasing)
+      va_found_ = nullptr;
+    if (activates && device_->HasSparseBuffers()) {
+      clears_.clear();
+      named_.clear();
+      allocator_->InvalidateCurrentPass();
+      allocator_->AllocatePass<EncoderData>()->type = EncoderType::Settle;
+      allocator_->InvalidateCurrentPass();
+      return;
+    }
     constexpr auto uav = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, draw_writes = uav | D3D12_BARRIER_ACCESS_RENDER_TARGET |
                        D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_STREAM_OUTPUT;
     // common access is any access, writes included
     auto any = [](D3D12_BARRIER_ACCESS access, D3D12_BARRIER_ACCESS of) {
       return access == D3D12_BARRIER_ACCESS_COMMON || (access != D3D12_BARRIER_ACCESS_NO_ACCESS && (access & of));
     };
+    bool ordered = false;
     for (auto &group : std::span(pBarrierGroups, NumBarrierGroups))
       for (UINT32 i = 0; i < group.NumBarriers; i++) {
         auto [before, after] =
@@ -4869,10 +5046,307 @@ public:
         if (!clears_.empty())
           BarrierNames(resource);
         BarrierLeaves(resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATES(0));
-        if (Order(any(before, draw_writes) && PassWrote(resource), any(before, uav) || any(after, uav)))
-          return;
+        if (!ordered)
+          ordered = Order(any(before, draw_writes) && PassWrote(resource), any(before, uav) || any(after, uav));
       }
   }
+
+  // MetalFX (IMTLD3D12CommandListExt): a feature's scaler, and the inputs it was made for
+  struct UpscalerCache final : IMTLD3D12Upscaler {
+    void STDMETHODCALLTYPE
+    Destroy() final {
+      delete this;
+    }
+    std::array<uint32_t, 14> key{};
+    Rc<TemporalScaler> temporal;
+    Rc<DenoisedScaler> denoised;
+  };
+
+  static Texture *
+  UpscaleTexture(ID3D12Resource *resource) {
+    return resource ? static_cast<MTLD3D12Resource *>(resource)->texture.ptr() : nullptr;
+  }
+
+  static WMT::Texture
+  UpscaleView(Texture *texture, WMTPixelFormat format = WMTPixelFormatInvalid) {
+    if (!texture)
+      return {};
+    if (format == WMTPixelFormatInvalid || format == texture->pixelFormat())
+      return texture->view(texture->fullView).texture;
+    return texture->view(texture->createView({.format = format, .type = WMTTextureType2D})).texture;
+  }
+
+  // depth and exposure as MetalFX reads them: a 32- or 16-bit texture a game created typeless is held as unsigned
+  // integers, and MetalFX reads those bits as the float they hold (Starfield's depth and exposure are R32_TYPELESS)
+  static WMTPixelFormat
+  ScalarFloatFormat(WMTPixelFormat format) {
+    switch (format) {
+    case WMTPixelFormatR32Uint:
+      return WMTPixelFormatR32Float;
+    case WMTPixelFormatR16Uint:
+      return WMTPixelFormatR16Float;
+    default:
+      return format;
+    }
+  }
+
+  // the float format MetalFX reads motion vectors as: DLSS takes them as floats, held as such or, in a typeless
+  // resource, as unsigned integers. normalized or signed integer motion vectors hold no float to read
+  static WMTPixelFormat
+  MotionVectorFormat(WMTPixelFormat format) {
+    switch (format) {
+    case WMTPixelFormatRG16Uint:
+    case WMTPixelFormatRG16Float:
+      return WMTPixelFormatRG16Float;
+    case WMTPixelFormatRG32Uint:
+    case WMTPixelFormatRG32Float:
+      return WMTPixelFormatRG32Float;
+    case WMTPixelFormatRGBA16Float:
+      return WMTPixelFormatRGBA16Float;
+    default:
+      return WMTPixelFormatInvalid;
+    }
+  }
+
+  // the pass, after everything before it and before everything after it
+  UpscaleEncoderData *
+  RecordUpscale() {
+    OrderingPoint();
+    allocator_->InvalidateCurrentPass();
+    auto pass = allocator_->AllocatePass<UpscaleEncoderData>();
+    pass->type = EncoderType::Upscale;
+    allocator_->InvalidateCurrentPass();
+    OrderingPoint();
+    return pass;
+  }
+
+  HRESULT
+  TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc, IMTLD3D12Upscaler **ppCache) {
+    if (!pDesc || !ppCache)
+      return E_INVALIDARG;
+    auto color = UpscaleTexture(pDesc->Color), output = UpscaleTexture(pDesc->Output),
+         depth = UpscaleTexture(pDesc->Depth), motion = UpscaleTexture(pDesc->MotionVector),
+         exposure = UpscaleTexture(pDesc->ExposureTexture);
+    if (!color || !output || !depth || !motion)
+      return E_INVALIDARG;
+    auto motion_format = MotionVectorFormat(motion->pixelFormat());
+    if (motion_format == WMTPixelFormatInvalid) {
+      ERR("TemporalUpscale: motion vectors of format ", motion->pixelFormat(), " are not supported");
+      return E_INVALIDARG;
+    }
+    if (pDesc->MotionVectorInDisplayRes) {
+      static bool warned = false;
+      if (!std::exchange(warned, true))
+        WARN("TemporalUpscale: motion vectors at the output resolution are not supported yet");
+    }
+    auto depth_format = ScalarFloatFormat(depth->pixelFormat());
+    auto cache = static_cast<UpscalerCache *>(*ppCache);
+    if (!cache)
+      *ppCache = cache = new UpscalerCache;
+    std::array<uint32_t, 14> key{1,
+                                 color->width(),
+                                 color->height(),
+                                 output->width(),
+                                 output->height(),
+                                 uint32_t(color->pixelFormat()),
+                                 uint32_t(output->pixelFormat()),
+                                 uint32_t(depth_format),
+                                 uint32_t(motion_format),
+                                 uint32_t(!!pDesc->AutoExposure)};
+    if (!cache->temporal || cache->key != key) {
+      WMTFXTemporalScalerInfo info{};
+      info.color_format = color->pixelFormat();
+      info.output_format = output->pixelFormat();
+      info.depth_format = depth_format;
+      info.motion_format = motion_format;
+      info.input_width = color->width();
+      info.input_height = color->height();
+      info.output_width = output->width();
+      info.output_height = output->height();
+      info.input_content_min_scale = 1.0f;
+      info.input_content_max_scale = 3.0f;
+      info.auto_exposure = pDesc->AutoExposure;
+      info.input_content_properties_enabled = true;
+      info.requires_synchronous_initialization = true;
+      cache->temporal = new TemporalScaler(device_->GetMTLDevice(), info, device_->UsesMetal4());
+      if (!cache->temporal->scaler().handle) {
+        cache->temporal = nullptr;
+        ERR("TemporalUpscale: MetalFX has no temporal scaler for ", info.input_width, "x", info.input_height, " to ",
+            info.output_width, "x", info.output_height);
+        return E_FAIL;
+      }
+      cache->key = key;
+      Logger::info(str::format(
+          "MetalFX: temporal upscaling ", info.input_width, "x", info.input_height, " to ", info.output_width, "x",
+          info.output_height, device_->UsesMetal4() ? " (Metal 4)" : ""
+      ));
+      // MULLION_LOG_LEVEL=debug: what the game gives the scaler, for an image that comes out wrong
+      if (Logger::logLevel() <= LogLevel::Debug)
+        Logger::debug(str::format(
+            "MetalFX: color format ", color->pixelFormat(), ", output format ", output->pixelFormat(), " usage ",
+            output->usage(), ", depth format ", depth->pixelFormat(), " ", depth->width(), "x", depth->height(),
+            ", motion format ", motion_format, " ", motion->width(), "x", motion->height(), ", exposure ",
+            exposure ? str::format(exposure->pixelFormat(), " ", exposure->width(), "x", exposure->height()) : "none",
+            ", auto exposure ", pDesc->AutoExposure, ", content ", pDesc->InputContentWidth, "x",
+            pDesc->InputContentHeight, ", pre-exposure ", pDesc->PreExposure, ", motion scale ",
+            pDesc->MotionVectorScaleX, ",", pDesc->MotionVectorScaleY, ", depth reversed ", pDesc->DepthReversed,
+            ", motion at output resolution ", pDesc->MotionVectorInDisplayRes
+        ));
+    }
+    auto pass = RecordUpscale();
+    pass->temporal = cache->temporal;
+    pass->color = UpscaleView(color);
+    pass->output = UpscaleView(output);
+    pass->depth = UpscaleView(depth, depth_format);
+    pass->motion = UpscaleView(motion, motion_format);
+    pass->exposure =
+        UpscaleView(exposure, exposure ? ScalarFloatFormat(exposure->pixelFormat()) : WMTPixelFormatInvalid);
+    pass->props = WMTFXTemporalScalerProps{
+        pDesc->InputContentWidth ? pDesc->InputContentWidth : color->width(),
+        pDesc->InputContentHeight ? pDesc->InputContentHeight : color->height(),
+        bool(pDesc->InReset),
+        bool(pDesc->DepthReversed),
+        pDesc->MotionVectorScaleX,
+        pDesc->MotionVectorScaleY,
+        pDesc->JitterOffsetX,
+        pDesc->JitterOffsetY,
+        pDesc->PreExposure,
+    };
+    return S_OK;
+  }
+
+  HRESULT
+  DenoisedUpscale(const MTL_DENOISED_UPSCALE_D3D12_DESC *pDesc, IMTLD3D12Upscaler **ppCache) {
+    if (!pDesc || !ppCache)
+      return E_INVALIDARG;
+    auto color = UpscaleTexture(pDesc->Color), output = UpscaleTexture(pDesc->Output),
+         depth = UpscaleTexture(pDesc->Depth), motion = UpscaleTexture(pDesc->MotionVector),
+         diffuse = UpscaleTexture(pDesc->DiffuseAlbedo), specular = UpscaleTexture(pDesc->SpecularAlbedo),
+         normals = UpscaleTexture(pDesc->Normals),
+         roughness = pDesc->RoughnessInNormalAlpha ? normals : UpscaleTexture(pDesc->Roughness),
+         hit_distance = UpscaleTexture(pDesc->SpecularHitDistance), exposure = UpscaleTexture(pDesc->ExposureTexture);
+    if (!color || !output || !depth || !motion || !diffuse || !specular || !normals || !roughness)
+      return E_INVALIDARG;
+    auto motion_format = MotionVectorFormat(motion->pixelFormat());
+    if (motion_format == WMTPixelFormatInvalid) {
+      ERR("DenoisedUpscale: motion vectors of format ", motion->pixelFormat(), " are not supported");
+      return E_INVALIDARG;
+    }
+    auto cache = static_cast<UpscalerCache *>(*ppCache);
+    if (!cache)
+      *ppCache = cache = new UpscalerCache;
+    auto depth_format = ScalarFloatFormat(depth->pixelFormat());
+    std::array<uint32_t, 14> key{2,
+                                 color->width(),
+                                 color->height(),
+                                 output->width(),
+                                 output->height(),
+                                 uint32_t(color->pixelFormat()),
+                                 uint32_t(output->pixelFormat()),
+                                 uint32_t(depth_format),
+                                 uint32_t(motion_format),
+                                 uint32_t(diffuse->pixelFormat()),
+                                 uint32_t(specular->pixelFormat()),
+                                 uint32_t(normals->pixelFormat()),
+                                 uint32_t(roughness->pixelFormat()),
+                                 uint32_t(hit_distance ? hit_distance->pixelFormat() : 0) << 1 | !!pDesc->AutoExposure};
+    if (!cache->denoised || cache->key != key) {
+      WMTFXDenoisedScalerInfo info{};
+      info.color_format = color->pixelFormat();
+      info.depth_format = depth_format;
+      info.motion_format = motion_format;
+      info.diffuse_albedo_format = diffuse->pixelFormat();
+      info.specular_albedo_format = specular->pixelFormat();
+      info.normal_format = normals->pixelFormat();
+      info.roughness_format = roughness->pixelFormat();
+      info.specular_hit_distance_format = hit_distance ? hit_distance->pixelFormat() : WMTPixelFormatInvalid;
+      info.output_format = output->pixelFormat();
+      info.input_width = color->width();
+      info.input_height = color->height();
+      info.output_width = output->width();
+      info.output_height = output->height();
+      info.auto_exposure = pDesc->AutoExposure;
+      info.requires_synchronous_initialization = true;
+      cache->denoised = new DenoisedScaler(device_->GetMTLDevice(), info, device_->UsesMetal4());
+      if (!cache->denoised->scaler().handle) {
+        cache->denoised = nullptr;
+        ERR("DenoisedUpscale: MetalFX has no denoised scaler for ", info.input_width, "x", info.input_height, " to ",
+            info.output_width, "x", info.output_height);
+        return E_FAIL;
+      }
+      cache->key = key;
+      Logger::info(str::format(
+          "MetalFX: denoised upscaling ", info.input_width, "x", info.input_height, " to ", info.output_width, "x",
+          info.output_height, device_->UsesMetal4() ? " (Metal 4)" : ""
+      ));
+    }
+    auto pass = RecordUpscale();
+    pass->denoised = cache->denoised;
+    auto &args = pass->denoise;
+    args.color = UpscaleView(color).handle;
+    args.depth = UpscaleView(depth, depth_format).handle;
+    args.motion = UpscaleView(motion, motion_format).handle;
+    args.diffuse_albedo = UpscaleView(diffuse).handle;
+    args.specular_albedo = UpscaleView(specular).handle;
+    args.normal = UpscaleView(normals).handle;
+    // MetalFX reads roughness from the first channel: packed in the normals' alpha, it is read through a view whose
+    // red is their alpha
+    args.roughness = pDesc->RoughnessInNormalAlpha
+                         ? UpscaleView(normals, WMTPixelFormat(normals->pixelFormat() | WMTPixelFormatAGBASwizzle)).handle
+                         : UpscaleView(roughness).handle;
+    args.specular_hit_distance = UpscaleView(hit_distance).handle;
+    args.exposure =
+        UpscaleView(exposure, exposure ? ScalarFloatFormat(exposure->pixelFormat()) : WMTPixelFormatInvalid).handle;
+    args.output = UpscaleView(output).handle;
+    args.pre_exposure = pDesc->PreExposure;
+    args.jitter_offset_x = pDesc->JitterOffsetX;
+    args.jitter_offset_y = pDesc->JitterOffsetY;
+    args.motion_vector_scale_x = pDesc->MotionVectorScaleX;
+    args.motion_vector_scale_y = pDesc->MotionVectorScaleY;
+    args.reset = pDesc->InReset;
+    args.depth_reversed = pDesc->DepthReversed;
+    memcpy(args.world_to_view, pDesc->WorldToView, sizeof(args.world_to_view));
+    memcpy(args.view_to_clip, pDesc->ViewToClip, sizeof(args.view_to_clip));
+    return S_OK;
+  }
+
+  class UpscaleExt final : public IMTLD3D12CommandListExt {
+  public:
+    explicit UpscaleExt(MTLD3D12GraphicsCommandListImpl *list) : list_(list) {}
+
+    HRESULT STDMETHODCALLTYPE
+    QueryInterface(REFIID riid, void **ppvObject) final {
+      return list_->QueryInterface(riid, ppvObject);
+    }
+    ULONG STDMETHODCALLTYPE
+    AddRef() final {
+      return list_->AddRef();
+    }
+    ULONG STDMETHODCALLTYPE
+    Release() final {
+      return list_->Release();
+    }
+    BOOL STDMETHODCALLTYPE
+    SupportsTemporalUpscale() final {
+      return list_->device_->GetMTLDevice().supportsFXTemporalScaler();
+    }
+    BOOL STDMETHODCALLTYPE
+    SupportsDenoisedUpscale() final {
+      return list_->device_->GetMTLDevice().supportsFXDenoisedScaler(list_->device_->UsesMetal4());
+    }
+    HRESULT STDMETHODCALLTYPE
+    TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc, IMTLD3D12Upscaler **ppCache) final {
+      return list_->TemporalUpscale(pDesc, ppCache);
+    }
+    HRESULT STDMETHODCALLTYPE
+    DenoisedUpscale(const MTL_DENOISED_UPSCALE_D3D12_DESC *pDesc, IMTLD3D12Upscaler **ppCache) final {
+      return list_->DenoisedUpscale(pDesc, ppCache);
+    }
+
+  private:
+    MTLD3D12GraphicsCommandListImpl *list_;
+  };
+  UpscaleExt upscale_ext_{this};
 };
 
 HRESULT STDMETHODCALLTYPE

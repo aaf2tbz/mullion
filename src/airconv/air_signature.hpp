@@ -73,12 +73,14 @@ enum class Sign { inapplicable, with_sign, no_sign };
 
 using TextureKind = llvm::air::Texture::ResourceKind;
 
-inline TextureKind lowering_texture_1d_to_2d(TextureKind kind) {
+// a 1D view is a 2D texture one texel high, and one a shader compares against (SampleCmp) a depth texture, as Metal
+// compares only those
+inline TextureKind lowering_texture_1d_to_2d(TextureKind kind, bool compared = false) {
   switch (kind) {
   case TextureKind::texture_1d:
-    return TextureKind::texture_2d;
+    return compared ? TextureKind::depth_2d : TextureKind::texture_2d;
   case TextureKind::texture_1d_array:
-    return TextureKind::texture_2d_array;
+    return compared ? TextureKind::depth_2d_array : TextureKind::texture_2d_array;
   default:
     break;
   }
@@ -87,11 +89,12 @@ inline TextureKind lowering_texture_1d_to_2d(TextureKind kind) {
 
 // a non-array, non-multisampled bindless D3D12 1D or 2D view is a 1-layer 2D array; array views keep their layers.
 // a shader may declare an array for a view that is not one (D3D11.3 22.3.12), and a handle of another type than its
-// view's reads the wrong layer and mip on Apple7
-inline TextureKind lowering_texture_to_array(TextureKind kind) {
+// view's reads the wrong layer and mip on Apple7. a 1D view a shader compares against is a depth texture
+inline TextureKind lowering_texture_to_array(TextureKind kind, bool compared = false) {
   switch (kind) {
   case TextureKind::texture_1d:
   case TextureKind::texture_1d_array:
+    return compared ? TextureKind::depth_2d_array : TextureKind::texture_2d_array;
   case TextureKind::texture_2d:
     return TextureKind::texture_2d_array;
   case TextureKind::depth_2d:
@@ -460,7 +463,7 @@ public:
   uint32_t DefineTexture(
     std::string name, TextureKind kind, MemoryAccess access,
     MSLScalerType scaler_type, uint32_t location_index = UINT32_MAX,
-    std::optional<uint32_t> raster_order_group = std::nullopt
+    std::optional<uint32_t> raster_order_group = std::nullopt, bool compared = false
   );
   uint32_t
   DefineSampler(std::string name, uint32_t location_index = UINT32_MAX);
@@ -574,6 +577,7 @@ struct InputThreadPositionInGrid {};        // uint3
 struct InputThreadgroupPositionInGrid {};   // uint3
 
 struct InputThreadgroupsPerGrid {};         // uint3
+struct InputThreadsPerThreadgroup {};       // uint3
 // uint3: the origin the encoder's stage-in region has when the kernel is dispatched
 struct InputStageInGridOrigin {};
 
@@ -642,7 +646,8 @@ using FunctionInput = template_concat_t<
     /* kernel */
     InputThreadIndexInThreadgroup, InputThreadPositionInThreadgroup,
     InputThreadPositionInGrid, InputThreadgroupPositionInGrid,
-    InputThreadgroupsPerGrid, InputStageInGridOrigin, InputThreadIndexInSIMDGroup, InputThreadsPerSIMDGroup>>;
+    InputThreadgroupsPerGrid, InputStageInGridOrigin, InputThreadIndexInSIMDGroup, InputThreadsPerSIMDGroup,
+    InputThreadsPerThreadgroup>>;
 
 using FunctionOutput = std::variant<
   /* vertex */

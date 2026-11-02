@@ -91,6 +91,10 @@ WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 
 WINEMETAL_API void MTLCommandBuffer_waitUntilCompleted(obj_handle_t cmdbuf);
 
+// the command buffer's work is done: `event` has reached `value`, which the buffer signals after its work, or the
+// buffer has completed or failed, which it may do without signalling. its status (Completed, an error) can come later
+WINEMETAL_API void MTLCommandBuffer_waitUntilSignaled(obj_handle_t cmdbuf, obj_handle_t event, uint64_t value);
+
 enum WMTCommandBufferStatus : uint64_t {
   WMTCommandBufferStatusNotEnqueued = 0,
   WMTCommandBufferStatusEnqueued = 1,
@@ -240,6 +244,13 @@ enum WMTCompareFunction : uint8_t {
   WMTCompareFunctionAlways = 7,
 };
 
+// MTLSamplerReductionMode (macOS 26), which Metal ignores unless the min, mag and mip filters are all linear
+enum WMTSamplerReductionMode : uint8_t {
+  WMTSamplerReductionModeWeightedAverage = 0,
+  WMTSamplerReductionModeMinimum = 1,
+  WMTSamplerReductionModeMaximum = 2,
+};
+
 struct WMTSamplerInfo {
   enum WMTSamplerMinMagFilter min_filter;
   enum WMTSamplerMinMagFilter mag_filter;
@@ -255,6 +266,7 @@ struct WMTSamplerInfo {
   bool normalized_coords;
   bool lod_average;
   bool support_argument_buffers;
+  enum WMTSamplerReductionMode reduction_mode;
   uint64_t gpu_resource_id; // out
 };
 
@@ -449,6 +461,7 @@ enum WMTPixelFormat : uint32_t {
   WMTPixelFormatR001Swizzle = 0b000011010010u << 12,
   WMTPixelFormat0R01Swizzle = 0b100101010010u << 12,
   WMTPixelFormatGBARSwizzle = 0b001001001011u << 12,
+  WMTPixelFormatAGBASwizzle = 0b011000000000u << 12,
   WMTPixelFormatRGB1Swizzle = WMTPixelFormatAlphaIsOne,
 
   WMTPixelFormatBGRX8Unorm = WMTPixelFormatAlphaIsOne | WMTPixelFormatBGRA8Unorm,
@@ -1264,7 +1277,9 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDrawMeshThreadgroups,
   WMTRenderCommandDrawMeshThreadgroupsIndirect,
   WMTRenderCommandMemoryBarrier,
-  Unused0,
+  /* a geometry draw (wmtcmd_render_mullion_geometry_draw) of a pipeline whose mesh function runs alone: the warps are
+     mesh threadgroups, and what the object stage would read is bound to the mesh stage */
+  WMTRenderCommandMullionMeshDraw,
   Unused1,
   Unused2,
   WMTRenderCommandMullionGeometryDraw,
@@ -1584,6 +1599,8 @@ struct wmtcmd_render_mullion_geometry_draw {
   uint32_t vertex_per_warp;
   // the most object threadgroups one Metal draw may have: more are drawn in parts (0: one draw)
   uint32_t max_object_threadgroups;
+  // the threads of each mesh threadgroup (0 or 1: one), which a conservative hull's points are shared among
+  uint32_t mesh_threads;
 };
 
 struct wmtcmd_render_mullion_geometry_draw_indexed {
@@ -1598,6 +1615,8 @@ struct wmtcmd_render_mullion_geometry_draw_indexed {
   uint32_t vertex_per_warp;
   // the most object threadgroups one Metal draw may have: more are drawn in parts (0: one draw)
   uint32_t max_object_threadgroups;
+  // the threads of each mesh threadgroup (0 or 1: one), which a conservative hull's points are shared among
+  uint32_t mesh_threads;
 };
 
 struct wmtcmd_render_mullion_geometry_draw_indirect {
@@ -1776,6 +1795,9 @@ WINEMETAL_API bool MTLDevice_supportsShaderBarycentricCoordinates(obj_handle_t d
 
 WINEMETAL_API uint64_t MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device);
 
+// whether a sampler's reductionMode reaches what it samples: measured once per device, as no property says so
+WINEMETAL_API bool MTLDevice_supportsSamplerReduction(obj_handle_t device);
+
 WINEMETAL_API bool MTLDevice_supportsTextureSampleCount(obj_handle_t device, uint8_t sample_count);
 
 WINEMETAL_API bool MTLDevice_hasUnifiedMemory(obj_handle_t device);
@@ -1847,6 +1869,74 @@ WINEMETAL_API void MTLCommandBuffer_encodeSpatialScale(
     obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
 );
 
+/* MetalFX temporal upscaling for Metal 4 command buffers (MTL4FXTemporalScaler): 0 where the device has none */
+WINEMETAL_API obj_handle_t MTLDevice_newTemporalScaler4(obj_handle_t device, const struct WMTFXTemporalScalerInfo *info);
+
+WINEMETAL_API void MTL4CommandBuffer_encodeTemporalScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t depth,
+    obj_handle_t motion, obj_handle_t exposure, obj_handle_t fence, const struct WMTFXTemporalScalerProps *props
+);
+
+/* MetalFX temporal denoised upscaling (MTLFXTemporalDenoisedScaler, macOS 26): a ray-traced frame's noisy color,
+ * with its G-buffer, upscaled and denoised. A format of WMTPixelFormatInvalid leaves an optional input out */
+struct WMTFXDenoisedScalerInfo {
+  enum WMTPixelFormat color_format;
+  enum WMTPixelFormat depth_format;
+  enum WMTPixelFormat motion_format;
+  enum WMTPixelFormat diffuse_albedo_format;
+  enum WMTPixelFormat specular_albedo_format;
+  enum WMTPixelFormat normal_format;
+  enum WMTPixelFormat roughness_format;
+  enum WMTPixelFormat specular_hit_distance_format; /* optional */
+  enum WMTPixelFormat output_format;
+  uint32_t input_width;
+  uint32_t input_height;
+  uint32_t output_width;
+  uint32_t output_height;
+  bool auto_exposure;
+  bool requires_synchronous_initialization;
+};
+
+/* 0 where the device has none; metal4: a scaler Metal 4 command buffers encode */
+WINEMETAL_API obj_handle_t
+MTLDevice_newDenoisedScaler(obj_handle_t device, const struct WMTFXDenoisedScalerInfo *info, bool metal4);
+
+struct WMTFXDenoisedScaleArgs {
+  obj_handle_t color;
+  obj_handle_t depth;
+  obj_handle_t motion;
+  obj_handle_t diffuse_albedo;
+  obj_handle_t specular_albedo;
+  obj_handle_t normal;
+  obj_handle_t roughness;
+  obj_handle_t specular_hit_distance; /* optional */
+  obj_handle_t exposure;              /* optional */
+  obj_handle_t output;
+  obj_handle_t fence;
+  float pre_exposure;
+  float jitter_offset_x;
+  float jitter_offset_y;
+  float motion_vector_scale_x;
+  float motion_vector_scale_y;
+  bool reset;
+  bool depth_reversed;
+  /* column-major, which a D3D row-major matrix of row vectors is as it is in memory */
+  float world_to_view[16];
+  float view_to_clip[16];
+};
+
+WINEMETAL_API void
+MTLCommandBuffer_encodeDenoisedScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, const struct WMTFXDenoisedScaleArgs *args, bool metal4
+);
+
+/* MetalFX for Metal 4 command buffers (MTL4FXSpatialScaler): 0 where the device has none */
+WINEMETAL_API obj_handle_t MTLDevice_newSpatialScaler4(obj_handle_t device, const struct WMTFXSpatialScalerInfo *info);
+
+WINEMETAL_API void MTL4CommandBuffer_encodeSpatialScale(
+    obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
+);
+
 WINEMETAL_API obj_handle_t NSString_string(const char *data, enum WMTStringEncoding encoding);
 
 WINEMETAL_API obj_handle_t NSString_alloc_init(const char *data, enum WMTStringEncoding encoding);
@@ -1867,6 +1957,9 @@ WINEMETAL_API bool MTLDevice_supportsFXSpatialScaler(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supportsFXTemporalScaler(obj_handle_t device);
 
+/* MetalFX temporal denoised upscaling, for Metal 4 command buffers or for Metal 3 ones */
+WINEMETAL_API bool MTLDevice_supportsFXDenoisedScaler(obj_handle_t device, bool metal4);
+
 struct WMTLayerProps {
   obj_handle_t device;
   double contents_scale;
@@ -1876,6 +1969,9 @@ struct WMTLayerProps {
   bool display_sync_enabled;
   bool framebuffer_only;
   enum WMTPixelFormat pixel_format;
+  // the layer's size on screen, in its points (MetalLayer_getProps only; setProps leaves it)
+  double bounds_width;
+  double bounds_height;
 };
 
 WINEMETAL_API void MetalLayer_setProps(obj_handle_t layer, const struct WMTLayerProps *props);
@@ -2066,8 +2162,11 @@ WINEMETAL_API void MTLCommandBuffer_encodeWaitForEvent(obj_handle_t cmdbuf, obj_
 
 WINEMETAL_API void MTLSharedEvent_signalValue(obj_handle_t event, uint64_t value);
 
+// sets the NT event once `event` has `at_value`. with `reference`, the event object the handle names now, through a
+// handle of the notification's own: the caller may close its handle before then. without, the handle itself, which
+// stays open until the notification has come
 WINEMETAL_API void MTLSharedEvent_setWin32EventAtValue(
-    obj_handle_t event, obj_handle_t shared_event_listener, void *nt_event_handle, uint64_t at_value
+    obj_handle_t event, obj_handle_t shared_event_listener, void *nt_event_handle, uint64_t at_value, bool reference
 );
 
 WINEMETAL_API obj_handle_t MTLDevice_newFence(obj_handle_t device);
@@ -2110,9 +2209,16 @@ WINEMETAL_API bool WMTSetMetalShaderCachePath(const char *path);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info);
 
-WINEMETAL_API bool WMTBootstrapRegister(const char *name, mach_port_t mach_port);
+// registers `mach_port`, the port of `object` (an MTLSharedEvent or MTLTexture), under `name` for other processes to
+// look up; the name lasts while object, or an object WMTBootstrapKeep gave it, does (winemetal_unix.c, shared_name)
+WINEMETAL_API bool WMTBootstrapRegister(const char *name, obj_handle_t object, mach_port_t mach_port);
 
+// a send right to the port registered under `name`; each success is followed by WMTBootstrapKeep
 WINEMETAL_API bool WMTBootstrapLookUp(const char *name, mach_port_t *mach_port);
+
+// `object`, made from the port WMTBootstrapLookUp gave, keeps the name too when this process registered it; 0 when no
+// object was made. WMT::SharedNameHold (Metal.hpp) makes the call
+WINEMETAL_API void WMTBootstrapKeep(const char *name, obj_handle_t object);
 
 WINEMETAL_API mach_port_t MTLSharedEvent_createMachPort(obj_handle_t event);
 
@@ -2481,7 +2587,11 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixMetal4NewBuffer, WMTUnixMetal4Encoder,
        WMTUnixMetal4Commands, WMTUnixMetal4EndEncoder, WMTUnixMetal4Commit, WMTUnixMetal4Feedback, WMTUnixMetal4Wait,
        WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
-       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases, WMTUnixCallCount };
+       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases, WMTUnixMetal4WaitGPU,
+       WMTUnixBootstrapKeep, WMTUnixDeviceSupportsSamplerReduction,
+       WMTUnixCommandBufferWaitSignal, WMTUnixDeviceNewSpatialScaler4, WMTUnixMetal4SpatialScale,
+       WMTUnixDeviceNewTemporalScaler4, WMTUnixMetal4TemporalScale, WMTUnixDeviceNewDenoisedScaler,
+       WMTUnixCommandBufferDenoisedScale, WMTUnixDeviceSupportsFXDenoisedScaler, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
@@ -2558,13 +2668,18 @@ WINEMETAL_API void MTL4CommandEncoder_endEncoding(obj_handle_t encoder, bool seg
 WINEMETAL_API void MTL4CommandBuffer_commit(obj_handle_t buffer);
 WINEMETAL_API struct WMTMetal4Feedback MTL4CommandBuffer_feedback(obj_handle_t buffer);
 WINEMETAL_API void MTL4CommandBuffer_waitUntilCompleted(obj_handle_t buffer);
+// the GPU is done with the buffer's work, or the buffer failed: what it wrote is there. its feedback (status(), the
+// error, its GPU times) may come later, which waitUntilCompleted waits for too
+WINEMETAL_API void MTL4CommandBuffer_waitForGPU(obj_handle_t buffer);
 WINEMETAL_API obj_handle_t MTL4CounterHeap_new(obj_handle_t device, uint64_t count);
 WINEMETAL_API uint64_t MTLDevice_queryTimestampFrequency(obj_handle_t device);
 WINEMETAL_API void MTL4CommandBuffer_present(obj_handle_t buffer, obj_handle_t drawable, double after);
 
 WINEMETAL_API void MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handle_t event, uint64_t value);
 // the buffer's next encoder begins with a barrier, against all the queue's work before it, that makes memory reached
-// through aliased addresses consistent: a reserved buffer's tiles and a placed resource over the same heap memory
-WINEMETAL_API void MTL4CommandBuffer_orderAliases(obj_handle_t buffer);
+// through aliased addresses consistent: a reserved buffer's tiles and a placed resource over the same heap memory.
+// `inside`: when the next is a compute encoder's and the open one holds all the queue's work since the last such
+// barrier, a barrier of the same visibility inside the open one, against its own work, instead
+WINEMETAL_API void MTL4CommandBuffer_orderAliases(obj_handle_t buffer, bool inside);
 
 #endif

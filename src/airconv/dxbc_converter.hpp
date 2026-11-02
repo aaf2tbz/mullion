@@ -118,6 +118,10 @@ public:
   // the input registers a pixel shader also reads at each vertex of the primitive (DXIL's AttributeAtVertex)
   uint32_t vertex_value_reg_mask = 0;
   bool use_barycentrics = false;
+  // a pixel shader that may discard
+  bool discards = false;
+  // the shader reads SV_InnerCoverage
+  bool use_inner_coverage = false;
 };
 
 Instruction readInstruction(
@@ -226,6 +230,9 @@ struct io_binding_map {
   // the samples a pixel shader's output keeps: those of its clip test (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
   // in the depth bounds (depth_bounds)
   llvm::Value *kept_samples = nullptr;
+  // o0.a as the pixel shader wrote it, before the shader blends target 0, for alpha-to-coverage (D3D11.3 17.18);
+  // null when o0 is not blended
+  llvm::Value *coverage_alpha = nullptr;
   // a conservative rasterizer's SV_InnerCoverage, 0 or 1; null without one
   llvm::Value *inner_coverage = nullptr;
   // a coarse shading pixel shader's rate (D3D12_SHADING_RATE), its SV_ShadingRate
@@ -308,6 +315,8 @@ struct context {
   // the shader's groups work together through globallycoherent memory, which each group sync makes visible GPU-wide
   // (SM50_SHADER_FLAG_COHERENT_GROUP_SYNC)
   bool coherent_group_sync = false;
+  // an amplification shader may build the payload it sends in Metal's payload itself (SM50_SHADER_FLAG_STAGED_PAYLOAD)
+  bool direct_payload = false;
   // the function is made from the shader's own signature, so it takes the SIMD-group inputs the shader defines; not
   // so for a domain shader run inside a geometry shader's function, nor for a ray shader's visible function
   bool own_signature = true;
@@ -406,6 +415,11 @@ inline std::string
 clip_varying_name(uint32_t index) {
   return "clip" + std::to_string(index);
 }
+// a cull distance a pipeline's pixel shader tests (SM50_CULL_VARYING)
+inline std::string
+cull_varying_name(uint32_t index) {
+  return SM50_CULL_VARYING + std::to_string(index);
+}
 constexpr air::MSLScalerOrVectorType
 varying_type(RegisterComponentType type) {
   return type == RegisterComponentType::Float ? air::MSLScalerOrVectorType(air::msl_float) : air::msl_uint;
@@ -464,11 +478,12 @@ struct SignatureContext {
 RegisterComponentType component_type_from_pixel_format(air::MTLPixelFormat format);
 
 // the input a stage that writes rasterized positions scales them with (llvm::air::AIRBuilder::RasterScale)
+// (all SM50_RASTER_SCALE_WORDS for a stage that reads the mesh group origin)
 inline uint32_t
-DefineRasterScale(air::FunctionSignatureBuilder &signature) {
+DefineRasterScale(air::FunctionSignatureBuilder &signature, uint32_t words = 1) {
   return signature.DefineInput(air::ArgumentBindingBuffer{
       .location_index = SM50_BINDING_INDEX_RASTER_SCALE,
-      .array_size = 1,
+      .array_size = words,
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = air::msl_float,
@@ -560,9 +575,11 @@ public:
   // dispatch comes in parts (MTL_SHADER_REFLECTION::GroupsWorkTogether), each part's groups numbered from the
   // stage-in grid's origin
   bool groups_work_together = false;
-  // a shader with 64-bit atomics on resources, whose locks wait for the threadgroups that hold them: where the GPU
-  // emulates them all, its dispatch comes in parts too (MTL_SHADER_REFLECTION::DeviceAtomics64)
+  // a shader with 64-bit atomics on resources that take locks, which wait for the threadgroups that hold them: its
+  // dispatch comes in parts too (MTL_SHADER_REFLECTION::DeviceAtomics64), but where each is a `native_extreme`
+  // (device_atomics64_native) on a GPU that has those
   bool device_atomics64 = false;
+  bool device_atomics64_native = true;
   bool reads_dispatch_position = false;
   uint32_t input_control_point_count = ~0u;
   uint32_t output_control_point_count = ~0u;
@@ -599,6 +616,8 @@ public:
   uint32_t ps_flat_input_mask = 0, ps_noperspective_input_mask = 0;
   // a pixel shader that runs per pixel or sample at any shading rate (MTL_PIXEL_SHADER_REFLECTION's FineShading)
   bool ps_fine_shading = false;
+  // a pixel shader that outputs depth (MTL_PIXEL_SHADER_REFLECTION's DepthOutput)
+  bool ps_depth_output = false;
   std::string dxil; // bitcode of a DXIL shader, empty for DXBC
   // a DXIL library's ray tracing shaders, by their functions' names
   struct RayShader {
@@ -627,13 +646,21 @@ public:
 
 void declare_dispatch_origin(SM50ShaderInternal *sm50_shader);
 
+// stands, in a pixel shader, for whether Mullion keeps the lane's writes: the leader of a coarse pixel that has not
+// discarded under coarse shading (CoarseShading::Finish), and every lane otherwise (FinishFeedbackLanes). sampler
+// feedback's lanes put their writes together only among such lanes
+constexpr const char *kFeedbackLaneWrites = "mullion.feedback_lane_writes";
+// gives what kFeedbackLaneWrites stands for that CoarseShading did not the value true, and removes it
+void FinishFeedbackLanes(llvm::Module &module);
+
 // a pixel shader of coarse pixels, two wide or high at most (SM50_SHADER_PSO_PIXEL_SHADER_DATA's coarse_shading). a
 // coarse pixel is in one quad, whose lanes it covers run the shader with their inputs where the coarse pixel's center
 // is (so a derivative spans coarse pixels) and take the outputs of one, the leader, which alone discards and writes
 class CoarseShading {
 public:
-  // its inputs, defined before the function is made: `varying` is the primitive's rate, or 0
-  CoarseShading(air::FunctionSignatureBuilder &signature, uint32_t varying);
+  // its inputs, defined before the function is made: `varying` is the primitive's rate, or 0. `elide_discard` leaves
+  // the coarse pixel's discard out of a shader that has none (SM50_SHADER_FLAG_COARSE_DISCARD_ALWAYS)
+  CoarseShading(air::FunctionSignatureBuilder &signature, uint32_t varying, bool elide_discard);
   // in the entry block, before anything reads the inputs: the coarse pixel, its leader, and its inputs' values
   void
   Enter(llvm::Function *function, llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, io_binding_map &resource);
@@ -657,6 +684,8 @@ private:
   llvm::Value *lane_ = nullptr, *leader_ = nullptr, *leads_ = nullptr, *wide_ = nullptr, *high_ = nullptr;
   llvm::AllocaInst *discarded_ = nullptr, *pixel_discarded_ = nullptr;
   llvm::Instruction *discard_ = nullptr;
+  llvm::BranchInst *discard_branch_ = nullptr;
+  bool elide_discard_ = true;
   llvm::IRBuilder<> *builder_ = nullptr;
   llvm::Value *fine_index(llvm::Value *x, llvm::Value *y);
 };
@@ -702,7 +731,8 @@ std::vector<std::unique_ptr<BasicBlock>> read_control_flow(
 
 uint32_t next_pow2(uint32_t x);
 
-size_t estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t patch_per_group);
+// the payload a hull shader's object threadgroup leaves: with `groups`, with the groups of workloads too
+size_t estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t patch_per_group, bool groups = false);
 
 
 // the tessellation factor a pipeline's stages are built for, and the most segments it cuts an edge into
@@ -717,8 +747,15 @@ TessellatorOutputPrimitive get_output_primitive(SM50ShaderInternal *pHullStage);
 std::pair<uint32_t, uint32_t>
 mesh_threadgroups_per_workload(SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, uint32_t factor_int);
 
+// the most vertices and primitives of a group of workloads that one mesh threadgroup takes (tessellation_group_size),
+// or 0 where each workload takes its own (air_tessellation.metal's tess_output)
+uint32_t tessellation_group_limit(
+    SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, uint32_t factor_int
+);
+
 llvm::StructType *tessellation_payload_type(
-    SM50ShaderInternal *pHullStage, uint32_t factor_int, air::AirType &types, llvm::LLVMContext &context
+    SM50ShaderInternal *pHullStage, uint32_t factor_int, air::AirType &types, llvm::LLVMContext &context,
+    uint32_t group_limit = 0
 );
 
 llvm::Value *setup_domain_stage(
@@ -781,7 +818,7 @@ void setup_immediate_constant_buffer(
   air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
 );
 
-llvm::Error convert_null_geometry_shader(const char *name, llvm::LLVMContext &context, llvm::Module &module);
+llvm::Error convert_null_geometry_shader(const char *name, llvm::LLVMContext &context, llvm::Module &module, bool direct);
 llvm::Error convert_pass_through_geometry_shader(
   const SM50ShaderInternal *pVertexStage, const char *name, llvm::LLVMContext &context, llvm::Module &module,
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
@@ -794,6 +831,11 @@ llvm::Error convert_dxbc_geometry_shader(
   llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   SM50ShaderInternal *pHullStage = nullptr
 );
+
+// a geometry shader's primitives per stream when every invocation completes the same (MTL_GEOMETRY_SHADER_REFLECTION's
+// FixedEmits): its code runs from start to return without a branch, so its emits and cuts are fixed, and it emits no
+// more vertices than it declares
+std::optional<std::array<uint32_t, 4>> fixed_stream_primitives(const SM50ShaderInternal *pShaderInternal);
 
 llvm::Error convert_dxbc_vertex_for_geometry_shader(
   const SM50ShaderInternal *pShaderInternal, const char *name,
@@ -834,26 +876,38 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
 // conservative rasterization (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative), dxbc_converter_gs.cpp: the
 // triangle Metal rasterizes for one of the pipeline's
 struct ConservativeTriangle {
-  using Weights = pvalue[3][3];
+  static constexpr uint32_t kMostPoints = SM50_CONSERVATIVE_HULL_POINTS;
+  using Weights = pvalue[kMostPoints][3];
+  uint32_t points = 3;                         // the grown triangle's, or a hull's SM50_CONSERVATIVE_HULL_POINTS
   Weights over_w, linear;                      // each point's weights of the corners
-  pvalue position[3], rcp_w[3];                // each point's, and the plane's 1/w there
-  pvalue sum[3];                               // each point's sum of its linear weights, which blends divide by
+  pvalue position[kMostPoints];                // each point's
+  pvalue rcp_w[kMostPoints];                   // the plane's 1/w there
+  pvalue sum[kMostPoints];                     // each point's sum of its linear weights, which blends divide by
   pvalue window[SM50_CONSERVATIVE_CORNERS][2]; // the polygon the pixel shader tests pixels against
   pvalue culled;                               // nothing of it is drawn
+  // a hull's points in the window, and what weighs a point (conservative_weigh)
+  std::vector<std::array<pvalue, 2>> hull_points;
+  pvalue corners[3], row[3][3], det, degenerate, first_depth, viewport;
 };
 
 // conservative_triangle's comment, at its definition
 ConservativeTriangle conservative_triangle(
     llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, air::AirType &types, pvalue const (&clip)[3],
-    pvalue viewports, pvalue viewport_index
+    pvalue viewports, pvalue viewport_index, bool hull = false, bool weigh = true
+);
+// conservative_weigh's comment, at its definition
+void conservative_weigh(
+    llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, ConservativeTriangle &out, const std::array<pvalue, 2> &point
 );
 // the varyings of point `u` the pixel shader tests and divides by (SM50_CONSERVATIVE_VARYINGS, SM50_CONSERVATIVE_RCP_W),
 // and with `barycentrics` the primitive's weights there (SM50_BARYCENTRIC_ROWS), from mesh vertex data `at` on
 void conservative_varyings(
     llvm::air::AIRBuilder &air, const ConservativeTriangle &triangle, uint32_t u, pvalue vertex, uint32_t at,
-    bool barycentrics
+    bool barycentrics, bool window = true
 );
-void define_conservative_varyings(air::FunctionSignatureBuilder &signature, uint32_t at, bool barycentrics);
+void define_conservative_varyings(
+    air::FunctionSignatureBuilder &signature, uint32_t at, bool barycentrics, bool window = true
+);
 // the output registers (`output`, int4s) of the triangle's point `u`, from the corners' (`corner`): blended as the
 // pixel shader interpolates them (over w, or in the window), the position the triangle's, flat and integer ones their
 // own corner's

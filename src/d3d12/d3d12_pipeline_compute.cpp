@@ -59,8 +59,10 @@ public:
       return hr;
 
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
-    groups_work_together = ref_cs.GroupsWorkTogether ||
-                           (ref_cs.DeviceAtomics64 && (device_->GetShaderFlags() & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64));
+    groups_work_together =
+        ref_cs.GroupsWorkTogether ||
+        (ref_cs.DeviceAtomics64 &&
+         (!ref_cs.DeviceAtomics64Native || (device_->GetShaderFlags() & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64)));
     if (groups_work_together)
       Logger::info(str::format("compute pipeline ", name, ": its threadgroups work together, it is dispatched in parts"));
 
@@ -220,8 +222,15 @@ public:
   Initialize(const void *blob, SIZE_T size) {
     if (!size)
       return S_OK;
-    if (!blob || size < kHeaderSize || memcmp(blob, kMagic, sizeof(kMagic)))
+    if (!blob)
       return FAIL(E_INVALIDARG);
+    // a blob that is not a Mullion library at all (another driver's, an older Mullion's) is one of another driver:
+    // games keep their pipeline cache file across runs and only replace it on DRIVER_VERSION_MISMATCH, so
+    // E_INVALIDARG would leave them building every pipeline on every launch (vkd3d-proton's
+    // d3d12_cached_pipeline_state_validate: "Avoid E_INVALIDARG with an invalid header size, since that may confuse
+    // some games")
+    if (size < kHeaderSize || memcmp(blob, kMagic, sizeof(kMagic)))
+      return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     auto data = static_cast<const char *>(blob);
     SIZE_T offset = sizeof(kMagic);
     auto read = [&](auto &value) {

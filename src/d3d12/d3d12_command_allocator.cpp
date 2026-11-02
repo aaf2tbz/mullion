@@ -172,6 +172,13 @@ MTLD3D12CommandAllocatorImpl::GPURecordsFor(EncoderData *Root) {
 }
 
 MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
+  // what no submitted list still runs goes to the device's pool
+  if (!pending) {
+    for (auto &[key, unused] : icb_pool_)
+      device_->indirect_command_buffers.Give(std::move(unused));
+    for (auto &used : icb_)
+      device_->indirect_command_buffers.Give(std::move(used));
+  }
   ReleaseRuns();
   delete records_;
 }
@@ -187,6 +194,9 @@ MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
     case EncoderType::Predicate:
     case EncoderType::Later:
     case EncoderType::Settle:
+      break;
+    case EncoderType::Upscale:
+      reinterpret_cast<UpscaleEncoderData *>(pass)->~UpscaleEncoderData();
       break;
     case EncoderType::Clear:
     case EncoderType::Render:
@@ -292,7 +302,10 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   encoder_last = nullptr;
   encoder_count_ = 0;
 
-  // the pool keeps only what the last use made, so it grows with a use and never past it
+  // the pool keeps only what the last use made, so it grows with a use and never past it; what that use left unused
+  // goes to the device's, for another allocator
+  for (auto &[key, unused] : icb_pool_)
+    device_->indirect_command_buffers.Give(std::move(unused));
   icb_pool_.clear();
   for (auto &used : icb_)
     icb_pool_.emplace(used.key, std::move(used));
@@ -373,8 +386,8 @@ MTLD3D12CommandAllocatorImpl::EncodeComputeResolver(MTLD3D12CommandSignature *pC
 }
 
 // an indirect command buffer of the kind `info` describes, for `count` commands: a pooled one of the same kind and
-// size when the allocator has one, else a new one, of the next power of two in size so that others fit it. both
-// leave its GPU resource ID in `info`; the lists keep it until the allocator is reset
+// size when the allocator or else the device has one, else a new one, of the next power of two in size so that others
+// fit it. both leave its GPU resource ID in `info`; the lists keep it until the allocator is reset
 WMT::IndirectCommandBuffer
 MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options) {
   uint64_t capacity = std::bit_ceil(std::max<uint64_t>(count, 1));
@@ -387,13 +400,14 @@ MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, uin
   PooledICB entry;
   bool pooled = false;
   for (auto [it, end] = icb_pool_.equal_range(key); it != end; ++it)
-    if (it->second.capacity == capacity && it->second.options == options &&
-        !memcmp(&it->second.kind, &kind, sizeof(kind))) {
+    if (it->second.Is(key, kind, capacity, options)) {
       entry = std::move(it->second);
       icb_pool_.erase(it);
       pooled = true;
       break;
     }
+  if (!pooled)
+    pooled = device_->indirect_command_buffers.Take(key, kind, capacity, options, entry);
   if (!pooled) {
     entry.icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, capacity, options);
     entry.gpu_resource_id = info.gpu_resource_id;
@@ -493,7 +507,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  // an indexed command of an ordinary pipeline is kIndexedCommands (IndirectRenderCommandData::zeros)
+  // room for kIndexedCommands commands per indexed command of an ordinary pipeline: its draw, and past all the draws,
+  // its extra commands, should it have any (IndirectRenderCommandData::zeros, extras_claimed)
   size_t each = !tessellation && pCmdSig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? kIndexedCommands : 1;
   WMT::IndirectCommandBuffer icb;
   if (!draws)
@@ -539,6 +554,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   auto &zeros = *device_->recording.zeros;
   data->zeros = each > 1 ? gpu_heap_buffer_address_ + zeros.offset : 0;
   data->zero_count = zeros.length / sizeof(uint16_t);
+  // the resolver's last thread runs the extras an execution claims, and leaves the counts at zero for the next
+  data->extras_claimed = data->extras_done = 0;
   data->draws = 0;
   data->so_targets = data->so_scratch_size = data->so_invocations = data->so_lacked = 0;
   if (draws) {

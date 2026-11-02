@@ -663,12 +663,15 @@ llvm::Error convert_dxbc_pixel_shader(
         if (pso_alpha_to_coverage) {
           // o0.a of 0 or less, or NaN, covers no sample, 1 or more all n, and between them the nearest count of
           // samples (D3D11.3 17.18)
-          auto output = ctx.resource.output.ptr_float4;
-          auto output_ty = llvm::cast<llvm::PointerType>(output->getType())->getNonOpaquePointerElementType();
-          auto o0 = builder.CreateLoad(
-            output_ty->getArrayElementType(), builder.CreateConstInBoundsGEP2_32(output_ty, output, 0, 0)
-          );
-          auto alpha = builder.CreateExtractElement(o0, 3);
+          auto alpha = ctx.resource.coverage_alpha;
+          if (!alpha) {
+            auto output = ctx.resource.output.ptr_float4;
+            auto output_ty = llvm::cast<llvm::PointerType>(output->getType())->getNonOpaquePointerElementType();
+            auto o0 = builder.CreateLoad(
+              output_ty->getArrayElementType(), builder.CreateConstInBoundsGEP2_32(output_ty, output, 0, 0)
+            );
+            alpha = builder.CreateExtractElement(o0, 3);
+          }
           auto zero = llvm::ConstantFP::get(ctx.types._float, 0.0), one = llvm::ConstantFP::get(ctx.types._float, 1.0);
           alpha = builder.CreateSelect(builder.CreateFCmpOGT(alpha, zero), alpha, zero);
           alpha = builder.CreateSelect(builder.CreateFCmpOLT(alpha, one), alpha, one);
@@ -728,6 +731,30 @@ llvm::Error convert_dxbc_pixel_shader(
     }));
   if (clips || pso_sample_mask != 0xffffffff)
     input_coverage = func_signature.DefineInput(air::InputInputCoverage{});
+  // the cull distances' varyings, linear in the window (SM50_CULL_VARYING)
+  std::vector<uint32_t> culls;
+  for (uint32_t i = 0; pso_data && i < pso_data->cull_distances; i++)
+    culls.push_back(func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = cull_varying_name(i), .type = air::msl_float, .interpolation = air::Interpolation::center_no_perspective,
+        .pull_mode = false
+    }));
+  // and the depth a pipeline that clamps it would take, which a shader that may discard has to write itself: Metal
+  // clamps what it interpolates past the depth range wrongly, and what it writes as it should (probe-depth-clamp.m),
+  // unless the shader writes its own or its tests come first
+  if (culls.size() && pso_data->cull_depth && !pso_disable_depth_output && !early_tests &&
+      !std::ranges::any_of(func_signature.Outputs(), [](auto &output) {
+        return std::holds_alternative<air::OutputDepth>(output);
+      })) {
+    auto position = func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
+    auto at = func_signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
+    epilogue >> [=](pvalue value) {
+      return make_irvalue([=](struct context ctx) {
+        return ctx.builder.CreateInsertValue(
+            value, ctx.builder.CreateExtractElement(ctx.function->getArg(position), uint64_t(2)), {at}
+        );
+      });
+    };
+  }
 
   // the depth bounds test of a GPU without one: the pixel's position, whether the draw tests, and the samples that pass
   uint32_t bounds_position = ~0u, bounds_enabled = ~0u, bounds_mask = ~0u;
@@ -762,6 +789,9 @@ llvm::Error convert_dxbc_pixel_shader(
   uint32_t conservative_position = ~0u, conservative_window[SM50_CONSERVATIVE_VARYINGS],
            conservative_rcp_w[SM50_CONSERVATIVE_RCP_W], conservative_coverage = ~0u, conservative_sample = ~0u;
   std::vector<std::pair<uint32_t, uint32_t>> conservative_over_w; // an input, and where it is interpolated
+  // a hull covers just the pixels the primitive touches: the shader tests them only for SV_InnerCoverage
+  bool conservative_hull = pso_data && pso_data->conservative && pso_data->conservative_hull;
+  bool conservative_test = pso_data && pso_data->conservative && (!conservative_hull || shader_info->use_inner_coverage);
   if (pso_data && pso_data->conservative) {
     auto &inputs = func_signature.Inputs();
     for (uint32_t i = 0; i < inputs.size(); i++) {
@@ -803,7 +833,7 @@ llvm::Error convert_dxbc_pixel_shader(
         });
     conservative_position =
         func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
-    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+    for (uint32_t i = 0; conservative_test && i < SM50_CONSERVATIVE_VARYINGS; i++)
       conservative_window[i] = func_signature.DefineInput(air::InputFragmentStageIn{
           .user = "mullion_conservative" + std::to_string(i),
           .type = air::msl_float,
@@ -811,11 +841,17 @@ llvm::Error convert_dxbc_pixel_shader(
           .pull_mode = false
       });
     // the depth, clamped to the viewport's range (D3D11.3 17.10): Metal clamps what a function that may discard
-    // interpolates past it wrongly, and what one writes as it should (probe-depth-clamp.m)
+    // interpolates past it wrongly, and what one writes as it should (probe-depth-clamp.m). a hull's own pixels need
+    // no discard, so only a shader that discards or writes memory itself writes it
     bool writes_depth = std::ranges::any_of(func_signature.Outputs(), [](auto &output) {
       return std::holds_alternative<air::OutputDepth>(output);
     });
-    if (!writes_depth && !pso_disable_depth_output && !func_signature.EarlyFragmentTests()) {
+    // every discard and coverage the converter adds counts: the depth bounds, the pipeline's sample mask,
+    // alpha-to-coverage, clip distances tested per sample and coarse pixels
+    bool clamps_wrongly = !conservative_hull || shader_info->discards || !shader_info->uavMap.empty() ||
+                          pso_data->depth_bounds || pso_sample_mask != 0xffffffff || pso_alpha_to_coverage ||
+                          pso_data->clip_distances || coarse_shading;
+    if (!writes_depth && clamps_wrongly && !pso_disable_depth_output && !func_signature.EarlyFragmentTests()) {
       auto at = func_signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
       epilogue >> [=](pvalue value) {
         return make_irvalue([=](struct context ctx) {
@@ -828,7 +864,9 @@ llvm::Error convert_dxbc_pixel_shader(
 
   std::optional<CoarseShading> coarse;
   if (coarse_shading)
-    coarse.emplace(func_signature, pso_data->shading_rate_varying);
+    coarse.emplace(
+      func_signature, pso_data->shading_rate_varying, !(shader_flags & SM50_SHADER_FLAG_COARSE_DISCARD_ALWAYS)
+    );
 
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
@@ -878,11 +916,40 @@ llvm::Error convert_dxbc_pixel_shader(
   setup_metal_version(module, metal_version);
   air.CenteredSamples = pso_data && pso_data->centered_samples;
 
+  // a pixel of a primitive a cull distance culls is discarded before the shader does anything, the quad's derivatives
+  // taken while all its threads run: one where a varying and both its derivatives are 0 (SM50_CULL_VARYING)
+  if (culls.size()) {
+    auto zero = llvm::ConstantFP::get(types._float, 0.0);
+    llvm::Value *culled = builder.getFalse();
+    for (auto index : culls) {
+      auto in_front = function->getArg(index);
+      auto behind = builder.CreateAnd(
+          builder.CreateFCmpOEQ(in_front, zero),
+          builder.CreateAnd(
+              builder.CreateFCmpOEQ(air.CreateDerivative(in_front, false), zero),
+              builder.CreateFCmpOEQ(air.CreateDerivative(in_front, true), zero)
+          )
+      );
+      culled = builder.CreateOr(culled, behind);
+    }
+    auto discard = llvm::BasicBlock::Create(context, "cull_discard", function, epilogue_bb);
+    auto live = llvm::BasicBlock::Create(context, "cull_live", function, epilogue_bb);
+    builder.CreateCondBr(culled, discard, live);
+    builder.SetInsertPoint(discard);
+    air.CreateDiscard();
+    // and does nothing more: Metal keeps a discarded run's memory writes under multisampling
+    if (function->getReturnType()->isVoidTy())
+      builder.CreateRetVoid();
+    else
+      builder.CreateRet(llvm::Constant::getNullValue(function->getReturnType()));
+    builder.SetInsertPoint(live);
+  }
+
   std::vector<std::pair<llvm::Argument *, llvm::Value *>> conservative_inputs;
   llvm::SmallPtrSet<llvm::Instruction *, 32> conservative_own;
   if (conservative_position != ~0u) {
     pvalue window[SM50_CONSERVATIVE_VARYINGS];
-    for (uint32_t i = 0; i < SM50_CONSERVATIVE_VARYINGS; i++)
+    for (uint32_t i = 0; conservative_test && i < SM50_CONSERVATIVE_VARYINGS; i++)
       window[i] = function->getArg(conservative_window[i]);
     auto position = function->getArg(conservative_position);
     // what reads the inputs gets them divided by the 1/w Metal interpolates with them, and the position's w over it
@@ -914,15 +981,19 @@ llvm::Error convert_dxbc_pixel_shader(
            ~conservative_sample ? builder.CreateShl(builder.getInt32(1), function->getArg(conservative_sample)) : all}
       );
     }
-    auto [culled, inside] = conservative_overlap(builder, air, position, window);
-    resource_map.inner_coverage = builder.CreateZExt(inside, builder.getInt32Ty());
-    auto discard = llvm::BasicBlock::Create(context, "conservative_discard", function, epilogue_bb);
-    auto live = llvm::BasicBlock::Create(context, "conservative_live", function, epilogue_bb);
-    builder.CreateCondBr(culled, discard, live);
-    builder.SetInsertPoint(discard);
-    air.CreateDiscard();
-    builder.CreateBr(live);
-    builder.SetInsertPoint(live);
+    if (conservative_test) {
+      auto [culled, inside] = conservative_overlap(builder, air, position, window);
+      resource_map.inner_coverage = builder.CreateZExt(inside, builder.getInt32Ty());
+      if (!conservative_hull) {
+        auto discard = llvm::BasicBlock::Create(context, "conservative_discard", function, epilogue_bb);
+        auto live = llvm::BasicBlock::Create(context, "conservative_live", function, epilogue_bb);
+        builder.CreateCondBr(culled, discard, live);
+        builder.SetInsertPoint(discard);
+        air.CreateDiscard();
+        builder.CreateBr(live);
+        builder.SetInsertPoint(live);
+      }
+    }
     for (auto &block : *function)
       for (auto &instruction : block)
         conservative_own.insert(&instruction);
@@ -1089,6 +1160,17 @@ llvm::Error convert_dxbc_pixel_shader(
   builder.SetInsertPoint(epilogue_bb);
   if (coarse)
     coarse->Leave(builder, air, resource_map);
+  // alpha-to-coverage takes o0.a from before the output merger blends (D3D11.3 17.18), and the shader's own blend of
+  // target 0 writes over o0
+  if (pso_alpha_to_coverage && held[0] != ~0u)
+    resource_map.coverage_alpha = builder.CreateExtractElement(
+      builder.CreateLoad(
+        types._float4, builder.CreateConstInBoundsGEP2_32(
+                         llvm::ArrayType::get(types._float4, max_output_register), resource_map.output.ptr_float4, 0, 0
+                       )
+      ),
+      3
+    );
   for (uint32_t rt = 0; rt < 8; rt++)
     if (held[rt] != ~0u)
       blend_output(
@@ -1107,6 +1189,7 @@ llvm::Error convert_dxbc_pixel_shader(
   }
   if (coarse)
     coarse->Finish();
+  FinishFeedbackLanes(module);
   // the shader reads the conservative rasterizer's inputs, and divides what it evaluates of one over w by 1/w's there
   for (auto [input, value] : conservative_inputs)
     input->replaceUsesWithIf(value, [&](llvm::Use &use) {
@@ -1329,6 +1412,11 @@ llvm::Error convert_dxbc_vertex_shader(
       air::OutputClipDistance{pShaderInternal->clip_distance_scalars.size()}
     );
   };
+  // and whether each vertex is in front of each cull distance, for the pixel shader to cull by (SM50_CULL_VARYING)
+  std::vector<uint32_t> cull_out_idx;
+  if (gs_passthrough && gs_passthrough->CullDistanceVaryings)
+    for (uint32_t i = 0; i < pShaderInternal->cull_distance_scalars.size(); i++)
+      cull_out_idx.push_back(func_signature.DefineOutput(air::OutputVertex{.user = cull_varying_name(i), .type = air::msl_float}));
 
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
@@ -1464,6 +1552,22 @@ llvm::Error convert_dxbc_vertex_shader(
         value, clip_distance_array, {clip_distance_out_idx}
       );
   };
+  for (uint32_t i = 0; value && i < cull_out_idx.size(); i++) {
+    auto &scalar = pShaderInternal->cull_distance_scalars[i];
+    auto distance = builder.CreateLoad(
+        types._float, builder.CreateGEP(
+                          resource_map.output.ptr_float4->getType()->getNonOpaquePointerElementType(),
+                          resource_map.output.ptr_float4,
+                          {builder.getInt32(0), builder.getInt32(scalar.reg), builder.getInt32(scalar.component)}
+                      )
+    );
+    auto in_front = builder.CreateFCmpOGE(distance, llvm::ConstantFP::get(types._float, 0.0));
+    value = builder.CreateInsertValue(
+        value,
+        builder.CreateSelect(in_front, llvm::ConstantFP::get(types._float, 1.0), llvm::ConstantFP::get(types._float, 0.0)),
+        {cull_out_idx[i]}
+    );
+  }
 
   if (value == nullptr) {
     builder.CreateRetVoid();
@@ -1799,7 +1903,7 @@ static int SM50InitializeUncached(
       auto scaler_type = to_air_scaler_type(srv.scaler_type);
       srv.arg_index = binding_table.DefineTexture(
         "t" + std::to_string(range_id), texture_kind, access, scaler_type,
-        attr_index
+        attr_index, std::nullopt, srv.compared
       );
     } else {
       srv.arg_index = binding_table.DefineBuffer(
@@ -1839,7 +1943,9 @@ static int SM50InitializeUncached(
       flags |= MTL_SM50_SHADER_ARGUMENT_READ_ACCESS;
     }
     if (srv.resource_type != ResourceType::NonApplicable)
-      flags |= (MTL_SM50_SHADER_ARGUMENT_FLAG)stand_in_flags(lowering_texture_1d_to_2d(to_air_resource_type(srv.resource_type, srv.compared)), srv.scaler_type);
+      flags |= (MTL_SM50_SHADER_ARGUMENT_FLAG)stand_in_flags(
+        lowering_texture_1d_to_2d(to_air_resource_type(srv.resource_type, srv.compared), srv.compared), srv.scaler_type
+      );
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::SRV,
       .SM50BindingSlot = range_id,
@@ -1960,6 +2066,7 @@ static int SM50InitializeUncached(
     }
     pRefl->GroupsWorkTogether = sm50_shader->groups_work_together;
     pRefl->DeviceAtomics64 = sm50_shader->device_atomics64;
+    pRefl->DeviceAtomics64Native = sm50_shader->device_atomics64_native;
     // a mesh shader's conservative triangles: its outputs wait in threadgroup memory, 16 KB of it, for a mesh of its
     // triangles, three vertices each of its components and the conservative rasterizer's, each primitive its own
     // and four words. a group too large for one mesh runs once for each, which one that writes resources cannot
@@ -2050,6 +2157,7 @@ static int SM50InitializeUncached(
           sm50_shader->gs_output_topology == microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && triangles &&
           3 * triangles <= 256 && triangles <= 512 &&
           mullion::dxbc::mesh_size(3 * triangles, vertex_size, triangles * 4) <= mullion::dxbc::mesh_size_limit;
+      pRefl->GeometryShader.FixedEmits = mullion::dxbc::fixed_stream_primitives(sm50_shader).has_value();
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
       pRefl->PixelShader = {sm50_shader->pso_valid_output_reg_mask, sm50_shader->ps_has_coverage_output, 0, 0,
@@ -2058,6 +2166,11 @@ static int SM50InitializeUncached(
       // EvaluateAttribute* evaluates where the shader chooses, which coarse shading does not move
       pRefl->PixelShader.FineShading = sm50_shader->ps_fine_shading || sm50_shader->shader_info.pull_mode_reg_mask;
       pRefl->PixelShader.Barycentrics = sm50_shader->shader_info.use_barycentrics;
+      pRefl->PixelShader.DepthOutput = sm50_shader->ps_depth_output;
+      pRefl->PixelShader.EarlyTests = sm50_shader->func_signature.EarlyFragmentTests();
+      pRefl->PixelShader.Discards = sm50_shader->shader_info.discards;
+      pRefl->PixelShader.VertexValues = sm50_shader->shader_info.vertex_value_reg_mask != 0;
+      pRefl->PixelShader.InnerCoverage = sm50_shader->shader_info.use_inner_coverage;
       for (auto &out : sm50_shader->output_signature) {
         if (out.reg() >= std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats))
           continue;
@@ -2487,6 +2600,9 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   bool pass_through =
       mullion::dxbc::args_get_data<SM50_SHADER_PSO_GEOMETRY_SHADER, SM50_SHADER_PSO_GEOMETRY_SHADER_DATA>(pGeometryShaderArgs, &pso_data) &&
       pso_data->pass_through;
+  SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
+  bool direct = mullion::dxbc::args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pGeometryShaderArgs, &so) &&
+                !so->counting && SM50StreamOutputDirect(so->single_pass, pGeometryShader != nullptr, pass_through);
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
@@ -2499,7 +2615,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
                                       (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName, context, *pModule,
                                       pGeometryShaderArgs
                                   )
-                                : mullion::dxbc::convert_null_geometry_shader(FunctionName, context, *pModule)) {
+                                : mullion::dxbc::convert_null_geometry_shader(FunctionName, context, *pModule, direct)) {
     errorOut << llvm::toString(std::move(err));
     *ppError = (sm50_error_t)errorObj;
     return 1;

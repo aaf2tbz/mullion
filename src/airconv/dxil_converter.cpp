@@ -37,6 +37,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include <format>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace mullion::dxbc {
@@ -323,10 +324,112 @@ opcode(const CallInst *call) {
   return cast<ConstantInt>(call->getArgOperand(0))->getZExtValue();
 }
 
+// DxilConstants.h AtomicBinOpCode order
+AtomicRMWInst::BinOp
+atomic_op(uint32_t code) {
+  constexpr AtomicRMWInst::BinOp ops[] = {
+      AtomicRMWInst::Add, AtomicRMWInst::And,  AtomicRMWInst::Or,   AtomicRMWInst::Xor,  AtomicRMWInst::Min,
+      AtomicRMWInst::Max, AtomicRMWInst::UMin, AtomicRMWInst::UMax, AtomicRMWInst::Xchg,
+  };
+  return ops[code];
+}
+
+// Metal has its own 64-bit minimum and maximum, unsigned and without the old value. Unreal's Nanite writes its
+// visibility buffer so from every thread of its rasterizer, where the locks stall for seconds and give up.
+// they do not take the locks of the other 64-bit atomics, so a shader has them only when it has no other
+bool
+native_extreme(const CallInst *call) {
+  if (opcode(call) != AtomicBinOp || !call->use_empty())
+    return false;
+  auto extreme = atomic_op(cast<ConstantInt>(call->getArgOperand(2))->getZExtValue());
+  return extreme == AtomicRMWInst::UMax || extreme == AtomicRMWInst::UMin;
+}
+
 bool
 is_dx_op(const Value *value) {
   auto call = dyn_cast<CallInst>(value);
   return call && call->getCalledFunction() && call->getCalledFunction()->getName().startswith("dx.op.");
+}
+
+// the 64-bit atomics split64 does, as the op on 32-bit halves: a subtract is an add of the negated value
+std::optional<AtomicRMWInst::BinOp>
+split_kind(AtomicRMWInst::BinOp op) {
+  switch (op) {
+  case AtomicRMWInst::Add:
+  case AtomicRMWInst::Sub:
+    return AtomicRMWInst::Add;
+  case AtomicRMWInst::And:
+  case AtomicRMWInst::Or:
+  case AtomicRMWInst::Xor:
+    return op;
+  default:
+    return std::nullopt;
+  }
+}
+
+// a shader whose 64-bit atomics are all on raw or structured buffers and all one op that commutes with itself (add,
+// and, or or xor), none using its old value, splits them into 32-bit atomics without the locks (split64): that op.
+// a raw or structured buffer's words are a buffer's memory, whose 32-bit halves Metal has atomics on; a typed
+// buffer's or texture's 64-bit texels are not, and may alias a buffer's words
+std::optional<AtomicRMWInst::BinOp>
+buffer_split(ArrayRef<CallInst *> calls, const ShaderInfo &info) {
+  auto constant = [](Value *v) { return (uint32_t)cast<ConstantInt>(v)->getZExtValue(); };
+  auto raw_buffer = [&](Value *handle) {
+    auto made = dyn_cast<CallInst>(handle);
+    if (!made || !is_dx_op(made) || opcode(made) != CreateHandle || constant(made->getArgOperand(1)) != UAV)
+      return false;
+    auto uav = info.uavMap.find(constant(made->getArgOperand(2)));
+    return uav != info.uavMap.end() && uav->second.resource_type == shader::common::ResourceType::NonApplicable;
+  };
+  std::optional<AtomicRMWInst::BinOp> split;
+  for (auto call : calls)
+    if (call->getType()->isIntegerTy(64) && (opcode(call) == AtomicBinOp || opcode(call) == AtomicCompareExchange)) {
+      auto kind = opcode(call) == AtomicBinOp && call->use_empty() && raw_buffer(call->getArgOperand(1))
+                      ? split_kind(atomic_op(constant(call->getArgOperand(2))))
+                      : std::nullopt;
+      if (!kind || (split && *split != *kind))
+        return std::nullopt;
+      split = kind;
+    }
+  return split;
+}
+
+// SM50_RAY_SHADER_CALLS of a library function and of the functions it calls
+uint32_t
+ray_calls(const Function &F) {
+  uint32_t calls = 0;
+  SmallPtrSet<const Function *, 8> seen{&F};
+  SmallVector<const Function *, 8> next{&F};
+  while (!next.empty()) {
+    auto f = next.pop_back_val();
+    for (auto &I : instructions(f)) {
+      auto call = dyn_cast<CallInst>(&I);
+      auto callee = call ? call->getCalledFunction() : nullptr;
+      if (!call || (callee && callee->isIntrinsic()))
+        continue;
+      if (is_dx_op(call)) {
+        auto op = opcode(call);
+        calls |= op == TraceRay ? SM50_RAY_SHADER_CALLS_TRACE : op == CallShader ? SM50_RAY_SHADER_CALLS_CALLABLE : 0;
+      } else if (!callee || callee->isDeclaration()) {
+        // another library's function, or an indirect call
+        calls |= SM50_RAY_SHADER_CALLS_TRACE | SM50_RAY_SHADER_CALLS_CALLABLE;
+      } else if (seen.insert(callee).second) {
+        next.push_back(callee);
+      }
+    }
+  }
+  return calls;
+}
+
+// MULLION_AIRCONV_SKIP=feedback-merge: every lane writes each texel of its sample's footprint to a sampler feedback
+// map itself (WriteSamplerFeedback), as before lanes put their writes together. it is in the shader cache's key
+bool
+feedback_merge_skipped() {
+  static const bool skipped = [] {
+    auto names = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    return names && strstr(names, "feedback-merge");
+  }();
+  return skipped;
 }
 
 // SM 6.6 annotates every handle with its resource's properties, which the handle's range says already: what uses the
@@ -949,7 +1052,7 @@ read_dxil(
       if (!f || !kind)
         continue;
       auto size = [&](uint64_t t) { return tag(properties, t) ? (uint32_t)md_uint(*tag(properties, t)) : 0; };
-      shader->ray_shaders.push_back({f->getName().str(), {(uint32_t)md_uint(*kind), size(6), size(7)}});
+      shader->ray_shaders.push_back({f->getName().str(), {(uint32_t)md_uint(*kind), size(6), size(7), ray_calls(*f)}});
     }
     return Error::success();
   }
@@ -1085,7 +1188,8 @@ read_dxil(
             shader, id, D3D10_SB_INTERPOLATION_MODE(entry.input[id].interpolation), evaluated_barycentrics.contains(id)
         );
   // groupshared 64-bit atomics hash their locks with the threadgroup's position (`locked`); those on resources share
-  // their locks among threadgroups
+  // their locks among threadgroups, but where they split (buffer_split)
+  std::vector<CallInst *> atomics64;
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
@@ -1094,8 +1198,11 @@ read_dxil(
         else if (auto cx = dyn_cast<AtomicCmpXchgInst>(&I); cx && cx->getCompareOperand()->getType()->isIntegerTy(64))
           used_ops.insert(GroupId);
         else if (auto call = dyn_cast<CallInst>(&I); call && is_dx_op(call) && call->getType()->isIntegerTy(64) &&
-                 (opcode(call) == AtomicBinOp || opcode(call) == AtomicCompareExchange))
-          shader->device_atomics64 = true;
+                 (opcode(call) == AtomicBinOp || opcode(call) == AtomicCompareExchange)) {
+          atomics64.push_back(call);
+          shader->device_atomics64_native &= native_extreme(call);
+        }
+  shader->device_atomics64 = !atomics64.empty() && !buffer_split(atomics64, info);
   // threadgroups work together when one waits for what another does: a loop that reads globally coherent memory
   auto coherent = [&](Value *handle) {
     auto made = dyn_cast<CallInst>(handle);
@@ -1130,6 +1237,7 @@ read_dxil(
   for (auto [op, type] : attribute_inputs)
     if (used_ops.count(op) && !mesh_stage)
       declare(D3D10_SB_OPCODE_DCL_INPUT, type, 0, 0, D3D10_SB_NAME_UNDEFINED, 0, ~0u);
+  info.discards = used_ops.count(Discard) != 0;
   if (used_ops.count(SampleIndex))
     shader->func_signature.DefineInput(air::InputSampleIndex{});
   for (auto op : {BufferStore, RawBufferStore, TextureStore, AtomicBinOp, AtomicCompareExchange, BufferUpdateCounter,
@@ -1143,7 +1251,9 @@ read_dxil(
   if (shader->shader_type != D3D10_SB_VERTEX_SHADER &&
       (used({WaveIsFirstLane, WaveGetLaneIndex, WaveGetLaneCount, WavePrefixOp, WaveMultiPrefixOp,
              WaveMultiPrefixBitCount}) ||
-       (compute && used({DerivFineX, DerivFineY})))) {
+       (compute && used({DerivFineX, DerivFineY})) ||
+       (!feedback_merge_skipped() &&
+        used({WriteSamplerFeedback, WriteSamplerFeedbackBias, WriteSamplerFeedbackLevel, WriteSamplerFeedbackGrad})))) {
     shader->func_signature.DefineInput(air::InputThreadIndexInSIMDGroup{});
     shader->func_signature.DefineInput(air::InputThreadsPerSIMDGroup{});
   }
@@ -1357,6 +1467,34 @@ convert_dxil(
           inlined = true;
         }
     }
+  // LLVM's integer division and remainder by zero are undefined, as is INT_MIN / -1, and Apple's GPUs give the dividend
+  // for a remainder by zero; D3D's give all ones (DXIL.rst, UDiv), as DXBC's udiv does here. a divisor that may be zero
+  // (or -1, signed) divides as one when it is, and a quotient or remainder by zero is all ones
+  if (start)
+    for (auto &I : make_early_inc_range(instructions(*start))) {
+      auto op = I.getOpcode();
+      bool is_signed = op == llvm::Instruction::SDiv || op == llvm::Instruction::SRem;
+      if (!is_signed && op != llvm::Instruction::UDiv && op != llvm::Instruction::URem)
+        continue;
+      auto dividend = I.getOperand(0), divisor = I.getOperand(1);
+      if (auto known = dyn_cast<ConstantInt>(divisor); known && !known->isZero() && !(is_signed && known->isMinusOne()))
+        continue;
+      auto type = I.getType();
+      IRBuilder<> ir(&I);
+      auto zero = ir.CreateICmpEQ(divisor, Constant::getNullValue(type));
+      Value *one = zero;
+      if (is_signed)
+        one = ir.CreateOr(
+            zero, ir.CreateAnd(
+                      ir.CreateICmpEQ(dividend, ConstantInt::get(type, APInt::getSignedMinValue(type->getScalarSizeInBits()))),
+                      ir.CreateICmpEQ(divisor, Constant::getAllOnesValue(type))
+                  )
+        );
+      I.setOperand(1, ir.CreateSelect(one, ConstantInt::get(type, 1), divisor));
+      ir.SetInsertPoint(I.getNextNode());
+      auto result = ir.CreateSelect(zero, Constant::getAllOnesValue(type), &I);
+      I.replaceUsesWithIf(result, [&](Use &use) { return use.getUser() != result; });
+    }
   // one Metal function can run several DXIL functions (a hull shader's phases, the stages tessellation fuses), each
   // linked in on its own: only this one keeps its body, under a name no other takes, and module variables stay private
   // to it
@@ -1458,6 +1596,66 @@ convert_dxil(
       if (is_dx_op(&I))
         calls.push_back(cast<CallInst>(&I));
 
+  // an amplification shader builds its payload in a groupshared variable and sends it with DispatchMesh. where that
+  // variable is the payload from its first byte, no larger, and only loaded, stored and copied, the group builds it in
+  // Metal's payload itself: DispatchMesh copies nothing, its group needs no memory for it, and the group's barriers
+  // order the payload as they order groupshared memory. Otherwise (a local variable, atomics, another variable)
+  // DispatchMesh copies it as before
+  bool direct_payload = false;
+  if (ctx.direct_payload && shader->shader_type == D3D12_SB_AMPLIFICATION_SHADER) {
+    GlobalVariable *sent = nullptr;
+    std::vector<CallInst *> dispatches;
+    bool one = true;
+    for (auto call : calls)
+      if (opcode(call) == DispatchMesh) {
+        auto base = dyn_cast<GlobalVariable>(call->getArgOperand(4)->stripPointerCasts());
+        one &= base && (!sent || base == sent);
+        sent = base;
+        dispatches.push_back(call);
+      }
+    if (!one)
+      sent = nullptr;
+    auto &layout = ctx.module.getDataLayout();
+    // whether every access through `v` is one retarget can rebuild on the payload, besides DispatchMesh's
+    std::function<bool(Value *)> plain = [&](Value *v) {
+      for (auto user : v->users()) {
+        if (auto expr = dyn_cast<ConstantExpr>(user)) {
+          if ((expr->getOpcode() != llvm::Instruction::GetElementPtr && expr->getOpcode() != llvm::Instruction::BitCast) ||
+              !plain(expr))
+            return false;
+        } else if (isa<GetElementPtrInst>(user) || isa<BitCastInst>(user)) {
+          if (!plain(user))
+            return false;
+        } else if (auto store = dyn_cast<StoreInst>(user)) {
+          if (store->getPointerOperand() != v)
+            return false;
+        } else if (auto call = dyn_cast<CallInst>(user)) {
+          auto intrinsic = dyn_cast<IntrinsicInst>(call);
+          if (!(intrinsic && (isa<MemTransferInst>(intrinsic) || isa<MemSetInst>(intrinsic) || intrinsic->isLifetimeStartOrEnd())) &&
+              !std::count(dispatches.begin(), dispatches.end(), call))
+            return false;
+        } else if (!isa<LoadInst>(user))
+          return false;
+      }
+      return true;
+    };
+    if (sent && !dispatches.empty() && sent->getAddressSpace() == (unsigned)air::AddressSpace::threadgroup &&
+        layout.getTypeAllocSize(sent->getValueType()) <= std::max(shader->payload_size, 4u) && plain(sent)) {
+      for (auto call : dispatches)
+        call->setArgOperand(4, UndefValue::get(call->getArgOperand(4)->getType()));
+      IRBuilder<> b(&*ctx.function->getEntryBlock().getFirstInsertionPt());
+      auto payload = b.CreateBitCast(
+          ctx.resource.payload,
+          sent->getValueType()->getPointerTo(ctx.resource.payload->getType()->getPointerAddressSpace())
+      );
+      if (auto err = retarget(sent, payload))
+        return std::move(err);
+      if (sent->use_empty())
+        sent->eraseFromParent();
+      direct_payload = true;
+    }
+  }
+
   // a ray tracing shader's system values are fields of its context, and its calls of other shaders go through the
   // pipeline's function table: the runtime's slots (mullion_command.metal) or, from there, the shaders'
   auto ray = ctx.resource.ray_context;
@@ -1472,20 +1670,45 @@ convert_dxil(
         ty->getArrayElementType(), b.CreateInBoundsGEP(ty, ray_field(field), {b.getInt32(0), element})
     );
   };
+  // the device's lock table, which the 64-bit atomics' locks and the header of the structure of nothing are in: the
+  // global root arguments', or for a ray tracing shader with no global root signature its dispatch's. null where
+  // neither has one (airconv's command line, with no root signature)
+  auto atomic_locks = [&]() -> Value * {
+    if (auto locks = ctx.binding.GetAtomicLocks(air); locks || !ray)
+      return locks;
+    auto &b = ctx.builder;
+    auto i64 = b.getInt64Ty();
+    auto address = b.CreateLoad(
+        i64, b.CreateGEP(i64, b.CreateBitCast(ray_value(RayDispatch), i64->getPointerTo(2)),
+                         b.getInt32(offsetof(SM50_RAY_DISPATCH, atomic_locks) / sizeof(uint64_t)))
+    );
+    return b.CreateIntToPtr(address, b.getInt32Ty()->getPointerTo(1));
+  };
+  // the runtime's functions are called by name, as a Metal function calls an extern [[visible]] one: every ray
+  // tracing pipeline links them, and with no call through the table between them and the kernel, Metal can compile
+  // a trace into the kernel (mullion_command.metal, kRayFCIndex_DirectCalls)
   auto ray_call = [&](uint32_t slot, Value *first, Value *second) {
     auto &b = ctx.builder;
     auto i8p = b.getInt8PtrTy();
-    auto table = ray_value(RayShaders);
-    auto pointer = b.CreateCall(
-        ctx.module.getOrInsertFunction(
-            "air.get_function_pointer_visible_function_table",
-            FunctionType::get(i8p, {table->getType(), b.getInt32Ty()}, false)
-        ),
-        {table, b.getInt32(slot)}
-    );
     auto ty = FunctionType::get(b.getVoidTy(), {ray->getType(), i8p, i8p}, false);
     auto untyped = [&](Value *v) -> Value * { return v ? b.CreateBitCast(v, i8p) : ConstantPointerNull::get(i8p); };
-    b.CreateCall(ty, b.CreateBitCast(pointer, ty->getPointerTo()), {ray, untyped(first), untyped(second)});
+    const char *runtime = slot == SM50_RAY_FUNCTION_TRACE        ? "mullion_ray_trace"
+                          : slot == SM50_RAY_FUNCTION_REPORT_HIT ? "mullion_ray_report_hit"
+                          : slot == SM50_RAY_FUNCTION_CALL       ? "mullion_ray_call"
+                                                                 : nullptr;
+    assert(runtime);
+    auto reference = std::string(runtime) + ".MTL_VISIBLE_FN_REF";
+    auto callee = ctx.module.getFunction(reference);
+    if (!callee) {
+      callee = Function::Create(ty, GlobalValue::ExternalLinkage, reference, ctx.module);
+      callee->setSection("air.externally_defined");
+      ctx.module.getOrInsertNamedMetadata("air.visible_function_references")
+          ->addOperand(MDNode::get(
+              ctx.llvm, {MDString::get(ctx.llvm, "air.visible_function_reference"), ValueAsMetadata::get(callee),
+                         MDString::get(ctx.llvm, runtime)}
+          ));
+    }
+    b.CreateCall(ty, callee, {ray, untyped(first), untyped(second)});
   };
   // an any hit shader ends with its verdict where it calls IgnoreHit or AcceptHitAndEndSearch
   auto ray_verdict = [&](CallInst *call, SM50_RAY_VERDICT verdict) {
@@ -1657,13 +1880,29 @@ convert_dxil(
     vertex_columns = cm->registers[0].size() + 4 + clip_count;
     primitive_columns = cm->registers[1].size() + 3;
   }
-  // the counts SetMeshOutputCounts gave this thread, nothing until then
+  // only the counts of the first active thread count (Mesh Shader spec, SetMeshOutputCounts), and the shader sets them
+  // in uniform flow: the group's first SIMD-group sets them, as its first active thread has them (SetMeshOutputCounts
+  // below). where the group reads them once every thread is through, that SIMD-group keeps them in threadgroup
+  // memory, nothing until then; only it writes there, so no other's write lands after them
   Value *mesh_counts[2]{};
+  auto first_simd = [&] {
+    return ir.CreateICmpULT(ctx.resource.thread_id_in_group_flat_arg, ir.getInt32(std::max(ctx.simd_width, 1u)));
+  };
+  auto keep_counts = [&] {
+    IRBuilder<>::InsertPointGuard guard(ir);
+    // after the thread's index, which may still end the entry block
+    if (auto flat = dyn_cast<llvm::Instruction>(ctx.resource.thread_id_in_group_flat_arg))
+      flat->getNextNode() ? ir.SetInsertPoint(flat->getNextNode()) : ir.SetInsertPoint(flat->getParent());
+    else
+      ir.SetInsertPoint(&*ctx.function->getEntryBlock().getFirstInsertionPt());
+    auto elsewhere = threadgroup(ir.getInt32Ty());
+    for (auto &count : mesh_counts)
+      ir.CreateStore(ir.getInt32(0), ir.CreateSelect(first_simd(), count = threadgroup(ir.getInt32Ty()), elsewhere));
+  };
   if (cm) {
+    keep_counts();
     IRBuilder<>::InsertPointGuard guard(ir);
     ir.SetInsertPoint(&*ctx.function->getEntryBlock().getFirstInsertionPt());
-    for (auto &count : mesh_counts)
-      ir.CreateStore(ir.getInt32(0), count = ir.CreateAlloca(ir.getInt32Ty()));
     conservative_vertices =
         threadgroup(ArrayType::get(ArrayType::get(ir.getInt32Ty(), vertex_columns), std::max(shader->mesh_max_vertices, 1u)));
     conservative_primitives = threadgroup(
@@ -1675,10 +1914,9 @@ convert_dxil(
     if (culls)
       staged_culled = threadgroup(ArrayType::get(i8, shader->mesh_max_primitives));
   } else if (staged_positions || cull_distances) {
+    keep_counts();
     IRBuilder<>::InsertPointGuard guard(ir);
     ir.SetInsertPoint(&*ctx.function->getEntryBlock().getFirstInsertionPt());
-    for (auto &count : mesh_counts)
-      ir.CreateStore(ir.getInt32(0), count = ir.CreateAlloca(ir.getInt32Ty()));
     if (staged_positions)
       staged_position = threadgroup(ArrayType::get(ArrayType::get(ir.getFloatTy(), 4), shader->mesh_max_vertices));
     if (cull_distances) {
@@ -1940,14 +2178,6 @@ convert_dxil(
     return ir.CreateExtractElement(v, e.col + constant(arg(call, 3)));
   };
   auto fp_unary = [&](llvm::air::AIRBuilder::FPUnOp op, Value *v) { return air.CreateFPUnOp(op, v); };
-  // DxilConstants.h AtomicBinOpCode order
-  auto atomic_op = [](uint32_t code) {
-    constexpr AtomicRMWInst::BinOp ops[] = {
-        AtomicRMWInst::Add, AtomicRMWInst::And,  AtomicRMWInst::Or,   AtomicRMWInst::Xor,  AtomicRMWInst::Min,
-        AtomicRMWInst::Max, AtomicRMWInst::UMin, AtomicRMWInst::UMax, AtomicRMWInst::Xchg,
-    };
-    return ops[code];
-  };
 
   // Metal's SIMD-group functions, named as the Metal compiler names them (integers by signedness); every active lane
   // takes part, so they are convergent
@@ -2097,6 +2327,8 @@ convert_dxil(
     llvm::air::MemFlags memory;
     std::function<Value *()> read;
     std::function<void(Value *)> write;
+    // a buffer word's pointer, whose 32-bit halves have atomics (split64)
+    Value *halves = nullptr;
   };
   // the word at a buffer or groupshared pointer. groupshared words key with their threadgroup's position, so
   // threadgroups do not share locks for the same word
@@ -2126,21 +2358,47 @@ convert_dxil(
               [=, &ir, &air](Value *v) {
                 air.CreateDeviceCoherentStore(ir.CreateTrunc(v, i32), half(0));
                 air.CreateDeviceCoherentStore(ir.CreateTrunc(ir.CreateLShr(v, 32), i32), half(1));
-              }};
+              },
+              ptr};
     }
     for (uint32_t c = 0; c < 3; c++)
       key = ir.CreateAdd(ir.CreateMul(key, ir.getInt64(0x9e3779b97f4a7c15)), ir.CreateZExt(thread_input(GroupId, c), i64));
     return {key, llvm::air::MemFlags::Threadgroup, [=, &ir] { return (Value *)ir.CreateLoad(i64, ptr); },
             [=, &ir](Value *v) { ir.CreateStore(v, ptr); }};
   };
+  // a 64-bit add, subtract, and, or or xor whose old value goes unused, as an atomic on each 32-bit half, without a
+  // lock: a bitwise op's halves are independent, and an add carries into the high half when the low half wraps (each
+  // add's own low step tells whether it did). between the halves the word is part way through a step, so it is only
+  // for words that every other op of the shader changes the same way, unread (split_buffers): the steps then commute,
+  // and the word ends as some order of them would leave it
+  auto split64 = [&](Value *ptr, AtomicRMWInst::BinOp op, Value *v) {
+    auto i32 = ir.getInt32Ty();
+    if (op == AtomicRMWInst::Sub)
+      v = ir.CreateNeg(v);
+    auto low = ir.CreateBitCast(ptr, i32->getPointerTo(ptr->getType()->getPointerAddressSpace()));
+    auto high = ir.CreateConstGEP1_32(i32, low, 1);
+    auto lo = ir.CreateTrunc(v, i32), hi = ir.CreateTrunc(ir.CreateLShr(v, 32), i32);
+    auto kind = *split_kind(op);
+    auto old = air.CreateAtomicRMW(kind, low, lo);
+    if (kind == AtomicRMWInst::Add)
+      hi = ir.CreateAdd(hi, ir.CreateZExt(ir.CreateICmpULT(ir.CreateAdd(old, lo), old), i32));
+    air.CreateAtomicRMW(kind, high, hi);
+  };
   // a 64-bit atomic, which Apple GPUs lack (but min and max without a result): `update` of `word`'s old value under a
-  // lock word of `locks` hashed from its key, returning the old value. every 64-bit atomic takes a lock, so none races
-  // a lock-free one. the lanes of a SIMD group take their locks in rounds: in each, the first pending lane and every
-  // pending lane whose lock word is not the first's try theirs once, and a lane that takes its lock updates the word
-  // and releases it in the same round. so no lane waits across rounds on a lock its own group holds (the group's lanes
-  // do not run apart), lanes of different words do not wait for each other, and lanes of one word take turns as one
-  // lane at a time did
-  auto locked = [&](const Word64 &word, Value *locks, std::function<Value *(Value *)> update) -> Value * {
+  // lock word of `locks` hashed from its key, returning the old value. the native min and max and the split ones take
+  // no lock, so where another shader (another stage of a draw, an overlapping dispatch or another queue's work) does
+  // locked ops on the same word at the same time, without a barrier between, they race them. a locked add, and, or or
+  // xor on a buffer word writes its step as a split one does (`op`, of `operand`), so a split step of the same kind is
+  // never undone, though the old value the locked one returns may have a split step's low half and not yet its carry. a
+  // locked exchange, compare-exchange, min or max, any op on a typed view, and a split step of another kind, change the
+  // word in ways that do not commute with a split step, and may leave a value no order of the steps would. within one
+  // shader none of this arises (split_buffers, split_shared). the lanes of a SIMD group take their locks in rounds: in
+  // each, the first pending lane and every pending lane whose lock word is not the first's try theirs once, and a lane
+  // that takes its lock updates the word and releases it in the same round. so no lane waits across rounds on a lock
+  // its own group holds (the group's lanes do not run apart), lanes of different words do not wait for each other, and
+  // lanes of one word take turns as one lane at a time did
+  auto locked = [&](const Word64 &word, Value *locks, std::function<Value *(Value *)> update,
+                    std::optional<AtomicRMWInst::BinOp> op = std::nullopt, Value *operand = nullptr) -> Value * {
     if (air.DiscardWrites && word.memory != llvm::air::MemFlags::Threadgroup)
       return word.read();
     auto scope = word.memory == llvm::air::MemFlags::Threadgroup ? llvm::air::ThreadScope::Threadgroup
@@ -2151,7 +2409,9 @@ convert_dxil(
     auto loop = block("atomic64"), attempt = block("atomic64_attempt"), gate = block("atomic64_gate"),
          try_lock = block("atomic64_try"), deferred = block("atomic64_deferred"), held = block("atomic64_held"),
          retry = block("atomic64_retry"), waiting = block("atomic64_waiting"), given_up = block("atomic64_given_up"),
-         next = block("atomic64_next");
+         next = block("atomic64_next"), chosen = block("atomic64_chosen"), spin = block("atomic64_spin"),
+         spin_retry = block("atomic64_spin_retry"), spin_held = block("atomic64_spin_held"),
+         spin_given_up = block("atomic64_spin_given_up"), round_end = block("atomic64_round_end");
     // a pixel shader's helper lanes take no part: their atomics do nothing, so one would spin on a lock forever
     ir.SetInsertPoint(head->getTerminator());
     Value *lane = ctx.shader_type == D3D10_SB_PIXEL_SHADER
@@ -2198,18 +2458,31 @@ convert_dxil(
     ir.CreateCondBr(ir.CreateICmpEQ(spun, ir.getInt32(kSpins)), given_up, waiting);
     ir.SetInsertPoint(waiting);
     ir.CreateBr(next);
+    auto give_up = [&](llvm::BasicBlock *to) {
+      air.CreateAtomicRMW(
+          AtomicRMWInst::Or, ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(mask, ir.getInt32(2))}), ir.getInt32(1)
+      );
+      ir.CreateBr(to);
+    };
+    // the word's update, under the lock, which it then releases
+    auto hold = [&](llvm::BasicBlock *to) {
+      air.CreateAtomicFence(word.memory, scope);
+      auto value = word.read();
+      // an exchange's write does not wait on the read for its value, so nothing else keeps them in order
+      air.CreateAtomicFence(word.memory, scope);
+      if (word.halves && op && split_kind(*op))
+        split64(word.halves, *op, operand);
+      else
+        word.write(update(value));
+      air.CreateAtomicFence(word.memory, scope);
+      air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
+      ir.CreateBr(to);
+      return value;
+    };
     ir.SetInsertPoint(given_up);
-    air.CreateAtomicRMW(AtomicRMWInst::Or, ir.CreateGEP(ir.getInt32Ty(), locks, {ir.CreateAdd(mask, ir.getInt32(2))}), ir.getInt32(1));
-    ir.CreateBr(next);
+    give_up(next);
     ir.SetInsertPoint(held);
-    air.CreateAtomicFence(word.memory, scope);
-    auto value = word.read();
-    // an exchange's write does not wait on the read for its value, so nothing else keeps them in order
-    air.CreateAtomicFence(word.memory, scope);
-    word.write(update(value));
-    air.CreateAtomicFence(word.memory, scope);
-    air.CreateAtomicRMW(AtomicRMWInst::Add, lock, ir.getInt32(1));
-    ir.CreateBr(next);
+    auto value = hold(next);
     ir.SetInsertPoint(next);
     auto still = ir.CreatePHI(ir.getInt1Ty(), 5), got = ir.CreatePHI(ir.getInt64Ty(), 5);
     auto spins_next = ir.CreatePHI(ir.getInt32Ty(), 5), last_next = ir.CreatePHI(ir.getInt32Ty(), 5);
@@ -2226,10 +2499,47 @@ convert_dxil(
     incoming(waiting, ir.getTrue(), old, spun, seen);
     incoming(deferred, ir.getTrue(), old, spins, last);
     incoming(attempt, pending, old, spins, last);
-    pending->addIncoming(still, next);
-    old->addIncoming(got, next);
-    spins->addIncoming(spins_next, next);
-    last->addIncoming(last_next, next);
+    // then, with every lock the group took in the round released, its first lane still waiting spins on its own, as one
+    // lane at a time did: with only a try a round, locks that many groups want (every pixel of a texel's primitives on
+    // one) were not taken before the GPU's watchdog (d3d12_atomic64_pixels on family 7). no lane of its group holds
+    // that lock (one of its word left it to the first, the others released theirs), and it holds none itself
+    ir.CreateCondBr(still, chosen, round_end);
+    ir.SetInsertPoint(chosen);
+    ir.CreateCondBr(simd("simd_is_first", ir.getInt1Ty(), {}), spin, round_end);
+    ir.SetInsertPoint(spin);
+    auto spin_spins = ir.CreatePHI(ir.getInt32Ty(), 2), spin_last = ir.CreatePHI(ir.getInt32Ty(), 2);
+    spin_spins->addIncoming(spins_next, chosen);
+    spin_last->addIncoming(last_next, chosen);
+    auto spin_expected = ir.CreateAnd(spin_last, ir.getInt32(~1u));
+    auto spin_exchange = ir.CreateAtomicCmpXchg(lock, spin_expected, ir.CreateOr(spin_expected, ir.getInt32(1)), {},
+                                                AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
+    auto spin_seen = ir.CreateExtractValue(spin_exchange, 0);
+    ir.CreateCondBr(ir.CreateExtractValue(spin_exchange, 1), spin_held, spin_retry);
+    ir.SetInsertPoint(spin_retry);
+    auto spin_spun = ir.CreateSelect(
+        ir.CreateICmpEQ(spin_seen, spin_last), ir.CreateAdd(spin_spins, ir.getInt32(1)), ir.getInt32(0)
+    );
+    spin_spins->addIncoming(spin_spun, spin_retry);
+    spin_last->addIncoming(spin_seen, spin_retry);
+    ir.CreateCondBr(ir.CreateICmpEQ(spin_spun, ir.getInt32(kSpins)), spin_given_up, spin);
+    ir.SetInsertPoint(spin_given_up);
+    give_up(round_end);
+    ir.SetInsertPoint(spin_held);
+    auto spin_value = hold(round_end);
+    ir.SetInsertPoint(round_end);
+    auto still_end = ir.CreatePHI(ir.getInt1Ty(), 4), got_end = ir.CreatePHI(ir.getInt64Ty(), 4);
+    for (auto from : {next, chosen}) {
+      still_end->addIncoming(still, from);
+      got_end->addIncoming(got, from);
+    }
+    still_end->addIncoming(ir.getFalse(), spin_held);
+    got_end->addIncoming(spin_value, spin_held);
+    still_end->addIncoming(ir.getFalse(), spin_given_up);
+    got_end->addIncoming(PoisonValue::get(ir.getInt64Ty()), spin_given_up);
+    pending->addIncoming(still_end, round_end);
+    old->addIncoming(got_end, round_end);
+    spins->addIncoming(spins_next, round_end);
+    last->addIncoming(last_next, round_end);
     ir.CreateBr(loop);
     ir.SetInsertPoint(&*exit->getFirstInsertionPt());
     return old;
@@ -2273,19 +2583,11 @@ convert_dxil(
     return ret;
   };
 
-  // Metal has its own 64-bit minimum and maximum, unsigned and without the old value. Unreal's Nanite writes its
-  // visibility buffer so from every thread of its rasterizer, where the locks stall for seconds and give up.
-  // they do not take the locks of the other 64-bit atomics, so a shader has them only when it has no other
-  auto native_extreme = [&](CallInst *call) {
-    if (opcode(call) != AtomicBinOp || !call->use_empty())
-      return false;
-    auto extreme = atomic_op(constant(arg(call, 2)));
-    return extreme == AtomicRMWInst::UMax || extreme == AtomicRMWInst::UMin;
-  };
   bool native_extremes = air.HasAtomicMinMax64() && std::all_of(calls.begin(), calls.end(), [&](CallInst *call) {
     return !call->getType()->isIntegerTy(64) || (opcode(call) != AtomicBinOp && opcode(call) != AtomicCompareExchange) ||
            native_extreme(call);
   });
+  auto split_buffers = native_extremes ? std::nullopt : buffer_split(calls, info);
 
   for (auto call : calls) {
     ir.SetInsertPoint(call);
@@ -2589,18 +2891,19 @@ convert_dxil(
       ir.CreateStore(ir.CreateBitCast(v, slot), ptr);
       break;
     }
-    case SetMeshOutputCounts:
-      // Metal counts the vertices itself; a conservative mesh's are its triangles', set at the end
-      if (cm) {
-        for (unsigned i = 0; i < 2; i++)
-          ir.CreateStore(a(1 + i), mesh_counts[i]);
-        break;
-      }
-      air.CreateSetMeshPrimitiveCount(a(2));
+    case SetMeshOutputCounts: {
+      // the first SIMD-group sets the group's counts as its first active thread has them (mesh_counts). Metal counts
+      // the vertices itself; a conservative mesh's are its triangles', set at the end
+      Value *counts[2] = {move("simd_broadcast_first", a(1), {}), move("simd_broadcast_first", a(2), {})};
+      ir.SetInsertPoint(SplitBlockAndInsertIfThen(first_simd(), call, false));
+      if (!cm)
+        air.CreateSetMeshPrimitiveCount(counts[1]);
       if (mesh_counts[0])
         for (unsigned i = 0; i < 2; i++)
-          ir.CreateStore(a(1 + i), mesh_counts[i]);
+          ir.CreateStore(counts[i], mesh_counts[i]);
+      ir.SetInsertPoint(call);
       break;
+    }
     case EmitIndices:
       for (unsigned i = 0; i < corners; i++) {
         auto index = ir.CreateTrunc(a(2 + i), i8);
@@ -2628,12 +2931,15 @@ convert_dxil(
         break;
       }
       // DispatchMesh is a group barrier, and takes its arguments from the group's first thread (Mesh Shader spec,
-      // "DispatchMesh intrinsic"): the threads build the payload together, and one sends it
-      air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+      // "DispatchMesh intrinsic"): the threads build the payload together, and one sends it. a payload built in
+      // place needs neither: Metal starts an object threadgroup's mesh grid once all its threads are through
+      if (!direct_payload)
+        air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
       ir.SetInsertPoint(SplitBlockAndInsertIfThen(
           ir.CreateICmpEQ(ctx.resource.thread_id_in_group_flat_arg, ir.getInt32(0)), call, false
       ));
-      ir.CreateStore(ir.CreateLoad(type, local), payload);
+      if (!direct_payload)
+        ir.CreateStore(ir.CreateLoad(type, local), payload);
       // a conservative mesh shader grows each D3D group's triangles in slices, threadgroups along x
       Value *grid = UndefValue::get(FixedVectorType::get(ir.getInt32Ty(), 3));
       for (unsigned i = 0; i < 3; i++)
@@ -2756,25 +3062,22 @@ convert_dxil(
     }
     case CBufferLoad: {
       // DXIL.rst CBufferLoad aligns the offset; DXR shader records can put root constants after one DWORD. past the
-      // bound size it reads 0 (D3D11.3 7.5): from the start instead, its value dropped, as LoadConstantBuffer does
+      // bound size it reads 0 (D3D11.3 7.5): from a row of zeros instead, as LoadConstantBuffer does
       auto &buffer = *handles[a(1)].cbuffer;
       auto offset = ir.CreateZExt(a(2), ir.getInt64Ty());
-      Value *inside = nullptr;
-      if (buffer.Metadata) {
-        auto end = ir.CreateAdd(offset, ir.getInt64(ctx.module.getDataLayout().getTypeStoreSize(ty).getFixedSize()));
-        inside = ir.CreateICmpULE(end, buffer.Metadata);
-        offset = ir.CreateSelect(inside, offset, ir.getInt64(0));
-      }
       auto space = buffer.Pointer->getType()->getPointerAddressSpace();
-      auto pointer = ir.CreateGEP(
+      Value *pointer = ir.CreateGEP(
           ir.getInt8Ty(), ir.CreatePointerCast(buffer.Pointer, ir.getInt8Ty()->getPointerTo(space)), offset
       );
+      if (buffer.Metadata) {
+        auto end = ir.CreateAdd(offset, ir.getInt64(ctx.module.getDataLayout().getTypeStoreSize(ty).getFixedSize()));
+        auto zero = ir.CreatePointerCast(dxbc.ZeroRow(), ir.getInt8Ty()->getPointerTo(space));
+        pointer = ir.CreateSelect(ir.CreateICmpULE(end, buffer.Metadata), pointer, zero);
+      }
       ret = ir.CreateAlignedLoad(
           ty, ir.CreatePointerCast(pointer, ty->getPointerTo(space)),
           std::min(Align(constant(a(3))), getKnownAlignment(buffer.Pointer, ctx.module.getDataLayout()))
       );
-      if (inside)
-        ret = ir.CreateSelect(inside, ret, Constant::getNullValue(ty));
       break;
     }
     case CBufferLoadLegacy: {
@@ -2812,6 +3115,8 @@ convert_dxil(
       bool compute = ctx.shader_type == D3D11_SB_COMPUTE_SHADER;
       Value *residency_level = nullptr, *residency_bias = bias, *residency_clamp = nullptr;
       Value *residency_dx = nullptr, *residency_dy = nullptr;
+      // how the sample takes its LOD, for a minimum or maximum filter; a comparison filter does not reduce
+      std::optional<Converter::Footprint> footprint;
       std::function<std::pair<Value *, Value *>(Value *, Value *)> read;
       if (compute && (op == Sample || op == SampleBias)) {
         auto [dx, dy] = quad_gradients(coord);
@@ -2820,6 +3125,7 @@ convert_dxil(
         auto gx = dxbc.BiasGradient(dx, bias), gy = dxbc.BiasGradient(dy, bias);
         auto clamp = min_lod(tex, a(op == Sample ? 10 : 11));
         residency_dx = gx, residency_dy = gy, residency_clamp = clamp, residency_bias = nullptr;
+        footprint = {.DDX = dx, .DDY = dy, .Bias = bias, .MinLOD = clamp};
         read = [&, gx, gy, clamp](Value *s, Value *) {
           return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
         };
@@ -2838,6 +3144,7 @@ convert_dxil(
         case Sample: {
           auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(10))}};
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
+          footprint = {.Bias = options.first.bias, .MinLOD = options.second.lod};
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
@@ -2851,6 +3158,7 @@ convert_dxil(
               llvm::air::sample_bias{ir.CreateFAdd(a(10), bias)}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(11))}
           };
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
+          footprint = {.Bias = options.first.bias, .MinLOD = options.second.lod};
           read = [&, options](Value *s, Value *) {
             return dxbc.SampleImplicit(
                 *tex.texture, s, smp.sampler->Metadata, coord, array, offset, nullptr, options.first.bias,
@@ -2862,16 +3170,18 @@ convert_dxil(
         case SampleLevel: {
           auto lod = llvm::air::sample_level{min_lod(tex, ir.CreateFAdd(a(10), bias))};
           residency_level = lod.lod;
+          footprint = {.Level = a(10)};
           read = [&, lod](Value *s, Value *) {
             return air.CreateSample(texture, handle, s, coord, array, offset, lod);
           };
           break;
         }
         case SampleGrad: {
-          auto gx = dxbc.BiasGradient(vec(call, 10, logical, coord_ty), bias);
-          auto gy = dxbc.BiasGradient(vec(call, 13, logical, coord_ty), bias);
+          auto dx = vec(call, 10, logical, coord_ty), dy = vec(call, 13, logical, coord_ty);
+          auto gx = dxbc.BiasGradient(dx, bias), gy = dxbc.BiasGradient(dy, bias);
           auto clamp = min_lod(tex, a(16));
           residency_dx = gx, residency_dy = gy, residency_clamp = clamp, residency_bias = nullptr;
+          footprint = {.DDX = dx, .DDY = dy, .Bias = bias, .MinLOD = clamp};
           read = [&, gx, gy, clamp](Value *s, Value *) {
             return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
           };
@@ -2913,6 +3223,11 @@ convert_dxil(
           *tex.texture, sampler, smp.sampler->Border, smp.sampler->Metadata, value,
           [&](Value *s) { return read(s, nullptr).first; }, reference
       );
+      if (footprint)
+        std::tie(value, residency) = dxbc.MinMaxFilter(
+            *tex.texture, sampler, smp.sampler->Border, smp.sampler->Metadata, coord, array, offset, *footprint,
+            {value, residency}
+        );
       ret = to_struct(ty, value, residency);
       break;
     }
@@ -3175,6 +3490,101 @@ convert_dxil(
            ir.getTrue()},
           {air.CreateConvertToUnsigned(fp_unary(AIRBuilder::ceil, lod)), mip_linear},
       };
+      // most of a sample's writes are another's already: the two mips are one at a whole LOD, the two texels of an
+      // axis are mostly in one region, and the lanes of a SIMD group mostly sample close together. one atomic per
+      // texel of every footprint contends on the map's few texels (tests/perf sampler_feedback: 8 atomics a thread
+      // into a 32 by 32 map, 17 times the GPU time of the same pass sampling). so a sample leaves out the writes its
+      // other writes make, and a SIMD group's lanes put together their writes to one texel of the map, which one lane
+      // makes. the map's texels get the same bits. MULLION_AIRCONV_SKIP=feedback-merge leaves this out
+      bool merge_skipped = feedback_merge_skipped();
+      if (!merge_skipped)
+        levels[1].second = ir.CreateAnd(mip_linear, ir.CreateICmpNE(levels[1].first, levels[0].first));
+      // lanes put their writes together only where they write one map: its handle is the same in every lane unless
+      // it was made with a NonUniformResourceIndex. compute and pixel shaders have their lane's index. a pixel shader's
+      // helper lanes write nothing ("Helper lanes" in the spec; Metal drops their atomics), so they take no part
+      auto made = dyn_cast<CallInst>(a(1));
+      auto non_uniform = made && is_dx_op(made) && opcode(made) == CreateHandle
+                             ? dyn_cast<ConstantInt>(made->getArgOperand(4))
+                             : nullptr;
+      bool merge = !merge_skipped && non_uniform && non_uniform->isZero() &&
+                   (ctx.shader_type == D3D11_SB_COMPUTE_SHADER || ctx.shader_type == D3D10_SB_PIXEL_SHADER) &&
+                   simd_inputs;
+      // a pixel shader's lane takes part only where it would write itself: not a helper, and where Mullion keeps the
+      // write, which a coarse pixel's other lanes and a lane that discarded under coarse shading do not
+      // (CoarseShading::Finish gives kFeedbackLaneWrites its value)
+      Value *writes = ir.getTrue();
+      if (merge && ctx.shader_type == D3D10_SB_PIXEL_SHADER)
+        writes = ir.CreateAnd(
+            ir.CreateNot(simd("simd_is_helper_thread", ir.getInt1Ty(), {})),
+            ir.CreateCall(ctx.module.getOrInsertFunction(kFeedbackLaneWrites, FunctionType::get(ir.getInt1Ty(), false)))
+        );
+      auto ctz = ctx.module.getOrInsertFunction(
+          "air.ctz.i64", FunctionType::get(ir.getInt64Ty(), {ir.getInt64Ty(), ir.getInt1Ty()}, false)
+      );
+      // ORs `bits` into the map's texel x, y of `slice`
+      auto record = [&](Value *x, Value *y, Value *slice, Value *bits) {
+        auto write = [&](Value *x, Value *y, Value *slice, Value *bits) {
+          Value *pos = UndefValue::get(air.getIntTy(2));
+          pos = ir.CreateInsertElement(ir.CreateInsertElement(pos, x, (uint64_t)0), y, 1);
+          air.CreateAtomicRMW(map.Texture, map.Handle, AtomicRMWInst::Or, pos, ir.CreateVectorSplat(4, bits), slice);
+        };
+        if (merge_skipped)
+          return write(x, y, slice, bits);
+        auto wanted = ir.CreateICmpNE(bits, ir.getInt32(0));
+        auto key = ir.CreateOr(x, ir.CreateShl(y, 16));
+        auto first = ir.CreateAnd(wanted, writes);
+        // the rest of the shader goes on in a block of its own
+        auto head = ir.GetInsertBlock();
+        llvm::BasicBlock *rest;
+        if (ir.GetInsertPoint() == head->end()) {
+          rest = llvm::BasicBlock::Create(ctx.llvm, "feedback_written", ctx.function, head->getNextNode());
+          ir.CreateBr(rest);
+        } else
+          rest = SplitBlock(head, &*ir.GetInsertPoint());
+        auto block = [&](const char *name) { return llvm::BasicBlock::Create(ctx.llvm, name, ctx.function, rest); };
+        // a block made here is empty, one split off holds the rest
+        auto go_on = [&] { rest->empty() ? ir.SetInsertPoint(rest) : ir.SetInsertPoint(&*rest->getFirstInsertionPt()); };
+        if (!merge) {
+          // a write of no bits is left out
+          auto one = block("feedback_write");
+          head->getTerminator()->eraseFromParent();
+          ir.SetInsertPoint(head);
+          ir.CreateCondBr(wanted, one, rest);
+          ir.SetInsertPoint(one);
+          write(x, y, slice, bits);
+          ir.CreateBr(rest);
+          return go_on();
+        }
+        // in turn, the first lane still to write takes the bits of every lane writing its texel, and writes them. the
+        // loop is the SIMD group's: each turn writes at least one lane's texel
+        auto loop = block("feedback_merge"), turn = block("feedback_turn"), lead = block("feedback_lead"),
+             next = block("feedback_next");
+        head->getTerminator()->setSuccessor(0, loop);
+        ir.SetInsertPoint(loop);
+        auto pending = ir.CreatePHI(ir.getInt1Ty(), 2);
+        pending->addIncoming(first, head);
+        auto lanes = simd("simd_ballot", ir.getInt64Ty(), {pending}, ir.getInt64Ty());
+        ir.CreateCondBr(ir.CreateICmpNE(lanes, ir.getInt64(0)), turn, rest);
+        ir.SetInsertPoint(turn);
+        auto leader = ir.CreateTrunc(ir.CreateCall(ctz, {lanes, ir.getFalse()}), ir.getInt32Ty());
+        auto leader_key = move("simd_shuffle", key, {i16(leader)});
+        auto leader_slice = move("simd_shuffle", slice, {i16(leader)});
+        auto same = ir.CreateAnd(
+            pending, ir.CreateAnd(ir.CreateICmpEQ(key, leader_key), ir.CreateICmpEQ(slice, leader_slice))
+        );
+        auto merged =
+            simd("simd_or", ir.getInt32Ty(), {ir.CreateSelect(same, bits, ir.getInt32(0))}, ir.getInt32Ty());
+        ir.CreateCondBr(ir.CreateICmpEQ(lane_index(), leader), lead, next);
+        ir.SetInsertPoint(lead);
+        write(
+            ir.CreateAnd(leader_key, ir.getInt32(0xffff)), ir.CreateLShr(leader_key, 16), leader_slice, merged
+        );
+        ir.CreateBr(next);
+        ir.SetInsertPoint(next);
+        pending->addIncoming(ir.CreateAnd(pending, ir.CreateNot(same)), next);
+        ir.CreateBr(loop);
+        go_on();
+      };
       auto modes = field(SM50_SAMPLER_METADATA_ADDRESS, 5);
       auto axis_modes = ir.getInt32(SM50_SAMPLER_ADDRESS_COUNT);
       // an anisotropic filter's taps: as many as its ratio, evenly along its line, which the sample is the middle of.
@@ -3242,21 +3652,22 @@ convert_dxil(
               auto region = min(
                   air.CreateConvertToSigned(ir.CreateFMul(center, to_float(coarse))), ir.CreateSub(coarse, ir.getInt32(1))
               );
-              regions[axis][k] = {ir.CreateShl(region, mip), kept};
+              region = ir.CreateShl(region, mip);
+              // the second texel in the first's region adds nothing to it
+              if (k && !merge_skipped)
+                kept = ir.CreateAnd(
+                    kept, ir.CreateNot(ir.CreateAnd(regions[axis][0].second, ir.CreateICmpEQ(region, regions[axis][0].first)))
+                );
+              regions[axis][k] = {region, kept};
             }
           }
           auto bit = ir.CreateShl(ir.getInt32(1), mip);
+          auto slice = array ? ir.CreateAdd(array, first_slice) : first_slice;
           for (unsigned corner = 0; corner < 4; corner++) {
             auto &[x, keep_x] = regions[0][corner & 1];
             auto &[y, keep_y] = regions[1][corner >> 1];
-            Value *pos = UndefValue::get(air.getIntTy(2));
-            pos = ir.CreateInsertElement(ir.CreateInsertElement(pos, x, (uint64_t)0), y, 1);
             auto kept = ir.CreateAnd(mip_kept, ir.CreateAnd(keep_x, keep_y));
-            air.CreateAtomicRMW(
-                map.Texture, map.Handle, AtomicRMWInst::Or, pos,
-                ir.CreateVectorSplat(4, ir.CreateSelect(kept, bit, ir.getInt32(0))),
-                array ? ir.CreateAdd(array, first_slice) : first_slice
-            );
+            record(x, y, slice, ir.CreateSelect(kept, bit, ir.getInt32(0)));
           }
         }
       });
@@ -3283,7 +3694,23 @@ convert_dxil(
         ret = UndefValue::get(ty);
         break;
       }
-      auto locks = ty->isIntegerTy(64) ? ctx.binding.GetAtomicLocks(air) : nullptr;
+      // split_buffers holds only where every 64-bit atomic of the shader is on a raw or structured buffer
+      if (ty->isIntegerTy(64) && split_buffers && h.buffer) {
+        split64(
+            unit_ptr(*h.buffer, ir.getInt64Ty(), ir.CreateLShr(byte_address(h, a(first), a(first + 1)), 3)),
+            atomic_op(constant(a(2))), a(6)
+        );
+        ret = UndefValue::get(ty);
+        break;
+      }
+      // Metal has texture atomics on integer textures only: a float exchange on a typed resource (an R32_FLOAT
+      // RWTexture or RWBuffer, HLSL SM 6.6, which DXIL gives as an exchange of its bits) runs under a lock as a
+      // 64-bit atomic does, its bits the word's low half
+      bool float_texel =
+          !h.buffer && !ty->isIntegerTy(64) && h.texture->Texture.sample_type == Texture::sample_float;
+      auto locks = ty->isIntegerTy(64) || float_texel ? atomic_locks() : nullptr;
+      if (float_texel && !locks)
+        return make_error<UnsupportedFeature>("float atomic on a typed resource without the atomic lock table");
       if (locks) {
         // aliases key the backing allocation and its coordinates, rather than the Metal view and relative slice
         auto texel = [&]() -> Word64 {
@@ -3307,14 +3734,22 @@ convert_dxil(
                                ir.CreateLShr(origin, ir.getInt32Ty()->getBitWidth()));
           }
           return {key, llvm::air::MemFlags::Texture,
-                  [=, &ir, &air, &t] {
+                  [=, &ir, &air, &t]() -> Value * {
                     auto v = air.CreateRead(t.Texture, t.Handle, address, array, nullptr, ir.getInt32(0), true).first;
+                    if (float_texel)
+                      return ir.CreateZExt(ir.CreateBitCast(ir.CreateExtractElement(v, (uint64_t)0), ir.getInt32Ty()), i64);
                     return ir.CreateOr(
                         ir.CreateZExt(ir.CreateExtractElement(v, (uint64_t)0), i64),
                         ir.CreateShl(ir.CreateZExt(ir.CreateExtractElement(v, 1), i64), 32)
                     );
                   },
                   [=, &ir, &air, &t](Value *v) {
+                    if (float_texel) {
+                      auto bits = ir.CreateBitCast(ir.CreateTrunc(v, ir.getInt32Ty()), ir.getFloatTy());
+                      air.CreateWrite(t.Texture, t.Handle, address, array, nullptr, ir.getInt32(0),
+                                      ir.CreateVectorSplat(4, bits), true);
+                      return;
+                    }
                     Value *halves = Constant::getNullValue(FixedVectorType::get(ir.getInt32Ty(), 4));
                     halves = ir.CreateInsertElement(halves, ir.CreateTrunc(v, ir.getInt32Ty()), (uint64_t)0);
                     halves = ir.CreateInsertElement(halves, ir.CreateTrunc(ir.CreateLShr(v, 32), ir.getInt32Ty()), 1);
@@ -3326,10 +3761,19 @@ convert_dxil(
                                    *h.buffer, ir.getInt64Ty(), ir.CreateLShr(byte_address(h, a(first), a(first + 1)), 3)
                                ))
                              : texel();
-        ret = locked(word, locks, [&](Value *old) {
-          return exchange ? ir.CreateSelect(ir.CreateICmpEQ(old, a(5)), a(6), old)
-                          : buildAtomicRMWValue(atomic_op(code), ir, old, a(6));
-        });
+        // a float's operands are its bits, so a compare is of bits (-0.0 is not 0.0)
+        auto operand = [&](unsigned i) {
+          return float_texel ? ir.CreateZExt(ir.CreateBitCast(a(i), ir.getInt32Ty()), ir.getInt64Ty()) : a(i);
+        };
+        ret = locked(
+            word, locks,
+            [&](Value *old) {
+              return exchange ? ir.CreateSelect(ir.CreateICmpEQ(old, operand(5)), operand(6), old)
+                              : buildAtomicRMWValue(atomic_op(code), ir, old, operand(6));
+            },
+            exchange ? std::nullopt : std::optional(atomic_op(code)), operand(6));
+        if (float_texel)
+          ret = ir.CreateBitCast(ir.CreateTrunc(ret, ir.getInt32Ty()), ty);
         break;
       }
       if (ty->isIntegerTy(64))
@@ -3496,16 +3940,9 @@ convert_dxil(
     case Log:
       ret = fp_unary(llvm::air::AIRBuilder::log2, a(1));
       break;
-    // D3D11.3 22.10.7 requires NaN for infinities and NaNs; integer selection survives fast math's cancellation
-    case Frc: {
-      auto bits = ir.CreateBitCast(a(1), ty->getWithNewType(ir.getIntNTy(ty->getScalarSizeInBits())));
-      auto inf = APFloat::getInf(ty->getScalarType()->getFltSemantics()).bitcastToAPInt();
-      auto non_finite = ir.CreateICmpEQ(ir.CreateAnd(bits, inf), ConstantInt::get(bits->getType(), inf));
-      auto fraction = ir.CreateBitCast(fp_unary(llvm::air::AIRBuilder::fract, a(1)), bits->getType());
-      auto nan = APFloat::getQNaN(ty->getScalarType()->getFltSemantics()).bitcastToAPInt();
-      ret = ir.CreateBitCast(ir.CreateSelect(non_finite, ConstantInt::get(bits->getType(), nan), fraction), ty);
+    case Frc:
+      ret = dxbc.Fraction(a(1));
       break;
-    }
     case Sqrt:
       ret = fp_unary(llvm::air::AIRBuilder::sqrt, a(1));
       break;
@@ -3826,9 +4263,10 @@ convert_dxil(
       auto i64 = ir.getInt64Ty();
       auto structure_ty = opaque("struct._instance_acceleration_structure_t")->getPointerTo(1);
       auto address = ir.CreatePtrToInt(handles[a(2)].buffer->Pointer, i64);
-      auto nothing = ir.CreateSub(
-          ir.CreatePtrToInt(ctx.binding.GetAtomicLocks(air), i64), ir.getInt64(SM50_NULL_ACCELERATION_STRUCTURE_HEADER_SIZE)
-      );
+      auto locks = atomic_locks();
+      if (!locks)
+        return make_error<UnsupportedFeature>("TraceRayInline without a lock table");
+      auto nothing = ir.CreateSub(ir.CreatePtrToInt(locks, i64), ir.getInt64(SM50_NULL_ACCELERATION_STRUCTURE_HEADER_SIZE));
       auto header = ir.CreateIntToPtr(
           ir.CreateSelect(ir.CreateICmpEQ(address, ir.getInt64(0)), nothing, address), i64->getPointerTo(1)
       );
@@ -3976,7 +4414,6 @@ convert_dxil(
           clip[k] = ir.CreateInsertElement(clip[k], real(word(conservative_vertices, corner[k], position_at + c)), c);
       }
       Value *viewport = primitive_outputs[2] ? (Value *)word(conservative_primitives, p, cm->registers[1].size() + 2) : ir.getInt32(0);
-      viewport = air.CreateIntBinOp(llvm::air::AIRBuilder::min, viewport, ir.getInt32(15), false);
       auto triangle = conservative_triangle(ir, air, ctx.types, clip, cm->viewports, viewport);
       auto blend = [&](const ConservativeTriangle::Weights &parts, uint32_t u, uint32_t column) {
         Value *sum = nullptr;
@@ -4098,6 +4535,20 @@ convert_dxil(
       });
     ir.CreateBr(epilogue);
   }
+  // where the group builds its payload in place, its barriers order the payload as they order groupshared memory
+  if (direct_payload)
+    for (auto &BB : *ctx.function)
+      for (auto &I : BB) {
+        auto call = dyn_cast<CallInst>(&I);
+        auto callee = call ? call->getCalledFunction() : nullptr;
+        if (!callee || (callee->getName() != "air.wg.barrier" && callee->getName() != "air.atomic.fence"))
+          continue;
+        auto flags = dyn_cast<ConstantInt>(call->getArgOperand(0));
+        if (flags && (flags->getZExtValue() & uint32_t(llvm::air::MemFlags::Threadgroup)))
+          call->setArgOperand(
+              0, ConstantInt::get(flags->getType(), flags->getZExtValue() | uint32_t(llvm::air::MemFlags::ObjectData))
+          );
+      }
   // groupshared 64-bit atomics, which DXIL has as LLVM's own atomic instructions
   SmallVector<llvm::Instruction *> wide;
   for (auto &BB : *ctx.function)
@@ -4106,9 +4557,26 @@ convert_dxil(
         wide.push_back(rmw);
       else if (auto cx = dyn_cast<AtomicCmpXchgInst>(&I); cx && cx->getCompareOperand()->getType()->isIntegerTy(64))
         wide.push_back(cx);
+  // as for buffers, the shader's groupshared ones split when they are all one op that commutes with itself, unread
+  std::optional<AtomicRMWInst::BinOp> split_shared;
+  for (auto I : wide) {
+    auto rmw = dyn_cast<AtomicRMWInst>(I);
+    auto kind = rmw && rmw->use_empty() ? split_kind(rmw->getOperation()) : std::nullopt;
+    if (!kind || (split_shared && *split_shared != *kind)) {
+      split_shared.reset();
+      break;
+    }
+    split_shared = kind;
+  }
   for (auto I : wide) {
     ir.SetInsertPoint(I);
-    auto locks = ctx.binding.GetAtomicLocks(air);
+    if (split_shared) {
+      auto rmw = cast<AtomicRMWInst>(I);
+      split64(rmw->getPointerOperand(), rmw->getOperation(), rmw->getValOperand());
+      I->eraseFromParent();
+      continue;
+    }
+    auto locks = atomic_locks();
     if (!locks)
       return make_error<UnsupportedFeature>("64-bit groupshared atomic without a lock table");
     Value *ret;
@@ -4298,7 +4766,10 @@ convert_dxil_mesh_stage(
     return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
   setup_tgsm(shader_info, resource_map, types, module);
 
-  auto raster_scale = DefineRasterScale(func_signature);
+  // a mesh shader without an amplification shader runs DispatchMesh's grid itself, which Metal has smaller than D3D12:
+  // a grid past it runs in parts, and the raster scale's buffer tells each part's first group
+  bool origin = mesh && link && !link->amplified && !conservative;
+  auto raster_scale = DefineRasterScale(func_signature, origin ? SM50_RASTER_SCALE_WORDS : 1);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -4345,6 +4816,14 @@ convert_dxil_mesh_stage(
       );
     }
   }
+  if (origin) {
+    auto i32 = builder.getInt32Ty();
+    auto words = builder.CreateBitCast(function->getArg(raster_scale), i32->getPointerTo((unsigned)air::AddressSpace::constant));
+    for (unsigned i = 0; i < 3; i++) {
+      auto first = builder.CreateLoad(i32, builder.CreateConstGEP1_32(i32, words, SM50_RASTER_SCALE_MESH_ORIGIN + i));
+      group = builder.CreateInsertElement(group, builder.CreateAdd(builder.CreateExtractElement(group, i), first), i);
+    }
+  }
   auto size = llvm::ConstantDataVector::get(context, llvm::ArrayRef<uint32_t>(threads, 3));
   auto at = [&](unsigned i) { return builder.CreateExtractElement(thread, i); };
   resource_map.thread_id_in_group_arg = thread;
@@ -4370,6 +4849,7 @@ convert_dxil_mesh_stage(
       .metal_version = metal_version,
       .simd_width = sm50_common ? sm50_common->simd_width : 0,
       .coherent_group_sync = pShaderInternal->groups_work_together && (shader_flags & SM50_SHADER_FLAG_COHERENT_GROUP_SYNC),
+      .direct_payload = !mesh && !(shader_flags & SM50_SHADER_FLAG_STAGED_PAYLOAD),
   };
 
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);

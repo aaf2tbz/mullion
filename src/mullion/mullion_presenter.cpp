@@ -5,6 +5,7 @@
 #include "mullion_presenter.hpp"
 #include "mullion_diag.hpp"
 #include "util_likely.hpp"
+#include "util_math.hpp"
 
 
 namespace mullion {
@@ -16,11 +17,28 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
     sample_count_(sample_count),
     window_(window) {
   layer_.getProps(layer_props_);
+  native_contents_scale_ = layer_props_.contents_scale;
   layer_props_.device = device;
   layer_props_.opaque = true;
   layer_props_.display_sync_enabled = false;
   layer_props_.framebuffer_only = false; // how strangely setting it true results in worse performance
   layer_props_.contents_scale = layer_props_.contents_scale * scale_factor;
+}
+
+bool
+Presenter::upscaleOutputSize(uint32_t input_width, uint32_t input_height, uint32_t &width, uint32_t &height) {
+  WMTLayerProps props{};
+  if (!layer_)
+    return false;
+  layer_.getProps(props);
+  double scale = native_contents_scale_ > 0 ? native_contents_scale_ : 1.0;
+  uint32_t native_width = uint32_t(props.bounds_width * scale + 0.5);
+  uint32_t native_height = uint32_t(props.bounds_height * scale + 0.5);
+  if (native_width < input_width || native_height < input_height)
+    return false;
+  width = native_width;
+  height = native_height;
+  return true;
 }
 
 bool
@@ -220,11 +238,13 @@ Presenter::encodeCommands(
 
   // a layer whose drawable timed out drops this frame; only a window without a layer takes frames through GDI
   if (!layer_) {
-    WindowFrame frame{{}, nullptr, (uint32_t)width, (uint32_t)height, number};
-    WMTBufferInfo buffer_info{.length = frame.width * frame.height * 4ull, .options = WMTResourceStorageModeShared};
-    buffer_info.memory.set(nullptr);
+    WindowFrame frame{.width = (uint32_t)width, .height = (uint32_t)height, .number = number};
+    WMTBufferInfo buffer_info{
+        .length = align(frame.width * frame.height * 4ull, MULLION_PAGE_SIZE), .options = WMTResourceStorageModeShared
+    };
+    frame.pixels.reset(wsi::aligned_malloc(buffer_info.length, MULLION_PAGE_SIZE));
+    buffer_info.memory.set(frame.pixels.get());
     frame.buffer = device_.newBuffer(buffer_info);
-    frame.pixels = buffer_info.memory.get();
     wmtcmd_blit_copy_from_texture_to_buffer copy{.type = WMTBlitCommandCopyFromTextureToBuffer};
     copy.next.set(nullptr);
     copy.src = target.handle;
@@ -275,7 +295,7 @@ Presenter::drawToWindow(double after) {
     return;
   SetStretchBltMode(dc, COLORONCOLOR);
   StretchDIBits(
-      dc, 0, 0, client.right, client.bottom, 0, 0, frame.width, frame.height, frame.pixels, &bitmap, DIB_RGB_COLORS,
+      dc, 0, 0, client.right, client.bottom, 0, 0, frame.width, frame.height, frame.pixels.get(), &bitmap, DIB_RGB_COLORS,
       SRCCOPY
   );
   ReleaseDC(window_, dc);
