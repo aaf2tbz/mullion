@@ -9,6 +9,9 @@
 #include "../d3d12/d3d12_interfaces.hpp"
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace mullion {
 
@@ -32,6 +35,64 @@ GetExt(ID3D12GraphicsCommandList *list) {
   if (!list || FAILED(list->QueryInterface(IID_PPV_ARGS(&ext))))
     return nullptr;
   return ext;
+}
+
+// NGX's NVSDK_NGX_FeatureCommonInfo: where the application keeps its feature libraries (nvsdk_ngx_defs.h)
+struct NVNGX_PathListInfo {
+  const wchar_t *const *Path;
+  unsigned int Length;
+};
+struct NVNGX_FeatureCommonInfo {
+  NVNGX_PathListInfo PathListInfo;
+  void *InternalData;
+};
+
+// the folders an Init named for feature libraries
+static std::mutex library_paths_mutex;
+static std::vector<std::wstring> library_paths;
+
+static void
+RememberLibraryPaths(const void *feature_info) {
+  auto info = static_cast<const NVNGX_FeatureCommonInfo *>(feature_info);
+  if (!info || !info->PathListInfo.Path)
+    return;
+  std::lock_guard lock(library_paths_mutex);
+  for (unsigned i = 0; i < info->PathListInfo.Length; i++)
+    if (info->PathListInfo.Path[i])
+      library_paths.emplace_back(info->PathListInfo.Path[i]);
+}
+
+// whether the application ships a feature's library (`name`): NVIDIA's NGX core offers a feature only when it finds
+// its snippet (nvngx_dlss.dll for Super Resolution, nvngx_dlssd.dll for Ray Reconstruction) loaded, beside the
+// executable, or in a folder Init or the discovery names. a game that ships none asks for the feature anyway where it
+// is offered, and then has none of its inputs: Control, which has no nvngx_dlssd.dll, turns Ray Reconstruction on
+// when the feature requirements say it is supported, and its renderer passes no Ray Reconstruction textures
+static bool
+HasFeatureLibrary(const wchar_t *name, const void *feature_info = nullptr) {
+  if (GetModuleHandleW(name))
+    return true;
+  std::vector<std::wstring> folders;
+  wchar_t exe[MAX_PATH];
+  if (DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH); length && length < MAX_PATH) {
+    std::wstring path(exe, length);
+    folders.push_back(path.substr(0, path.find_last_of(L"\\/")));
+  }
+  {
+    std::lock_guard lock(library_paths_mutex);
+    folders.insert(folders.end(), library_paths.begin(), library_paths.end());
+  }
+  if (auto info = static_cast<const NVNGX_FeatureCommonInfo *>(feature_info); info && info->PathListInfo.Path)
+    for (unsigned i = 0; i < info->PathListInfo.Length; i++)
+      if (info->PathListInfo.Path[i])
+        folders.emplace_back(info->PathListInfo.Path[i]);
+  for (auto &folder : folders) {
+    auto path = folder;
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+      path += L'\\';
+    if (GetFileAttributesW((path + name).c_str()) != INVALID_FILE_ATTRIBUTES)
+      return true;
+  }
+  return false;
 }
 
 static ID3D12Resource *
@@ -67,6 +128,7 @@ NVSDK_NGX_D3D12_Init(
     unsigned long long id, const wchar_t *path, ID3D12Device *device, const void *feature_info, unsigned int sdk_version
 ) {
   Logger::debug("NGX: NVSDK_NGX_D3D12_Init");
+  RememberLibraryPaths(feature_info);
   return NVNGX_RESULT_OK;
 }
 
@@ -84,6 +146,7 @@ NVSDK_NGX_D3D12_Init_ProjectID(
     ID3D12Device *device, unsigned int sdk_version, const void *feature_info
 ) {
   Logger::debug("NGX: NVSDK_NGX_D3D12_Init_ProjectID");
+  RememberLibraryPaths(feature_info);
   return NVNGX_RESULT_OK;
 }
 
@@ -93,6 +156,7 @@ NVSDK_NGX_D3D12_Init_with_ProjectID(
     ID3D12Device *device, const void *feature_info, unsigned int sdk_version
 ) {
   Logger::debug("NGX: NVSDK_NGX_D3D12_Init_with_ProjectID");
+  RememberLibraryPaths(feature_info);
   return NVNGX_RESULT_OK;
 }
 
@@ -141,7 +205,7 @@ NVSDK_NGX_D3D12_GetCapabilityParameters(NVNGXParameter **out_params) {
   void *optimal = nullptr, *stats = nullptr;
   params->Get(NVNGX_Parameter_DLSSOptimalSettingsCallback, &optimal);
   params->Get("DLSSGetStatsCallback", &stats);
-  params->Set("SuperSamplingDenoising.Available", 1u);
+  params->Set("SuperSamplingDenoising.Available", unsigned(HasFeatureLibrary(L"nvngx_dlssd.dll")));
   params->Set("SuperSamplingDenoising.NeedsUpdatedDriver", 0);
   params->Set("SuperSamplingDenoising.MinDriverVersionMajor", 0);
   params->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
@@ -165,7 +229,8 @@ NVSDK_NGX_D3D12_GetFeatureRequirements(
   if (!requirement || !discovery_info)
     return NVNGX_RESULT_INVALID_PARAMETER;
   if (discovery_info->FeatureID == NVNGX_FEATURE_SUPERSAMPLING ||
-      discovery_info->FeatureID == NVNGX_FEATURE_RAYRECONSTRUCTION) {
+      (discovery_info->FeatureID == NVNGX_FEATURE_RAYRECONSTRUCTION &&
+       HasFeatureLibrary(L"nvngx_dlssd.dll", discovery_info->FeatureInfo))) {
     requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_SUPPORTED;
     requirement->MinHWArchitecture = 0;
     strcpy_s(requirement->MinOSVersion, "10.0.16299.0");
@@ -196,7 +261,7 @@ NVSDK_NGX_D3D12_CreateFeature(
     return NVNGX_RESULT_OK;
   }
   if (feature == NVNGX_FEATURE_RAYRECONSTRUCTION) {
-    if (!ext->SupportsDenoisedUpscale())
+    if (!ext->SupportsDenoisedUpscale() || !HasFeatureLibrary(L"nvngx_dlssd.dll"))
       return NVNGX_RESULT_FEATURE_NOT_SUPPORTED;
     auto dlssd = std::make_unique<DLSSDFeature>();
     dlssd->feature = NVNGX_FEATURE_RAYRECONSTRUCTION;
