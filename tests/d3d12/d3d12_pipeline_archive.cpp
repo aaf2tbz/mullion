@@ -1,13 +1,16 @@
 // contract: a pipeline made in one process is not compiled again in the next. Mullion keeps the GPU binaries of the
-// pipelines it compiles in binary archives beside its shader cache (pipelines_<version>/chunk_<n>.metallib, saved
-// whole when a device is released), and a later process making the same pipelines loads them from there: it adds
-// nothing, so no chunk is written again and none begun. Either way the pipelines draw and dispatch what they write.
+// pipelines it compiles in binary archives beside its shader cache (pipelines_<version>/chunk_<n>.metallib), a chunk
+// written once it is full and the compiles into it end, or when a device is released; a later process making the
+// same pipelines loads them from there: it adds nothing, so no chunk is written again and none begun. The pipelines
+// are created on several threads at once, in chunks of a few (MULLION_D3D12_PIPELINE_ARCHIVE_CHUNK), so chunks close
+// while compiles into them go on. Either way the pipelines draw and dispatch what they write.
 // with the archive turned off (MULLION_D3D12_PIPELINE_ARCHIVE=0) nothing is kept.
 // the target is one row with a column per graphics pipeline: pipeline n writes its own value into column n; compute
 // pipeline n writes its own value into element n of a buffer.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <chrono>
+#include <thread>
 
 static const char hlsl[] = R"hlsl(
 cbuffer C : register(b0) { uint column; };
@@ -20,7 +23,7 @@ RWByteAddressBuffer written : register(u0);
 [numthreads(1, 1, 1)] void cs() { written.Store(INDEX * 4, VALUE); }
 )hlsl";
 
-static const UINT graphics = 12, computes = 4;
+static const UINT graphics = 20, computes = 4, chunk_pipelines = 7, threads = 4;
 
 // one process's pipelines, drawn and dispatched; the device's release saves what the archive holds
 static int
@@ -59,15 +62,25 @@ child(int argc, char **argv, Compiler &compiler) {
     desc.NumRenderTargets = 1, desc.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
     desc.SampleDesc = {1, 0};
     std::vector<ComPtr<ID3D12PipelineState>> pipelines(graphics + computes);
-    for (UINT i = 0; i < graphics; i++) {
-      desc.PS = bytecode(pixel_shaders[i]);
-      CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelines[i])));
-    }
-    step("compute pipelines");
-    for (UINT i = 0; i < computes; i++) {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC compute{rs.Get(), bytecode(compute_shaders[i])};
-      CHECK(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&pipelines[graphics + i])));
-    }
+    std::vector<HRESULT> results(graphics + computes, S_OK);
+    std::vector<std::thread> creators;
+    for (UINT t = 0; t < threads; t++)
+      creators.emplace_back([&, t] {
+        for (UINT i = t; i < graphics + computes; i += threads)
+          if (i < graphics) {
+            auto own = desc;
+            own.PS = bytecode(pixel_shaders[i]);
+            results[i] = device->CreateGraphicsPipelineState(&own, IID_PPV_ARGS(&pipelines[i]));
+          } else {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC compute{rs.Get(), bytecode(compute_shaders[i - graphics])};
+            results[i] = device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&pipelines[i]));
+          }
+      });
+    for (auto &creator : creators)
+      creator.join();
+    for (UINT i = 0; i < graphics + computes; i++)
+      if (!expect(SUCCEEDED(results[i]), "pipeline %u was created with %#lx", i, results[i]))
+        return verdict();
 
     step("draws and dispatches");
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -210,6 +223,7 @@ main(int argc, char **argv) {
   auto run = [&](const char *mode, const char *directory, bool archive) {
     step("process %s, store %s", mode, directory);
     std::string store = "MULLION_SHADER_CACHE_PATH=" + unix_path(directory);
+    std::string chunk_size = "MULLION_D3D12_PIPELINE_ARCHIVE_CHUNK=" + std::to_string(chunk_pipelines);
     const char *args[] = {
         "env",
         "-u",
@@ -218,6 +232,7 @@ main(int argc, char **argv) {
         "MULLION_D3D12_DEFER_PIPELINES",
         store.c_str(),
         archive ? "MULLION_D3D12_PIPELINE_ARCHIVE=1" : "MULLION_D3D12_PIPELINE_ARCHIVE=0",
+        chunk_size.c_str(),
         loader_path,
         exe,
         argc > 1 ? argv[1] : "dxbc",
@@ -233,17 +248,25 @@ main(int argc, char **argv) {
               "no temporary directory"))
     return verdict();
 
+  // every pipeline in a chunk: the full ones, and the last at the device's release. a chunk takes the compiles begun
+  // before it closed, so it may hold a few more than chunk_pipelines
   run("first", kept, true);
   auto folder = archive_folder(kept);
-  auto first = chunk(folder, 0);
-  expect(first.exists && first.size > 0, "the first process saved no archive in %s", kept);
+  std::vector<Chunk> first;
+  for (int n = 0; chunk(folder, n).exists; n++)
+    first.push_back(chunk(folder, n));
+  expect(first.size() >= 2 && first.size() <= (graphics + computes + chunk_pipelines - 1) / chunk_pipelines,
+         "the first process saved %zu chunks of its %u pipelines in %s", first.size(), graphics + computes, kept);
 
-  // the same pipelines again: all of them in the saved chunk, so it is not written again and no chunk is begun
+  // the same pipelines again: all of them in the saved chunks, so none is written again and none begun
   run("second", kept, true);
-  auto again = chunk(folder, 0);
-  expect(again.exists && again.size == first.size && !CompareFileTime(&again.written, &first.written),
-         "the second process wrote chunk 0 again (size %llu, was %llu)", again.size, first.size);
-  expect(!chunk(folder, 1).exists, "the second process compiled pipelines the archive holds, and saved chunk 1");
+  for (size_t n = 0; n < first.size(); n++) {
+    auto again = chunk(folder, n);
+    expect(again.exists && again.size == first[n].size && !CompareFileTime(&again.written, &first[n].written),
+           "the second process wrote chunk %zu again (size %llu, was %llu)", n, again.size, first[n].size);
+  }
+  expect(!chunk(folder, first.size()).exists,
+         "the second process compiled pipelines the archive holds, and saved chunk %zu", first.size());
 
   run("off", off, false);
   expect(archive_folder(off).empty(), "an archive was saved with MULLION_D3D12_PIPELINE_ARCHIVE=0");

@@ -465,6 +465,14 @@ _NSObject_description(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// the archives a pipeline is looked up in, with the one it was just compiled into: a pipeline kept in an archive is
+// compiled into it (add...PipelineFunctionsWithDescriptor) and then made from it, one compile where making it and then
+// adding it compiles it twice
+static NSArray *
+archives_with(NSArray *archives, obj_handle_t archive) {
+  return [archives ? archives : @[] arrayByAddingObject:(id<MTLBinaryArchive>)archive];
+}
+
 static NTSTATUS
 CREATES(_MTLDevice_newComputePipelineState)(void *obj) {
   struct unixcall_mtldevice_newcomputepso *params = obj;
@@ -484,13 +492,13 @@ CREATES(_MTLDevice_newComputePipelineState)(void *obj) {
                                                     count:info->num_binary_archives_for_lookup];
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+  if (info->binary_archive_for_serialization &&
+      [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
+                                                                                                      error:nil])
+    descriptor.binaryArchives = archives_with(descriptor.binaryArchives, info->binary_archive_for_serialization);
   params->ret_pso =
       (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
   params->ret_error = (obj_handle_t)[err retain];
-  if (!err && info->binary_archive_for_serialization) {
-    [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
-                                                                                                      error:&err];
-  }
   [descriptor release];
   return STATUS_SUCCESS;
 }
@@ -700,15 +708,15 @@ CREATES(_MTLDevice_newRenderPipelineState)(void *obj) {
   NSError *err = NULL;
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+  if (info->binary_archive_for_serialization &&
+      [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
+                                                                                                     error:nil])
+    descriptor.binaryArchives = archives_with(descriptor.binaryArchives, info->binary_archive_for_serialization);
   params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
                                                                                               options:options
                                                                                            reflection:nil
                                                                                                 error:&err];
   params->ret_error = (obj_handle_t)[err retain];
-  if (!err && info->binary_archive_for_serialization) {
-    [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
-                                                                                                     error:&err];
-  }
   [descriptor release];
   return STATUS_SUCCESS;
 }
@@ -801,6 +809,11 @@ CREATES(_MTLDevice_newMeshRenderPipelineState)(void *obj) {
       descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
                                                       count:info->num_binary_archives_for_lookup];
     options = info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+    if (info->binary_archive_for_serialization &&
+        [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
+            addMeshRenderPipelineFunctionsWithDescriptor:descriptor
+                                                   error:nil])
+      descriptor.binaryArchives = archives_with(descriptor.binaryArchives, info->binary_archive_for_serialization);
   }
 #endif
   NSError *err = NULL;
@@ -809,15 +822,6 @@ CREATES(_MTLDevice_newMeshRenderPipelineState)(void *obj) {
                                                                                                reflection:nil
                                                                                                     error:&err];
   params->ret_error = (obj_handle_t)[err retain];
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
-  if (@available(macOS 15, *)) {
-    if (!err && info->binary_archive_for_serialization) {
-      [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
-          addMeshRenderPipelineFunctionsWithDescriptor:descriptor
-                                                 error:&err];
-    }
-  }
-#endif
   [descriptor release];
   return STATUS_SUCCESS;
 }
