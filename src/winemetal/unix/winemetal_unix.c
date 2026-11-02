@@ -3607,6 +3607,8 @@ _WMTGetOSVersion(void *obj) {
   return STATUS_SUCCESS;
 }
 
+NSString *resolve_cache_dir(NSString *path, bool path_is_file);
+
 static NTSTATUS
 CREATES(_MTLDevice_newBinaryArchive)(void *obj) {
   struct unixcall_mtldevice_newbinaryarchive *params = obj;
@@ -3615,7 +3617,7 @@ CREATES(_MTLDevice_newBinaryArchive)(void *obj) {
   MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
   if (params->url.ptr != NULL) {
     path_str = [[NSString alloc] initWithCString:params->url.ptr encoding:NSUTF8StringEncoding];
-    url = [[NSURL alloc] initFileURLWithPath:path_str];
+    url = [[NSURL alloc] initFileURLWithPath:resolve_cache_dir(path_str, true)];
     desc.url = url;
   }
   NSError *err = NULL;
@@ -3632,10 +3634,17 @@ CREATES(_MTLDevice_newBinaryArchive)(void *obj) {
 static NTSTATUS
 _MTLBinaryArchive_serialize(void *obj) {
   struct unixcall_mtlbinaryarchive_serialize *params = obj;
+  // written beside it and put in its place, so that a process ending meanwhile leaves the last whole file
   NSString *path_str = [[NSString alloc] initWithCString:params->url.ptr encoding:NSUTF8StringEncoding];
-  NSURL *url = [[NSURL alloc] initFileURLWithPath:path_str];
+  NSString *path = resolve_cache_dir(path_str, true);
+  NSString *temporary = [path stringByAppendingFormat:@".%d.tmp", getpid()];
+  NSURL *url = [[NSURL alloc] initFileURLWithPath:temporary];
   NSError *err = NULL;
-  [(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err];
+  if ([(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err] &&
+      rename([temporary fileSystemRepresentation], [path fileSystemRepresentation]))
+    err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+  if (err)
+    unlink([temporary fileSystemRepresentation]);
   params->ret_error = (obj_handle_t)[err retain];
   [url release];
   [path_str release];

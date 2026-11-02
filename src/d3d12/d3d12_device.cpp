@@ -22,6 +22,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_pipeline.hpp"
+#include "d3d12_pipeline_archive.hpp"
 #include "Metal.hpp"
 #include "com/com_pointer.hpp"
 #include "com/com_object.hpp"
@@ -294,6 +295,7 @@ public:
   }
 
   ~MTLD3D12DeviceImpl() {
+    PipelineArchive::SaveMade();
     std::lock_guard lock(device_singletons_lock);
     std::erase_if(device_singletons, [this](auto &entry) { return entry.second == this; });
   }

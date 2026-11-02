@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline.hpp"
+#include "d3d12_pipeline_archive.hpp"
 #include "mullion_format.hpp"
 #include "mullion_stream_output.hpp"
 #include "mullion_shader_cache.hpp"
@@ -679,7 +680,8 @@ protected:
   WMT::Reference<WMT::RenderPipelineState>
   CreatePipeline(const Info &info, WMT::Reference<WMT::Error> &error,
                  std::function<WMT::Reference<WMT::Function>()> statistics_geometry_shader = {}) {
-    auto pipeline = device_->GetMTLDevice().newRenderPipelineState(info, error);
+    auto pipeline = PipelineArchive::Get(device_->GetMTLDevice(), device_->GetMetalVersion())
+                        .Make(device_->GetMTLDevice(), info, error);
     if (!pipeline || (!rtv_mask && !dsv_mask && !pixel_shader && !statistics_geometry_shader))
       return pipeline;
     std::lock_guard<mullion::mutex> lock(render_targets_mutex_);
@@ -1948,7 +1950,8 @@ public:
             info.stencil_pixel_format = WMTPixelFormatInvalid;
           else if (any_format)
             info.stencil_pixel_format = DSVFormat;
-          return device_->GetMTLDevice().newRenderPipelineState(info, error);
+          return PipelineArchive::Get(device_->GetMTLDevice(), device_->GetMetalVersion())
+              .Make(device_->GetMTLDevice(), info, error);
         },
         descriptor.info
     );

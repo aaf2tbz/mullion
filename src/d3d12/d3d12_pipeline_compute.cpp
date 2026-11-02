@@ -20,6 +20,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline.hpp"
+#include "d3d12_pipeline_archive.hpp"
 #include "log/log.hpp"
 #include <array>
 #include <limits>
@@ -86,7 +87,7 @@ public:
       info.compute_function = cs_func;
       info.support_indirect_command_buffers = true;
 
-      pso = metal.newComputePipelineState(info, err);
+      pso = PipelineArchive::Get(metal, device_->GetMetalVersion()).MakeCompute(metal, info, err);
       if (!pso) {
         ERR("Failed to create compute PSO of shader ", name, ": ", err.description().getUTF8String());
         DumpShaders({pDesc->CS});

@@ -19,7 +19,8 @@
 }
 @end
 
-static inline NSString *
+// a path relative to the user's cache folder made absolute, and the folder (or the file's) made
+NSString *
 resolve_cache_dir(NSString *path, bool path_is_file) {
   if (![path hasPrefix:@"/"]) {
     char buf[PATH_MAX];
