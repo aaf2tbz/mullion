@@ -25,6 +25,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <set>
 
 namespace mullion::dxbc {
 
@@ -128,7 +131,7 @@ public:
     auto [Pointer, Metadata] = GetBufferDescriptor(
         Builder, HeapPointer, Index, Builder.getIntTy(4)->getPointerTo(2), CBuf.range.lower_bound, DescriptorOffset
     );
-    return ConstantBufferDescriptor{Pointer, Metadata};
+    return ConstantBufferDescriptor{Pointer, UncheckedCBVs.contains(Range) ? nullptr : Metadata, true};
   }
 
   SamplerDescriptor
@@ -292,13 +295,13 @@ public:
     auto DescriptorOffset = Iter->second.second;
     auto HeapPointer = GetArgument(Builder, RootSignatureArgumentIndex, SRV.arg_index);
     if (DescriptorOffset == ~0u) {
-      return BufferDescriptor{HeapPointer, Builder.builder.getInt64(0xffffffff), SRV.structure_stride, false};
+      return BufferDescriptor{HeapPointer, Builder.builder.getInt64(0xffffffff), SRV.structure_stride, false, true};
     }
     auto [Pointer, Metadata] = GetBufferDescriptor(
         Builder, HeapPointer, Index, Builder.getIntTy()->getPointerTo(1), SRV.range.lower_bound, DescriptorOffset
     );
 
-    return BufferDescriptor{Pointer, Metadata, SRV.structure_stride, false};
+    return BufferDescriptor{Pointer, Metadata, SRV.structure_stride, false, UncheckedSRVs.contains(Range)};
   }
 
   virtual llvm::Optional<BufferDescriptor>
@@ -315,14 +318,16 @@ public:
     auto HeapPointer = GetArgument(Builder, RootSignatureArgumentIndex, UAV.arg_index);
     if (DescriptorOffset == ~0u) {
       return BufferDescriptor{
-          HeapPointer, Builder.builder.getInt64(0xffffffff), UAV.structure_stride, UAV.global_coherent
+          HeapPointer, Builder.builder.getInt64(0xffffffff), UAV.structure_stride, UAV.global_coherent, true
       };
     }
     auto [Pointer, Metadata] = GetBufferDescriptor(
         Builder, HeapPointer, Index, Builder.getIntTy()->getPointerTo(1), UAV.range.lower_bound, DescriptorOffset
     );
 
-    return BufferDescriptor{Pointer, Metadata, UAV.structure_stride, UAV.global_coherent};
+    return BufferDescriptor{
+        Pointer, Metadata, UAV.structure_stride, UAV.global_coherent, UncheckedUAVs.contains(Range)
+    };
   }
 
   virtual llvm::Optional<CounterDescriptor>
@@ -370,6 +375,8 @@ public:
   std::map<RangeId, std::pair<SamplerInfo, uint64_t>> Samplers;
   std::map<RangeId, std::pair<ShaderResourceViewInfo, uint64_t>> SRVs;
   std::map<RangeId, std::pair<UnorderedAccessViewInfo, uint64_t>> UAVs;
+  // the buffers and constant buffers whose loads go unchecked (BufferDescriptor::LoadsUnchecked)
+  std::set<RangeId> UncheckedCBVs, UncheckedSRVs, UncheckedUAVs;
 };
 
 std::unique_ptr<BindingMap>
@@ -460,6 +467,20 @@ setup_binding_rootsig(
     return false;
   };
 
+  // a range a driver may promote to a root descriptor, whose loads then go unchecked: neither DESCRIPTORS_VOLATILE
+  // (root signature 1.0's ranges are, as the deserializer gives them) nor DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS
+  // (D3D12_DESCRIPTOR_RANGE_FLAGS). MULLION_AIRCONV_SKIP=unchecked-ranges keeps every range's checks
+  static const bool keep_checks = [] {
+    auto names = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    return names && strstr(names, "unchecked-ranges");
+  }();
+  // D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS, which the bundled header does not have
+  constexpr uint32_t keeping_bounds_checks = 0x10000;
+  auto unchecked = [&](const D3D12_DESCRIPTOR_RANGE1 &range) -> bool {
+    return !keep_checks &&
+           !(range.Flags & (D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | keeping_bounds_checks));
+  };
+
   for (unsigned i = 0; i < root_sig.NumParameters; i++) {
     auto &Parameter = root_sig.pParameters[i];
 
@@ -486,6 +507,8 @@ setup_binding_rootsig(
                   srv, calculated_descriptor_offset + (srv.range.lower_bound - range.BaseShaderRegister)
               };
               binding_map->SRVs[range_id].first.arg_index = table_index;
+              if (unchecked(range))
+                binding_map->UncheckedSRVs.insert(range_id);
             }
           }
           break;
@@ -500,6 +523,8 @@ setup_binding_rootsig(
                   uav, calculated_descriptor_offset + (uav.range.lower_bound - range.BaseShaderRegister)
               };
               binding_map->UAVs[range_id].first.arg_index = table_index;
+              if (unchecked(range))
+                binding_map->UncheckedUAVs.insert(range_id);
               if (uav.rasterizer_order)
                 raster_order_group = 1;
             }
@@ -515,6 +540,8 @@ setup_binding_rootsig(
                   cbuf, calculated_descriptor_offset + (cbuf.range.lower_bound - range.BaseShaderRegister)
               };
               binding_map->ConstantBuffers[range_id].first.arg_index = table_index;
+              if (unchecked(range))
+                binding_map->UncheckedCBVs.insert(range_id);
             }
           }
           break;

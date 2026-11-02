@@ -3254,7 +3254,11 @@ convert_dxil(
       // one bound for a load of several units where its last unit is inside
       auto read = mask & kMaskAll, last = llvm::Log2_32(read) * parts + parts - 1;
       bool whole = !store && !feedback && read && (parts > 1 || (read & (read - 1)));
-      auto v = dxbc.LoadBufferUnits(b, base, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units);
+      // a structured element's fields share its bound
+      Value *structured = !store && !feedback && b.StructureStride ? a(2) : nullptr;
+      auto v = !store && b.LoadsUnchecked
+                   ? units(base, true)
+                   : dxbc.LoadBufferUnits(b, base, whole ? ir.CreateAdd(base, ir.getInt64(last)) : nullptr, unit->getBitWidth() / 8, units, structured);
       if (!store)
         ret = to_struct(ty, v, residency);
       break;

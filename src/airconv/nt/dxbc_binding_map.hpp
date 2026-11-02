@@ -9,6 +9,9 @@ namespace mullion::dxbc {
 struct ConstantBufferDescriptor {
   llvm::Value *Pointer;
   llvm::Value *Metadata; // may be null
+  // a Direct3D 12 view's: its size a multiple of 256 bytes (D3D12_CONSTANT_BUFFER_VIEW_DESC), and a null view the
+  // device's 64 KiB of zeros, so its first 16 rows are always in bounds and its constant rows are by 256-byte block
+  bool Blocks = false;
 };
 
 struct SamplerDescriptor {
@@ -38,6 +41,10 @@ struct BufferDescriptor {
   llvm::Value *Metadata;
   uint32_t StructureStride;
   bool GlobalCoherent;
+  // its loads may read past its end: a root descriptor's, or a root signature 1.1 range's that is neither
+  // DESCRIPTORS_VOLATILE nor DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS, which a driver may promote to a root
+  // descriptor, and root descriptors have no bounds checks (D3D12_DESCRIPTOR_RANGE_FLAGS). Stores keep theirs
+  bool LoadsUnchecked = false;
 };
 
 struct CounterDescriptor {

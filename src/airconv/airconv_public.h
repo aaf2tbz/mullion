@@ -6,7 +6,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 95
+#define AIRCONV_VERSION 96
 
 #ifdef __cplusplus
 #include <string>

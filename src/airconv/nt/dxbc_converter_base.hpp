@@ -63,6 +63,7 @@ struct BufferResourceHandle {
   uint32_t StructureStride; // 0 if not structured
   Swizzle Swizzle;
   bool GlobalCoherent;
+  bool LoadsUnchecked = false; // BufferDescriptor's
 };
 
 struct AtomicBufferResourceHandle {
@@ -638,7 +639,7 @@ public:
   MakeBufferHandle(const BufferDescriptor &Descriptor, Swizzle Swizzle) {
     return {
         Descriptor.Pointer, Descriptor.Metadata, Descriptor.StructureStride, Swizzle,
-        Descriptor.GlobalCoherent && SupportsMemoryCoherency()
+        Descriptor.GlobalCoherent && SupportsMemoryCoherency(), Descriptor.LoadsUnchecked
     };
   }
 
@@ -761,10 +762,11 @@ public:
   llvm::Value *LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm::Value *Ptr, bool Inside = false);
   llvm::Value *LoadBufferUnits(
       BufferResourceHandle &Buffer, llvm::Value *Base, llvm::Value *Last, uint32_t UnitBytes,
-      llvm::function_ref<llvm::Value *(llvm::Value *, bool)> Read
+      llvm::function_ref<llvm::Value *(llvm::Value *, bool)> Read, llvm::Value *Element = nullptr
   );
   void LoadBufferWords(
-      BufferResourceHandle &Buf, llvm::Value *Index, const DstOperand &Dst, const std::optional<DstOperand> &Feedback
+      BufferResourceHandle &Buf, llvm::Value *Index, const DstOperand &Dst, const std::optional<DstOperand> &Feedback,
+      llvm::Value *Element = nullptr
   );
 
   llvm::Value * CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm::Value* Index);
