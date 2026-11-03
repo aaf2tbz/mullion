@@ -201,27 +201,21 @@ struct PredicateEncoderData : EncoderData {
   EncoderData *end;
 };
 
-// MetalFX temporal upscaling (`temporal`), or temporal denoised upscaling (`denoised`, its inputs in `denoise`)
+// MetalFX temporal upscaling (`temporal`), temporal denoised upscaling (`denoised`, its inputs in `denoise`), or frame
+// interpolation (`interpolator`, its inputs in `interpolate`)
 struct UpscaleEncoderData : EncoderData {
   Rc<TemporalScaler> temporal;
   Rc<DenoisedScaler> denoised;
+  Rc<FrameInterpolator> interpolator;
   WMT::Texture color, output, depth, motion, exposure;
   WMTFXTemporalScalerProps props;
   WMTFXDenoisedScaleArgs denoise;
+  WMTFXFrameInterpolateArgs interpolate;
 };
 
 // a command on acceleration structures that cannot be recorded when the application records it: a deserializing
 // copy, whose source is in memory only once the work before has run, or a command on a structure that such a copy
 // makes. the queue records it when it gets there, on a list of its own
-// MetalFX temporal upscaling (`temporal`), or temporal denoised upscaling (`denoised`, its inputs in `denoise`)
-struct UpscaleEncoderData : EncoderData {
-  Rc<TemporalScaler> temporal;
-  Rc<DenoisedScaler> denoised;
-  WMT::Texture color, output, depth, motion, exposure;
-  WMTFXTemporalScalerProps props;
-  WMTFXDenoisedScaleArgs denoise;
-};
-
 struct LaterEncoderData : EncoderData {
   enum { Copy, Information, Build } command;
   // CopyRaytracingAccelerationStructure
