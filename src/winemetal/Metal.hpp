@@ -389,6 +389,11 @@ public:
   }
 
   uint64_t
+  staticThreadgroupMemoryLength() const {
+    return MTLComputePipelineState_staticThreadgroupMemoryLength(handle);
+  }
+
+  uint64_t
   threadExecutionWidth() const {
     return MTLComputePipelineState_threadExecutionWidth(handle);
   }
@@ -1209,6 +1214,16 @@ public:
     return MTLDevice_gpuCoreCount(handle);
   }
 
+  uint64_t
+  maxThreadgroupMemoryLength() const {
+    return MTLDevice_maxThreadgroupMemoryLength(handle);
+  }
+
+  uint64_t
+  maxThreadsPerThreadgroup() const {
+    return MTLDevice_maxThreadsPerThreadgroup(handle);
+  }
+
   bool
   supportsPlacementSparse() const {
     return MTLDevice_supportsPlacementSparse(handle);
@@ -1480,6 +1495,11 @@ public:
   bool
   supportsFXTemporalScaler() {
     return MTLDevice_supportsFXTemporalScaler(handle);
+  }
+
+  bool
+  supportsFXDenoisedScaler(bool metal4) {
+    return MTLDevice_supportsFXDenoisedScaler(handle, metal4);
   }
 
   void

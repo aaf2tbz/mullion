@@ -535,7 +535,7 @@ Converter::LoadBuffer(const AtomicDstOperandUAV &DstOp) {
 
   return llvm::Optional<AtomicBufferResourceHandle>(
       {descriptor->Pointer, descriptor->Metadata, descriptor->StructureStride, DstOp.mask,
-       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
+       descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->Bounded}
   );
 }
 
@@ -2482,8 +2482,10 @@ Converter::MinMaxFilter(
   if (!Emulates || !Filtered.first || Tex.Logical == Texture::texture_buffer || Info.is_ms)
     return Filtered;
   // a static sampler is known when the pipeline is made. one that reduces still asks its metadata, which says whether
-  // Metal's sampler reduces for it (mullion::Sampler)
-  if (auto Known = KnownReductions.find(SamplerMetadata); Known != KnownReductions.end() && !Known->second)
+  // Metal's sampler reduces for it (mullion::Sampler). a descriptor's emulates only once a sampler of the device
+  // reduces where Metal cannot (SM50_SHADER_FLAG_NO_MINMAX_FILTER)
+  auto Static = KnownReductions.find(SamplerMetadata);
+  if (Static != KnownReductions.end() ? !Static->second : air.noMinMaxFilter())
     return Filtered;
   auto Field = [&](unsigned Shift, unsigned Bits) {
     return ir.CreateAnd(ir.CreateTrunc(ir.CreateLShr(SamplerMetadata, Shift), ir.getInt32Ty()), (1u << Bits) - 1);
@@ -3931,7 +3933,7 @@ Converter::CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Valu
   if (!Buffer.StructureStride && !Inside)
     Index = ir.CreateAnd(Index, llvm::ConstantInt::get(Index->getType(), UINT32_MAX / sizeof(uint32_t)));
   auto Addr = ir.CreateGEP(ir.getInt32Ty(), Buffer.Pointer, {Index});
-  if (!Buffer.Metadata || Inside) {
+  if (!Buffer.Bounds() || Inside) {
     return Addr;
   }
   auto Dwords = ir.CreateLShr(DecodeRawBufferByteLength(Buffer.Metadata), 2);
@@ -3948,7 +3950,7 @@ Converter::LoadBufferValue(BufferResourceHandle &Buffer, llvm::Type *Type, llvm:
     return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(Type, Ptr)
                                  : ir.CreateLoad(Type, Ptr, Ptr->getType()->getPointerAddressSpace() == 3);
   };
-  if (!Buffer.Metadata || Inside)
+  if (!Buffer.Bounds() || Inside)
     return Load(Ptr);
   // a null pointer is a bounds result, not a zero-valued load (D3D11.3 22.4.10 and 22.4.12). the load reads the view's
   // first unit instead and its value is dropped: a branch round every load splits the shader into blocks whose live
@@ -3971,7 +3973,7 @@ Converter::LoadBufferUnits(
     BufferResourceHandle &Buffer, llvm::Value *Base, llvm::Value *Last, uint32_t UnitBytes,
     llvm::function_ref<llvm::Value *(llvm::Value *, bool)> Read
 ) {
-  if (!Buffer.Metadata || !Last || !Buffer.StructureStride)
+  if (!Buffer.Bounds() || !Last || !Buffer.StructureStride)
     return Read(Base, false);
   auto Bytes = DecodeRawBufferByteLength(Buffer.Metadata);
   auto Units = ir.CreateZExtOrTrunc(ir.CreateUDiv(Bytes, llvm::ConstantInt::get(Bytes->getType(), UnitBytes)), Last->getType());
@@ -3983,7 +3985,7 @@ Converter::LoadBufferUnits(
 llvm::Value *
 Converter::CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm::Value *Index) {
   auto Addr = ir.CreateGEP(ir.getInt32Ty(), Buffer.Pointer, {Index});
-  if (!Buffer.Metadata) {
+  if (!Buffer.Bounds()) {
     return Addr;
   }
   auto ByteLength = DecodeRawBufferByteLength(Buffer.Metadata);

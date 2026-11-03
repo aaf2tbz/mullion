@@ -1084,9 +1084,9 @@ public:
 
   DrawCallStatus
   PreDraw(bool SkipResourceBinding = false) {
-    // a sampler with a custom border may have come since the pipeline was set (MTLD3D12PipelineState::borderless)
-    if (pso_graphics_ && pso_graphics_->borderless && device_->custom_borders) {
-      pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pso_graphics_->Bordered(device_));
+    // a sampler that needs what the pipeline leaves out may have come since it was set (MTLD3D12PipelineState::left_out)
+    while (pso_graphics_ && (pso_graphics_->left_out & device_->sampler_emulations)) {
+      pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pso_graphics_->Fuller(device_));
       dirty_state_.set(DirtyState::GraphicsPipelineState);
     }
     if (!pso_graphics_)
@@ -1245,9 +1245,11 @@ public:
       cmd_setrs.depth_clip_mode = pso_graphics_->conservative ? WMTDepthClipModeClamp : pso_graphics_->depth_clip_mode;
       cmd_setrs.fill_mode = pso_graphics_->fill_mode;
       // one by one: libstdc++ assigns no std::array to a std::tuple of references
-      auto [depth_bias, depth_bias_clamp, scole_scale] = depth_bias_.value_or(
-        std::array{pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale}
-      );
+      auto [depth_bias, depth_bias_clamp, scole_scale] =
+          pso_graphics_->unbiased ? std::array<FLOAT, 3>{}
+                                  : depth_bias_.value_or(std::array{
+                                        pso_graphics_->depth_bias, pso_graphics_->depth_bias_clamp, pso_graphics_->scole_scale
+                                    });
       cmd_setrs.depth_bias = depth_bias;
       cmd_setrs.depth_bias_clamp = depth_bias_clamp;
       cmd_setrs.scole_scale = scole_scale;
@@ -1961,8 +1963,8 @@ public:
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute)
       Overlap(StartComputePass(), {});
 
-    if (pso_compute_ && pso_compute_->borderless && device_->custom_borders) {
-      pso_compute_ = static_cast<MTLD3D12ComputePipelineState *>(pso_compute_->Bordered(device_));
+    while (pso_compute_ && (pso_compute_->left_out & device_->sampler_emulations)) {
+      pso_compute_ = static_cast<MTLD3D12ComputePipelineState *>(pso_compute_->Fuller(device_));
       dirty_state_.set(DirtyState::ComputePipelineState);
     }
     if (!pso_compute_)
@@ -2020,8 +2022,7 @@ public:
       auto parts = static_cast<ComputePartsEncoderData *>(StartComputePass(true));
       if (!PreDispatch())
         return;
-      auto &group = pso_compute_->threadgroup_size;
-      parts->at_once = std::max<uint64_t>(device_->ThreadsAtOnce() / (group.width * group.height * group.depth), 1);
+      parts->at_once = pso_compute_->groups_at_once;
       parts->size = {X, Y, Z};
       parts->type = EncoderType::ComputeParts;
       Isolate(X, Y, Z);
@@ -3772,6 +3773,19 @@ public:
       } else {
         if (!PreDispatch(sig->UpdateRootArguments))
           return;
+        // commands that only dispatch, all of them, are Metal's own indirect dispatches of the arguments where they
+        // are: no resolver writing an indirect command buffer, and no barrier between the two
+        if (!parts && !sig->UpdateRootArguments && !CountBufferAddress && !predication_region_ &&
+            active_statistics_.empty()) {
+          for (UINT i = 0; i < MaxCommandCount; i++) {
+            auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+            dispatch.type = WMTComputeCommandDispatchIndirect;
+            dispatch.indirect_args_buffer = arg_buffer->buffer->current()->buffer();
+            dispatch.indirect_args_offset = ArgBufferOffset + uint64_t(i) * sig->ByteStride;
+          }
+          Isolate(0, 0, 0);
+          return;
+        }
         cmd = parts ? allocator_->EncodeComputeResolver(sig, MaxCommandCount)
                     : allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
         if (!active_statistics_.empty()) {
@@ -3802,7 +3816,6 @@ public:
         auto [mapped, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(D3D12_DISPATCH_ARGUMENTS),
                                                        alignof(D3D12_DISPATCH_ARGUMENTS));
         cmd->dispatches = allocator_->gpu_heap_buffer_address_ + at;
-        auto &group = pso_compute_->threadgroup_size;
         for (UINT i = 0; i < MaxCommandCount; i++) {
           auto pass = static_cast<ComputePartsEncoderData *>(StartComputePass(true));
           PreDispatch(sig->UpdateRootArguments);
@@ -3818,7 +3831,7 @@ public:
               binding.index = index;
             }
           }
-          pass->at_once = std::max<uint64_t>(device_->ThreadsAtOnce() / (group.width * group.height * group.depth), 1);
+          pass->at_once = pso_compute_->groups_at_once;
           pass->indirect = static_cast<const D3D12_DISPATCH_ARGUMENTS *>(mapped) + i;
           pass->type = EncoderType::ComputeParts;
         }
@@ -5074,40 +5087,31 @@ public:
     return texture->view(texture->createView({.format = format, .type = WMTTextureType2D})).texture;
   }
 
-  // the float format MetalFX reads motion vectors of a typeless or integer resource as
-  // depth and exposure as MetalFX reads them: a 32- or 16-bit texture a game created typeless is viewed as
+  // depth and exposure as MetalFX reads them: a 32- or 16-bit texture a game created typeless is held as unsigned
   // integers, and MetalFX reads those bits as the float they hold (Starfield's depth and exposure are R32_TYPELESS)
   static WMTPixelFormat
   ScalarFloatFormat(WMTPixelFormat format) {
     switch (format) {
     case WMTPixelFormatR32Uint:
-    case WMTPixelFormatR32Sint:
       return WMTPixelFormatR32Float;
     case WMTPixelFormatR16Uint:
-    case WMTPixelFormatR16Sint:
       return WMTPixelFormatR16Float;
     default:
       return format;
     }
   }
 
+  // the float format MetalFX reads motion vectors as: DLSS takes them as floats, held as such or, in a typeless
+  // resource, as unsigned integers. normalized or signed integer motion vectors hold no float to read
   static WMTPixelFormat
   MotionVectorFormat(WMTPixelFormat format) {
     switch (format) {
     case WMTPixelFormatRG16Uint:
     case WMTPixelFormatRG16Float:
-    case WMTPixelFormatRG16Sint:
-    case WMTPixelFormatRG16Snorm:
-    case WMTPixelFormatRG16Unorm:
       return WMTPixelFormatRG16Float;
     case WMTPixelFormatRG32Uint:
     case WMTPixelFormatRG32Float:
-    case WMTPixelFormatRG32Sint:
       return WMTPixelFormatRG32Float;
-    case WMTPixelFormatRGBA16Sint:
-    case WMTPixelFormatRGBA16Snorm:
-    case WMTPixelFormatRGBA16Uint:
-    case WMTPixelFormatRGBA16Unorm:
     case WMTPixelFormatRGBA16Float:
       return WMTPixelFormatRGBA16Float;
     default:
@@ -5239,11 +5243,6 @@ public:
       ERR("DenoisedUpscale: motion vectors of format ", motion->pixelFormat(), " are not supported");
       return E_INVALIDARG;
     }
-    if (pDesc->RoughnessInNormalAlpha) {
-      static bool warned = false;
-      if (!std::exchange(warned, true))
-        WARN("DenoisedUpscale: roughness in the normals' alpha is read from their first channel");
-    }
     auto cache = static_cast<UpscalerCache *>(*ppCache);
     if (!cache)
       *ppCache = cache = new UpscalerCache;
@@ -5301,7 +5300,11 @@ public:
     args.diffuse_albedo = UpscaleView(diffuse).handle;
     args.specular_albedo = UpscaleView(specular).handle;
     args.normal = UpscaleView(normals).handle;
-    args.roughness = UpscaleView(roughness).handle;
+    // MetalFX reads roughness from the first channel: packed in the normals' alpha, it is read through a view whose
+    // red is their alpha
+    args.roughness = pDesc->RoughnessInNormalAlpha
+                         ? UpscaleView(normals, WMTPixelFormat(normals->pixelFormat() | WMTPixelFormatAGBASwizzle)).handle
+                         : UpscaleView(roughness).handle;
     args.specular_hit_distance = UpscaleView(hit_distance).handle;
     args.exposure =
         UpscaleView(exposure, exposure ? ScalarFloatFormat(exposure->pixelFormat()) : WMTPixelFormatInvalid).handle;
@@ -5340,9 +5343,7 @@ public:
     }
     BOOL STDMETHODCALLTYPE
     SupportsDenoisedUpscale() final {
-      // MetalFX's denoiser is there from macOS 26, which Metal 4 needs too
-      return list_->device_->GetMTLDevice().supportsFamily(WMTGPUFamilyMetal4) &&
-             list_->device_->GetMTLDevice().supportsFXTemporalScaler();
+      return list_->device_->GetMTLDevice().supportsFXDenoisedScaler(list_->device_->UsesMetal4());
     }
     HRESULT STDMETHODCALLTYPE
     TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc, IMTLD3D12Upscaler **ppCache) final {

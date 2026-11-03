@@ -1508,6 +1508,33 @@ MTLComputePipelineState_maxTotalThreadsPerThreadgroup(obj_handle_t pipeline) {
   return params.ret;
 }
 
+WINEMETAL_API uint64_t
+MTLComputePipelineState_staticThreadgroupMemoryLength(obj_handle_t pipeline) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = pipeline;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixComputeStaticThreadgroupMemory, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLDevice_maxThreadgroupMemoryLength(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceMaxThreadgroupMemory, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLDevice_maxThreadsPerThreadgroup(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceMaxThreadsPerThreadgroup, &params);
+  return params.ret;
+}
+
 WINEMETAL_API bool
 MTLDevice_supports32BitFloatFiltering(obj_handle_t device) {
   struct unixcall_generic_obj_uint64_ret params;
@@ -1532,6 +1559,16 @@ MTLDevice_supportsShaderBarycentricCoordinates(obj_handle_t device) {
   params.handle = device;
   params.ret = 0;
   UNIX_CALL(WMTUnixDeviceSupportsShaderBarycentrics, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsFXDenoisedScaler(obj_handle_t device, bool metal4) {
+  struct unixcall_generic_obj_uint64_uint64_ret params;
+  params.handle = device;
+  params.arg = metal4;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupportsFXDenoisedScaler, &params);
   return params.ret;
 }
 

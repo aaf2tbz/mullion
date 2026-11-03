@@ -48,7 +48,7 @@ public:
     rootsig.next = nullptr;
 
     SM50_SHADER_COMMON_DATA common;
-    common.flags = SM50_SHADER_FLAG(device_->GetShaderFlags() | (borderless ? SM50_SHADER_FLAG_NO_CUSTOM_BORDER : 0));
+    common.flags = SM50_SHADER_FLAG(device_->GetShaderFlags() | left_out);
     common.type = SM50_SHADER_COMMON;
     common.metal_version = device_->GetMetalVersion();
     common.simd_width = device_->GetSIMDWidth();
@@ -59,8 +59,9 @@ public:
       return hr;
 
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
-    groups_work_together = ref_cs.GroupsWorkTogether ||
-                           (ref_cs.DeviceAtomics64 && (device_->GetShaderFlags() & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64));
+    bool locks = ref_cs.DeviceAtomics64 &&
+                 (!ref_cs.DeviceAtomics64Native || (device_->GetShaderFlags() & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64));
+    groups_work_together = ref_cs.GroupsWorkTogether || locks;
     if (groups_work_together)
       Logger::info(str::format("compute pipeline ", name, ": its threadgroups work together, it is dispatched in parts"));
 
@@ -93,6 +94,12 @@ public:
         return E_FAIL;
       }
     }
+    // a lock's holder waits behind the spinning SIMD groups that share its core (MTL_SHADER_REFLECTION::DeviceAtomics64):
+    // those of a part run at once, where other waits need only be kept
+    if (groups_work_together)
+      groups_at_once = device_->GroupsAtOnce(
+          pso, uint64_t(threadgroup_size.width) * threadgroup_size.height * threadgroup_size.depth, !locks
+      );
 
     if (device_->NamesPasses())
       device_->PipelineMade(name, "compute", start);
@@ -149,7 +156,7 @@ CreateComputePipelineState(
   auto pso = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
   if (HRESULT hr = PipelineKey(*pDesc, pso->library_key); FAILED(hr))
     return hr;
-  pso->borderless = Borderless(pDevice, {.desc_cs = *pDesc});
+  Lean(*pso.ptr(), pDevice, {.desc_cs = *pDesc});
   if (cached)
     pso->cached_shaders = *cached;
   HRESULT hr = pso->Initialize(&desc);

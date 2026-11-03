@@ -394,6 +394,26 @@ private:
 class MTLD3D12Fence : public ID3D12Fence1 {
 public:
   std::shared_ptr<Reached> completion = std::make_shared<Reached>();
+  // the last value a Signal of a Metal 4 queue gave the fence, with what says on the GPU that it is there: the
+  // queue's completion event at the command buffer the Signal follows, committed already. a Wait of a queue of the
+  // same device waits for that on the GPU, not for the CPU to see the value (MTLD3D12CommandQueue::Wait)
+  struct Following {
+    uint64_t value = 0;
+    const void *device = nullptr;
+    WMT::Reference<WMT::SharedEvent> event;
+    uint64_t seq = 0;
+  };
+  // a Wait whose queue holds its work behind a gate until the fence is at `value`: a Signal of the same device's to
+  // that value opens it once the Signal's command buffer is committed, and the queue waits for it on the GPU
+  struct Opener {
+    uint64_t value;
+    const void *device;
+    std::shared_ptr<std::atomic<bool>> closed;
+    std::function<void(const WMT::Reference<WMT::SharedEvent> &, uint64_t)> open;
+  };
+  mullion::mutex following_mutex;
+  Following following;
+  std::vector<Opener> openers;
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
   // the fence's value from now on, which a shared fence also gives the devices it is shared with
@@ -441,6 +461,7 @@ public:
 class MTLD3D12CommandSignature : public ID3D12CommandSignature {
 public:
   D3D12_INDIRECT_ARGUMENT_TYPE CommandType;
+  UINT ByteStride;
   UINT UpdateRootArguments : 1;
   UINT UpdateVertexBuffers : 1;
   UINT UpdateIndexBuffer   : 1;
@@ -479,12 +500,13 @@ public:
   Sha1Digest library_key;
   mullion::mutex shader_mutex;
   PipelineShaderCache cached_shaders;
-  // made while no sampler had a border color Metal lacks (MTLD3D12Device::custom_borders), its shaders leave out the
-  // emulation of one (SM50_SHADER_FLAG_NO_CUSTOM_BORDER): what it is made of, to make it again with the emulation
-  // once a draw or dispatch can read such a sampler
-  std::shared_ptr<const PipelineStateStream> borderless;
-  Com<ID3D12PipelineState> bordered;
-  ID3D12PipelineState *Bordered(MTLD3D12Device *Device);
+  // the sampler emulations its shaders leave out, as no sampler of the device needed them when it was made
+  // (MTLD3D12Device::sampler_emulations), and what it is made of, to make it again with them once a draw or dispatch
+  // can read a sampler that does
+  unsigned left_out = 0;
+  std::shared_ptr<const PipelineStateStream> lean;
+  Com<ID3D12PipelineState> fuller;
+  ID3D12PipelineState *Fuller(MTLD3D12Device *Device);
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
 
@@ -568,6 +590,9 @@ public:
   float depth_bias;
   float scole_scale;
   float depth_bias_clamp;
+  // it rasterizes points or lines, which take no depth bias (D3D11.3 15.10); Metal gives them one with a stray slope
+  // when an indirect command buffer draws them, so none is set
+  bool unbiased = false;
   uint32_t forced_sample_count;
   // D3D12_DEPTH_STENCIL_DESC1::DepthBoundsTestEnable, on a device that has the test, and on one that has not, where the
   // pixel shader tests the samples a kernel finds in the bounds before the draw (SM50_SHADER_PSO_PIXEL_SHADER_DATA's
@@ -596,6 +621,8 @@ public:
   WMTSize threadgroup_size;
   // see MTL_SHADER_REFLECTION::GroupsWorkTogether and DeviceAtomics64
   bool groups_work_together = false;
+  // a part of such a dispatch, in threadgroups (MTLD3D12Device::GroupsAtOnce)
+  uint64_t groups_at_once = 1;
 };
 
 // timestamp queries sample the GPU's clock into counter sample buffers. Metal makes few of them, with few samples
@@ -612,9 +639,16 @@ public:
     std::unordered_set<std::shared_ptr<Reached>> values;
   } fences;
 
-  // a sampler has a border color Metal lacks (PopulateWMTSamplerInfo), so pipelines made from now on emulate it
-  // (MTLD3D12PipelineState::borderless)
-  std::atomic<bool> custom_borders{false};
+  // what the device's samplers have needed of kSamplerEmulations: a border color Metal lacks (PopulateWMTSamplerInfo),
+  // a minimum or maximum filter Metal's sampler does not apply (mullion::Sampler). pipelines made from now on emulate
+  // it (MTLD3D12PipelineState::left_out)
+  static constexpr unsigned kSamplerEmulations = SM50_SHADER_FLAG_NO_CUSTOM_BORDER | SM50_SHADER_FLAG_NO_MINMAX_FILTER;
+  std::atomic<unsigned> sampler_emulations{0};
+  // the bytecode lean pipelines keep, once per shader however many pipelines share it
+  struct {
+    mullion::mutex mutex;
+    std::unordered_map<Sha1Digest, std::weak_ptr<const std::string>> bytes;
+  } lean_shaders;
 
   // ExecuteIndirect's indirect command buffers that no allocator holds: what an allocator's last use left unused, and
   // what an allocator held when it was destroyed. an allocator takes from its own pool first, then from this one, so
@@ -695,9 +729,10 @@ public:
   // the removal reason as it is, for Mullion's own checks. GetDeviceRemovedReason first reads what Metal said of the
   // command buffers whose work has finished (SettleCommandQueueFeedback): their fences are signalled before that comes
   virtual HRESULT RemovedReason() = 0;
-  // how many threads of a compute shader go to the GPU at once when its threadgroups wait for one another: the
-  // lanes it runs at once (the estimate behind TotalLaneCount)
-  virtual uint64_t ThreadsAtOnce() = 0;
+  // how many threadgroups of `threads` each of a compute pipeline go to the GPU at once when they wait for one
+  // another: those its cores keep (an Apple GPU takes turns among the ones it does not keep, which a group that waits
+  // makes take seconds), or with `kept` false those its SIMD groups run at once, the estimate behind TotalLaneCount
+  virtual uint64_t GroupsAtOnce(WMT::ComputePipelineState pipeline, uint64_t threads, bool kept) = 0;
   // the Metal language version the device's shaders are converted for (ShaderMetalVersion)
   virtual SM50_SHADER_METAL_VERSION GetMetalVersion() = 0;
   // the shader compiler's flags for what this GPU lacks (GPUShaderFlags)
@@ -781,6 +816,9 @@ public:
 
   // the placement sparse page size whose tiles are D3D12's, or 0 without placement sparse resources (tiled resources)
   virtual WMTSparsePageSize GetSparsePageSize() = 0;
+  // a tile of memory that sparse resources map where they hold none of their own (MTLD3D12CommandQueueImpl::Settle):
+  // the device's, as they may outlive the queue that mapped them
+  virtual WMT::Heap SpareTile() = 0;
 
   virtual FormatCapability GetMTLPixelFormatCapability(WMTPixelFormat Format) = 0;
 

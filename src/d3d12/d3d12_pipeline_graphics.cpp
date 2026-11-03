@@ -467,7 +467,8 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, culls,
-             cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+             cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull] =
+          *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
       hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, clips, culls, cull_depth, blend,
            bounds, late, conservative, coarse, rate, quads, hull);
       break;
@@ -881,7 +882,7 @@ struct Group {
   // it does not test)
   WMT::Reference<WMT::Function>
   CompileTestFragment(bool conservative, bool depth, bool bounds, uint32_t sample_mask, uint32_t culls, bool cull_depth) {
-    // and a clamped one where it may discard by cull distance
+    // and a clamped depth where it may discard by cull distance
     depth |= conservative || (culls && cull_depth);
     bool masked = bounds || sample_mask != ~0u;
     auto corners = std::to_string(SM50_CONSERVATIVE_CORNERS);
@@ -1216,6 +1217,8 @@ public:
     depth_bias = pDesc->RasterizerState.DepthBias;
     scole_scale = pDesc->RasterizerState.SlopeScaledDepthBias;
     depth_bias_clamp = pDesc->RasterizerState.DepthBiasClamp;
+    unbiased = !pDesc->GS.BytecodeLength && (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT ||
+                                             pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
     winding = pDesc->RasterizerState.FrontCounterClockwise ? WMTWindingCounterClockwise : WMTWindingClockwise;
     forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
   }
@@ -1274,7 +1277,7 @@ public:
     WMT::Reference<WMT::Error> err;
 
     SM50_SHADER_COMMON_DATA common;
-    common.flags = SM50_SHADER_FLAG(device_->GetShaderFlags() | (borderless ? SM50_SHADER_FLAG_NO_CUSTOM_BORDER : 0));
+    common.flags = SM50_SHADER_FLAG(device_->GetShaderFlags() | left_out);
     common.type = SM50_SHADER_COMMON;
     common.metal_version = device_->GetMetalVersion();
     common.simd_width = device_->GetSIMDWidth();
@@ -1987,7 +1990,7 @@ CreateGraphicsPipelineState(
   PipelineStateStream stream{.desc_graphics = *pDesc, .desc_as = AS, .desc_ms = MS, .depth_bounds = depth_bounds};
   if (depth_stencil2)
     stream.depth_stencil2 = *depth_stencil2;
-  pso->borderless = Borderless(pDevice, stream);
+  Lean(*pso.ptr(), pDevice, stream);
   if (cached)
     pso->cached_shaders = *cached;
   pso->depth_bounds = depth_bounds && pDevice->GetMTLDevice().supportsFamily(WMTGPUFamilyApple10);
@@ -1998,12 +2001,13 @@ CreateGraphicsPipelineState(
   return pso->QueryInterface(riid, ppPipelineState);
 };
 
-std::shared_ptr<const PipelineStateStream>
-Borderless(MTLD3D12Device *device, const PipelineStateStream &stream) {
-  if (device->custom_borders)
-    return {};
+void
+Lean(MTLD3D12PipelineState &pso, MTLD3D12Device *device, const PipelineStateStream &stream) {
+  if (!(pso.left_out = MTLD3D12Device::kSamplerEmulations & ~device->sampler_emulations))
+    return;
   struct Owned : PipelineStateStream {
     std::deque<std::string> bytes;
+    std::vector<std::shared_ptr<const std::string>> shaders;
     std::vector<D3D12_SO_DECLARATION_ENTRY> outputs;
     std::vector<UINT> strides;
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
@@ -2016,8 +2020,15 @@ Borderless(MTLD3D12Device *device, const PipelineStateStream &stream) {
   auto &graphics = owned->desc_graphics;
   for (auto code : {&cs.CS, &graphics.VS, &graphics.PS, &graphics.DS, &graphics.HS, &graphics.GS, &owned->desc_as,
                     &owned->desc_ms})
-    if (code->pShaderBytecode)
-      code->pShaderBytecode = keep(code->pShaderBytecode, code->BytecodeLength);
+    if (code->pShaderBytecode) {
+      auto key = Sha1HashState::compute(code->pShaderBytecode, code->BytecodeLength);
+      std::lock_guard<mullion::mutex> lock(device->lean_shaders.mutex);
+      auto &kept = device->lean_shaders.bytes[key];
+      auto shader = kept.lock();
+      if (!shader)
+        kept = shader = std::make_shared<const std::string>((const char *)code->pShaderBytecode, code->BytecodeLength);
+      code->pShaderBytecode = owned->shaders.emplace_back(std::move(shader))->data();
+    }
   cs.CachedPSO = graphics.CachedPSO = {};
   owned->signature = cs.pRootSignature ? cs.pRootSignature : graphics.pRootSignature;
   auto &so = graphics.StreamOutput;
@@ -2033,15 +2044,15 @@ Borderless(MTLD3D12Device *device, const PipelineStateStream &stream) {
   for (auto &element : owned->elements)
     element.SemanticName = keep(element.SemanticName, strlen(element.SemanticName) + 1);
   layout.pInputElementDescs = owned->elements.data();
-  return owned;
+  pso.lean = owned;
 }
 
 ID3D12PipelineState *
-MTLD3D12PipelineState::Bordered(MTLD3D12Device *Device) {
+MTLD3D12PipelineState::Fuller(MTLD3D12Device *Device) {
   std::lock_guard<mullion::mutex> lock(shader_mutex);
-  if (!bordered && FAILED(borderless->Create(Device, __uuidof(ID3D12PipelineState), (void **)&bordered)))
-    ERR("pipeline ", name, ": the variant that emulates custom borders failed");
-  return bordered.ptr();
+  if (!fuller && FAILED(lean->Create(Device, __uuidof(ID3D12PipelineState), (void **)&fuller)))
+    ERR("pipeline ", name, ": the variant that emulates its samplers failed");
+  return fuller.ptr();
 }
 
 HRESULT

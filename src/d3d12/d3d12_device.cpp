@@ -272,6 +272,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   std::vector<uint32_t> free_ray_functions_;
   uint32_t next_ray_function_ = SM50_RAY_FUNCTION_FIRST_SHADER;
   WMT::Reference<WMT::ResidencySet> residency_set_;
+  WMT::Reference<WMT::Heap> spare_tile_;
   // allocations were added or removed since the set was last committed (CommitResidency)
   bool residency_dirty_ = false;
   // the buffers by GPU address and the sparse ones' mapped tiles, under a lock of their own: every index buffer, root
@@ -443,10 +444,20 @@ public:
   }
 
   uint64_t
-  ThreadsAtOnce() {
-    // MULLION_D3D12_THREADS_AT_ONCE gives the number, for a test or to tell what a part's size does
+  GroupsAtOnce(WMT::ComputePipelineState pipeline, uint64_t threads, bool kept) {
+    // MULLION_D3D12_THREADS_AT_ONCE gives the threads, for a test or to tell what a part's size does
     static const uint64_t given = strtoull(env::getEnvVar("MULLION_D3D12_THREADS_AT_ONCE").c_str(), nullptr, 10);
-    return given ? given : total_lanes_;
+    if (given || !kept)
+      return std::max<uint64_t>((given ? given : total_lanes_) / threads, 1);
+    // a core keeps a threadgroup of the most threads the device takes in one, whose barriers need them all at once, so
+    // as many of these groups as fit in those threads (not the pipeline's own most: the converter declares it as its
+    // group's size), and in the core's threadgroup memory where that is fixed: dynamic caching (Apple9 on) gives
+    // threadgroups their memory from the core's cache, where groups that took the most each still kept that many
+    uint64_t per_core = GetMTLDevice().maxThreadsPerThreadgroup() / threads;
+    auto memory = pipeline.staticThreadgroupMemoryLength();
+    if (memory && !GetMTLDevice().supportsFamily(WMTGPUFamilyApple9))
+      per_core = std::min<uint64_t>(per_core, GetMTLDevice().maxThreadgroupMemoryLength() / memory);
+    return std::max<uint64_t>(per_core, 1) * GetMTLDevice().gpuCoreCount();
   }
 
   SM50_SHADER_METAL_VERSION
@@ -2483,6 +2494,22 @@ public:
   WMTSparsePageSize
   GetSparsePageSize() {
     return sparse_page_size_;
+  }
+
+  WMT::Heap
+  SpareTile() final {
+    std::unique_lock<mullion::mutex> lock(residency_lock_);
+    if (!spare_tile_) {
+      WMTHeapInfo info{};
+      info.sparse_page_size = sparse_page_size_;
+      info.size = GetMTLDevice().sparseTileSizeInBytes(info.sparse_page_size);
+      info.type = WMTHeapTypePlacement;
+      spare_tile_ = GetMTLDevice().newHeap(info);
+      WMT::Allocation tile = spare_tile_;
+      residency_set_.addAllocations(&tile, 1);
+      residency_dirty_ = true;
+    }
+    return spare_tile_;
   }
 
   virtual FormatCapability

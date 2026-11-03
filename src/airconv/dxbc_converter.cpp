@@ -909,6 +909,7 @@ llvm::Error convert_dxbc_pixel_shader(
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
           .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
+          .noMinMaxFilter = bool(shader_flags & SM50_SHADER_FLAG_NO_MINMAX_FILTER),
       },
       builder, nulldbg
   );
@@ -1291,6 +1292,7 @@ llvm::Error convert_dxbc_compute_shader(
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
           .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
+          .noMinMaxFilter = bool(shader_flags & SM50_SHADER_FLAG_NO_MINMAX_FILTER),
       },
       builder, nulldbg
   );
@@ -1452,6 +1454,7 @@ llvm::Error convert_dxbc_vertex_shader(
           .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
           .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
           .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
+          .noMinMaxFilter = bool(shader_flags & SM50_SHADER_FLAG_NO_MINMAX_FILTER),
       },
       builder, nulldbg
   );
@@ -2066,6 +2069,7 @@ static int SM50InitializeUncached(
     }
     pRefl->GroupsWorkTogether = sm50_shader->groups_work_together;
     pRefl->DeviceAtomics64 = sm50_shader->device_atomics64;
+    pRefl->DeviceAtomics64Native = sm50_shader->device_atomics64_native;
     // a mesh shader's conservative triangles: its outputs wait in threadgroup memory, 16 KB of it, for a mesh of its
     // triangles, three vertices each of its components and the conservative rasterizer's, each primitive its own
     // and four words. a group too large for one mesh runs once for each, which one that writes resources cannot

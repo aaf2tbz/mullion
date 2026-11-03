@@ -191,10 +191,10 @@ main(int argc, char **argv) {
       alternate.Reset();
       CHECK(other.As(&alternate));
     }
-    // with one adapter, WARP included, there is one device (D3D12CreateDevice returns it), so no queue of another
-    // device can reach D3D11On12CreateDevice
+    // Mullion's WARP adapter is the GPU's (EnumWarpAdapter), so a process has one D3D12 device and no queue of
+    // another device can be given
     if (original == alternate) {
-      printf("note: one D3D12 device per adapter and one adapter, so no other device's queue to reject\n");
+      printf("host: one D3D12 device per process; a queue of another device is not exercised\n");
       return verdict();
     }
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

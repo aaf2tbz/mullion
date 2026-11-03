@@ -359,6 +359,10 @@ main(int argc, char **argv) {
           }
   }
   step("inject the lock table's give-up flag without holding a GPU lock");
+  // a device is a singleton per adapter while it is held (D3D12CreateDevice, Remarks): the device made below is a new
+  // one, whose lock table is seen as it is made, once this one is gone
+  root.Reset();
+  device.Reset();
   lock_bytes = SM50_NULL_ACCELERATION_STRUCTURE_HEADER_SIZE +
                sizeof(uint32_t) * (UINT64(std::bit_ceil(options.TotalLaneCount)) + 2);
   auto module = reinterpret_cast<BYTE *>(GetModuleHandleA("d3d12core.dll"));
@@ -385,10 +389,6 @@ main(int argc, char **argv) {
     return verdict();
   original_buffer = reinterpret_cast<decltype(original_buffer)>(*import);
   *import = reinterpret_cast<ULONG_PTR>(observe_buffer);
-  // an adapter has one device at a time (D3D12CreateDevice returns the one there is): the first goes, with the root
-  // signature that holds it, so that the next is made, and its lock table with it
-  root.Reset();
-  device.Reset();
   ComPtr<ID3D12Device> failed;
   const auto created = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&failed));
   *import = reinterpret_cast<ULONG_PTR>(original_buffer);
@@ -406,12 +406,13 @@ main(int argc, char **argv) {
   InterlockedExchange(given_up, 1);
   expect(submit(failed.Get(), queue.Get(), list.Get()) == DXGI_ERROR_DEVICE_HUNG, "give-up submission removed device");
   expect(failed->GetDeviceRemovedReason() == DXGI_ERROR_DEVICE_HUNG, "give-up reports DXGI_ERROR_DEVICE_HUNG");
-  // the removal stays with the removed device: once it is released, the adapter makes a working one again
+  // the removal is the failed device's: once it is released, the adapter's next device has none
   list.Reset();
   allocator.Reset();
   queue.Reset();
   failed.Reset();
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-  expect(device->GetDeviceRemovedReason() == S_OK, "removal persists on the failed device alone");
+  ComPtr<ID3D12Device> next;
+  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&next)));
+  expect(next->GetDeviceRemovedReason() == S_OK, "removal persists on the failed device alone");
   return verdict();
 }

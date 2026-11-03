@@ -1369,7 +1369,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_render_mullion_geometry_draw *body = (struct wmtcmd_render_mullion_geometry_draw *)next;
       [encoder setMeshBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       draw_geometry_parts(encoder, body->warp_count, body->instance_count, body->vertex_per_warp,
-                          body->max_object_threadgroups, true, 0);
+                          body->max_object_threadgroups, true, body->mesh_threads);
       break;
     }
     case WMTRenderCommandMullionGeometryDrawIndexed: {
@@ -2227,10 +2227,28 @@ _MTLDevice_supportsFXTemporalScaler(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_supportsFXDenoisedScaler(void *obj) {
+  struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->handle;
+  params->ret = 0;
+  if (@available(macOS 26.0, *))
+    params->ret = params->arg ? [MTLFXTemporalDenoisedScalerDescriptor supportsMetal4FX:device]
+                              : [MTLFXTemporalDenoisedScalerDescriptor supportsDevice:device];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MetalLayer_setProps(void *obj) {
   struct unixcall_generic_obj_constptr_noret *params = obj;
   CAMetalLayer *layer = (CAMetalLayer *)params->handle;
   const struct WMTLayerProps *props = params->arg.ptr;
+  // a present sets them all each frame, and each setting waits for the main thread: only a change is set
+  if (layer.device == (id<MTLDevice>)props->device && layer.opaque == props->opaque &&
+      layer.framebufferOnly == props->framebuffer_only && layer.contentsScale == props->contents_scale &&
+      layer.displaySyncEnabled == props->display_sync_enabled &&
+      CGSizeEqualToSize(layer.drawableSize, CGSizeMake(props->drawable_width, props->drawable_height)) &&
+      layer.pixelFormat == to_metal_pixel_format(props->pixel_format))
+    return STATUS_SUCCESS;
   execute_on_main(^{
     layer.device = (id<MTLDevice>)props->device;
     layer.opaque = props->opaque;
@@ -3093,6 +3111,11 @@ _MetalLayer_setColorSpace(void *obj) {
   params->ret = false;
   if (!name)
     return STATUS_SUCCESS;
+  CFStringRef current = layer.colorspace ? CGColorSpaceGetName(layer.colorspace) : NULL;
+  if (current && CFEqual(current, name) && layer.wantsExtendedDynamicRangeContent == WMT_COLORSPACE_IS_HDR(colorspace)) {
+    params->ret = true;
+    return STATUS_SUCCESS;
+  }
   CGColorSpaceRef ref = CGColorSpaceCreateWithName(name);
   if (!ref)
     return STATUS_SUCCESS;
@@ -3734,9 +3757,11 @@ shared_name_release(struct shared_name *entry) {
   pthread_mutex_unlock(&shared_names_lock);
   if (!last)
     return;
-  /* the cancel handler runs after the last request handler, and destroys the receive right */
-  dispatch_source_cancel(entry->source);
-  dispatch_release(entry->source);
+  /* the cancel handler runs after the last request handler, destroys the receive right and frees entry, which it can
+   * do before dispatch_source_cancel returns */
+  dispatch_source_t source = entry->source;
+  dispatch_source_cancel(source);
+  dispatch_release(source);
 }
 
 /* attached to each object that keeps a name: the name goes with the last of them */
@@ -3996,6 +4021,27 @@ _MTLComputePipelineState_maxTotalThreadsPerThreadgroup(void *obj) {
 }
 
 static NTSTATUS
+_MTLComputePipelineState_staticThreadgroupMemoryLength(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLComputePipelineState>)params->handle staticThreadgroupMemoryLength];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_maxThreadgroupMemoryLength(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle maxThreadgroupMemoryLength];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_maxThreadsPerThreadgroup(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle maxThreadsPerThreadgroup].width;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLRenderPipelineState>)params->handle maxTotalThreadgroupsPerMeshGrid];
@@ -4122,10 +4168,24 @@ _MTL4CommandQueue_event(void *obj) {
   struct unixcall_mtl4_event *params = obj;
   if (@available(macOS 26.0, *)) {
     id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
-    if (params->wait)
-      [queue waitForEvent:(id<MTLEvent>)params->event value:params->value];
-    else
-      [queue signalEvent:(id<MTLEvent>)params->event value:params->value];
+    id<MTLEvent> event = (id<MTLEvent>)params->event;
+    bool wait = params->wait;
+    uint64_t value = params->value;
+    void (^call)(void) = ^{
+      if (wait)
+        [queue waitForEvent:event value:value];
+      else
+        [queue signalEvent:event value:value];
+    };
+    // the queue's commits that came before are late: the call stays behind them (the copied block holds the queue
+    // and the event)
+    if (test_late_ns) {
+      pthread_mutex_lock(&test_late_mutex);
+      dispatch_async(test_late_commits, call);
+      pthread_mutex_unlock(&test_late_mutex);
+    } else {
+      call();
+    }
   }
   return STATUS_SUCCESS;
 }
@@ -4768,7 +4828,8 @@ _WMTDiagWrite(void *obj) {
   }
   if (!file || fwrite(params->lines.ptr, 1, params->length, file) != params->length || fflush(file)) {
     params->ret = 0;
-    perror("mullion-diag: write record");
+    if (file)
+      perror("mullion-diag: write record");
   }
   pthread_mutex_unlock(&lock);
   return STATUS_SUCCESS;
@@ -6119,7 +6180,7 @@ API_AVAILABLE(macos(26.0)) metal4_render(MullionMetal4Encoder *state, const stru
                     SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       metal4_draw_geometry_parts(
           state, body->warp_count, body->instance_count, body->vertex_per_warp, body->max_object_threadgroups, mesh_only,
-          mesh_only ? 0 : body->mesh_threads
+          body->mesh_threads
       );
       break;
     }
@@ -6917,6 +6978,10 @@ const void *__wine_unix_call_funcs[] = {
     &_MTL4CommandBuffer_encodeTemporalScale,
     &_MTLDevice_newDenoisedScaler,
     &_MTLCommandBuffer_encodeDenoisedScale,
+    &_MTLDevice_supportsFXDenoisedScaler,
+    &_MTLComputePipelineState_staticThreadgroupMemoryLength,
+    &_MTLDevice_maxThreadgroupMemoryLength,
+    &_MTLDevice_maxThreadsPerThreadgroup,
 };
 
 #ifndef MULLION_NATIVE
@@ -7126,6 +7191,10 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4CommandBuffer_encodeTemporalScale,
     &_MTLDevice_newDenoisedScaler,
     &_MTLCommandBuffer_encodeDenoisedScale,
+    &_MTLDevice_supportsFXDenoisedScaler,
+    &_MTLComputePipelineState_staticThreadgroupMemoryLength,
+    &_MTLDevice_maxThreadgroupMemoryLength,
+    &_MTLDevice_maxThreadsPerThreadgroup,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");
