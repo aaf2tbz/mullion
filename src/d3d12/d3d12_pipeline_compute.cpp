@@ -97,16 +97,21 @@ public:
 
       // a pipeline whose threadgroups work together is measured below (GroupsAtOnce), so it is made here
       if (DeferredPipeline::Enabled() && !groups_work_together) {
-        // Metal's compile of it on a compile thread (DeferredPipeline), as a graphics pipeline's; a failure there
-        // leaves `pso` null, and the dispatches of it are dropped. it holds the pipeline by pointer: the pipeline's
-        // destructor drops or finishes it (Cancel)
+        // Metal's compile of it on a compile thread (DeferredPipeline), as a graphics pipeline's, through the program's
+        // pipeline archive (Archived); a failure there leaves `pso` null, and the dispatches of it are dropped. it holds
+        // the pipeline by pointer: the pipeline's destructor drops or finishes it (Cancel)
         deferred = std::make_shared<DeferredPipeline>([self = this, info, cs_func]() {
           WMT::Reference<WMT::Error> error;
-          if (!(self->pso = self->device_->GetMTLDevice().newComputePipelineState(info, error)))
+          auto device = self->device_;
+          if (!(self->pso = device->Archived(info, error, [&](auto &info, auto &error) {
+                  return device->GetMTLDevice().newComputePipelineState(info, error);
+                })))
             ERR("Failed to create compute PSO of shader ", self->name, ": ", error.description().getUTF8String());
         });
         DeferredPipeline::Queue(deferred);
-      } else if (!(pso = metal.newComputePipelineState(info, err))) {
+      } else if (!(pso = device_->Archived(info, err, [&](auto &info, auto &error) {
+                     return metal.newComputePipelineState(info, error);
+                   }))) {
         ERR("Failed to create compute PSO of shader ", name, ": ", err.description().getUTF8String());
         DumpShaders({pDesc->CS});
         return E_FAIL;
