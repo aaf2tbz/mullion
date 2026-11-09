@@ -813,6 +813,9 @@ private:
   std::string queue_events_;
 
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
+  // the last sparse buffer mapping table Commit made, and what it holds (only Commit, under the committing scope)
+  WMT::Reference<WMT::Buffer> sparse_table_;
+  std::vector<uint64_t> sparse_table_mappings_;
   mullion::thread inflight_cmdbuf_wait_thread_;
 
   // a command buffer that does not complete stops the queue with no error from Metal: a thread reports the one the
@@ -1552,7 +1555,11 @@ public:
       gate_->closed.wait(true);
       mappings = device_->SparseBufferMappings();
     }
-    if (!mappings.empty()) {
+    // the GPU only reads a table, and nothing writes it once made: the queue's last one goes on while the mappings
+    // are the same, which they are from one frame to the next (making one each time is a late object creation)
+    if (!mappings.empty() && mappings == sparse_table_mappings_) {
+      sparse_mappings = sparse_table_;
+    } else if (!mappings.empty()) {
       WMTBufferInfo info{mappings.size() * sizeof(mappings[0]), WMTResourceStorageModeShared};
       sparse_mappings = device_->GetMTLDevice().newBuffer(info);
       if (!sparse_mappings) {
@@ -1560,6 +1567,8 @@ public:
         return;
       }
       sparse_mappings.updateContents(0, mappings.data(), info.length);
+      sparse_table_ = sparse_mappings;
+      sparse_table_mappings_ = std::move(mappings);
     }
     static const bool isolate = !env::getEnvVar("MULLION_D3D12_ISOLATE").empty();
     MetalCommandBuffer cmdbuf = scope.inflight->cmdbuf;

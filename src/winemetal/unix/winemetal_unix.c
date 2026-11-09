@@ -5630,6 +5630,28 @@ API_AVAILABLE(macos(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
   }
 }
 
+// the queue's residency sets that no work holds, emptied: making one while the GPU works is a late object creation
+// (Xcode's API usage insight), once for every command buffer. the queue's first command buffer makes eight, which
+// cover the command buffers a queue has in flight; more are made only past that
+static NSMutableArray *
+API_AVAILABLE(macos(26.0)) metal4_residency_sets(id<MTL4CommandQueue> queue) {
+  static char key;
+  @synchronized(queue) {
+    NSMutableArray *pool = objc_getAssociatedObject(queue, &key);
+    if (!pool) {
+      pool = [NSMutableArray array];
+      MTLResidencySetDescriptor *descriptor = [[[MTLResidencySetDescriptor alloc] init] autorelease];
+      for (unsigned i = 0; i < 8; i++) {
+        id<MTLResidencySet> set = [queue.device newResidencySetWithDescriptor:descriptor error:nil];
+        if (set)
+          [pool addObject:[set autorelease]];
+      }
+      objc_setAssociatedObject(queue, &key, pool, OBJC_ASSOCIATION_RETAIN);
+    }
+    return pool;
+  }
+}
+
 @implementation MullionMetal4Buffer
 // a debug group is the command buffer's, so none of its encoders is open
 - (void)pushDebugGroup:(NSString *)name {
@@ -5666,16 +5688,27 @@ API_AVAILABLE(macos(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
     [tables[i] release];
   [objects release];
   [allocations release];
-  [residency release];
   [buffer release];
   // the GPU is done with the commands once the buffer's feedback came, and never had those of one not committed
-  if (allocator && (finished || feedback.status < WMTCommandBufferStatusCommitted)) {
-    [allocator reset];
-    NSMutableArray *pool = metal4_allocators(queue);
-    @synchronized(pool) {
-      [pool addObject:allocator];
+  if (finished || feedback.status < WMTCommandBufferStatusCommitted) {
+    if (allocator) {
+      [allocator reset];
+      NSMutableArray *pool = metal4_allocators(queue);
+      @synchronized(pool) {
+        [pool addObject:allocator];
+      }
+    }
+    // emptied and committed, so it holds none of this buffer's allocations while it waits
+    if (residency) {
+      [residency removeAllAllocations];
+      [residency commit];
+      NSMutableArray *pool = metal4_residency_sets(queue);
+      @synchronized(pool) {
+        [pool addObject:residency];
+      }
     }
   }
+  [residency release];
   [allocator release];
   [event release];
   [fence release];
@@ -5815,8 +5848,15 @@ _MTL4CommandBuffer_new(void *obj) {
     state->allocations = [[NSMutableSet alloc] init];
     state->objects = [[NSMutableSet alloc] init];
     state->feedback_ready = dispatch_group_create();
-    state->residency =
-        [state->device newResidencySetWithDescriptor:[[[MTLResidencySetDescriptor alloc] init] autorelease] error:nil];
+    NSMutableArray *sets = metal4_residency_sets(state->queue);
+    @synchronized(sets) {
+      state->residency = [[sets lastObject] retain];
+      if (state->residency)
+        [sets removeLastObject];
+    }
+    if (!state->residency)
+      state->residency =
+          [state->device newResidencySetWithDescriptor:[[[MTLResidencySetDescriptor alloc] init] autorelease] error:nil];
     if (!state->buffer || !state->allocator || !state->residency || !state->objects || !state->allocations) {
       [state fail:nil];
       p->ret = (obj_handle_t)state;

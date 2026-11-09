@@ -357,9 +357,10 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   acceleration_structures_.clear();
   acceleration_structure_inputs_.clear();
 
-  // the next lists copy in the last buffer while the last lists took half of it: an allocator keeps at most twice what
-  // its last lists copied
-  if (!temp_buffers_.empty() && 2 * temp_used_ >= temp_buffers_.back().length)
+  // the next lists copy in the last buffer while the last lists copied anything: making one while the GPU works is a
+  // late object creation (Xcode's API usage insight), every frame where a list copies less than half of it. an
+  // allocator whose lists copied nothing lets it go
+  if (!temp_buffers_.empty() && temp_used_)
     temp_buffers_.erase(temp_buffers_.begin(), temp_buffers_.end() - 1);
   else
     temp_buffers_.clear();
