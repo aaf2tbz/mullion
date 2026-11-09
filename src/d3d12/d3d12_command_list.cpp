@@ -2273,6 +2273,24 @@ public:
       return;
     auto src_desc = pSrc->pResource->GetDesc();
     auto dst_desc = pDst->pResource->GetDesc();
+    // MULLION_TRACE_RESOURCE=heavy: every texture copy, where from and where to
+    if (trace::Heavy(trace::Resource))
+      TRACE_IN(Resource, "CopyTextureRegion to ", pDst->pResource, " (", dst_desc.Width, "x", dst_desc.Height,
+               " format ", uint32_t(dst_desc.Format), ") ",
+               pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? "subresource " : "footprint at ",
+               pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? uint64_t(pDst->SubresourceIndex)
+                                                                       : pDst->PlacedFootprint.Offset,
+               " at ", DstX, ",", DstY, ",", DstZ, " from ", pSrc->pResource, " (", src_desc.Width, "x",
+               src_desc.Height, ") ",
+               pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? "subresource " : "footprint at ",
+               pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? uint64_t(pSrc->SubresourceIndex)
+                                                                       : pSrc->PlacedFootprint.Offset,
+               pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
+                   ? str::format(" ", pSrc->PlacedFootprint.Footprint.Width, "x", pSrc->PlacedFootprint.Footprint.Height,
+                                 " pitch ", pSrc->PlacedFootprint.Footprint.RowPitch)
+                   : std::string(),
+               pSrcBox ? str::format(" box ", pSrcBox->left, ",", pSrcBox->top, "-", pSrcBox->right, ",", pSrcBox->bottom)
+                       : std::string());
     // a copy into a texture may run before the render pass, but not one of RGB32 or D24 texels, which a kernel
     // converts
     Hoisted hoisted{this};

@@ -736,7 +736,10 @@ public:
 
     bool minmax =
         sampler->metadata >> SM50_SAMPLER_METADATA_REDUCTION & ((1 << SM50_SAMPLER_METADATA_REDUCTION_BITS) - 1);
-    if (minmax)
+    // MULLION_D3D12_MINMAX_FILTER=0 leaves the minimum and maximum filters' emulation out of pipelines (A/B runs): such
+    // samplers then filter as Metal's do
+    static const bool minmax_filter = env::getEnvVar("MULLION_D3D12_MINMAX_FILTER") != "0";
+    if (minmax_filter && minmax)
       device_->sampler_emulations |= SM50_SHADER_FLAG_NO_MINMAX_FILTER;
     if (trace::On(trace::Shader) &&
         (custom || minmax || (D3D12_DECODE_IS_ANISOTROPIC_FILTER(pDesc->Filter) && pDesc->MipLODBias != 0)))

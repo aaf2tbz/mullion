@@ -931,7 +931,14 @@ public:
       out->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;
       // placement sparse resources carry tier 3: a reserved 3D texture is a placement sparse 3D texture, whose tiles
       // GetResourceTiling reports, Metal's slabs a texel deep rather than D3D11.3's standard 3D shapes (5.9.4)
-      out->TiledResourcesTier = sparse_page_size_ ? D3D12_TILED_RESOURCES_TIER_3 : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+      // d3d12.tiledResources = False or MULLION_D3D12_TILED_RESOURCES=<tier> reports another tier, 0 for none
+      static const int tier = [] {
+        auto set = env::getEnvVar("MULLION_D3D12_TILED_RESOURCES");
+        return set.empty() ? (Config::getInstance().getOption<bool>("d3d12.tiledResources", true) ? 3 : 0)
+                           : std::clamp(atoi(set.c_str()), 0, 3);
+      }();
+      out->TiledResourcesTier =
+          sparse_page_size_ ? D3D12_TILED_RESOURCES_TIER(tier) : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
       out->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;
       out->PSSpecifiedStencilRefSupported = TRUE;
       out->TypedUAVLoadAdditionalFormats = TRUE;

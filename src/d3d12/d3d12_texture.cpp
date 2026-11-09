@@ -623,6 +623,19 @@ public:
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
     view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, metal_format.PixelFormat);
+    // MULLION_TRACE_RESOURCE=heavy: every texture SRV, with the resource's and the view's formats, the component
+    // mapping and the Metal format the view gets (with its swizzle bits)
+    if (trace::Heavy(trace::Resource))
+      TRACE_IN(Resource, "SRV of texture ", this, " ", desc_.Width, "x", desc_.Height, "x", desc_.DepthOrArraySize,
+               " mips ", desc_.MipLevels, ": resource format ", uint32_t(desc_.Format), ", view format ",
+               uint32_t(ViewDesc.Format), ", dimension ", uint32_t(ViewDesc.ViewDimension), ", mapping 0x",
+               str::format(std::hex, ViewDesc.Shader4ComponentMapping), ", texture pixel format ",
+               uint32_t(texture->pixelFormat()), ", view pixel format 0x",
+               str::format(std::hex, uint64_t(view_descriptor.format)),
+               ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+                   ? str::format(", most detailed mip ", ViewDesc.Texture2D.MostDetailedMip, ", mips ",
+                                 ViewDesc.Texture2D.MipLevels, ", min LOD clamp ", ViewDesc.Texture2D.ResourceMinLODClamp)
+                   : std::string());
 
     if (texture->pixelFormat() == WMTPixelFormatDepth32Float || texture->pixelFormat() == WMTPixelFormatDepth16Unorm) {
       view_descriptor.format = EncodeComponentMapping(
@@ -1227,6 +1240,12 @@ public:
       *TotalTileCount = per_slice * slices;
     if (PackedMipInfo)
       *PackedMipInfo = packed;
+    if (trace::Heavy(trace::Resource))
+      TRACE_IN(Resource, "GetResourceTiling of ", this, " ", desc_.Width, "x", desc_.Height, " mips ", mips,
+               ": tile ", shape.WidthInTexels, "x", shape.HeightInTexels, ", standard mips ",
+               uint32_t(packed.NumStandardMips), ", packed mips ", uint32_t(packed.NumPackedMips), " in ",
+               packed.NumTilesForPackedMips, " tiles from tile ", packed.StartTileIndexInOverallResource,
+               " (Metal tail from mip ", first, ", ", bytes, " bytes), total ", per_slice * slices);
     if (StandardTileShape)
       *StandardTileShape = shape;
     if (!SubresourceTilingCount)
