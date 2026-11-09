@@ -18,6 +18,7 @@ d3d12_src = [
   'd3d12_state_object.cpp',
   'd3d12_swapchain.cpp',
   'd3d12_texture.cpp',
+  'd3d12_upload_check.cpp',
   '../d3d10/d3d10_blob.cpp',
 ]
 

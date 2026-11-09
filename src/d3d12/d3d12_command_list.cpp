@@ -195,6 +195,9 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
 
   // GPU addresses of the bound CBV/SRV/UAV and sampler heaps (SetDescriptorHeaps)
   uint64_t resource_heap_ = 0, sampler_heap_ = 0;
+  // the bound CBV/SRV/UAV heap itself, whose descriptors MULLION_D3D12_UPLOAD_CHECK reads
+  MTLD3D12DescriptorHeap *resource_heap_object_ = nullptr;
+  UINT resource_heap_size_ = 0;
 
   // a bundle keeps its calls, and ExecuteBundle replays them on the calling list: they read the state the caller set and
   // leave theirs set, as bundles inherit and pass state
@@ -772,6 +775,9 @@ public:
 
     rootsig_graphics_ = nullptr;
     memset(rootarg_graphics_staging_, 0, sizeof(rootarg_graphics_staging_));
+    resource_heap_object_ = nullptr;
+    resource_heap_size_ = 0;
+    upload_reads.clear();
 
     rootsig_compute_ = nullptr;
     memset(rootarg_compute_staging_, 0, sizeof(rootarg_compute_staging_));
@@ -1817,6 +1823,100 @@ public:
     barrier(WMTRenderStagePreRaster, WMTRenderStages(WMTRenderStagePreRaster | WMTRenderStageFragment));
   }
 
+  // MULLION_D3D12_UPLOAD_CHECK: what a draw of few vertices an instance and more than one instance (a particle
+  // system's sprites) reads from upload heap buffers, through the graphics root signature's root CBVs and SRVs and its
+  // tables' CBVs and buffer SRVs
+  // MULLION_D3D12_SPRITE_SHADERS=1 (read once): each pipeline a draw of at most 6 vertices an instance and more than one
+  // instance (a particle system's sprites) is made with, once, by its shaders' SHA-1s (MULLION_SHADER_DUMP_ALL's names)
+  void
+  LogSpriteShaders(UINT Count, UINT Instances, bool Indexed) {
+    static const bool enabled = env::getEnvVar("MULLION_D3D12_SPRITE_SHADERS") == "1";
+    if (!enabled || Instances < 2 || Count > 6 || !pso_graphics_)
+      return;
+    static mullion::mutex lock;
+    static std::unordered_set<const void *> seen;
+    {
+      std::lock_guard guard(lock);
+      if (!seen.insert(pso_graphics_.ptr()).second)
+        return;
+    }
+    WARN("sprite pipeline: ", Count, Indexed ? " indices x " : " vertices x ", Instances, " instances, root signature ",
+         (void *)rootsig_graphics_.ptr(), ", shaders ", pso_graphics_->name);
+  }
+
+  void
+  CollectUploadReads(UINT Count, UINT Instances) {
+    if (!upload_check::Enabled() || Instances < 2 || Count > 12 || upload_reads.size() > 20000)
+      return;
+    auto rootsig = rootsig_graphics_.ptr();
+    if (!rootsig)
+      return;
+    auto add = [&](uint64_t va, uint64_t length, uint32_t parameter, uint32_t descriptor) {
+      if (!va || !length)
+        return;
+      uint64_t offset = 0, end = 0;
+      auto allocation = device_->LookupBufferByVA(va, &offset, &end);
+      if (!allocation || !upload_check::IsUpload(allocation) || !allocation->mappedMemory(0))
+        return;
+      length = std::min<uint64_t>({length, end - va, uint64_t(1) << 20});
+      for (auto &known : upload_reads)
+        if (known.va == va && known.length == length)
+          return;
+      upload_check::Range range;
+      range.allocation = allocation;
+      range.data = static_cast<const uint8_t *>(allocation->mappedMemory(0)) + offset;
+      range.length = length;
+      range.va = va;
+      range.count = Count;
+      range.instances = Instances;
+      range.parameter = parameter;
+      range.descriptor = descriptor;
+      upload_reads.push_back(std::move(range));
+    };
+    for (uint32_t i = 0; i < rootsig->CheckedParameters.size() && i < rootsig->ParameterSlots; i++) {
+      auto &parameter = rootsig->CheckedParameters[i];
+      uint64_t value = rootarg_graphics_staging_[rootsig->SlotQwordOffsets[i]];
+      switch (parameter.type) {
+      // a root CBV has no size: its first 256 bytes, which no other constant buffer's can share (CBVs are 256-byte
+      // aligned). a root SRV has neither size nor that alignment, and is left out
+      case D3D12_ROOT_PARAMETER_TYPE_CBV:
+        add(value, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, i, ~0u);
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
+        if (!resource_heap_object_ || value < resource_heap_)
+          break;
+        uint64_t base = (value - resource_heap_) >> EMBEDDED_DESCRIPTOR_HANDLE::kIncrementBits;
+        for (auto &range : parameter.ranges)
+          for (uint32_t k = 0; k < range.count; k++) {
+            uint64_t index = base + range.offset + k;
+            if (index >= resource_heap_size_)
+              break;
+            auto &descriptor = resource_heap_object_->GetDescriptor(UINT(index));
+            switch (descriptor.type) {
+            case ShaderVisibleDescriptorType::ConstantBuffer:
+              add(descriptor.ConstantBuffer.address, descriptor.ConstantBuffer.size, i, uint32_t(range.offset + k));
+              break;
+            // the address the view was made with: its buffer may be gone, from a descriptor no shader reads now
+            case ShaderVisibleDescriptorType::SRVBuffer:
+              add(resource_heap_object_->GetCheckedAddress(UINT(index)), descriptor.SRVBuffer.slice.byteLength, i,
+                  uint32_t(range.offset + k));
+              break;
+            case ShaderVisibleDescriptorType::SRVTexelBuffer:
+              add(resource_heap_object_->GetCheckedAddress(UINT(index)), descriptor.SRVTexelBuffer.slice.byteLength, i,
+                  uint32_t(range.offset + k));
+              break;
+            default:
+              break;
+            }
+          }
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+
   void STDMETHODCALLTYPE
   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) {
     if (Bundled() && Record([=](auto *l) { l->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); }))
@@ -1832,6 +1932,8 @@ public:
     if (status == DrawCallStatus::Invalid)
       return;
     CountDraw(VertexCountPerInstance, InstanceCount);
+    CollectUploadReads(VertexCountPerInstance, InstanceCount);
+    LogSpriteShaders(VertexCountPerInstance, InstanceCount, false);
     if (pso_graphics_->threads_per_patch) {
       EncodeTessellationDraw(
           D3D12_DRAW_ARGUMENTS{VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation},
@@ -1884,6 +1986,8 @@ public:
     if (status == DrawCallStatus::Invalid)
       return;
     CountDraw(IndexCountPerInstance, InstanceCount, true, StartVertexLocation);
+    CollectUploadReads(IndexCountPerInstance, InstanceCount);
+    LogSpriteShaders(IndexCountPerInstance, InstanceCount, true);
     if (pso_graphics_->threads_per_patch) {
       EncodeTessellationDraw(
           D3D12_DRAW_INDEXED_ARGUMENTS{
@@ -2948,6 +3052,10 @@ public:
       Heaps[i]->GetDesc(&desc);
       Heaps[i]->GetGPUDescriptorHandleForHeapStart(&start);
       (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler_heap_ : resource_heap_) = start.ptr;
+      if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        resource_heap_object_ = static_cast<MTLD3D12DescriptorHeap *>(Heaps[i]);
+        resource_heap_size_ = desc.NumDescriptors;
+      }
     }
     WriteHeapArguments(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments);
     WriteHeapArguments(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments);
@@ -3869,6 +3977,24 @@ public:
       CountBufferAddress = count_buffer->buffer->current()->gpuAddress() + CountBufferOffset;
     }
     bool rays = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    // MULLION_D3D12_SPRITE_SHADERS: each pipeline an indirect draw is made with, once (a particle system's sprites
+    // draw so, their counts written on the GPU)
+    if (static const bool sprites = env::getEnvVar("MULLION_D3D12_SPRITE_SHADERS") == "1";
+        sprites && pso_graphics_ &&
+        (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW ||
+         sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)) {
+      static mullion::mutex lock;
+      static std::unordered_set<const void *> seen;
+      bool first;
+      {
+        std::lock_guard guard(lock);
+        first = seen.insert(pso_graphics_.ptr()).second;
+      }
+      if (first)
+        WARN("indirect pipeline: ", sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? "indexed" : "plain",
+             " draws, max ", MaxCommandCount, CountBufferAddress ? ", count buffer" : "", ", stride ", sig->ByteStride,
+             sig->UpdateRootArguments ? ", updates root arguments" : "", ", shaders ", pso_graphics_->name);
+    }
     if (!MaxCommandCount) {
       ResetIndirectState(sig, rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
       return;

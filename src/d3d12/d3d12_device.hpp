@@ -23,6 +23,7 @@
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_device_interfaces.hpp"
 #include "d3d12_recording_arena.hpp"
+#include "d3d12_upload_check.hpp"
 #include "dxgi1_2.h"
 #include "dxgi_interfaces.h"
 #include "airconv_public.h"
@@ -142,6 +143,8 @@ public:
   // whether a command on an acceleration structure that is not there is left for the queue (LaterEncoderData),
   // which records it on a list that leaves nothing
   bool leaves_for_later = true;
+  // what the list's sprite-like draws read from upload heaps (MULLION_D3D12_UPLOAD_CHECK)
+  upload_check::Ranges upload_reads;
 };
 
 class MTLD3D12CommandAllocator : public ID3D12CommandAllocator {
@@ -186,6 +189,22 @@ inline D3D12_RESOURCE_DESC
 WithoutMipRegion(const D3D12_RESOURCE_DESC1 &desc1) {
   return {desc1.Dimension, desc1.Alignment, desc1.Width,      desc1.Height, desc1.DepthOrArraySize,
           desc1.MipLevels, desc1.Format,    desc1.SampleDesc, desc1.Layout, desc1.Flags};
+}
+
+// a resource's name (ID3D12Object::SetName) as its Metal object's label, where a capture may be taken
+// (MTL_CAPTURE_ENABLED=1, read once): a capture then names each texture and buffer as the application does
+inline void
+LabelForCapture(obj_handle_t object, const WCHAR *name) {
+  static const bool capturable = env::getEnvVar("MTL_CAPTURE_ENABLED") == "1";
+  if (!capturable || !object || !name)
+    return;
+  int length = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr);
+  if (length <= 0)
+    return;
+  std::string label(length, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, name, -1, label.data(), length, nullptr, nullptr);
+  // setLabel: of any Metal object (MTLCommandEncoder_setLabel sends it as it is)
+  MTLCommandEncoder_setLabel(object, WMT::String::string(label.c_str(), WMTUTF8StringEncoding).handle);
 }
 
 class MTLD3D12Resource : public ID3D12Resource2 {
@@ -451,6 +470,17 @@ public:
   // the most any root signature uploads: a qword per parameter (a DWORD of root cost at least), then the two heaps and
   // the lock table
   static constexpr uint32_t kMaxUploadQwords = D3D12_MAX_ROOT_COST + 3;
+
+  // each parameter's type, and a table's CBV and SRV ranges as offsets from the table's start and counts, for
+  // MULLION_D3D12_UPLOAD_CHECK (filled only with it)
+  struct CheckedRange {
+    uint32_t offset, count;
+  };
+  struct CheckedParameter {
+    D3D12_ROOT_PARAMETER_TYPE type;
+    std::vector<CheckedRange> ranges;
+  };
+  std::vector<CheckedParameter> CheckedParameters;
 
   size_t NumStaticSamplers;
   uint64_t const *EncodedStaticSamplers;

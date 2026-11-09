@@ -238,6 +238,15 @@ TraceResource(HRESULT hr, const char *how, const D3D12_RESOURCE_DESC *desc, void
 }
 
 class MTLD3D12DeviceImpl;
+
+// whether 64-bit atomics on typed resources, groupshared memory and descriptor heap resources are reported.
+// MULLION_D3D12_ATOMIC64=0 (read once) reports none, for A/B runs of an application that chooses its path by them
+// (Unreal Engine's Nanite)
+static bool
+Atomic64Reported() {
+  static const bool reported = env::getEnvVar("MULLION_D3D12_ATOMIC64") != "0";
+  return reported;
+}
 // D3D12 devices are singletons per adapter, adapters the same when their LUIDs are (Microsoft Learn,
 // D3D12CreateDevice, Remarks): the device of each LUID, while the application holds it. the list holds no reference;
 // a device leaves it as it is destroyed
@@ -257,7 +266,11 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   Com<IMTLDXGIAdapter> adapter_;
   D3D11On12Source on12_source_{this};
 
-  bool advertise_numa_ = false;
+  // a GPU of memory of its own (no UMA, custom heaps of pool L1) where MULLION_D3D12_UMA=0 (read once), for A/B runs of
+  // an application that manages its memory by the architecture (Unreal Engine's upload and dynamic buffers)
+  bool advertise_numa_ = env::getEnvVar("MULLION_D3D12_UMA") == "0";
+  // MULLION_D3D12_TBR=0 (read once): no tile-based renderer, for A/B runs as above
+  const bool tile_based_ = env::getEnvVar("MULLION_D3D12_TBR") != "0";
 
   mullion::mutex residency_lock_;
   std::atomic<HRESULT> removed_ = S_OK;
@@ -793,7 +806,7 @@ public:
       if (out->NodeIndex > 0)
         return FAIL(E_INVALIDARG);
       out->CacheCoherentUMA = FALSE;
-      out->TileBasedRenderer = TRUE;
+      out->TileBasedRenderer = tile_based_;
       out->UMA = !advertise_numa_;
       return S_OK;
     }
@@ -804,7 +817,7 @@ public:
       if (out->NodeIndex > 0)
         return FAIL(E_INVALIDARG);
       out->CacheCoherentUMA = FALSE;
-      out->TileBasedRenderer = TRUE;
+      out->TileBasedRenderer = tile_based_;
       out->UMA = !advertise_numa_;
       out->IsolatedMMU = FALSE;
       return S_OK;
@@ -915,7 +928,16 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
-      out->HighestShaderModel = std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_7);
+      // MULLION_D3D12_SHADER_MODEL=6.5 (read once): the highest shader model reported, for A/B runs of an application
+      // that chooses its path by it (Unreal Engine's bindless resources from 6.6)
+      static const D3D_SHADER_MODEL highest = [] {
+        auto given = env::getEnvVar("MULLION_D3D12_SHADER_MODEL");
+        unsigned major = 0, minor = 0;
+        if (given.empty() || std::sscanf(given.c_str(), "%u.%u", &major, &minor) != 2 || major != 6 || minor > 7)
+          return D3D_SHADER_MODEL_6_7;
+        return D3D_SHADER_MODEL(0x60 + minor);
+      }();
+      out->HighestShaderModel = std::min(out->HighestShaderModel, highest);
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
@@ -1020,7 +1042,10 @@ public:
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4 *>(pFeatureData);
       out->MSAA64KBAlignedTextureSupported = TRUE;
-      out->Native16BitShaderOpsSupported = TRUE;
+      // MULLION_D3D12_NATIVE16=0 (read once): no native 16-bit shader ops, for A/B runs of an application that compiles
+      // its shaders by them
+      static const bool native16 = env::getEnvVar("MULLION_D3D12_NATIVE16") != "0";
+      out->Native16BitShaderOpsSupported = native16;
       // TODO(d3d12): revise when d3d12 shared resource is implemented
       out->SharedResourceCompatibilityTier = D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
       return S_OK;
@@ -1042,7 +1067,9 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
-      out->MeshShaderTier = D3D12_MESH_SHADER_TIER_1;
+      // MULLION_D3D12_MESH_SHADERS=0 (read once): none, for A/B runs of an application that chooses its path by them
+      static const bool mesh = env::getEnvVar("MULLION_D3D12_MESH_SHADERS") != "0";
+      out->MeshShaderTier = mesh ? D3D12_MESH_SHADER_TIER_1 : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
       // 1.0 would need the first mip and slice of a paired texture's view in the shader
       out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_1_0;
       return S_OK;
@@ -1168,14 +1195,14 @@ public:
       if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS9>(pFeatureData, DataSize) != S_OK)
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
-      out->AtomicInt64OnTypedResourceSupported = TRUE;
-      out->AtomicInt64OnGroupSharedSupported = TRUE;
+      out->AtomicInt64OnTypedResourceSupported = Atomic64Reported();
+      out->AtomicInt64OnGroupSharedSupported = Atomic64Reported();
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
       if (NotSupported<D3D12_FEATURE_DATA_D3D12_OPTIONS11>(pFeatureData, DataSize) != S_OK)
         return FAIL(E_INVALIDARG);
-      reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData)->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
+      reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData)->AtomicInt64OnDescriptorHeapResourceSupported = Atomic64Reported();
       return S_OK;
     }
     // variable rate shading, which pixel shaders of coarse pixels emulate: per primitive from a vertex or geometry

@@ -172,6 +172,10 @@ public:
 
   virtual ShaderVisibleDescriptorCPUStorage const &GetDescriptor(UINT Index) = 0;
 
+  // a buffer SRV's GPU address, from its offset on, as the view was made (MULLION_D3D12_UPLOAD_CHECK, which keeps
+  // them): read without the buffer, which may be gone from a descriptor no shader reads any more. 0 without
+  virtual uint64_t GetCheckedAddress(UINT Index) = 0;
+
   virtual void CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
 };
 

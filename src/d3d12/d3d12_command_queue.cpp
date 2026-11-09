@@ -817,6 +817,9 @@ private:
   WMT::Reference<WMT::Buffer> sparse_table_;
   std::vector<uint64_t> sparse_table_mappings_;
   mullion::thread inflight_cmdbuf_wait_thread_;
+  // MULLION_D3D12_UPLOAD_CHECK's submissions that no Signal has followed yet
+  mullion::mutex unsignaled_checks_mutex_;
+  std::vector<std::shared_ptr<upload_check::Submission>> unsignaled_checks_;
 
   // a command buffer that does not complete stops the queue with no error from Metal: a thread reports the one the
   // completion thread has waited on for StuckTime(), with what Metal says of it and what is in it. a warning: one
@@ -1522,9 +1525,32 @@ public:
     }
     Trace("ExecuteCommandLists of ", Count);
     FLIGHT_HEAVY(Sync, "queue %p: ExecuteCommandLists of %llu", this, uint64_t(Count));
-    auto work = [this, recorded = std::move(recorded), allocators = std::move(allocators)]() mutable {
+    // what the lists' sprite-like draws read from upload heaps, as it is now that the application has handed it over
+    // (MULLION_D3D12_UPLOAD_CHECK)
+    std::shared_ptr<upload_check::Submission> checks;
+    if (upload_check::Enabled()) {
+      checks = std::make_shared<upload_check::Submission>();
+      for (UINT i = 0; i < Count; i++) {
+        auto &reads = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i])->upload_reads;
+        checks->ranges.insert(checks->ranges.end(), reads.begin(), reads.end());
+      }
+      upload_check::Snapshot(checks->ranges);
+      checks->executed = GetTickCount64();
+      if (checks->ranges.empty())
+        checks.reset();
+      else {
+        std::lock_guard lock(unsignaled_checks_mutex_);
+        unsignaled_checks_.push_back(checks);
+      }
+    }
+    auto work = [this, recorded = std::move(recorded), allocators = std::move(allocators), checks]() mutable {
       auto began = profile_ ? diag::Now() : 0;
-      Commit(recorded, std::move(allocators));
+      if (checks)
+        checks->commit_began = GetTickCount64();
+      auto timed = checks;
+      Commit(recorded, std::move(allocators), std::move(checks));
+      if (timed)
+        timed->commit_ended = GetTickCount64();
       if (profile_)
         diag::Write(diag::Line("span", "execute", recorded.size(), GetCurrentThreadId(), began, diag::Now() - began));
     };
@@ -1534,7 +1560,10 @@ public:
   }
 
   void
-  Commit(const std::vector<EncoderData *> &recorded, std::vector<Com<MTLD3D12CommandAllocator>> &&allocators = {}) {
+  Commit(
+      const std::vector<EncoderData *> &recorded, std::vector<Com<MTLD3D12CommandAllocator>> &&allocators = {},
+      std::shared_ptr<upload_check::Submission> checks = {}
+  ) {
     // "calling ExecuteCommandLists twice in succession ... guarantees that the first workload (A) finishes before the
     // second workload (B)": the call's first pass waits for all before it
     order_next_ = true;
@@ -1543,8 +1572,20 @@ public:
     struct Keeps {
       CommittingScope &scope;
       std::vector<Com<MTLD3D12CommandAllocator>> allocators;
-      ~Keeps() { scope.inflight->allocators = std::move(allocators); }
-    } keeps{scope, std::move(allocators)};
+      std::shared_ptr<upload_check::Submission> checks;
+      ~Keeps() {
+        scope.inflight->allocators = std::move(allocators);
+        // once the last command buffer of the lists completes, what they read is summed again
+        if (checks) {
+          auto then = std::move(scope.inflight->completed);
+          scope.inflight->completed = [then = std::move(then), checks = std::move(checks)] {
+            if (then)
+              then();
+            upload_check::Verify(*checks);
+          };
+        }
+      }
+    } keeps{scope, std::move(allocators), std::move(checks)};
     if constexpr (Metal4)
       if (!scope.inflight->cmdbuf)
         return;
@@ -2526,6 +2567,17 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   Signal(ID3D12Fence *pFence, UINT64 Value) {
+    // the submissions MULLION_D3D12_UPLOAD_CHECK checks that no Signal has followed yet: this one tells the
+    // application they are done
+    if (upload_check::Enabled()) {
+      std::lock_guard lock(unsignaled_checks_mutex_);
+      for (auto &checks : unsignaled_checks_) {
+        pFence->AddRef();
+        checks->fence = pFence;
+        checks->value = Value;
+      }
+      unsignaled_checks_.clear();
+    }
     // from the CPU, once the work before has completed and what it left for the CPU is done
     auto work = [this, fence = Com<MTLD3D12Fence, false>(static_cast<MTLD3D12Fence *>(pFence)), Value] {
       // after a submission another thread is in the middle of

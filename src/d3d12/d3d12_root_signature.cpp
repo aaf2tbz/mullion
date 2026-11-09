@@ -22,6 +22,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
+#include "d3d12_upload_check.hpp"
 #include "mullion_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
@@ -572,6 +573,28 @@ public:
           }
           if (is_normal_range && is_sampler_range)
             return FAIL(E_INVALIDARG);
+        }
+      }
+    }
+
+    // the parameters MULLION_D3D12_UPLOAD_CHECK walks: an unbounded range is taken as its first 64 descriptors
+    if (upload_check::Enabled()) {
+      for (unsigned i = 0; i < desc.NumParameters; i++) {
+        auto &parameter = desc.pParameters[i];
+        auto &checked = CheckedParameters.emplace_back(CheckedParameter{parameter.ParameterType, {}});
+        if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+          continue;
+        uint32_t next = 0;
+        for (unsigned j = 0; j < parameter.DescriptorTable.NumDescriptorRanges; j++) {
+          auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
+          uint32_t offset =
+              range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                  ? next
+                  : range.OffsetInDescriptorsFromTableStart;
+          uint32_t count = range.NumDescriptors == UINT_MAX ? 64 : std::min<uint32_t>(range.NumDescriptors, 256);
+          next = offset + count;
+          if (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV || range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV)
+            checked.ranges.push_back({offset, count});
         }
       }
     }

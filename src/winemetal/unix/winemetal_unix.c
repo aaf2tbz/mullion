@@ -4715,6 +4715,18 @@ _MTLDevice_heapBufferSizeAndAlign(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// MULLION_D3D12_PLACED_UNOPTIMIZED=1 (read once): textures placed in heaps are made without Metal's GPU-optimized
+// contents (its lossless compression), and their heap sizes are measured so, for A/B runs on memory that textures share
+static bool
+placed_unoptimized(void) {
+  static int unoptimized = -1;
+  if (unoptimized < 0) {
+    const char *value = getenv("MULLION_D3D12_PLACED_UNOPTIMIZED");
+    unoptimized = value && !strcmp(value, "1");
+  }
+  return unoptimized;
+}
+
 static NTSTATUS
 _MTLDevice_heapTextureSizeAndAlign(void *obj) {
   struct unixcall_mtldevice_heaptexturesizeandalign *params = obj;
@@ -4722,6 +4734,8 @@ _MTLDevice_heapTextureSizeAndAlign(void *obj) {
   struct WMTTextureInfo *info = params->info.ptr;
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
+  if (placed_unoptimized())
+    desc.allowGPUOptimizedContents = NO;
   MTLSizeAndAlign ret = [device heapTextureSizeAndAlignWithDescriptor:desc];
   params->ret_size = ret.size;
   params->ret_align = ret.align;
@@ -4754,6 +4768,8 @@ CREATES(_MTLHeap_newTexture)(void *obj) {
   struct WMTTextureInfo *info = params->info.ptr;
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
+  if (placed_unoptimized())
+    desc.allowGPUOptimizedContents = NO;
 
   id<MTLTexture> ret;
   if (~params->offset == 0)

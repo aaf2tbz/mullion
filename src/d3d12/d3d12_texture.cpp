@@ -287,6 +287,14 @@ class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
 public:
   MTLD3D12Texture(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
 
+  HRESULT STDMETHODCALLTYPE
+  SetName(const WCHAR *name) override {
+    HRESULT hr = MTLD3D12Pageable<MTLD3D12Resource>::SetName(name);
+    if (texture && texture->current())
+      LabelForCapture(texture->current()->texture().handle, name);
+    return hr;
+  }
+
   HRESULT
   Initialize(
       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,

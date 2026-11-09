@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "d3d12_upload_check.hpp"
 #include "com/com_pointer.hpp"
 #include "mullion_format.hpp"
 
@@ -34,6 +35,14 @@ class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
 
 public:
   MTLD3D12Buffer(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
+
+  HRESULT STDMETHODCALLTYPE
+  SetName(const WCHAR *name) override {
+    HRESULT hr = MTLD3D12Pageable<MTLD3D12Resource>::SetName(name);
+    if (buffer && buffer->current())
+      LabelForCapture(buffer->current()->buffer().handle, name);
+    return hr;
+  }
 
   HRESULT
   Initialize(
@@ -100,6 +109,11 @@ public:
     if (!buffer->current()->buffer())
       return FAIL(E_OUTOFMEMORY);
     device_->RegisterResidencyAndVA(buffer->current());
+    // memory the CPU writes for the GPU to read (MULLION_D3D12_UPLOAD_CHECK)
+    // upload heaps alone, which the GPU cannot write (no unordered access): a change is the CPU's
+    if (upload_check::Enabled() && !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+        (heap_props_.Type == D3D12_HEAP_TYPE_UPLOAD || heap_props_.Type == D3D12_HEAP_TYPE(5) /* GPU_UPLOAD */))
+      upload_check::AddUpload(buffer->current());
 
     return S_OK;
   };
@@ -107,6 +121,8 @@ public:
   // the address is another buffer's to have at once, as one placed where this was has it; the buffer itself stays for
   // the work in flight
   ~MTLD3D12Buffer() {
+    if (buffer && upload_check::Enabled())
+      upload_check::RemoveUpload(buffer->current());
     if (!buffer || !buffer->current()->buffer())
       return;
     device_->UnregisterVA(buffer->current());

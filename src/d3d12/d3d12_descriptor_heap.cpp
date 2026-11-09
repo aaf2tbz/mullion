@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_upload_check.hpp"
 #include "d3d12_pageable.hpp"
 #include "com/com_pointer.hpp"
 #include "airconv_public.h"
@@ -152,8 +153,21 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   Rc<Buffer> buffer_;
   ShaderVisibleDescriptorGPUStorage *mapped_argument_buffer_ = nullptr;
   uint64_t argument_buffer_gpu_address_ = 0;
+  // buffer SRVs' GPU addresses, with MULLION_D3D12_UPLOAD_CHECK (GetCheckedAddress)
+  std::vector<uint64_t> checked_addresses_;
+
+  void
+  SetCheckedAddress(UINT Index, Buffer *Buffer, const BufferSlice &Slice) {
+    if (!checked_addresses_.empty())
+      checked_addresses_[Index] = Buffer ? Buffer->current()->gpuAddress() + Slice.byteOffset : 0;
+  }
 
 public:
+  uint64_t
+  GetCheckedAddress(UINT Index) override {
+    return Index < checked_addresses_.size() ? checked_addresses_[Index] : 0;
+  }
+
   MTLD3D12DescriptorHeapImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12DescriptorHeap>(pDevice) {}
 
   HRESULT
@@ -174,6 +188,8 @@ public:
       if (!storage)
         return FAIL(E_OUTOFMEMORY);
       descriptors_ = {(ShaderVisibleDescriptorCPUStorage *)storage, count};
+      if (upload_check::Enabled())
+        checked_addresses_.assign(count, 0);
     }
 
     if (pDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
@@ -379,6 +395,7 @@ public:
     cpu_storage.SRVTexelBuffer.buffer = Buffer;
     cpu_storage.SRVTexelBuffer.slice = Slice;
     cpu_storage.SRVTexelBuffer.view = View;
+    SetCheckedAddress(Index, Buffer, Slice);
     if (mapped_argument_buffer_) { 
       auto &gpu_storage = mapped_argument_buffer_[Index];
       if (Buffer) {
@@ -415,6 +432,7 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::SRVBuffer;
     cpu_storage.SRVBuffer.buffer = Buffer;
     cpu_storage.SRVBuffer.slice = Slice;
+    SetCheckedAddress(Index, Buffer, Slice);
     if (mapped_argument_buffer_) {
       auto &gpu_storage = mapped_argument_buffer_[Index];
       if (Buffer) {
@@ -501,6 +519,9 @@ public:
       static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo)->descriptors_[DescriptorTo + i] = descriptors_[From + i];
       static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo)->mapped_argument_buffer_[DescriptorTo + i] =
           mapped_argument_buffer_[From + i];
+      auto &to = static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo)->checked_addresses_;
+      if (!to.empty())
+        to[DescriptorTo + i] = From + i < checked_addresses_.size() ? checked_addresses_[From + i] : 0;
     }
   }
 };

@@ -4,8 +4,11 @@
 #include "util_env.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <ctime>
+#include <string>
+#include <vector>
 
 #ifdef __WIN32
 #include "windows.h"
@@ -43,6 +46,13 @@ struct Capture {
   ULONGLONG trigger_checked = 0;
 #endif
   bool capture_key_pressed_ = false;
+#ifdef _WIN32
+  // MULLION_CAPTURE_KEY: the key that captures the next frames, with the modifiers held for it, as "f10" (the
+  // default), "cmd+e" or "ctrl+shift+f9": cmd (or win, the key Wine's macOS driver gives Command), ctrl, alt (or
+  // option) and shift, then a letter, a digit or f1 to f24. "none" turns the key off
+  int capture_key_ = VK_F10;
+  std::vector<std::pair<int, int>> capture_modifiers_;
+#endif
   unsigned holds = 0;
   mullion::thread stopping_;
   std::atomic<bool> stopped_ = true;
@@ -71,7 +81,62 @@ struct Capture {
     }
     if (!trigger_path.empty())
       WARN("Mullion capture: a capture starts when ", trigger_path, " appears");
+#ifdef _WIN32
+    if (auto key = env::getEnvVar("MULLION_CAPTURE_KEY"); !key.empty()) {
+      if (ParseCaptureKey(key))
+        WARN("Mullion capture: a capture starts at ", key);
+      else
+        WARN("Mullion capture: MULLION_CAPTURE_KEY ", key, " names no key; the key is F10");
+    }
+#endif
   }
+
+#ifdef _WIN32
+  // `text` as capture_key_ and capture_modifiers_ (each a key and the other key of its pair, either of which holds
+  // it); false, with both left as they were, where it is not a key
+  bool
+  ParseCaptureKey(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (text == "none") {
+      capture_key_ = 0;
+      capture_modifiers_.clear();
+      return true;
+    }
+    std::vector<std::pair<int, int>> modifiers;
+    int key = 0;
+    size_t start = 0;
+    while (start <= text.size()) {
+      auto end = text.find('+', start);
+      auto part = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+      start = end == std::string::npos ? text.size() + 1 : end + 1;
+      if (key)
+        return false; // the key comes last
+      if (part == "cmd" || part == "command" || part == "win")
+        modifiers.push_back({VK_LWIN, VK_RWIN});
+      else if (part == "ctrl" || part == "control")
+        modifiers.push_back({VK_CONTROL, VK_CONTROL});
+      else if (part == "alt" || part == "option")
+        modifiers.push_back({VK_MENU, VK_MENU});
+      else if (part == "shift")
+        modifiers.push_back({VK_SHIFT, VK_SHIFT});
+      else if (part.size() == 1 && std::isalnum((unsigned char)part[0]))
+        key = std::toupper((unsigned char)part[0]); // 'A'-'Z' and '0'-'9' are their own virtual keys
+      else if (part.size() >= 2 && part.size() <= 3 && part[0] == 'f' &&
+               std::all_of(part.begin() + 1, part.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        int n = std::atoi(part.c_str() + 1);
+        if (n < 1 || n > 24)
+          return false;
+        key = VK_F1 + n - 1;
+      } else
+        return false;
+    }
+    if (!key)
+      return false;
+    capture_key_ = key;
+    capture_modifiers_ = std::move(modifiers);
+    return true;
+  }
+#endif
 
   NextAction
   getNextAction(uint64_t frame) {
@@ -136,12 +201,16 @@ struct Capture {
 #ifdef _WIN32
     if (state != State::Idle)
       return false;
-    SHORT state_ = GetAsyncKeyState(VK_F10);
-    if (state_ & 0x8000 && !capture_key_pressed_) {
+    if (!capture_key_)
+      return false;
+    bool down = GetAsyncKeyState(capture_key_) & 0x8000;
+    for (auto [key, other] : capture_modifiers_)
+      down = down && ((GetAsyncKeyState(key) & 0x8000) || (GetAsyncKeyState(other) & 0x8000));
+    if (down && !capture_key_pressed_) {
       capture_key_pressed_ = true;
       return true;
     }
-    capture_key_pressed_ = state_ & 0x8000;
+    capture_key_pressed_ = down;
 #endif
     return false;
   }
