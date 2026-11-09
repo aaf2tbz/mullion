@@ -2206,7 +2206,9 @@ Lean(MTLD3D12PipelineState &pso, MTLD3D12Device *device, const PipelineStateStre
       std::lock_guard<mullion::mutex> lock(device->lean_shaders.mutex);
       auto &kept = device->lean_shaders.bytes[key];
       auto shader = kept.lock();
-      if (!shader)
+      // the digest reads a DXBC container's own size (ShaderDigest), which a stated length may pass: one kept for a
+      // shorter length is not this one's
+      if (!shader || shader->size() != code->BytecodeLength)
         kept = shader = std::make_shared<const std::string>((const char *)code->pShaderBytecode, code->BytecodeLength);
       code->pShaderBytecode = owned->shaders.emplace_back(std::move(shader))->data();
     }
