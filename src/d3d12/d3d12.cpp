@@ -210,8 +210,29 @@ ShaderContainerHolds(const void *container, size_t size) {
   return hash == md5::DxbcHash::Holds || (hash == md5::DxbcHash::None && experimental_shader_models);
 }
 
+// the bytes of a shader the SHA1 reads: a DXBC container's own size where it says less than the length it is given.
+// a digest is taken before the container is checked (MTLD3D12PipelineState::Name, Lean), and the bytes past the
+// container's end may not be the application's to read (a D3D12_SHADER_BYTECODE whose length overstates its
+// container, which creation refuses after)
+static size_t
+DigestLength(const void *code, size_t size) {
+  struct {
+    uint32_t fourcc;
+    uint8_t hash[16];
+    uint16_t major, minor;
+    uint32_t container_size;
+  } header;
+  if (!code || size < sizeof(header))
+    return size;
+  std::memcpy(&header, code, sizeof(header));
+  if (header.fourcc != microsoft::DXBC_FOURCC_NAME || header.container_size >= size)
+    return size;
+  return header.container_size;
+}
+
 Sha1Digest
 ShaderDigest(const void *code, size_t size) {
+  size = DigestLength(code, size);
   if (auto own = Own(code, size)) {
     std::shared_lock lock(known_lock);
     if (auto found = known.find(*own); found != known.end())
