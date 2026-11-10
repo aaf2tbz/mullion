@@ -2,6 +2,7 @@
 #include "d3d11.h"
 #include "nvngx.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "nvngx_feature.hpp"
 #include "nvngx_parameter.hpp"
 #include "../d3d11/d3d11_interfaces.hpp"
@@ -202,6 +203,40 @@ NVSDK_NGX_UpdateFeature(const void *app_id, const unsigned int feature) {
   return NVNGX_RESULT_OK;
 }
 
+// METALSHARP_DLSS_SCALE: the render scale every DLSS mode gets, for a game that picks the mode itself (Minecraft's ray
+// tracing resets its upscaling option to Quality): a mode (ultra_performance, performance, balanced, quality,
+// ultra_quality, dlaa) or a fraction of the output size, from 0.25 to 1. Unset or unreadable: the mode's own scale.
+// VKD3D-Proton-MacOS's NGX core reads the same variable.
+static float
+ScaleOverride(float scale) {
+  static const float override_scale = [] {
+    std::string value = env::getEnvVar("METALSHARP_DLSS_SCALE");
+    for (auto &c : value)
+      c = (char)tolower((unsigned char)c);
+    static const struct {
+      const char *name;
+      float scale;
+    } modes[] = {{"ultra_performance", 1.0f / 3.0f}, {"performance", 0.5f}, {"balanced", 58.0f / 100.0f},
+                 {"quality", 1.0f / 1.5f},          {"ultra_quality", 1.0f / 1.3f}, {"dlaa", 1.0f}};
+    float result = 0.0f;
+    for (const auto &mode : modes)
+      if (value == mode.name)
+        result = mode.scale;
+    if (!result && !value.empty()) {
+      char *end = nullptr;
+      float number = strtof(value.c_str(), &end);
+      if (end && !*end && number >= 0.25f && number <= 1.0f)
+        result = number;
+    }
+    if (result)
+      Logger::info(str::format("NGX: METALSHARP_DLSS_SCALE=", value, ": every DLSS mode renders at this scale"));
+    else if (!value.empty())
+      Logger::warn(str::format("NGX: METALSHARP_DLSS_SCALE=", value, " is not a mode or a scale from 0.25 to 1, ignored"));
+    return result;
+  }();
+  return override_scale ? override_scale : scale;
+}
+
 inline static NVNGX_RESULT
 NVNGX_DLSS_GetOptimalSettingsCallback(NVNGXParameter *params) {
   unsigned int width;
@@ -236,6 +271,7 @@ NVNGX_DLSS_GetOptimalSettingsCallback(NVNGXParameter *params) {
     scale = 58.0f / 100.0f;
     break;
   }
+  scale = ScaleOverride(scale);
 
   out_width = std::ceil(width * scale);
   out_height = std::ceil(height * scale);
