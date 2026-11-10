@@ -220,10 +220,13 @@ public:
         guid == __uuidof(ID3D10Device1))
       hr = S_OK;
 
-    // We can't really reconstruct the version numbers
-    // returned by Windows drivers from Metal
-    if (SUCCEEDED(hr) && umd_version)
-      umd_version->QuadPart = ~0ull;
+    // Metal has no Windows driver version; applications parse this one as a WDDM driver's, 32.0.xxxxx.yyyy (the
+    // NVIDIA driver number being the last five digits), so it is the newest such version: all ones would read as
+    // driver 65535.65535, which version gates turn down
+    if (SUCCEEDED(hr) && umd_version) {
+      umd_version->HighPart = 0x00200000;
+      umd_version->LowPart = 0xffffffffu;
+    }
 
     if (FAILED(hr)) {
       Logger::err("DXGI: CheckInterfaceSupport: Unsupported interface");

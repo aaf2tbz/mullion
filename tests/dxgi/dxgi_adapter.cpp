@@ -140,6 +140,10 @@ main(int argc, char **argv) {
       HRESULT b = current->CheckInterfaceSupport(iid, &repeated);
       ::expect(a == S_OK && b == S_OK && first.QuadPart == repeated.QuadPart,
                "D3D10 interface/version output: %#lx / %#lx", a, b);
+      // a WDDM driver's version, a.b.c.d with a 16-bit field each: Windows 10 drivers are 2x or 3x.0.c.d, and
+      // applications that gate features on it (Minecraft's ray tracing among them) turn down an all-ones major
+      ::expect(HIWORD(first.HighPart) >= 20 && HIWORD(first.HighPart) < 100,
+               "driver version major %u is no WDDM driver's", HIWORD(first.HighPart));
     }
     for (const GUID &iid : {__uuidof(IUnknown), __uuidof(IDXGIFactory), __uuidof(ID3D11Device),
                            __uuidof(ID3D11Device1), __uuidof(ID3D11Device2), __uuidof(ID3D11Device3),
