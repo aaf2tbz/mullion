@@ -3809,14 +3809,14 @@ static NTSTATUS
 _MTLBinaryArchive_serialize(void *obj) {
   struct unixcall_mtlbinaryarchive_serialize *params = obj;
   NSString *path_str = [[NSString alloc] initWithCString:params->url.ptr encoding:NSUTF8StringEncoding];
-  NSString *path = resolve_cache_dir(path_str, true), *written = [path stringByAppendingString:@".new"];
-  NSURL *url = [[NSURL alloc] initFileURLWithPath:written];
+  NSString *path = resolve_cache_dir(path_str, true);
+  NSURL *url = [[NSURL alloc] initFileURLWithPath:path];
   NSError *err = NULL;
-  // a file that is replaced whole, never one half written (Apple: an archive updated at runtime needs corruption
-  // resiliency, MTLBinaryArchive.h)
-  if ([(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err] &&
-      rename(written.fileSystemRepresentation, path.fileSystemRepresentation))
-    err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+  // straight to the archive's file, which Metal replaces whole (a new file in its place) when the archive gained
+  // pipelines, and leaves as it is when it gained none. a serialize with nothing new copies the file Metal wrote last:
+  // writing to a file of our own and renaming it over the archive's took that one away, and the copy failed
+  // (NSCocoaErrorDomain 4)
+  [(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err];
   params->ret_error = (obj_handle_t)[err retain];
   [url release];
   [path_str release];
