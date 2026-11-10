@@ -89,6 +89,8 @@ private:
 #define ERR(...) Logger::err(str::format(__VA_ARGS__))
 
 #define FAIL(code) Logger::fail(code, #code, __func__, __FILE_NAME__, __LINE__)
+// a failure logged under the name of the entry point `function` that a shared helper fails for
+#define FAIL_AS(function, code) Logger::fail(code, #code, function, __FILE_NAME__, __LINE__)
 
 #define ERR_ONCE(...)                                                          \
   static bool s_errorShown = false;                                            \

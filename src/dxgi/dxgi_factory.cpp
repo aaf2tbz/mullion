@@ -208,7 +208,7 @@ public:
     descFs.Windowed = pDesc->Windowed;
 
     IDXGISwapChain1 *swapChain = nullptr;
-    HRESULT hr = CreateSwapChainForWindow(pDevice, pDesc->OutputWindow, &desc, &descFs, &swapChain);
+    HRESULT hr = CreateSwapChainForWindow(pDevice, pDesc->OutputWindow, &desc, &descFs, &swapChain, __func__);
 
     *ppSwapChain = swapChain;
     return hr;
@@ -219,7 +219,7 @@ public:
       IUnknown *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
-    return CreateSwapChainForWindow(pDevice, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+    return CreateSwapChainForWindow(pDevice, hWnd, pDesc, pFullscreenDesc, ppSwapChain, __func__);
   }
 
   // what CreateSwapChain and CreateSwapChainForHwnd do, called by both. CreateSwapChain does not go through
@@ -230,11 +230,11 @@ public:
   HRESULT
   CreateSwapChainForWindow(
       IUnknown *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
-      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain) {
+      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain, const char *caller) {
     InitReturnPtr(ppSwapChain);
 
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
-      return FAIL(DXGI_ERROR_INVALID_CALL);
+      return FAIL_AS(caller, DXGI_ERROR_INVALID_CALL);
 
     if ((pDesc->Flags & (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) &&
         pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && pDesc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
@@ -243,11 +243,11 @@ public:
     if (pDesc->Format != DXGI_FORMAT_UNKNOWN &&
         (pDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || pDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) &&
         !IsFlipSwapChainFormat(pDesc->Format))
-      return FAIL(DXGI_ERROR_INVALID_CALL);
+      return FAIL_AS(caller, DXGI_ERROR_INVALID_CALL);
 
     // every effect but DISCARD "cannot be used with multisampling" (Microsoft Learn, DXGI_SWAP_EFFECT)
     if (pDesc->SwapEffect != DXGI_SWAP_EFFECT_DISCARD && (pDesc->SampleDesc.Count != 1 || pDesc->SampleDesc.Quality))
-      return FAIL(DXGI_ERROR_INVALID_CALL);
+      return FAIL_AS(caller, DXGI_ERROR_INVALID_CALL);
 
     Com<IMTLSwapChainFactory> swapchain_factory;
     if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&swapchain_factory)))) {
