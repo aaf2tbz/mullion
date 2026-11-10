@@ -545,6 +545,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     return holding_ || gate_->closed;
   }
 
+  bool
+  HoldsWork() final {
+    return Holding();
+  }
+
   void
   CommitHeld() {
     env::setThreadName("mullion-held-work-thread");

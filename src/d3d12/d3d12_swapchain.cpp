@@ -44,6 +44,12 @@ Ref: https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxg
 This value is 1 by default.
 */
 constexpr size_t kSwapchainLatency = 1;
+/**
+Ref: https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgidevice1-setmaximumframelatency
+a swap chain without the waitable object: Present blocks while this many frames are queued (the default of
+IDXGIDevice1, which a D3D12 device has none of to change it with)
+*/
+constexpr size_t kPresentLatency = 3;
 
 /**
 TODO: some implementations can be shared with d3d11 swapchain
@@ -132,6 +138,8 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IMTLDXGISwapChain, MTLD3
   D3D12_RESOURCE_DESC backbuffer_desc_;
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_;
   HANDLE present_semaphore_;
+  // Presents that went ahead without a frame's count (PresentFrame)
+  uint32_t latency_owed_ = 0;
   std::unique_ptr<CpuFence> frame_latency_fence_;
   WMT::Object native_view_;
   WindowFollower follower_;
@@ -221,8 +229,13 @@ public:
     presenter =
         Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count, hWnd));
 
-    frame_latency = kSwapchainLatency;
-    present_semaphore_ = CreateSemaphore(nullptr, frame_latency, DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
+    // the application waits on the semaphore where the swap chain has the waitable object, Present does otherwise. a
+    // Present that goes ahead without a count still gives one back when its frame is done: no count may be lost to
+    // the semaphore's most (PresentFrame takes it back)
+    bool waitable = desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    frame_latency = waitable ? kSwapchainLatency : kPresentLatency;
+    present_semaphore_ =
+        CreateSemaphore(nullptr, frame_latency, waitable ? DXGI_MAX_SWAP_CHAIN_BUFFERS : LONG_MAX, nullptr);
 
     if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
       frame_latency_fence_ = std::make_unique<CpuFence>();
@@ -879,6 +892,43 @@ public:
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
     auto began = diag::profile ? diag::Now() : 0;
+    // without the waitable object, Present waits while kPresentLatency frames are queued, as DXGI's does: a game that
+    // records a frame per Present runs no further ahead of the GPU (each frame's allocators hold what its lists
+    // recorded until it completes). the queue releases a frame's count once it is shown or dropped. it stops waiting
+    // for frames a queue has held for 50 ms behind a fence value the application has yet to signal, which may complete
+    // only after it goes on (it may queue many Presents first): a hold that a thread of its own opens soon, as the
+    // D3DX12 residency library's paging fence is, is waited out. and no more than a second for a GPU that stopped
+    bool took = false;
+    if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {
+      // the counts of frames that went ahead without one: taken back as their frames give them
+      while (latency_owed_ && WaitForSingleObject(present_semaphore_, 0) == WAIT_OBJECT_0)
+        latency_owed_--;
+      auto held = [&] {
+        return queue_->HoldsWork() || (presentation_queue_ && presentation_queue_->HoldsWork()) ||
+               (!present_queues_.empty() && static_cast<MTLD3D12CommandQueue *>(present_queues_[current_buffer_].queue.ptr())->HoldsWork());
+      };
+      for (uint64_t start = GetTickCount64(), held_since = 0;;) {
+        if (WaitForSingleObject(present_semaphore_, 4) == WAIT_OBJECT_0) {
+          took = true;
+          break;
+        }
+        uint64_t now = GetTickCount64();
+        held_since = !held() ? 0 : held_since ? held_since : now;
+        if ((held_since && now - held_since >= 50) || now - start >= 1000) {
+          latency_owed_++;
+          break;
+        }
+      }
+      if (took && diag::profile)
+        diag::LatencyTaken(present_semaphore_);
+    }
+    // a frame the queue did not take never gives its count back
+    bool queued = false;
+    auto unqueued = [&](HRESULT result) {
+      if (took && !queued)
+        ReleaseSemaphore(present_semaphore_, 1, nullptr);
+      return result;
+    };
     // a window the picture keeps its size in may have another size by now
     if (settings_.Update(desc_, fullscreen_desc_.Windowed, hWnd, *presenter))
       ApplyLayerProps();
@@ -906,6 +956,7 @@ public:
           this, this->presenter.ptr(), backbuffer.ptr(), eye, present_semaphore_, vsync_duration, dump_id_,
           presentation_count_, previous.ptr(), std::move(copies), metalfx_scaler_.ptr(), upscaled_
       );
+      queued = SUCCEEDED(hr);
     } else {
       // one presentation order, bracketed by the assigned queue's work (IDXGISwapChain3::ResizeBuffers1).
       auto &present = present_queues_[current_buffer_];
@@ -918,12 +969,12 @@ public:
                   presentation_count_, previous.ptr(), std::move(copies), metalfx_scaler_.ptr(), upscaled_
               )
           ) ||
-          FAILED(hr = presentation_queue_->Signal(present_finished_.ptr(), sequence)) ||
+          !(queued = true) || FAILED(hr = presentation_queue_->Signal(present_finished_.ptr(), sequence)) ||
           FAILED(hr = present.queue->Wait(present_finished_.ptr(), sequence)))
-        return hr;
+        return unqueued(hr);
     }
     if (FAILED(hr))
-      return hr;
+      return unqueued(hr);
 
     presentation_count_ += 1;
     current_buffer_ = (current_buffer_ + 1) % backbuffers_.size();

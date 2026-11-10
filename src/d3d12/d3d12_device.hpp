@@ -169,6 +169,9 @@ public:
       HANDLE hLantecyWaitable, double after, uint64_t id, uint64_t number, ID3D12Resource *previous = nullptr,
       std::vector<PresentCopy> copies = {}, SpatialScaler *scaler = nullptr, WMT::Texture upscaled = {}
   ) = 0;
+  // true while the queue holds its work behind a Wait for a fence value no Signal has given yet: what it was given
+  // completes only once the application signals it
+  virtual bool HoldsWork() = 0;
 };
 
 // dxgiformat.h of the toolchain ends before the sampler feedback formats
