@@ -135,7 +135,9 @@ def clone(wine, to):
     Wine run Windows programs only with the 4KB-page entitlement, which a Wine one builds and signs ad hoc cannot have,
     and honours that entitlement only in the app bundle whose provisioning profile grants it: the copy is of the whole
     outermost bundle the Wine is in (or of the Wine alone outside one), its binaries kept as they are, with their
-    signatures and entitlements (ditto), so a Wine of another product runs the tests without the runner changing it"""
+    signatures and entitlements, so a Wine of another product runs the tests without the runner changing it. the copy
+    is made with cp -Rp, not ditto: ditto gives a directory its mode before filling it, so it cannot copy a bundle
+    installed read-only (MetalSharp's MetalSharp-Wine.app), and the copy is then made writable for the install"""
     source = wine.resolve()
     bundle = next((parent for parent in reversed(source.parents) if parent.suffix == ".app"), None)
     root = bundle or source
@@ -144,9 +146,11 @@ def clone(wine, to):
     key = f"{source}\n{(source / 'bin' / 'wine').resolve().stat().st_mtime_ns}\n"
     if not (stamp.exists() and stamp.read_text() == key):
         if to.exists():
+            subprocess.run(["chmod", "-R", "u+w", str(to)], check=True)
             shutil.rmtree(to)
         to.mkdir(parents=True)
-        subprocess.run(["ditto", str(root), str(copy)], check=True)
+        subprocess.run(["cp", "-Rp", str(root), str(copy)], check=True)
+        subprocess.run(["chmod", "-R", "u+w", str(copy)], check=True)
         stamp.write_text(key)
     return copy / source.relative_to(bundle) if bundle else copy
 
@@ -158,6 +162,9 @@ def clone(wine, to):
 FAULTS = ("Device error", "failed assertion", "Invalid Metal usage", "message sent to deallocated instance")
 # Metal's API and shader validation, with the shader's reports on stderr, in the test's log (metalvalidation(1))
 VALIDATION = {"MTL_DEBUG_LAYER": "1", "MTL_SHADER_VALIDATION": "1", "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1"}
+# --validate shaders: shader validation alone, a fraction of the API validation's cost, for the tests of one shader
+# path; MULLION_SHADER_LOG puts what the GPU logs in the test's log as well (src/winemetal/unix/winemetal_unix.c)
+SHADER_VALIDATION = {"MTL_SHADER_VALIDATION": "1", "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1", "MULLION_SHADER_LOG": "1"}
 
 
 def waiting(markers):
@@ -461,7 +468,8 @@ def arguments(parser):
                         help="a meson build directory; with several, the first that has a library or the tests gives them")
     parser.add_argument("--wine", required=True, type=Path, help="a Wine's installation: the directory with bin/wine")
     parser.add_argument("--prefix", type=Path, help="the Wine prefix of the tests (made if missing); default: tests-prefix in the first build")
-    parser.add_argument("--validate", action="store_true", help="run under Metal's API and shader validation")
+    parser.add_argument("--validate", nargs="?", const="all", choices=("all", "shaders"),
+                        help="run under Metal's API and shader validation, or (shaders) its shader validation alone")
     parser.add_argument("--no-install", action="store_true", help="leave the Wine's libraries as they are")
     parser.add_argument("--clone", nargs="?", const=True, type=Path,
                         help="run in a copy of the Wine, made in this directory (default: tests-wine in the first build) "
@@ -605,7 +613,7 @@ def environment(args):
     overrides += ["d3dcompiler_47=n,b"] + ([f"{','.join(own)}=b"] if own else []) + ["mscoree,mshtml,winedbg.exe=d"]
     base["WINEDLLOVERRIDES"] = ";".join(overrides)
     if args.validate:
-        base.update(VALIDATION)
+        base.update(SHADER_VALIDATION if args.validate == "shaders" else VALIDATION)
     binary = wine / "bin" / "wine"
     # a Wine macOS will not run runs no test of Windows: the host's own tests still run
     try:
