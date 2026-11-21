@@ -84,6 +84,11 @@ DeferredContextBase::RecordWrappedUse(D3D11ResourceCommon *resource, const Resou
   ctx_state.current_cmdlist->regions.back().wrapped_uses.emplace_back(resource, subset, write);
 }
 
+// a command list's textures move to Metal's format view when the immediate context executes it
+template <>
+void
+DeferredContextBase::MoveToFormatViews() {}
+
 template <>
 void
 DeferredContextBase::PrepareTextureUse(std::span<const Rc<Texture>> textures) {
@@ -480,7 +485,7 @@ public:
     ctx_state.current_dynamic_buffer_allocations.clear();
     ctx_state.current_dynamic_texture_allocations.clear();
 
-    *ppCommandList = std::move(ctx_state.current_cmdlist);
+    Com<MTLD3D11CommandList> list = std::move(ctx_state.current_cmdlist);
     device->CreateCommandList((ID3D11CommandList **)&ctx_state.current_cmdlist);
 
     if (RestoreDeferredContextState)
@@ -488,6 +493,11 @@ public:
     else
       ResetD3D11ContextState();
 
+    // ppCommandList is optional: without it the list is released, its commands dropped, as Windows does (Wine's
+    // test_deferred_context_rendering)
+    if (!ppCommandList)
+      return E_UNEXPECTED;
+    *ppCommandList = std::move(list);
     return S_OK;
   }
 

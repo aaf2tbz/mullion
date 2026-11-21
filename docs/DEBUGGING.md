@@ -91,7 +91,7 @@ logs show whether frame time spikes coincide with shader compilation.
 
 Validation of the test suite is described in [TESTING.md 6.1](TESTING.md#6-running-tests-and-reading-results):
 `tests/run.py --validate` runs the tests under Metal's API and shader validation, and what the validation reports is
-in each test's log. `--validate shaders` runs shader validation alone, which costs a fraction of the API validation,
+in each test's log. `--validate-shaders` runs shader validation alone, which costs a fraction of the API validation,
 for the tests of the shader path a change touches.
 
 `MULLION_SHADER_LOG=1` gives every Metal 3 command queue a log state (macOS 15 and later), so what the GPU logs while it
@@ -169,7 +169,7 @@ Each program's Metal cache is a folder of its own, and together they are held to
 (default 8192, `0` for no limit): past it, the folders of the programs launched longest ago and not running are
 emptied, in the background at a program's start ([`cache.c`](../src/winemetal/unix/cache.c)).
 
-**Memory.** `MULLION_LOSSY_TEXTURES=1` is a memory saver: Direct3D 12's private half and float textures (RGBA16F and the
+**Memory.** `MULLION_LOSSY_TEXTURES=1` is a memory saver: Direct3D's private half and float textures (RGBA16F and the
 like, the large render targets of an HDR renderer) are made with Metal's lossy compression on an Apple8 GPU or later,
 and take half their memory, at a small cost in precision ([`mullion_memory.hpp`](../src/mullion/mullion_memory.hpp)).
 `MULLION_MEMORY_BUDGET=fixed` keeps the budget DXGI reports at 95% of the working set instead of following macOS's
