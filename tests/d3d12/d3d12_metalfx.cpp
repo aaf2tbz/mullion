@@ -155,7 +155,7 @@ main(int argc, char **argv) {
   valid.PreExposure = valid.MotionVectorScaleX = valid.MotionVectorScaleY = 1;
   // a missing input is refused; inputs DLSS would not be given are upscaled anyway, as a game's ray traced frame
   // gives them (src/d3d12/d3d12_command_list.cpp, TemporalUpscale), so only the missing ones are tried here
-  auto rejected = [&](auto change, const char *name) {
+  auto refused = [&](auto change, const char *name) {
     auto invalid = valid;
     change(invalid);
     IMTLD3D12Upscaler *cache = nullptr;
@@ -165,9 +165,9 @@ main(int argc, char **argv) {
       cache->Destroy();
   };
   step("missing temporal MetalFX inputs");
-  rejected([](auto &d) { d.Depth = nullptr; }, "no depth");
-  rejected([](auto &d) { d.MotionVector = nullptr; }, "no motion vectors");
-  rejected([](auto &d) { d.Output = nullptr; }, "no output");
+  refused([](auto &d) { d.Depth = nullptr; }, "no depth");
+  refused([](auto &d) { d.MotionVector = nullptr; }, "no motion vectors");
+  refused([](auto &d) { d.Output = nullptr; }, "no output");
 
   CHECK(list->Close());
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
