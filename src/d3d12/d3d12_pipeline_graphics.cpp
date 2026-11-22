@@ -969,7 +969,7 @@ protected:
     info.payload_memory_length = mesh_only ? 0
                                  : !counting && SM50StreamOutputDirect(single, !!GS.pShaderBytecode, pass_through)
                                      ? SM50_STREAM_OUTPUT_DIRECT_PAYLOAD_SIZE
-                                     : SM50_GEOMETRY_PAYLOAD_SIZE;
+                                     : SM50GeometryPayloadSize(vertex_registers);
     // `later`: Metal's compile of it into `*target` on a compile thread (DeferredPipeline), as a plain pipeline's.
     // its functions are made here, where what is wrong with the shaders shows, and go with it
     if (later) {
@@ -2422,6 +2422,14 @@ CreateGraphicsPipelineState(
   // depth attachment for each range, and what it drops is shading an application culls, not what it draws
   pso->depth_bounds_emulated = depth_bounds && !pso->depth_bounds && pDevice->emulate_depth_bounds;
   HRESULT hr = pso->Initialize(&desc, AS, MS, depth_stencil2);
+  // a pipeline that could not be made is, with d3d12.ignoreFailedPipelines, one of nothing: its Metal pipeline is
+  // null, so its draws are dropped. what runs out of memory still fails, as a cached blob of another build did above
+  if (FAILED(hr) && hr != E_OUTOFMEMORY && pDevice->ignore_failed_pipelines) {
+    WARN("CreateGraphicsPipelineState: the pipeline could not be made; its draws are dropped (d3d12.ignoreFailedPipelines)");
+    pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+    pso->failed = true;
+    hr = S_OK;
+  }
   if (FAILED(hr))
     return hr;
   return pso->QueryInterface(riid, ppPipelineState);

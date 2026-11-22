@@ -409,6 +409,7 @@ public:
     emulate_depth_bounds = Config::getInstance().getOption<bool>("d3d12.emulateDepthBounds", true);
     timestamp_queries = Config::getInstance().getOption<bool>("d3d12.timestampQueries", true);
     immediate_markers = Config::getInstance().getOption<bool>("d3d12.immediateMarkers", false);
+    ignore_failed_pipelines = Config::getInstance().getOption<bool>("d3d12.ignoreFailedPipelines", false);
     report_emulated_features = Config::getInstance().getOption<bool>("d3d12.reportEmulatedFeatures", false);
     
     WMTDepthStencilInfo info{};
@@ -1013,13 +1014,15 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
+      // shader model 6.8: wave size ranges, SampleCmpBias and SampleCmpGrad, SV_StartVertexLocation and
+      // SV_StartInstanceLocation, and Barrier of separate memory and semantics (work graphs are optional and absent).
       // MULLION_D3D12_SHADER_MODEL=6.5 (read once): the highest shader model reported, for A/B runs of an application
       // that chooses its path by it (Unreal Engine's bindless resources from 6.6)
       static const D3D_SHADER_MODEL highest = [] {
         auto given = env::getEnvVar("MULLION_D3D12_SHADER_MODEL");
         unsigned major = 0, minor = 0;
-        if (given.empty() || std::sscanf(given.c_str(), "%u.%u", &major, &minor) != 2 || major != 6 || minor > 7)
-          return D3D_SHADER_MODEL_6_7;
+        if (given.empty() || std::sscanf(given.c_str(), "%u.%u", &major, &minor) != 2 || major != 6 || minor > 8)
+          return D3D_SHADER_MODEL(0x68);
         return D3D_SHADER_MODEL(0x60 + minor);
       }();
       out->HighestShaderModel = std::min(out->HighestShaderModel, highest);
@@ -1370,9 +1373,10 @@ public:
     case sdk::D3D12_FEATURE_D3D12_OPTIONS21: {
       if (DataSize != sizeof(sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS21))
         return FAIL(E_INVALIDARG);
-      // no work graphs, and command signatures have tier 1.0's arguments (no incrementing constant)
+      // no work graphs, and command signatures have tier 1.0's arguments (no incrementing constant); shader model
+      // 6.8's comparison sampling at a bias or gradient, and its start vertex and instance locations
       *reinterpret_cast<sdk::D3D12_FEATURE_DATA_D3D12_OPTIONS21 *>(pFeatureData) = {
-          0, sdk::D3D12_EXECUTE_INDIRECT_TIER_1_0, FALSE, FALSE
+          0, sdk::D3D12_EXECUTE_INDIRECT_TIER_1_0, TRUE, TRUE
       };
       return S_OK;
     }

@@ -949,9 +949,11 @@ public:
   void
   encodeTemporalScale(
       FXTemporalScaler scaler, Texture color, Texture output, Texture depth, Texture motion, Texture exposure,
-      Fence fence, const WMTFXTemporalScalerProps &props
+      Texture reactive, Fence fence, const WMTFXTemporalScalerProps &props
   ) {
-    MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+    MTLCommandBuffer_encodeTemporalScale(
+        handle, scaler, color, output, depth, motion, exposure, reactive, fence, &props
+    );
   }
 };
 
@@ -1114,9 +1116,11 @@ public:
   void
   encodeTemporalScale(
       FXTemporalScaler scaler, Texture color, Texture output, Texture depth, Texture motion, Texture exposure,
-      Fence fence, const WMTFXTemporalScalerProps &props
+      Texture reactive, Fence fence, const WMTFXTemporalScalerProps &props
   ) {
-    MTL4CommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+    MTL4CommandBuffer_encodeTemporalScale(
+        handle, scaler, color, output, depth, motion, exposure, reactive, fence, &props
+    );
   }
   void
   encodeDenoisedScale(FXDenoisedScaler scaler, const WMTFXDenoisedScaleArgs &args) {
@@ -1552,6 +1556,13 @@ public:
   bool
   supportsFXDenoisedScaler(bool metal4) {
     return MTLDevice_supportsFXDenoisedScaler(handle, metal4);
+  }
+
+  WMTFXTemporalScalerSupport
+  temporalScalerSupport() {
+    WMTFXTemporalScalerSupport support;
+    MTLDevice_temporalScalerSupport(handle, &support);
+    return support;
   }
 
   void

@@ -18,7 +18,8 @@ test('host_tessellator',
                 include_directories : include_directories('metal', '../../src/airconv', '../../src/airconv/shaders', '../../libs'),
                 # the reference's and the Metal source's, neither written for this compiler's warnings
                 cpp_args : ['-w'], override_options : ['cpp_std=c++20'], native : true),
-     suite : 'host', timeout : 300)
+     # every factor and partitioning on one core: about 270 s on CI's runner, past 300 s when the runner is loaded
+     suite : 'host', timeout : 900)
 # the converter's own functions, built for the host as the bridge links them
 test('host_readerio_frame', executable('host_readerio_frame', 'readerio_frame.cpp',
      include_directories : llvm_include_path_darwin, dependencies : airconv_dep_darwin,
@@ -38,6 +39,27 @@ test('host_coherent_version',
 test('host_pixel_input_declarations',
      executable('host_pixel_input_declarations', 'pixel_input_declarations.cpp',
                 include_directories : llvm_include_path_darwin,
+                dependencies : [airconv_dep_darwin, dxbc_parser_native_dep],
+                cpp_args : ['-w'], override_options : ['cpp_std=c++20'], native : true),
+     suite : 'host', timeout : 120)
+test('host_geometry_payload',
+     executable('host_geometry_payload', 'geometry_payload.cpp',
+                include_directories : llvm_include_path_darwin,
+                dependencies : [airconv_dep_darwin, dxbc_parser_native_dep],
+                cpp_args : ['-w'], override_options : ['cpp_std=c++20'], native : true),
+     suite : 'host', timeout : 120)
+test('host_dxil_header',
+     executable('host_dxil_header', 'dxil_header.cpp', dependencies : [airconv_dep_darwin, dxbc_parser_native_dep],
+                cpp_args : ['-w'], override_options : ['cpp_std=c++20'], native : true),
+     suite : 'host', timeout : 120)
+test('host_position_invariance',
+     executable('host_position_invariance', 'position_invariance.cpp',
+                include_directories : llvm_include_path_darwin,
+                dependencies : [airconv_dep_darwin, dxbc_parser_native_dep],
+                cpp_args : ['-w'], override_options : ['cpp_std=c++20'], native : true),
+     suite : 'host', timeout : 120)
+test('host_metallib_header',
+     executable('host_metallib_header', 'metallib_header.cpp', include_directories : llvm_include_path_darwin,
                 dependencies : [airconv_dep_darwin, dxbc_parser_native_dep],
                 cpp_args : ['-w'], override_options : ['cpp_std=c++20'], native : true),
      suite : 'host', timeout : 120)
