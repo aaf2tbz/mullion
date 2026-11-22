@@ -2153,6 +2153,8 @@ struct WMTDisplayDescription {
   float maximum_edr_color_component_value;
   float maximum_potential_edr_color_component_value;
   float maximum_reference_edr_color_component_value;
+  // the display's refresh rate in frames a second, which a display mode Wine emulates leaves as it is; 0 unknown
+  double refresh_rate;
 };
 
 WINEMETAL_API void WMTGetDisplayDescription(uint32_t display_id, struct WMTDisplayDescription *desc);

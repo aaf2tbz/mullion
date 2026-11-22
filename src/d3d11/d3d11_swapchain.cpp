@@ -546,28 +546,15 @@ public:
     }
 
     if constexpr (EnableMetalFX) {
-      Com<D3D11ResourceCommon> upscaled;
-      D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc;
       // the display's (or the window's) resolution; the factor where the layer has no size yet
-      upscaled_desc_.Height *= scale_factor;
-      upscaled_desc_.Width *= scale_factor;
-      presenter->upscaleOutputSize(desc.Width, desc.Height, upscaled_desc_.Width, upscaled_desc_.Height);
-      upscaled_desc_.ArraySize = 1;
-      HRESULT hr = mullion::CreateDeviceTexture2D(
-          device_, &upscaled_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled)
-      );
-      if (FAILED(hr))
+      UINT width = backbuffer_desc.Width * scale_factor, height = backbuffer_desc.Height * scale_factor;
+      presenter->upscaleOutputSize(desc.Width, desc.Height, width, height);
+      Com<D3D11ResourceCommon> upscaled;
+      Rc<SpatialScaler> scaler;
+      if (HRESULT hr = MakeUpscaler(backbuffer_desc, backbuffers[0]->texture()->pixelFormat(), width, height, upscaled,
+                                    scaler);
+          FAILED(hr))
         return hr;
-
-      WMTFXSpatialScalerInfo info;
-      info.input_height = desc.Height;
-      info.input_width = desc.Width;
-      info.output_height = upscaled_desc_.Height;
-      info.output_width = upscaled_desc_.Width;
-      info.color_format = backbuffers[0]->texture()->pixelFormat();
-      info.output_format = upscaled->texture()->pixelFormat();
-      Rc<SpatialScaler> scaler = new SpatialScaler(device_->GetMTLDevice(), info);
-      D3D11_ASSERT(scaler && "otherwise metalfx failed to initialize");
       upscaled_backbuffer_ = std::move(upscaled);
       metalfx_scaler = std::move(scaler);
     }
@@ -576,6 +563,7 @@ public:
     backbuffer_desc_ = backbuffer_desc;
     backbuffers_ = std::move(backbuffers);
     settings_.Resized();
+    screen_refresh_rate_ = -1;
     ApplyLayerProps();
     return S_OK;
   };
@@ -631,6 +619,73 @@ public:
     fullscreen_desc_.Scaling = pDesc->Scaling;
     return S_OK;
   };
+
+  // the MetalFX scaler of buffers of `desc` to `width` x `height`, and the texture it upscales into
+  HRESULT
+  MakeUpscaler(
+      const D3D11_TEXTURE2D_DESC1 &desc, WMTPixelFormat format, UINT width, UINT height,
+      Com<D3D11ResourceCommon> &upscaled, Rc<SpatialScaler> &scaler
+  ) {
+    D3D11_TEXTURE2D_DESC1 upscaled_desc = desc;
+    upscaled_desc.Width = width;
+    upscaled_desc.Height = height;
+    upscaled_desc.ArraySize = 1;
+    if (HRESULT hr = mullion::CreateDeviceTexture2D(
+            device_, &upscaled_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled)
+        );
+        FAILED(hr))
+      return hr;
+    WMTFXSpatialScalerInfo info;
+    info.input_height = desc.Height;
+    info.input_width = desc.Width;
+    info.output_height = height;
+    info.output_width = width;
+    info.color_format = format;
+    info.output_format = upscaled->texture()->pixelFormat();
+    scaler = new SpatialScaler(device_->GetMTLDevice(), info);
+    D3D11_ASSERT(scaler && "otherwise metalfx failed to initialize");
+    return S_OK;
+  }
+
+  // the layer's size on screen changes after the buffers do (a window going fullscreen is resized by macOS after
+  // ResizeBuffers, which saw its earlier size): the scaler follows it, so the frame is upscaled to what it is shown
+  // at. frames already queued keep the scaler and texture they were given
+  // a sync interval's duration of the display mode's refreshes, as the screen shows it (Presenter::paceToScreen)
+  double
+  PacedDuration(double duration) {
+    if (screen_refresh_rate_ < 0)
+      screen_refresh_rate_ = Presenter::screenRefreshRate(wsi::getWindowMonitor(hWnd) == wsi::getDefaultMonitor());
+    double paced = Presenter::paceToScreen(duration, screen_refresh_rate_);
+    if (paced != duration && (paced_[0] != duration || paced_[1] != screen_refresh_rate_)) {
+      paced_[0] = duration;
+      paced_[1] = screen_refresh_rate_;
+      Logger::info(str::format(
+          "Present: a frame of ", 1 / duration, " Hz on a ", screen_refresh_rate_, " Hz screen is shown for ",
+          paced * screen_refresh_rate_, " of its refreshes"
+      ));
+    }
+    return paced;
+  }
+
+  void
+  FollowLayerSize() {
+    if constexpr (EnableMetalFX) {
+      if (!metalfx_scaler || !upscaled_backbuffer_ || backbuffers_.empty())
+        return;
+      UINT width = upscaled_backbuffer_->texture()->width(), height = upscaled_backbuffer_->texture()->height();
+      if (!presenter->upscaleOutputSize(desc_.Width, desc_.Height, width, height) ||
+          (width == upscaled_backbuffer_->texture()->width() && height == upscaled_backbuffer_->texture()->height()))
+        return;
+      Com<D3D11ResourceCommon> upscaled;
+      Rc<SpatialScaler> scaler;
+      if (FAILED(MakeUpscaler(backbuffer_desc_, backbuffers_[0]->texture()->pixelFormat(), width, height, upscaled,
+                              scaler)))
+        return;
+      upscaled_backbuffer_ = std::move(upscaled);
+      metalfx_scaler = std::move(scaler);
+      ApplyLayerProps();
+    }
+  }
 
   void ApplyLayerProps() {
     settings_.Update(desc_, fullscreen_desc_.Windowed, hWnd, *presenter);
@@ -832,6 +887,8 @@ public:
     // a window the picture keeps its size in may have another size by now
     if (settings_.Update(desc_, fullscreen_desc_.Windowed, hWnd, *presenter))
       ApplyLayerProps();
+    if (presentation_count_ % 16 == 0)
+      FollowLayerSize();
 
     if (should_exit_fs)
       SetFullscreenState(FALSE, nullptr);
@@ -854,10 +911,10 @@ public:
       return hr;
     }
 
+    // a sync interval is of the display mode's refreshes, shown on the screen's
     double vsync_duration =
-        std::max(SyncInterval * 1.0 /
-                     (preferred_max_frame_rate ? preferred_max_frame_rate
-                                               : init_refresh_rate_),
+        std::max(preferred_max_frame_rate ? SyncInterval * 1.0 / preferred_max_frame_rate
+                                          : PacedDuration(SyncInterval / init_refresh_rate_),
                  preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
 
     auto &cmd_queue = device_->GetMullionDevice().queue();
@@ -1164,6 +1221,10 @@ private:
   uint32_t frame_latency;
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   double init_refresh_rate_ = DBL_MAX;
+  // the refresh rate of the screen the window is on, found at the first present after the buffers are made (a mode
+  // change comes with ResizeBuffers); below 0 until then
+  double screen_refresh_rate_ = -1;
+  double paced_[2]{};
   int preferred_max_frame_rate = 0;
   HUDState hud;
   Rc<Presenter> presenter;

@@ -90,6 +90,17 @@ public:
   // input (the caller upscales by its factor then)
   bool upscaleOutputSize(uint32_t input_width, uint32_t input_height, uint32_t &width, uint32_t &height);
 
+  // how long a frame of a swap chain's sync interval is shown for at least (presentDrawableAfterMinimumDuration),
+  // given that of the display mode's refreshes it is and the screen's refresh rate: a mode Wine emulates
+  // (MetalSharp's MetalFX display) leaves the screen at its own refresh, on which a frame waits for the first refresh
+  // after its duration, so 1/60 s on a 144 Hz screen is three refreshes and 48 frames a second. a duration of more
+  // than one of the screen's refreshes that they do not divide is the whole refreshes in it; any other is kept (it
+  // is never made longer), as is every one where the rate is unknown
+  static double paceToScreen(double duration, double screen_rate);
+
+  // the refresh rate of the primary display or the other one (WMTGetDisplayDescription); 0 where unknown
+  static double screenRefreshRate(bool primary);
+
   // how later frames are put on the target (the swap chain's settings)
   void
   changePresentation(const MullionPresentation &presentation) {

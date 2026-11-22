@@ -2952,6 +2952,14 @@ public:
       cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
     else
       cmdbuf.presentDrawable(drawable);
+    // a swap chain makes a new scaler when its layer's size changes (FollowLayerSize): the one this frame upscales
+    // with, and its texture, last until the GPU is done with them
+    if (scaler && upscaled)
+      scope.inflight->completed = [then = std::move(scope.inflight->completed), scaler = Rc(scaler),
+                                   upscaled = WMT::Reference<WMT::Texture>(upscaled)] {
+        if (then)
+          then();
+      };
     if (!dump_frames.empty()) {
       DumpFrame(backbuffer, *scope.inflight, id, number);
       scope.inflight->settles = true;

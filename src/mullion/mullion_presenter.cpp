@@ -1,5 +1,6 @@
 
 #include <algorithm>
+#include <cmath>
 #include "Metal.hpp"
 #include "mullion_format.hpp"
 #include "mullion_presenter.hpp"
@@ -39,6 +40,23 @@ Presenter::upscaleOutputSize(uint32_t input_width, uint32_t input_height, uint32
   width = native_width;
   height = native_height;
   return true;
+}
+
+double
+Presenter::paceToScreen(double duration, double screen_rate) {
+  if (!(duration > 0) || !std::isfinite(duration) || !(screen_rate >= 24) || !std::isfinite(screen_rate))
+    return duration;
+  double refreshes = duration * screen_rate;
+  if (refreshes < 1 || std::abs(refreshes - std::round(refreshes)) < 0.01)
+    return duration;
+  return std::floor(refreshes) / screen_rate;
+}
+
+double
+Presenter::screenRefreshRate(bool primary) {
+  WMTDisplayDescription desc{};
+  WMTGetDisplayDescription(primary ? WMTGetPrimaryDisplayId() : WMTGetSecondaryDisplayId(), &desc);
+  return desc.refresh_rate;
 }
 
 bool

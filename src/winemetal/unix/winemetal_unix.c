@@ -3553,6 +3553,9 @@ _WMTGetDisplayDescription(void *obj) {
   struct unixcall_generic_obj_ptr_noret *params = obj;
   CGDirectDisplayID display_id = params->handle;
   struct WMTDisplayDescription *desc_out = params->arg.ptr;
+  CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display_id);
+  desc_out->refresh_rate = mode ? CGDisplayModeGetRefreshRate(mode) : 0;
+  CGDisplayModeRelease(mode);
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
   if (!profile || !GetDisplayColorGamut(profile, desc_out))
     GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);

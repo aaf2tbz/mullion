@@ -155,6 +155,10 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IMTLDXGISwapChain, MTLD3
   WMT::Reference<WMT::Texture> upscaled_;
   HUDState hud;
   double init_refresh_rate_ = DBL_MAX;
+  // the refresh rate of the screen the window is on, found at the first present after the buffers are made (a mode
+  // change comes with ResizeBuffers); below 0 until then
+  double screen_refresh_rate_ = -1;
+  double paced_[2]{};
   int preferred_max_frame_rate = 0;
   ModeSetGuard modeset_guard_;
   mullion::mutex mutex_;
@@ -638,42 +642,10 @@ public:
     Rc<SpatialScaler> scaler;
     WMT::Reference<WMT::Texture> upscaled;
     if (metalfx_) {
-      auto &color = backbuffers[0]->texture;
-      WMTTextureInfo info{};
-      info.pixel_format = color->pixelFormat();
       // the display's (or the window's) resolution; the factor where the layer has no size yet
-      info.width = uint32_t(backbuffer_desc.Width * scale_factor);
-      info.height = uint32_t(backbuffer_desc.Height * scale_factor);
-      presenter->upscaleOutputSize(uint32_t(backbuffer_desc.Width), backbuffer_desc.Height, info.width, info.height);
-      info.depth = 1;
-      info.array_length = 1;
-      info.type = WMTTextureType2D;
-      info.mipmap_level_count = 1;
-      info.sample_count = 1;
-      info.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget);
-      info.options = WMTResourceOptions(WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked);
-      upscaled = device_->GetMTLDevice().newTexture(info);
-      WMTFXSpatialScalerInfo scaler_info{
-          .color_format = color->pixelFormat(),
-          .output_format = color->pixelFormat(),
-          .input_width = uint32_t(backbuffer_desc.Width),
-          .input_height = backbuffer_desc.Height,
-          .output_width = info.width,
-          .output_height = info.height,
-      };
-      if (upscaled)
-        scaler = new SpatialScaler(device_->GetMTLDevice(), scaler_info, device_->UsesMetal4());
-      if (!upscaled || !scaler->scaler()) {
-        WARN("MetalFX: no spatial scaler for ", backbuffer_desc.Width, "x", backbuffer_desc.Height, " to ", info.width,
-             "x", info.height, "; presenting without it");
-        scaler = nullptr;
-        upscaled = {};
-      } else {
-        Logger::info(str::format(
-            "MetalFX: spatial upscaling ", backbuffer_desc.Width, "x", backbuffer_desc.Height, " to ", info.width, "x",
-            info.height, device_->UsesMetal4() ? " (Metal 4)" : ""
-        ));
-      }
+      uint32_t width = uint32_t(backbuffer_desc.Width * scale_factor), height = uint32_t(backbuffer_desc.Height * scale_factor);
+      presenter->upscaleOutputSize(uint32_t(backbuffer_desc.Width), backbuffer_desc.Height, width, height);
+      MakeUpscaler(backbuffers[0]->texture->pixelFormat(), backbuffer_desc, width, height, scaler, upscaled);
     }
 
     desc_ = desc;
@@ -685,6 +657,7 @@ public:
     // the first of the new buffers is the next to be presented
     current_buffer_ = 0;
     settings_.Resized();
+    screen_refresh_rate_ = -1;
     ApplyLayerProps();
     return S_OK;
   };
@@ -740,6 +713,86 @@ public:
     fullscreen_desc_.Scaling = pDesc->Scaling;
     return S_OK;
   };
+
+  // the MetalFX scaler of buffers of `desc` and `format` to `width` x `height`, and the texture it upscales into;
+  // neither where MetalFX makes no scaler of them
+  void
+  MakeUpscaler(
+      WMTPixelFormat format, const D3D12_RESOURCE_DESC &desc, uint32_t width, uint32_t height,
+      Rc<SpatialScaler> &scaler, WMT::Reference<WMT::Texture> &upscaled
+  ) {
+    WMTTextureInfo info{};
+    info.pixel_format = format;
+    info.width = width;
+    info.height = height;
+    info.depth = 1;
+    info.array_length = 1;
+    info.type = WMTTextureType2D;
+    info.mipmap_level_count = 1;
+    info.sample_count = 1;
+    info.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget);
+    info.options = WMTResourceOptions(WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked);
+    upscaled = device_->GetMTLDevice().newTexture(info);
+    WMTFXSpatialScalerInfo scaler_info{
+        .color_format = format,
+        .output_format = format,
+        .input_width = uint32_t(desc.Width),
+        .input_height = desc.Height,
+        .output_width = width,
+        .output_height = height,
+    };
+    scaler = upscaled ? new SpatialScaler(device_->GetMTLDevice(), scaler_info, device_->UsesMetal4()) : nullptr;
+    if (!upscaled || !scaler->scaler()) {
+      WARN("MetalFX: no spatial scaler for ", desc.Width, "x", desc.Height, " to ", width, "x", height,
+           "; presenting without it");
+      scaler = nullptr;
+      upscaled = {};
+      return;
+    }
+    Logger::info(str::format(
+        "MetalFX: spatial upscaling ", desc.Width, "x", desc.Height, " to ", width, "x", height,
+        device_->UsesMetal4() ? " (Metal 4)" : ""
+    ));
+  }
+
+  // the layer's size on screen changes after the buffers do: a window going fullscreen is resized by macOS after
+  // ResizeBuffers, which saw the window's earlier size (Elden Ring's scaler was made for 2400x1350 on a 1920x1080
+  // display, and kept). the scaler follows the layer, so the frame is upscaled to what it is shown at
+  // a sync interval's duration of the display mode's refreshes, as the screen shows it (Presenter::paceToScreen)
+  double
+  PacedDuration(double duration) {
+    if (screen_refresh_rate_ < 0)
+      screen_refresh_rate_ = Presenter::screenRefreshRate(wsi::getWindowMonitor(hWnd) == wsi::getDefaultMonitor());
+    double paced = Presenter::paceToScreen(duration, screen_refresh_rate_);
+    if (paced != duration && (paced_[0] != duration || paced_[1] != screen_refresh_rate_)) {
+      paced_[0] = duration;
+      paced_[1] = screen_refresh_rate_;
+      Logger::info(str::format(
+          "Present: a frame of ", 1 / duration, " Hz on a ", screen_refresh_rate_, " Hz screen is shown for ",
+          paced * screen_refresh_rate_, " of its refreshes"
+      ));
+    }
+    return paced;
+  }
+
+  void
+  FollowLayerSize() {
+    if (!metalfx_scaler_ || backbuffers_.empty())
+      return;
+    uint32_t width = upscaled_.width(), height = upscaled_.height();
+    if (!presenter->upscaleOutputSize(uint32_t(backbuffer_desc_.Width), backbuffer_desc_.Height, width, height) ||
+        (width == upscaled_.width() && height == upscaled_.height()))
+      return;
+    Rc<SpatialScaler> scaler;
+    WMT::Reference<WMT::Texture> upscaled;
+    MakeUpscaler(backbuffers_[0]->texture->pixelFormat(), backbuffer_desc_, width, height, scaler, upscaled);
+    if (!scaler)
+      return;
+    // the frames already queued hold the scaler and texture they were given (MTLD3D12CommandQueue::Commit)
+    metalfx_scaler_ = std::move(scaler);
+    upscaled_ = std::move(upscaled);
+    ApplyLayerProps();
+  }
 
   void
   ApplyLayerProps() {
@@ -932,9 +985,13 @@ public:
     // a window the picture keeps its size in may have another size by now
     if (settings_.Update(desc_, fullscreen_desc_.Windowed, hWnd, *presenter))
       ApplyLayerProps();
+    if (presentation_count_ % 16 == 0)
+      FollowLayerSize();
 
+    // a sync interval is of the display mode's refreshes, shown on the screen's
     double vsync_duration = std::max(
-        SyncInterval * 1.0 / (preferred_max_frame_rate ? preferred_max_frame_rate : init_refresh_rate_),
+        preferred_max_frame_rate ? SyncInterval * 1.0 / preferred_max_frame_rate
+                                 : PacedDuration(SyncInterval / init_refresh_rate_),
         preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0
     );
 
