@@ -468,8 +468,11 @@ CreateMTLTextureDescriptorInternal(
   // upscaler reads them through a view of another format (MotionVectorFormat), and so does one a copy fills where it
   // can defer, as that costs nothing until an upscale. either keeps its lossless compression until such a view, where
   // the caller can move the texture to an allocation with the usage then (pDefersFormatView, Texture::deferFormatView)
+  // Apple10 GPUs (the M6) read and write a view in another layout of a texture without it, as Direct3D 12 finds
+  // (PopulateWMTTextureInfo): there no typeless texture needs it
   auto motion = MotionVectorFormat(pDescOut->pixel_format);
   bool casts = ((metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS) && !DepthStencilPlanarFlags(pDescOut->pixel_format) &&
+                !pDevice->GetMTLDevice().supportsFamily(WMTGPUFamilyApple10) &&
                 CastsAcrossLayouts(pDevice->GetMTLDevice(), Format, false)) ||
                ((pDefersFormatView || (BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) &&
                 motion != WMTPixelFormatInvalid && motion != pDescOut->pixel_format);

@@ -263,6 +263,52 @@ draw_constants(float *values, UINT i) {
   values[7] = 1;
 }
 
+static ComPtr<ID3D11Buffer> full_cb;
+static ComPtr<ID3D11ShaderResourceView> target_srvs[4];
+
+// 4 1080p RGBA8 targets, typeless (UNORM targets, SNORM views sampled: another layout) or typed: each drawn over 8 times, then sampled
+static void
+make_targets(bool typeless) {
+  D3D11_TEXTURE2D_DESC desc{1920, 1080, 1, 1, typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM,
+                            {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE};
+  for (int i = 0; i < 4; i++) {
+    CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[i]));
+    D3D11_RENDER_TARGET_VIEW_DESC rd{DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_RTV_DIMENSION_TEXTURE2D};
+    CHECK(p.device->CreateRenderTargetView(p.targets[i].Get(), &rd, &p.rtvs[i]));
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{typeless ? DXGI_FORMAT_R8G8B8A8_SNORM : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                       D3D11_SRV_DIMENSION_TEXTURE2D};
+    sd.Texture2D.MipLevels = 1;
+    CHECK(p.device->CreateShaderResourceView(p.targets[i].Get(), &sd, &target_srvs[i]));
+  }
+  float values[8] = {-1, -1, 2, 2, 1, 1, 1, 1};
+  D3D11_BUFFER_DESC bd{sizeof(values), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+  D3D11_SUBRESOURCE_DATA init{values};
+  CHECK(p.device->CreateBuffer(&bd, &init, &full_cb));
+}
+
+static void
+targets_frame(ID3D11DeviceContext *c) {
+  float clear[4] = {0.1f, 0.2f, 0.3f, 1};
+  c->VSSetConstantBuffers(0, 1, full_cb.GetAddressOf());
+  c->PSSetConstantBuffers(0, 1, full_cb.GetAddressOf());
+  ID3D11ShaderResourceView *none = nullptr;
+  for (int t = 0; t < 4; t++) {
+    c->PSSetShaderResources(0, 1, &none);
+    c->OMSetRenderTargets(1, p.rtvs[t].GetAddressOf(), nullptr);
+    c->ClearRenderTargetView(p.rtvs[t].Get(), clear);
+    c->PSSetShader(p.ps[t].Get(), nullptr, 0);
+    for (int i = 0; i < 8; i++)
+      c->Draw(4, 0);
+  }
+  c->OMSetRenderTargets(1, p.rtv.GetAddressOf(), nullptr);
+  c->PSSetShader(p.ps_tex.Get(), nullptr, 0);
+  for (int t = 0; t < 4; t++) {
+    c->PSSetShaderResources(0, 1, target_srvs[t].GetAddressOf());
+    c->Draw(4, 0);
+  }
+  c->PSSetShaderResources(0, 1, &none);
+}
+
 struct Scene {
   const char *name, *description;
   std::function<void()> init;
@@ -446,6 +492,10 @@ scenes() {
          }
          c()->OMSetRenderTargets(1, p.rtv.GetAddressOf(), p.dsv.Get());
        }},
+      {"typed_targets", "4 RGBA8_UNORM 1080p targets, each cleared and drawn over 8 times, then sampled (baseline for typeless_targets)",
+       [] { make_targets(false); }, [c](UINT) { targets_frame(c()); }},
+      {"typeless_targets", "the same of R8G8B8A8_TYPELESS targets, drawn through UNORM views and sampled through SNORM ones",
+       [] { make_targets(true); }, [c](UINT) { targets_frame(c()); }},
       {"msaa_resolve", "a 4x RGBA16F 1080p target and 4x depth: cleared, 50 draws, resolved, each frame (Source 2's MSAA)",
        [] {
          D3D11_TEXTURE2D_DESC desc{1920, 1080, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {4, 0}, D3D11_USAGE_DEFAULT,
