@@ -3668,15 +3668,368 @@ static std::vector<Scene> submit_scenes()
     };
 }
 
+
+// ---- texture corpus: many textures of one kind live in each render pass (formats, views, volumes, samples) ----
+
+#include <dxgi1_4.h>
+
+// what Metal has allocated for the device, as DXGI reports it (QueryVideoMemoryInfo's CurrentUsage), in MiB
+static double device_memory_mb()
+{
+    static IDXGIAdapter3 *adapter = [] {
+        IDXGIFactory4 *factory = nullptr;
+        IDXGIAdapter3 *a = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+        {
+            factory->EnumAdapterByLuid(p.device->GetAdapterLuid(), IID_PPV_ARGS(&a));
+            factory->Release();
+        }
+        return a;
+    }();
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (!adapter || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return 0;
+    return info.CurrentUsage / 1048576.0;
+}
+
+static ID3D12Resource *create_resource(D3D12_RESOURCE_DIMENSION dim, UINT w, UINT h, UINT depth, UINT mips, DXGI_FORMAT format,
+                                       D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, UINT samples = 1,
+                                       const D3D12_CLEAR_VALUE *clear = nullptr)
+{
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = dim;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = (UINT16)depth;
+    rd.MipLevels = (UINT16)mips;
+    rd.Format = format;
+    rd.SampleDesc.Count = samples;
+    rd.Flags = flags;
+    ID3D12Resource *r = nullptr;
+    CHECK(p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, clear, IID_PPV_ARGS(&r)));
+    return r;
+}
+
+// fills every subresource of `r` (COPY_DEST) with hashed bytes through the upload ring, as a loader streams a DDS's
+// mips and slices, and leaves it in `after`; the copies are recorded on `l`
+static void fill_texture(ID3D12GraphicsCommandList *l, ID3D12Resource *r, D3D12_RESOURCE_STATES after, UINT seed)
+{
+    D3D12_RESOURCE_DESC rd = r->GetDesc();
+    UINT subresources = rd.MipLevels * (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize);
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(subresources);
+    std::vector<UINT> rows(subresources);
+    std::vector<UINT64> row_bytes(subresources);
+    UINT64 total = 0;
+    p.device->GetCopyableFootprints(&rd, 0, subresources, 0, layouts.data(), rows.data(), row_bytes.data(), &total);
+    void *cpu;
+    D3D12_GPU_VIRTUAL_ADDRESS va = upload_alloc((total + 511) & ~511ull, &cpu);
+    va = (va + 511) & ~511ull;
+    (void)cpu;
+    uint8_t *base = p.upload_ptr + (va - p.upload_ring->GetGPUVirtualAddress());
+    if (seed != ~0u)
+        for (UINT64 i = 0; i + 4 <= total; i += 4)
+            *(uint32_t *)(base + i) = (uint32_t)(i + seed) * 2654435761u;
+    double copies = qpc_ms();
+    for (UINT s = 0; s < subresources; s++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = { p.upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        src.PlacedFootprint = layouts[s];
+        src.PlacedFootprint.Offset += va - p.upload_ring->GetGPUVirtualAddress();
+        D3D12_TEXTURE_COPY_LOCATION dst = { r, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        dst.SubresourceIndex = s;
+        l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    barrier(l, r, D3D12_RESOURCE_STATE_COPY_DEST, after);
+    extras.add("copy_record_us", (qpc_ms() - copies) * 1000.0);
+}
+
+static const char *volume_hlsl = R"(
+cbuffer RC : register(b0) { float4 rc; };
+Texture3D vol[8] : register(t0);
+SamplerState smp : register(s0);
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+V vs_quad(uint id : SV_VertexID)
+{
+    V o;
+    float2 q = float2((id << 1) & 2, id & 2);
+    o.uv = q;
+    o.pos = float4((q * 2 - 1) * rc.z + rc.xy, 0.5, 1);
+    return o;
+}
+// a fog volume marched in 16 steps through two of the volumes (volumetric lighting, as God of War's froxels)
+float4 ps_volume(V i) : SV_Target
+{
+    float4 c = 0;
+    [unroll] for (int k = 0; k < 16; k++)
+    {
+        float3 at = float3(i.uv, k / 16.0 + rc.w);
+        c += vol[k & 7].SampleLevel(smp, at, 0) * vol[(k + 3) & 7].SampleLevel(smp, at.yzx, 0);
+    }
+    return c * 0.0625;
+}
+)";
+
+static std::vector<Scene> texture_scenes()
+{
+    static ID3D12DescriptorHeap *tex_rtv_heap, *tex_dsv_heap;
+    static std::vector<ID3D12Resource *> corpus, targets, depths, volumes, msaa, resolved;
+    static ID3D12PipelineState *tex8, *tex8_srgb, *tex8_typed, *volume_pso, *msaa_pso, *depth_pso;
+    static ID3D12Heap *stream_heap;
+    static double memory_before;
+    enum { SRV_CORPUS = 13000, SRV_TARGETS = 13100, SRV_DEPTHS = 13120, SRV_VOLUMES = 13140, SRV_STREAM = 13160 };
+    auto heaps = [] {
+        if (tex_rtv_heap)
+            return;
+        D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 32 };
+        CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&tex_rtv_heap)));
+        hd = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 16 };
+        CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&tex_dsv_heap)));
+        memory_before = device_memory_mb();
+    };
+    auto trtv = [](UINT i) { auto h = tex_rtv_heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * p.rtv_size; return h; };
+    auto tdsv = [](UINT i) {
+        auto h = tex_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)i * p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        return h;
+    };
+    // the memory the scene's resources hold, measured once after its setup
+    auto memory = [] { extras.add("mem_mb", device_memory_mb() - memory_before); };
+    // 8 textures of one format a pass, 1024x1024 with every mip: a material's set (DDS files of BCn)
+    auto bc_formats = std::vector<DXGI_FORMAT>{ DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC4_UNORM,
+                                                DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC6H_UF16, DXGI_FORMAT_BC7_UNORM_SRGB };
+    auto make_corpus = [heaps, bc_formats] {
+        heaps();
+        for (UINT f = 0; f < bc_formats.size(); f++)
+            for (UINT t = 0; t < 8; t++)
+            {
+                auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 1024, 1, 11, bc_formats[f], D3D12_RESOURCE_FLAG_NONE,
+                                         D3D12_RESOURCE_STATE_COPY_DEST);
+                run_init_commands([&](ID3D12GraphicsCommandList *l) { fill_texture(l, r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, f * 8 + t); });
+                p.device->CreateShaderResourceView(r, nullptr, srv_cpu(SRV_CORPUS + f * 8 + t));
+                corpus.push_back(r);
+            }
+        PsoDesc d; d.ps = "ps_tex"; tex8 = create_pso(d);
+    };
+    // 8 RGBA8 targets written through one format and read through another: typeless resources, as engines make for
+    // sRGB and linear views of one image
+    auto make_targets = [heaps, trtv](bool typeless) {
+        heaps();
+        for (UINT t = 0; t < 8; t++)
+        {
+            D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_R8G8B8A8_UNORM };
+            auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1,
+                                     typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, &cv);
+            D3D12_RENDER_TARGET_VIEW_DESC rd = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D };
+            p.device->CreateRenderTargetView(r, &rd, trtv(t));
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.Format = typeless ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2D.MipLevels = 1;
+            p.device->CreateShaderResourceView(r, &sd, srv_cpu(SRV_TARGETS + t));
+            targets.push_back(r);
+        }
+        PsoDesc d; d.ps = "ps_tex"; tex8_srgb = create_pso(d);
+        d = {}; d.ps = "ps_flat"; d.rt = DXGI_FORMAT_R8G8B8A8_UNORM; tex8_typed = create_pso(d);
+    };
+    auto targets_frame = [trtv](UINT f) {
+        ID3D12GraphicsCommandList *l = p.list;
+        for (UINT t = 0; t < 8; t++)
+        {
+            barrier(l, targets[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto h = trtv(t);
+            l->OMSetRenderTargets(1, &h, FALSE, nullptr);
+            viewport(l);
+            set_quad_state(l, tex8_typed);
+            for (UINT i = 0; i < 4; i++) fullscreen(l, f * 0.01f + t + i);
+            barrier(l, targets[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        auto bb = rtv(p.frame_index);
+        l->OMSetRenderTargets(1, &bb, FALSE, nullptr);
+        viewport(l);
+        set_quad_state(l, tex8_srgb);
+        l->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_TARGETS));
+        for (UINT i = 0; i < 4; i++) fullscreen(l, f * 0.01f);
+    };
+    // 4 2048x2048 shadow maps of R32_TYPELESS, drawn through a D32_FLOAT view and sampled through an R32_FLOAT one
+    auto make_depths = [heaps, tdsv] {
+        heaps();
+        for (UINT t = 0; t < 4; t++)
+        {
+            D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_D32_FLOAT };
+            cv.DepthStencil.Depth = 1.0f;
+            auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 2048, 2048, 1, 1, DXGI_FORMAT_R32_TYPELESS,
+                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, &cv);
+            D3D12_DEPTH_STENCIL_VIEW_DESC dd = { DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D };
+            p.device->CreateDepthStencilView(r, &dd, tdsv(t));
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.Format = DXGI_FORMAT_R32_FLOAT;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2D.MipLevels = 1;
+            p.device->CreateShaderResourceView(r, &sd, srv_cpu(SRV_DEPTHS + t));
+            depths.push_back(r);
+        }
+        for (UINT t = 4; t < 8; t++)
+            p.device->CreateShaderResourceView(depths[t - 4], nullptr, srv_cpu(SRV_DEPTHS + t)), (void)0;
+        PsoDesc d; d.num_rt = 0; d.depth = true; depth_pso = create_pso(d);
+        d = {}; d.ps = "ps_tex"; tex8 = create_pso(d);
+    };
+    auto depths_frame = [tdsv](UINT f) {
+        ID3D12GraphicsCommandList *l = p.list;
+        for (UINT t = 0; t < 4; t++)
+        {
+            barrier(l, depths[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            auto d = tdsv(t);
+            l->OMSetRenderTargets(0, nullptr, FALSE, &d);
+            l->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            D3D12_VIEWPORT vp = { 0, 0, 2048, 2048, 0, 1 };
+            D3D12_RECT sc = { 0, 0, 2048, 2048 };
+            l->RSSetViewports(1, &vp);
+            l->RSSetScissorRects(1, &sc);
+            set_quad_state(l, depth_pso);
+            for (UINT i = 0; i < 100; i++)
+            {
+                float rc[4] = { (float)(i % 10) / 5.0f - 0.9f, (float)(i / 10) / 5.0f - 0.9f, 0.15f, f * 0.001f };
+                l->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+                l->DrawInstanced(3, 1, 0, 0);
+            }
+            barrier(l, depths[t], D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        auto bb = rtv(p.frame_index);
+        l->OMSetRenderTargets(1, &bb, FALSE, nullptr);
+        viewport(l);
+        set_quad_state(l, tex8);
+        l->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_DEPTHS));
+        for (UINT i = 0; i < 4; i++) fullscreen(l, f * 0.01f);
+    };
+    // 8 128x128x128 RGBA16F volumes (16 MiB each) and 8 RGBA8 ones, marched per pixel
+    auto make_volumes = [heaps] {
+        heaps();
+        for (UINT t = 0; t < 8; t++)
+        {
+            auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 128, 128, 128, 1,
+                                     t < 4 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                                     D3D12_RESOURCE_STATE_COPY_DEST);
+            run_init_commands([&](ID3D12GraphicsCommandList *l) { fill_texture(l, r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, t); });
+            p.device->CreateShaderResourceView(r, nullptr, srv_cpu(SRV_VOLUMES + t));
+            volumes.push_back(r);
+        }
+        PsoDesc d; d.hlsl = volume_hlsl; d.ps = "ps_volume"; volume_pso = create_pso(d);
+    };
+    // 4 4x targets of RGBA16F with a 4x depth, resolved each frame, as an MSAA forward renderer
+    auto make_msaa = [heaps, trtv, tdsv] {
+        heaps();
+        for (UINT t = 0; t < 4; t++)
+        {
+            D3D12_CLEAR_VALUE cv = { HDR_FORMAT };
+            msaa.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1, HDR_FORMAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                           D3D12_RESOURCE_STATE_RESOLVE_SOURCE, 4, &cv));
+            p.device->CreateRenderTargetView(msaa.back(), nullptr, trtv(16 + t));
+            resolved.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1, HDR_FORMAT, D3D12_RESOURCE_FLAG_NONE,
+                                               D3D12_RESOURCE_STATE_RESOLVE_DEST));
+        }
+        D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_D32_FLOAT };
+        cv.DepthStencil.Depth = 1.0f;
+        msaa.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1, DXGI_FORMAT_D32_FLOAT,
+                                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, 4, &cv));
+        D3D12_DEPTH_STENCIL_VIEW_DESC dd = { DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2DMS };
+        p.device->CreateDepthStencilView(msaa.back(), &dd, tdsv(8));
+        PsoDesc d; d.rt = HDR_FORMAT; d.samples = 4; d.depth = true; d.num_rt = 1; msaa_pso = create_pso(d);
+    };
+    auto msaa_frame = [trtv, tdsv](UINT f) {
+        ID3D12GraphicsCommandList *l = p.list;
+        for (UINT t = 0; t < 4; t++)
+        {
+            barrier(l, msaa[t], D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto h = trtv(16 + t);
+            auto d = tdsv(8);
+            l->OMSetRenderTargets(1, &h, FALSE, &d);
+            float c[4] = { 0, 0, 0, 0 };
+            l->ClearRenderTargetView(h, c, 0, nullptr);
+            l->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            viewport(l);
+            set_quad_state(l, msaa_pso);
+            for (UINT i = 0; i < 50; i++) small_quad(l, i, f * 0.01f);
+            barrier(l, msaa[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            l->ResolveSubresource(resolved[t], 0, msaa[t], 0, HDR_FORMAT);
+        }
+        auto bb = rtv(p.frame_index);
+        l->OMSetRenderTargets(1, &bb, FALSE, nullptr);
+        viewport(l);
+    };
+    return {
+        { "tex_bc_corpus", "48 BCn textures (BC1, BC3, BC4, BC5, BC6H, BC7 sRGB; 1024x1024, all mips) sampled in one pass, 8 a draw",
+          [make_corpus, memory] { make_corpus(); memory(); }, [memory](UINT f) {
+            memory();
+            set_quad_state(p.list, tex8);
+            for (UINT b = 0; b < 6; b++)
+            {
+                p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_CORPUS + b * 8));
+                for (UINT i = 0; i < 4; i++) fullscreen(p.list, f * 0.01f);
+            }
+        } },
+        { "tex_typeless_targets", "8 RGBA8_TYPELESS 1080p targets drawn through UNORM views and sampled through sRGB ones",
+          [make_targets] { make_targets(true); }, [targets_frame, memory](UINT f) { memory(); targets_frame(f); } },
+        { "tex_typed_targets", "the same with RGBA8_UNORM targets and views (baseline for tex_typeless_targets)",
+          [make_targets] { make_targets(false); }, [targets_frame, memory](UINT f) { memory(); targets_frame(f); } },
+        { "tex_depth_typeless", "4 2048x2048 R32_TYPELESS shadow maps drawn as D32_FLOAT and sampled as R32_FLOAT each frame",
+          make_depths, [depths_frame, memory](UINT f) { memory(); depths_frame(f); } },
+        { "tex_volumes", "8 128^3 volumes (RGBA16F and RGBA8) marched 16 steps a pixel over the screen, 4 times",
+          make_volumes, [memory](UINT f) {
+            memory();
+            set_quad_state(p.list, volume_pso);
+            p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_VOLUMES));
+            for (UINT i = 0; i < 4; i++) fullscreen(p.list, f * 0.001f + i * 0.1f);
+        } },
+        { "tex_volume_upload", "a 128^3 RGBA8 volume (8 MiB) uploaded with CopyTextureRegion each frame (streamed froxels, LUTs)",
+          [heaps] {
+            heaps();
+            volumes.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 128, 128, 128, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                              D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST));
+        }, [](UINT f) {
+            ID3D12Resource *r = volumes.back();
+            fill_texture(p.list, r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, f < 2 ? f : ~0u);
+            barrier(p.list, r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        } },
+        { "tex_msaa_corpus", "4 4x MSAA RGBA16F 1080p targets with a 4x depth: 50 draws each and a resolve, each frame",
+          [make_msaa, memory] { make_msaa(); memory(); }, [msaa_frame, memory](UINT f) { memory(); msaa_frame(f); } },
+        { "tex_stream_mips", "a 1024x1024 BC7 texture with all 11 mips placed in a heap, filled, viewed and released each frame (streaming)",
+          [heaps] {
+            heaps();
+            D3D12_HEAP_DESC hd = { 4 << 20, { D3D12_HEAP_TYPE_DEFAULT }, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES };
+            CHECK(p.device->CreateHeap(&hd, IID_PPV_ARGS(&stream_heap)));
+        }, [](UINT f) {
+            double t = qpc_ms();
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = rd.Height = 1024;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 11;
+            rd.Format = DXGI_FORMAT_BC7_UNORM;
+            rd.SampleDesc.Count = 1;
+            ID3D12Resource *r = nullptr;
+            CHECK(p.device->CreatePlacedResource(stream_heap, 0, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r)));
+            fill_texture(p.list, r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, f < 2 ? f : ~0u);
+            p.device->CreateShaderResourceView(r, nullptr, srv_cpu(SRV_STREAM + f % 8));
+            extras.add("create_fill_view_us", (qpc_ms() - t) * 1000.0);
+            deferred_release(r);
+        } },
+    };
+}
+
 static std::vector<Scene> scenes()
 {
     std::vector<Scene> all = base_scenes(), more = more_scenes(), sm6 = sm6_scenes(), feat = feature_scenes(), eng = engine_scenes(),
-                       sub = submit_scenes();
+                       sub = submit_scenes(), tex = texture_scenes();
     all.insert(all.end(), more.begin(), more.end());
     all.insert(all.end(), sm6.begin(), sm6.end());
     all.insert(all.end(), feat.begin(), feat.end());
     all.insert(all.end(), eng.begin(), eng.end());
     all.insert(all.end(), sub.begin(), sub.end());
+    all.insert(all.end(), tex.begin(), tex.end());
     return all;
 }
 
