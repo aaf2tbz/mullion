@@ -78,6 +78,7 @@ struct Probe {
   ComPtr<ID3D11Texture2D> targets[4];
   ComPtr<ID3D11RenderTargetView> rtvs[4];
   ComPtr<ID3D11Query> occlusion[500];
+  ComPtr<ID3D11DeviceContext> deferred[8];
   ComPtr<ID3D11Texture2D> small[256];
   ComPtr<ID3D11ShaderResourceView> small_srvs[256];
   UINT ring_at = 0;
@@ -401,6 +402,41 @@ scenes() {
            c()->VSSetConstantBuffers(0, 1, p.cbs[i % 64].GetAddressOf());
            c()->Draw(4, 0);
          }
+       }},
+      {"deferred", "8 deferred contexts each record 500 draws a frame (a constant buffer and a texture each), which "
+                   "the immediate context executes",
+       [] {
+         for (auto &d : p.deferred)
+           CHECK(p.device->CreateDeferredContext(0, &d));
+       },
+       [c](UINT) {
+         for (auto &d : p.deferred) {
+           d->OMSetRenderTargets(1, p.rtv.GetAddressOf(), p.dsv.Get());
+           D3D11_VIEWPORT viewport{0, 0, 1920, 1080, 0, 1};
+           d->RSSetViewports(1, &viewport);
+           d->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+           d->VSSetShader(p.vs.Get(), nullptr, 0);
+           d->PSSetShader(p.ps_tex.Get(), nullptr, 0);
+           d->PSSetSamplers(0, 1, p.sampler.GetAddressOf());
+           for (UINT i = 0; i < 500; i++) {
+             d->VSSetConstantBuffers(0, 1, p.cbs[i % 64].GetAddressOf());
+             d->PSSetShaderResources(0, 1, p.srvs[i % 16].GetAddressOf());
+             d->Draw(4, 0);
+           }
+           ComPtr<ID3D11CommandList> list;
+           CHECK(d->FinishCommandList(FALSE, &list));
+           c()->ExecuteCommandList(list.Get(), TRUE);
+         }
+       }},
+      {"immediate_4000", "the same 4000 draws recorded on the immediate context (baseline for deferred)", [] {},
+       [c](UINT) {
+         c()->PSSetShader(p.ps_tex.Get(), nullptr, 0);
+         for (UINT k = 0; k < 8; k++)
+           for (UINT i = 0; i < 500; i++) {
+             c()->VSSetConstantBuffers(0, 1, p.cbs[i % 64].GetAddressOf());
+             c()->PSSetShaderResources(0, 1, p.srvs[i % 16].GetAddressOf());
+             c()->Draw(4, 0);
+           }
        }},
       {"draws_copies", "500 draws, each after a CopySubresourceRegion of 256 bytes into the constant buffer it reads",
        [] {}, [c](UINT) {
