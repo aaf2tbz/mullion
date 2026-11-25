@@ -190,6 +190,10 @@ public:
   HRESULT
   MapResource(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
               D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    // a resource written through a map, a dynamic one renamed in order with the commands, takes no part in an upload
+    // or a copy that goes before the open render pass (HoistedUpdate, HoistedCopy): it would see it as it was then
+    if (MapType != D3D11_MAP_READ)
+      WrittenInPass(GetResourceCommon(pResource));
     if (auto &wrapped = GetResourceCommon(pResource)->wrapped_resource) {
       D3D12_RANGE no_read{};
       HRESULT hr = wrapped->Map(Subresource, MapType == D3D11_MAP_WRITE ? &no_read : nullptr,

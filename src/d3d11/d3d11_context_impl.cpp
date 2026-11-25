@@ -1369,6 +1369,8 @@ public:
       UINT buffer_len = 0;
       UINT unused_bind_flag = 0;
       if (auto dynamic = GetDynamicBuffer(pDstResource, &buffer_len, &unused_bind_flag)) {
+        // renamed or written in order with the commands: nothing on it goes before the open render pass after this
+        WrittenInPass(GetResourceCommon(pDstResource));
         D3D11_MAPPED_SUBRESOURCE mapped;
         if ((CopyFlags & D3D11_COPY_DISCARD) || (copy_len == buffer_len && copy_offset == 0)) {
           MapResource(pDstResource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -3947,6 +3949,8 @@ public:
   // what the open render pass's draws have used: its targets, and each binding of a stage, vertex and index buffer,
   // stream output target and argument buffer as a draw takes it (recorded when bindings change, not every draw)
   std::unordered_set<D3D11ResourceCommon *> pass_used_;
+  // of those, the ones its draws may write: its targets, UAVs and stream output targets
+  std::unordered_set<D3D11ResourceCommon *> pass_written_;
   D3D11ResourceCommon *pass_index_buffer_ = nullptr;
 
   static bool
@@ -3961,12 +3965,32 @@ public:
       pass_used_.insert(resource);
   }
 
+  void
+  WrittenInPass(D3D11ResourceCommon *resource) {
+    if (pass_prelude_ && resource) {
+      pass_used_.insert(resource);
+      pass_written_.insert(resource);
+    }
+  }
+
   // the prelude of the open render pass, where an upload into `resource` can go instead of ending the pass
   Prelude *
   HoistedUpdate(D3D11ResourceCommon *resource) {
     if (!pass_prelude_ || !resource || pass_used_.contains(resource))
       return nullptr;
+    // what the pass does with it after this is ordered after the prelude's upload too, but nothing else may go
+    // before the pass now that it is written
+    WrittenInPass(resource);
     return pass_prelude_.get();
+  }
+
+  // the prelude, for a copy on the GPU into what no draw of the pass has used from what none has written: the draws
+  // before it read the source as it was before the pass too
+  Prelude *
+  HoistedCopy(D3D11ResourceCommon *destination, D3D11ResourceCommon *source) {
+    if (!source || source == destination || pass_written_.contains(source))
+      return nullptr;
+    return HoistedUpdate(destination);
   }
 
   template <typename Fn>
@@ -4151,7 +4175,7 @@ public:
       for (const auto &[slot, entry] : ShaderStage.SRVs)
         UsedInPass(entry.SRV->resource_.ptr());
       for (const auto &[slot, entry] : UAVBindingSet)
-        UsedInPass(entry.View->resource_.ptr());
+        WrittenInPass(entry.View->resource_.ptr());
     }
 
     if (reflection->NumConstantBuffers && dirty_cbuffer) {
@@ -4739,9 +4763,11 @@ public:
       }
     } else if (auto dst = GetResourceCommon(pDstResource)) {
       if (auto staging_src = GetStagingResource(pSrcResource, SrcSubresource)) {
-        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        auto hoisted = HoistedCopy(dst, GetResourceCommon(pSrcResource));
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseCopySource(staging_src);
-        EmitOP([dst_ = dst->buffer(), src_ = std::move(staging_src), DstX, SrcBox](ArgumentEncodingContext &enc) {
+        auto copy_op = [dst_ = dst->buffer(), src_ = std::move(staging_src), DstX, SrcBox](ArgumentEncodingContext &enc) {
           auto [src, src_offset] = enc.access(src_->buffer(), SrcBox.left, SrcBox.right - SrcBox.left, ResourceAccess::Read);
           auto [dst, dst_offset] = enc.access(dst_, DstX, SrcBox.right - SrcBox.left, ResourceAccess::Write);
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
@@ -4751,11 +4777,17 @@ public:
           cmd.src_offset = SrcBox.left + src_offset;
           cmd.dst = dst->buffer();;
           cmd.dst_offset = DstX + dst_offset;
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(copy_op));
+        else
+          EmitOP(std::move(copy_op));
       } else if (auto src = GetResourceCommon(pSrcResource)) {
-        // on-device copy
-        SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
-        EmitOP([dst_ = dst->buffer(), src_ = src->buffer(), DstX,
+        // on-device copy: before the open render pass where it can (HoistedCopy)
+        auto hoisted = HoistedCopy(dst, src);
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        auto copy_op = [dst_ = dst->buffer(), src_ = src->buffer(), DstX,
                                SrcBox](ArgumentEncodingContext& enc) {
           auto [src, src_offset] = enc.access(src_, SrcBox.left, SrcBox.right - SrcBox.left, ResourceAccess::Read);
           auto [dst, dst_offset] = enc.access(dst_, DstX, SrcBox.right - SrcBox.left, ResourceAccess::Write);
@@ -4766,7 +4798,11 @@ public:
           cmd.src_offset = SrcBox.left + src_offset;
           cmd.dst = dst->buffer();;
           cmd.dst_offset = DstX + dst_offset;
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(copy_op));
+        else
+          EmitOP(std::move(copy_op));
       } else {
         UNREACHABLE
       }
@@ -4964,10 +5000,11 @@ public:
           });
           return;
         }
-        // copy from staging to default: before the open render pass when no draw of it has used the destination
-        // (pass_prelude_), as an upload goes: no draw can have used a staging texture
-        auto hoisted = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? nullptr
-                                                                            : HoistedUpdate(GetResourceCommon(cmd.pDst));
+        // copy from staging to default: before the open render pass when no draw of it has used the destination and
+        // the staging texture was not mapped for writing since it began (HoistedCopy)
+        auto hoisted = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32
+                           ? nullptr
+                           : HoistedCopy(GetResourceCommon(cmd.pDst), GetResourceCommon(cmd.pSrc));
         if (!hoisted)
           SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
@@ -5009,11 +5046,13 @@ public:
         else
           EmitOP(std::move(copy_op));
       } else if (auto src = GetTexture(cmd.pSrc, cmd.Plane)) {
-        // on-device copy
-        SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        // on-device copy: before the open render pass where it can (HoistedCopy)
+        auto hoisted = HoistedCopy(GetResourceCommon(cmd.pDst), GetResourceCommon(cmd.pSrc));
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
         UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
         UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
-        EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd),
+        auto copy_op = [dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd),
                 overlap](ArgumentEncodingContext &enc) {
           auto src_format = src_->pixelFormat();
           auto dst_format = dst_->pixelFormat();
@@ -5072,7 +5111,11 @@ public:
           cmd_cptex.dst_slice = cmd.Dst.ArraySlice;
           cmd_cptex.dst_level = cmd.Dst.MipLevel;
           cmd_cptex.dst_origin = cmd.DstOrigin;
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(copy_op));
+        else
+          EmitOP(std::move(copy_op));
       } else {
         UNREACHABLE
       }
@@ -5443,6 +5486,7 @@ public:
       ClearFragmentAccess();
       pass_prelude_ = nullptr;
       pass_used_.clear();
+      pass_written_.clear();
       pass_index_buffer_ = nullptr;
       break;
     }
@@ -5656,9 +5700,9 @@ public:
         prelude = pass_prelude_ = std::make_shared<Prelude>();
         for (unsigned i = 0; i < state_.OutputMerger.NumRTVs; i++)
           if (auto &rtv = state_.OutputMerger.RTVs[i])
-            UsedInPass(rtv->resource_.ptr());
+            WrittenInPass(rtv->resource_.ptr());
         if (auto &dsv = state_.OutputMerger.DSV)
-          UsedInPass(dsv->resource_.ptr());
+          WrittenInPass(dsv->resource_.ptr());
       }
       EmitST([rtvs = std::move(rtvs), dsv = std::move(dsv_info), effective_render_target, uav_only, single_raster,
             render_target_height, render_target_width, sample_count,
@@ -6180,7 +6224,7 @@ public:
         UsedInPass(GetResourceCommon(pArgs));
       if (state_.StreamOutput.Targets.any_bound())
         for (const auto &[slot, entry] : state_.StreamOutput.Targets)
-          UsedInPass(entry.Buffer.ptr());
+          WrittenInPass(entry.Buffer.ptr());
     }
     if (device->shares_with_d3d12) {
       if constexpr (IndexedDraw)

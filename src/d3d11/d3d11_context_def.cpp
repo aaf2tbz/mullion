@@ -204,6 +204,9 @@ public:
   HRESULT
   MapResource(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
               D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    // as the immediate context's: what a map writes takes no part in what goes before the open render pass
+    if (MapType != D3D11_MAP_READ)
+      WrittenInPass(GetResourceCommon(pResource));
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {

@@ -2,12 +2,12 @@
 # family native
 --- a/src/d3d11/d3d11_context_impl.cpp
 +++ b/src/d3d11/d3d11_context_impl.cpp
-@@ -3964,7 +3964,7 @@
+@@ -3976,7 +3976,7 @@
    // the prelude of the open render pass, where an upload into `resource` can go instead of ending the pass
    Prelude *
    HoistedUpdate(D3D11ResourceCommon *resource) {
 -    if (!pass_prelude_ || !resource || pass_used_.contains(resource))
 +    if (!pass_prelude_ || !resource)
        return nullptr;
-     return pass_prelude_.get();
-   }
+     // what the pass does with it after this is ordered after the prelude's upload too, but nothing else may go
+     // before the pass now that it is written

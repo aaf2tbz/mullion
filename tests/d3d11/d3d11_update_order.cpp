@@ -2,7 +2,8 @@
 // it (D3D11's immediate and deferred contexts run commands in order), whether the resource is a texture a pixel or a
 // vertex shader reads or a vertex buffer, and whether a draw of the pass used it before the update or not (an upload
 // into a resource no draw of the pass has used yet goes before the pass, MULLION_D3D11_HOIST_UPDATES), and so is a
-// copy from a staging texture the CPU wrote, CopySubresourceRegion. each draw
+// copy from a staging texture the CPU wrote or one on the GPU from a resource no draw of the pass writes,
+// CopySubresourceRegion. each draw
 // writes what it read into its own columns of a 16x1 target: the draws before an update read the value before it.
 #include "d3d11_test.hpp"
 
@@ -71,8 +72,9 @@ main() {
     bool used_first;
     // updates, each followed by a draw
     uint32_t updates;
-    // a texture's updates are CopySubresourceRegion from a staging texture the CPU wrote, not UpdateSubresource
-    bool staging = false;
+    // a texture's updates are CopySubresourceRegion from a staging texture the CPU wrote, or (gpu) from a default
+    // texture, not UpdateSubresource
+    bool staging = false, gpu = false;
   };
   const Case cases[] = {
       {"pixel shader, read before the update", 0, true, 1},
@@ -85,6 +87,8 @@ main() {
       {"vertex buffer, not read before the first of three updates", 2, false, 3},
       {"pixel shader, read before a copy from a staging texture", 0, true, 1, true},
       {"pixel shader, not read before copies from a staging texture", 0, false, 2, true},
+      {"pixel shader, read before a copy from another texture", 0, true, 1, false, true},
+      {"pixel shader, not read before copies from another texture", 0, false, 2, false, true},
   };
   unsigned failures = 0;
   for (int deferred = 0; deferred < 2; deferred++)
@@ -146,6 +150,9 @@ main() {
         if (c.from == 2) {
           uint32_t values[4] = {value, value, value, value};
           context->UpdateSubresource(vb.Get(), 0, nullptr, values, 0, 0);
+        } else if (c.gpu) {
+          auto source = texture(value);
+          context->CopySubresourceRegion(tex.Get(), 0, 0, 0, 0, source.Get(), 0, nullptr);
         } else if (c.staging) {
           D3D11_TEXTURE2D_DESC desc{1, 1, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0}, D3D11_USAGE_STAGING, 0,
                                     D3D11_CPU_ACCESS_WRITE};
