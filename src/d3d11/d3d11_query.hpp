@@ -51,6 +51,11 @@ public:
   QueryState state_ = QueryState::Undefined;
   // MULLION_DIAG=profile: when GetData first found the query unfinished in this frame, and the frame
   uint64_t polled = 0, polled_frame = 0;
+  // the immediate context's chunk the query ended in, ~0 where unknown (a deferred context's): GetData flushes for a
+  // query unfinished only while that chunk is the one being recorded, and after `unflushed_polls` reaches
+  // kEventStallThreshold whatever it is
+  uint64_t ended_seq = ~0ull;
+  uint32_t unflushed_polls = 0;
 
   // the context's hold on what is bound: without the application's count, which holds the device
   virtual void AddRefPrivate() = 0;

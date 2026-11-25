@@ -409,6 +409,8 @@ public:
       return;
 
     std::lock_guard<d3d11_device_mutex> lock(mutex);
+    static_cast<MTLD3D11Query *>(pAsync)->ended_seq = cmd_queue.CurrentSeqId();
+    static_cast<MTLD3D11Query *>(pAsync)->unflushed_polls = 0;
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
@@ -580,9 +582,16 @@ public:
       ERR("Unknown query type ", desc.Query);
       return E_FAIL;
     }
+    // committing the chunk being recorded hastens only a query that ended in it: one that ended in a chunk already
+    // committed needs nothing more of this context, and a flush would end the open render pass (the next draw loads
+    // what it stored) for every query a frame polls, of the frame before, between its draws
     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
-      cmd_queue.CurrentFrameStatistics().event_stall++;
-      Flush();
+      auto query = static_cast<MTLD3D11Query *>(pAsync);
+      if (query->ended_seq >= cmd_queue.CurrentSeqId() || ++query->unflushed_polls >= kEventStallThreshold) {
+        query->unflushed_polls = 0;
+        cmd_queue.CurrentFrameStatistics().event_stall++;
+        Flush();
+      }
     }
     // polling within a frame until the query finishes is a wait; a query looked at again a frame later is not
     if (diag::profile) {

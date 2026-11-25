@@ -79,6 +79,7 @@ struct Probe {
   ComPtr<ID3D11Texture2D> targets[4];
   ComPtr<ID3D11RenderTargetView> rtvs[4];
   ComPtr<ID3D11Query> occlusion[500];
+  ComPtr<ID3D11Query> timestamps[3][200], timestamp_disjoint[3];
   ComPtr<ID3D11DeviceContext> deferred[8];
   // the present scenes' window and swap chain
   HWND window = nullptr;
@@ -494,6 +495,49 @@ scenes() {
            c()->Begin(p.occlusion[i].Get());
            c()->Draw(4, 0);
            c()->End(p.occlusion[i].Get());
+         }
+       }},
+      {"timestamps", "2000 draws with a timestamp query after every 10th, read two frames later (a GPU profiler's "
+                     "or a resolution scaler's pattern)",
+       [] {
+         for (auto &frame : p.timestamps)
+           for (auto &query : frame) {
+             D3D11_QUERY_DESC desc{D3D11_QUERY_TIMESTAMP};
+             CHECK(p.device->CreateQuery(&desc, &query));
+           }
+         for (auto &query : p.timestamp_disjoint) {
+           D3D11_QUERY_DESC desc{D3D11_QUERY_TIMESTAMP_DISJOINT};
+           CHECK(p.device->CreateQuery(&desc, &query));
+         }
+       },
+       [c](UINT f) {
+         auto &frame = p.timestamps[f % 3];
+         if (f >= 3)
+           for (auto &query : frame) {
+             UINT64 t;
+             c()->GetData(query.Get(), &t, sizeof(t), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+           }
+         c()->Begin(p.timestamp_disjoint[f % 3].Get());
+         for (UINT i = 0; i < 2000; i++) {
+           c()->Draw(4, 0);
+           if (i % 10 == 9)
+             c()->End(frame[i / 10].Get());
+         }
+         c()->End(p.timestamp_disjoint[f % 3].Get());
+       }},
+      {"polled_queries", "2000 draws, every 10th polling one of the last frame's occlusion queries with GetData's "
+                         "flags 0, as engines that test visibility a frame late do",
+       [] {}, [c](UINT f) {
+         for (UINT i = 0; i < 2000; i++) {
+           if (i % 10 == 0 && f) {
+             UINT64 samples;
+             c()->GetData(p.occlusion[i / 10].Get(), &samples, sizeof(samples), 0);
+           }
+           if (i % 10 == 0)
+             c()->Begin(p.occlusion[i / 10].Get());
+           c()->Draw(4, 0);
+           if (i % 10 == 9)
+             c()->End(p.occlusion[i / 10].Get());
          }
        }},
       {"readback", "a 256x256 copy into a staging texture, mapped for reading in the same frame", [] {}, [c](UINT) {

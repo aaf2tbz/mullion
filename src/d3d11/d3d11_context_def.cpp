@@ -358,6 +358,8 @@ public:
   End(ID3D11Asynchronous *pAsync) override {
     if (unlikely(!pAsync))
       return;
+    // ended where the list is executed, in a chunk not known here
+    static_cast<MTLD3D11Query *>(pAsync)->ended_seq = ~0ull;
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
