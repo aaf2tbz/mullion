@@ -78,6 +78,8 @@ struct Probe {
   ComPtr<ID3D11Texture2D> targets[4];
   ComPtr<ID3D11RenderTargetView> rtvs[4];
   ComPtr<ID3D11Query> occlusion[500];
+  ComPtr<ID3D11Texture2D> small[256];
+  ComPtr<ID3D11ShaderResourceView> small_srvs[256];
   UINT ring_at = 0;
 } p;
 
@@ -352,6 +354,52 @@ scenes() {
            D3D11_BOX box{(i % 16) * 64, (i / 16 % 16) * 64, 0, (i % 16) * 64 + 64, (i / 16 % 16) * 64 + 64, 1};
            pixels[0] = f + i;
            c()->UpdateSubresource(p.atlas.Get(), 0, &box, pixels.data(), 64 * 4, 0);
+         }
+       }},
+      {"draws_texture_updates", "500 textured draws, each after an UpdateSubresource of a 64x64 region of the atlas "
+                                "it samples (text drawn as its glyphs are added)",
+       [] {
+         CHECK(p.device->CreateShaderResourceView(p.atlas.Get(), nullptr, &p.srvs[15]));
+       },
+       [c](UINT f) {
+         static std::vector<uint32_t> pixels(64 * 64, 0xff00ff00);
+         c()->PSSetShader(p.ps_tex.Get(), nullptr, 0);
+         c()->PSSetShaderResources(0, 1, p.srvs[15].GetAddressOf());
+         for (UINT i = 0; i < 500; i++) {
+           D3D11_BOX box{(i % 16) * 64, (i / 16 % 16) * 64, 0, (i % 16) * 64 + 64, (i / 16 % 16) * 64 + 64, 1};
+           pixels[0] = f + i;
+           c()->UpdateSubresource(p.atlas.Get(), 0, &box, pixels.data(), 64 * 4, 0);
+           c()->VSSetConstantBuffers(0, 1, p.cbs[i % 64].GetAddressOf());
+           c()->Draw(4, 0);
+         }
+       }},
+      {"draws_fresh_textures", "256 textured draws, each after an UpdateSubresource of its own 64x64 texture, which "
+                               "no draw before it in the pass sampled (per-object dynamic textures, UI images)",
+       [] {
+         for (int i = 0; i < 256; i++) {
+           p.small[i] = make_texture(64, 64, D3D11_BIND_SHADER_RESOURCE);
+           CHECK(p.device->CreateShaderResourceView(p.small[i].Get(), nullptr, &p.small_srvs[i]));
+         }
+       },
+       [c](UINT f) {
+         static std::vector<uint32_t> pixels(64 * 64, 0xff0000ff);
+         c()->PSSetShader(p.ps_tex.Get(), nullptr, 0);
+         for (UINT i = 0; i < 256; i++) {
+           pixels[0] = f + i;
+           c()->UpdateSubresource(p.small[i].Get(), 0, nullptr, pixels.data(), 64 * 4, 0);
+           c()->PSSetShaderResources(0, 1, p.small_srvs[i].GetAddressOf());
+           c()->VSSetConstantBuffers(0, 1, p.cbs[i % 64].GetAddressOf());
+           c()->Draw(4, 0);
+         }
+       }},
+      {"draws_copies", "500 draws, each after a CopySubresourceRegion of 256 bytes into the constant buffer it reads",
+       [] {}, [c](UINT) {
+         c()->VSSetConstantBuffers(0, 1, p.default_cb.GetAddressOf());
+         c()->PSSetConstantBuffers(0, 1, p.default_cb.GetAddressOf());
+         for (UINT i = 0; i < 500; i++) {
+           D3D11_BOX box{0, 0, 0, 256, 1, 1};
+           c()->CopySubresourceRegion(p.default_cb.Get(), 0, 0, 0, 0, p.cbs[i % 64].Get(), 0, &box);
+           c()->Draw(4, 0);
          }
        }},
       {"occlusion", "500 occlusion queries, one around each draw, read back two frames later", [] {}, [c](UINT f) {

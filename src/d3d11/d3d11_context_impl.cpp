@@ -1389,9 +1389,12 @@ public:
       if (dst) {
         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
         staging_buffer.updateContents(offset, pSrcData, copy_len);
-        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        auto hoisted = HoistedUpdate(GetResourceCommon(pDstResource));
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseWrappedSubresource(pDstResource, DstSubresource, true);
-        EmitOP([staging_buffer, offset, dst = std::move(dst), copy_offset, copy_len](ArgumentEncodingContext &enc) {
+        auto upload_op = [staging_buffer, offset, dst = std::move(dst), copy_offset,
+                          copy_len](ArgumentEncodingContext &enc) {
           auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, ResourceAccess::Write);
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
           cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
@@ -1400,7 +1403,11 @@ public:
           cmd.src_offset = offset;
           cmd.dst = dst_buffer->buffer();
           cmd.dst_offset = copy_offset + dst_offset;
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(upload_op));
+        else
+          EmitOP(std::move(upload_op));
       } else {
         UNREACHABLE
       }
@@ -3929,6 +3936,46 @@ public:
     pass_fragment_written_ = false;
   }
 
+  // MULLION_D3D11_HOIST_UPDATES (on unless 0, read once): an upload into a resource no draw of the open render pass
+  // has used (UpdateSubresource of a texture or a default buffer) is encoded in a blit pass before the render pass,
+  // which keeps going: a blit ends a render pass, and the next one loads what it stored, about 40 us for a 1080p
+  // target and its depth on an M6, for each texture of glyphs or of a video frame updated between draws. the draws
+  // before the upload do not read the resource and the ones after it see what it wrote, as they would. the prelude is
+  // run where the pass starts on the encoding thread, so encoders are numbered in the order the GPU runs them
+  using Prelude = std::vector<std::function<void(ArgumentEncodingContext &)>>;
+  std::shared_ptr<Prelude> pass_prelude_;
+  // what the open render pass's draws have used: its targets, and each binding of a stage, vertex and index buffer,
+  // stream output target and argument buffer as a draw takes it (recorded when bindings change, not every draw)
+  std::unordered_set<D3D11ResourceCommon *> pass_used_;
+  D3D11ResourceCommon *pass_index_buffer_ = nullptr;
+
+  static bool
+  HoistsUpdates() {
+    static const bool hoists = env::getEnvVar("MULLION_D3D11_HOIST_UPDATES") != "0";
+    return hoists;
+  }
+
+  void
+  UsedInPass(D3D11ResourceCommon *resource) {
+    if (pass_prelude_ && resource)
+      pass_used_.insert(resource);
+  }
+
+  // the prelude of the open render pass, where an upload into `resource` can go instead of ending the pass
+  Prelude *
+  HoistedUpdate(D3D11ResourceCommon *resource) {
+    if (!pass_prelude_ || !resource || pass_used_.contains(resource))
+      return nullptr;
+    return pass_prelude_.get();
+  }
+
+  template <typename Fn>
+  static void
+  AddPrelude(Prelude *prelude, Fn &&fn) {
+    auto shared = std::make_shared<std::decay_t<Fn>>(std::forward<Fn>(fn));
+    prelude->push_back([shared](ArgumentEncodingContext &enc) { (*shared)(enc); });
+  }
+
   // the resources a stage's shader uses, each with whether it writes it; with Reads false, only those it writes
   template <bool Reads = true, typename Fn>
   void
@@ -4098,6 +4145,14 @@ public:
     bool uav_bound = UAVBindingSet.any_bound_masked(reflection->UAVSlotMask);
     if (!dirty_cbuffer && !dirty_sampler && !dirty_srv && !uav_bound)
       return;
+    if (pass_prelude_ && stage != PipelineStage::Compute) {
+      for (const auto &[slot, entry] : ShaderStage.ConstantBuffers)
+        UsedInPass(entry.Buffer.ptr());
+      for (const auto &[slot, entry] : ShaderStage.SRVs)
+        UsedInPass(entry.SRV->resource_.ptr());
+      for (const auto &[slot, entry] : UAVBindingSet)
+        UsedInPass(entry.View->resource_.ptr());
+    }
 
     if (reflection->NumConstantBuffers && dirty_cbuffer) {
       // a pointer and a size for each
@@ -4135,6 +4190,9 @@ public:
     auto &VertexBuffers = state_.InputAssembler.VertexBuffers;
     if (!VertexBuffers.any_dirty_masked((uint64_t)slot_mask))
       return;
+    if (pass_prelude_)
+      for (const auto &[slot, entry] : VertexBuffers)
+        UsedInPass(entry.Buffer.ptr());
 
     uint32_t num_slots = __builtin_popcount(slot_mask);
     auto offset = PreAllocateArgumentBuffer(16 * num_slots, 32);
@@ -5163,7 +5221,11 @@ public:
           }
         }
       }
-      SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+      auto hoisted = staging_dst || (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32)
+                         ? nullptr
+                         : HoistedUpdate(GetResourceCommon(cmd.pDst));
+      if (!hoisted)
+        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       if (staging_dst) {
         // a staging texture is rows of bytes in a buffer, of blocks where its format has them
         UseCopyDestination(staging_dst);
@@ -5188,7 +5250,7 @@ public:
         return;
       }
       UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
-      EmitOP([staging_buffer, offset, dst = std::move(dst), cmd = std::move(cmd),
+      auto upload_op = [staging_buffer, offset, dst = std::move(dst), cmd = std::move(cmd),
             bytes_per_depth_slice](ArgumentEncodingContext &enc) {
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
         auto upload = staging_buffer;
@@ -5213,7 +5275,11 @@ public:
         cmd_cptex.slice = cmd.Dst.ArraySlice;
         cmd_cptex.level = cmd.Dst.MipLevel;
         cmd_cptex.origin = cmd.DstOrigin;
-      });
+      };
+      if (hoisted)
+        AddPrelude(hoisted, std::move(upload_op));
+      else
+        EmitOP(std::move(upload_op));
     } else {
       UNREACHABLE
     }
@@ -5359,6 +5425,9 @@ public:
       visibility_result_segments_ = 0;
       pass_scissors_ = pass_viewports_ = 0;
       ClearFragmentAccess();
+      pass_prelude_ = nullptr;
+      pass_used_.clear();
+      pass_index_buffer_ = nullptr;
       break;
     }
     case CommandBufferState::ComputeEncoderActive:
@@ -5566,10 +5635,26 @@ public:
       allocated_encoder_argbuf_size_ = allocated_encoder_argbuf_size.get();
 
       bool single_raster = !uav_only && rs->ForcedSampleCount() == 1;
+      std::shared_ptr<Prelude> prelude;
+      if (HoistsUpdates()) {
+        prelude = pass_prelude_ = std::make_shared<Prelude>();
+        for (unsigned i = 0; i < state_.OutputMerger.NumRTVs; i++)
+          if (auto &rtv = state_.OutputMerger.RTVs[i])
+            UsedInPass(rtv->resource_.ptr());
+        if (auto &dsv = state_.OutputMerger.DSV)
+          UsedInPass(dsv->resource_.ptr());
+      }
       EmitST([rtvs = std::move(rtvs), dsv = std::move(dsv_info), effective_render_target, uav_only, single_raster,
             render_target_height, render_target_width, sample_count,
-            render_target_array, encoder_argbuf_size = std::move(allocated_encoder_argbuf_size)](ArgumentEncodingContext &ctx) {
+            render_target_array, encoder_argbuf_size = std::move(allocated_encoder_argbuf_size),
+            prelude = std::move(prelude)](ArgumentEncodingContext &ctx) {
         auto pool = WMT::MakeAutoreleasePool();
+        if (prelude && !prelude->empty()) {
+          ctx.startBlitPass();
+          for (auto &hoisted : *prelude)
+            hoisted(ctx);
+          ctx.endPass();
+        }
         uint32_t dsv_planar_flags = DepthStencilPlanarFlags(dsv.PixelFormat);
         for (auto &rtv : rtvs.span())
           if (rtv.Texture && rtv.Texture->render_buffer)
@@ -6070,6 +6155,16 @@ public:
     DrawCallStatus status;
     if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
       return status;
+    }
+    if (pass_prelude_) {
+      if constexpr (IndexedDraw)
+        if (auto index = state_.InputAssembler.IndexBuffer.ptr(); index != pass_index_buffer_)
+          UsedInPass(pass_index_buffer_ = index);
+      if (pArgs)
+        UsedInPass(GetResourceCommon(pArgs));
+      if (state_.StreamOutput.Targets.any_bound())
+        for (const auto &[slot, entry] : state_.StreamOutput.Targets)
+          UsedInPass(entry.Buffer.ptr());
     }
     if (device->shares_with_d3d12) {
       if constexpr (IndexedDraw)
