@@ -4808,10 +4808,13 @@ public:
         });
         promote_flush = true;
       } else if (auto src = GetResourceCommon(pSrcResource)) {
-        // copy from device to staging
-        SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+        // copy from device to staging: before the open render pass where it can (HoistedCopy), as a readback of what
+        // the pass's draws have not written
+        auto hoisted = HoistedCopy(GetResourceCommon(pDstResource), src);
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
         UseCopyDestination(staging_dst);
-        EmitOP([src_ = src->buffer(), dst_ = std::move(staging_dst), DstX, SrcBox](ArgumentEncodingContext &enc) {
+        auto copy_op = [src_ = src->buffer(), dst_ = std::move(staging_dst), DstX, SrcBox](ArgumentEncodingContext &enc) {
           auto [src, src_offset] = enc.access(src_, SrcBox.left, SrcBox.right - SrcBox.left, ResourceAccess::Read);
           auto [dst, dst_offset] = enc.access(dst_->buffer(), DstX, SrcBox.right - SrcBox.left, ResourceAccess::Write);
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
@@ -4821,7 +4824,11 @@ public:
           cmd.src_offset = SrcBox.left + src_offset;
           cmd.dst = dst->buffer();
           cmd.dst_offset = DstX + dst_offset;
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(copy_op));
+        else
+          EmitOP(std::move(copy_op));
         promote_flush = true;
       } else {
         UNREACHABLE
@@ -5051,10 +5058,15 @@ public:
           promote_flush = true;
           return;
         }
-        SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+        // before the open render pass where it can (HoistedCopy), but for a format a kernel converts after the copy
+        auto hoisted = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32
+                           ? nullptr
+                           : HoistedCopy(GetResourceCommon(cmd.pDst), GetResourceCommon(cmd.pSrc));
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
         UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
         UseCopyDestination(staging_dst);
-        EmitOP([=, src_ = std::move(src), dst_ = std::move(staging_dst),
+        auto copy_op = [=, src_ = std::move(src), dst_ = std::move(staging_dst),
               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
@@ -5084,7 +5096,11 @@ public:
                                    {row_pitch, image_pitch, dst_->bytesPerRow, dst_->bytesPerImage}, cmd.SrcSize);
             enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
           }
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(copy_op));
+        else
+          EmitOP(std::move(copy_op));
         promote_flush = true;
       } else {
         UNREACHABLE

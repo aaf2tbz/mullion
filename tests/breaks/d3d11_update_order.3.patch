@@ -1,0 +1,14 @@
+# a readback of a texture between the draws of a render pass goes before the pass even when its draws wrote it: it reads it as it was before them
+# family native
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -5061,7 +5061,7 @@
+         // before the open render pass where it can (HoistedCopy), but for a format a kernel converts after the copy
+         auto hoisted = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32
+                            ? nullptr
+-                           : HoistedCopy(GetResourceCommon(cmd.pDst), GetResourceCommon(cmd.pSrc));
++                           : HoistedUpdate(GetResourceCommon(cmd.pDst));
+         if (!hoisted)
+           SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+         UseWrappedSubresource(cmd.pSrc, cmd.SrcSubresource, false);
+

@@ -4,7 +4,9 @@
 // into a resource no draw of the pass has used yet goes before the pass, MULLION_D3D11_HOIST_UPDATES), and so is a
 // copy from a staging texture the CPU wrote or one on the GPU from a resource no draw of the pass writes,
 // CopySubresourceRegion, and so is a copy over the whole of a vertex buffer a draw of the pass read before it (it goes
-// before the pass into another allocation of the buffer, MULLION_D3D11_RENAME_COPIES). each draw
+// before the pass into another allocation of the buffer, MULLION_D3D11_RENAME_COPIES). a copy into a staging resource
+// between the draws reads what the draws before it wrote and the updates before it made, and nothing after it: of the
+// target, of the updated resource and of one the pass never writes (that one goes before the pass). each draw
 // writes what it read into its own columns of a 16x1 target: the draws before an update read the value before it.
 #include "d3d11_test.hpp"
 
@@ -184,6 +186,41 @@ main() {
         want[column] = want[column + 1] = value;
         column += 2;
       }
+      // read back between the draws: the target as the draws so far left it, the case's resource as its last update
+      // left it and the other texture as it was made, then one more update and draw, which none of them sees
+      D3D11_TEXTURE2D_DESC texel_desc{1, 1, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0}, D3D11_USAGE_STAGING, 0,
+                                      D3D11_CPU_ACCESS_READ};
+      ComPtr<ID3D11Texture2D> target_then, resource_then, other_then;
+      CHECK(device->CreateTexture2D(&target_desc, nullptr, &target_then));
+      CHECK(device->CreateTexture2D(&texel_desc, nullptr, &other_then));
+      D3D11_BUFFER_DESC vb_desc{sizeof(vertices), D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
+      ComPtr<ID3D11Buffer> vb_then;
+      if (c.from == 2) {
+        CHECK(device->CreateBuffer(&vb_desc, nullptr, &vb_then));
+      } else {
+        CHECK(device->CreateTexture2D(&texel_desc, nullptr, &resource_then));
+      }
+      context->CopyResource(target_then.Get(), target.Get());
+      if (c.from == 2)
+        context->CopyResource(vb_then.Get(), vb.Get());
+      else
+        context->CopyResource(resource_then.Get(), tex.Get());
+      context->CopyResource(other_then.Get(), other.Get());
+      auto want_then = want;
+      uint32_t resource_value = 10 + c.updates - 1;
+      {
+        uint32_t value = 77;
+        if (c.from == 2) {
+          uint32_t values[4] = {value, value, value, value};
+          context->UpdateSubresource(vb.Get(), 0, nullptr, values, 0, 0);
+        } else {
+          D3D11_BOX box{0, 0, 0, 1, 1, 1};
+          context->UpdateSubresource(tex.Get(), 0, &box, &value, 4, 4);
+        }
+        draw(column, column + 2);
+        want[column] = want[column + 1] = value;
+        column += 2;
+      }
       if (deferred) {
         ComPtr<ID3D11CommandList> list;
         CHECK(context->FinishCommandList(FALSE, &list));
@@ -200,6 +237,32 @@ main() {
           break;
         }
       immediate->Unmap(readback.Get(), 0);
+      // what the copies between the draws read
+      auto texel = [&](ID3D11Resource *resource) -> uint32_t {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (FAILED(immediate->Map(resource, 0, D3D11_MAP_READ, 0, &mapped)))
+          return ~0u;
+        uint32_t value = *static_cast<const uint32_t *>(mapped.pData);
+        immediate->Unmap(resource, 0);
+        return value;
+      };
+      CHECK(immediate->Map(target_then.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+      got = static_cast<const uint32_t *>(mapped.pData);
+      for (uint32_t x = 0; x < 16; x++)
+        if (got[x] != want_then[x]) {
+          if (failures++ < 12)
+            printf("wrong: %s%s: the target read back between the draws has column %u %u, want %u\n", c.name,
+                   deferred ? ", deferred" : "", x, got[x], want_then[x]);
+          break;
+        }
+      immediate->Unmap(target_then.Get(), 0);
+      uint32_t resource_got = texel(c.from == 2 ? static_cast<ID3D11Resource *>(vb_then.Get()) : resource_then.Get());
+      if (resource_got != resource_value && failures++ < 12)
+        printf("wrong: %s%s: the resource read back between the draws is %u, want %u\n", c.name,
+               deferred ? ", deferred" : "", resource_got, resource_value);
+      if (uint32_t other_got = texel(other_then.Get()); other_got != 99 && failures++ < 12)
+        printf("wrong: %s%s: the other texture read back between the draws is %u, want 99\n", c.name,
+               deferred ? ", deferred" : "", other_got);
     }
   if (failures) {
     printf("failed: %u wrong results\n", failures);
