@@ -1667,6 +1667,7 @@ public:
         enc.countPipelineStatistics(VertexCountPerInstance, InstanceCount, std::pair{NumControlPoint, NumControlPoint});
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      enc.encodeTessellationTemplates();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw>();
       cmd.type = WMTRenderCommandMullionTessellationMeshDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1734,6 +1735,7 @@ public:
                                     index_stride, index_buffer_offset, StartIndexLocation);
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      enc.encodeTessellationTemplates();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indexed>();
       cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -2119,6 +2121,7 @@ public:
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
         enc.resolveRenderPassBarrier();
+        enc.encodeTessellationTemplates();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indirect>();
         cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
@@ -2162,6 +2165,7 @@ public:
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
         enc.resolveRenderPassBarrier();
+        enc.encodeTessellationTemplates();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indexed_indirect>();
         cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
@@ -2284,6 +2288,7 @@ public:
             arguments.gpu_buffer, arguments.gpu_address, arguments.offset, ControlPointCount, PatchPerGroup, enc.tess_parts,
             dispatch.gpu_buffer, dispatch.gpu_address, dispatch.offset, max_object_threadgroups
         );
+        enc.encodeTessellationTemplates();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw_indirect>();
         cmd.type = WMTRenderCommandMullionTessellationMeshDrawIndirect;
         cmd.dispatch_args_buffer = dispatch.gpu_buffer;
