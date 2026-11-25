@@ -3936,6 +3936,7 @@ public:
     pass_fragment_access_.clear();
     pass_fragment_index_.clear();
     pass_fragment_written_ = false;
+    fragment_recent_ = {};
   }
 
   // MULLION_D3D11_HOIST_UPDATES (on unless 0, read once): an upload into a resource no draw of the open render pass
@@ -4104,8 +4105,11 @@ public:
       if (auto access = FindFragmentAccess(resource); access && (written || access->written))
         after = true;
     };
-    // a read orders nothing until a pixel shader of the pass has written
+    // a read orders nothing until a pixel shader of the pass has written, and a stage writes only through the
+    // output merger's UAVs or stream output: without them bound, nothing is looked at
     if (!pass_fragment_written_) {
+      if (!state_.OutputMerger.UAVs.any_bound() && !state_.StreamOutput.Targets.any_bound())
+        return false;
       for (auto stage : {PipelineStage::Vertex, PipelineStage::Hull, PipelineStage::Domain, PipelineStage::Geometry})
         EachStageResource<false>(stage, check);
       for (const auto &[slot, entry] : state_.StreamOutput.Targets)
@@ -4129,11 +4133,23 @@ public:
     return after;
   }
 
+  // the accesses recorded last, by a few bits of their resource's address: a draw's pixel shader reads what the one
+  // before it read (RecentSlot)
+  struct RecentFragmentAccess {
+    D3D11ResourceCommon *resource = nullptr;
+    bool written = false;
+  };
+  std::array<RecentFragmentAccess, kPassRecent> fragment_recent_{};
+
   void
   RecordFragmentAccess() {
     EachStageResource(PipelineStage::Pixel, [&](D3D11ResourceCommon *resource, bool written) {
       if (!resource)
         return;
+      auto &recent = fragment_recent_[RecentSlot(resource)];
+      if (recent.resource == resource && (recent.written || !written))
+        return;
+      recent = {resource, written};
       pass_fragment_written_ |= written;
       if (auto access = FindFragmentAccess(resource)) {
         access->written |= written;

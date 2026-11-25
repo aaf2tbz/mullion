@@ -1,0 +1,14 @@
+# a pixel shader's write to what an earlier draw of the pass only read is not recorded when the read was the last recorded of it: a later vertex stage read is not ordered after it
+# family native
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4147,7 +4147,7 @@
+       if (!resource)
+         return;
+       auto &recent = fragment_recent_[RecentSlot(resource)];
+-      if (recent.resource == resource && (recent.written || !written))
++      if (recent.resource == resource)
+         return;
+       recent = {resource, written};
+       pass_fragment_written_ |= written;
+
