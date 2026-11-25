@@ -292,6 +292,8 @@ struct ClearEncoderData : EncoderData {
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+  // the source was discarded right after (discardTexture): a render pass it joins stores none of its samples
+  bool discards_src = false;
 };
 
 class Presenter;
@@ -821,6 +823,14 @@ public:
   EncoderData *startBlitPass();
 
   void endPass();
+  // DiscardResource or DiscardView of a whole texture (D3D11): the render pass that drew it last, with no encoder
+  // after it, stores none of it (a 4x target resolved there resolves without its samples), and the next pass loads none
+  // of it while no encoder came between (discarded)
+  void discardTexture(Texture *texture);
+  bool discarded(const TextureAllocation *allocation) const {
+    return !discarded_.empty() && discard_last_ == encoder_last &&
+           std::find(discarded_.begin(), discarded_.end(), allocation) != discarded_.end();
+  }
 
   constexpr EncoderData *
   currentEncoder() {
@@ -1017,6 +1027,8 @@ private:
   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};
   EncoderData *encoder_last = &encoder_head;
   EncoderData *encoder_current = nullptr;
+  std::vector<const TextureAllocation *> discarded_;
+  const EncoderData *discard_last_ = nullptr;
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0

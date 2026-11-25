@@ -1422,13 +1422,30 @@ public:
   void
   STDMETHODCALLTYPE
   DiscardResource(ID3D11Resource *pResource) override {
-    /*
-    All the Discard* API is not implemented and that's probably fine (as it's
-    more like a hint of optimization, and Metal manages resources on its own)
-    FIXME: for render targets we can use this information: LoadActionDontCare
-    FIXME: A Map with D3D11_MAP_WRITE type could become D3D11_MAP_WRITE_DISCARD?
-    */
-    ERR_ONCE("Not implemented");
+    std::lock_guard<mutex_t> lock(mutex);
+    if (auto texture = pResource ? GetTexture(pResource) : nullptr)
+      DiscardTexture(texture);
+  }
+
+  // MULLION_D3D11_DISCARDS (on unless 0, read once): DiscardResource and DiscardView store and load nothing of the
+  // textures they discard whole (ArgumentEncodingContext::discardTexture); a buffer's discard does nothing, as before
+  static bool
+  DiscardsTextures() {
+    static const bool discards = env::getEnvVar("MULLION_D3D11_DISCARDS") != "0";
+    return discards;
+  }
+
+  void
+  DiscardTexture(Rc<Texture> texture) {
+    if (!DiscardsTextures())
+      return;
+    // a pass drawing to it ends: what it drew is discarded, and a draw after starts the next
+    bool bound = state_.OutputMerger.DSV && state_.OutputMerger.DSV->texture() == texture;
+    for (auto &rtv : state_.OutputMerger.RTVs)
+      bound |= rtv && rtv->texture() == texture;
+    if (bound)
+      InvalidateCurrentPass();
+    EmitST([texture = std::move(texture)](ArgumentEncodingContext &enc) { enc.discardTexture(texture.ptr()); });
   }
 
   void
@@ -1440,7 +1457,18 @@ public:
   void
   STDMETHODCALLTYPE
   DiscardView1(ID3D11View *pResourceView, const D3D11_RECT *pRects, UINT NumRects) override {
-    ERR_ONCE("Not implemented");
+    std::lock_guard<mutex_t> lock(mutex);
+    // a view of the whole of a texture of one subresource, without rectangles, discards the texture
+    if (!pResourceView || (pRects && NumRects))
+      return;
+    ID3D11Resource *resource = nullptr;
+    pResourceView->GetResource(&resource);
+    auto texture = resource ? GetTexture(resource) : nullptr;
+    if (resource)
+      resource->Release();
+    if (texture && texture->miplevelCount() == 1 && texture->arrayLength() == 1 &&
+        texture->textureType() != WMTTextureType3D)
+      DiscardTexture(texture);
   }
 #pragma endregion
 
@@ -5907,7 +5935,7 @@ public:
           auto &color = info.colors[rtv.RenderTargetIndex];
           color.attachment = ctx.access<PipelineStage::Pixel>(rtv.Texture, rtv.viewId, ResourceAccess::ReadWrite);
           color.depth_plane = rtv.DepthPlane;
-          color.load_action = WMTLoadActionLoad;
+          color.load_action = ctx.discarded(color.attachment->allocation) ? WMTLoadActionDontCare : WMTLoadActionLoad;
           color.store_action = WMTStoreActionStore;
           info.tile_barrier_pso_key.color_formats[rtv.RenderTargetIndex] = rtv.PixelFormat;
         };
@@ -5920,14 +5948,14 @@ public:
           if (dsv_planar_flags & 1) {
             auto &depth = info.depth;
             depth.attachment = ctx.access<PipelineStage::Pixel>(dsv.Texture, dsv.viewId, access_flag);
-            depth.load_action = WMTLoadActionLoad;
+            depth.load_action = ctx.discarded(depth.attachment->allocation) ? WMTLoadActionDontCare : WMTLoadActionLoad;
             depth.store_action = WMTStoreActionStore;
           }
 
           if (dsv_planar_flags & 2) {
             auto &stencil = info.stencil;
             stencil.attachment = ctx.access<PipelineStage::Pixel>(dsv.Texture, dsv.viewId, access_flag);
-            stencil.load_action = WMTLoadActionLoad;
+            stencil.load_action = ctx.discarded(stencil.attachment->allocation) ? WMTLoadActionDontCare : WMTLoadActionLoad;
             stencil.store_action = WMTStoreActionStore;
           }
         }

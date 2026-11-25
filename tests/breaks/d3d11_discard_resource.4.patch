@@ -1,0 +1,13 @@
+# a view discarded in a rectangle discards the whole texture
+# family native
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -1459,7 +1459,7 @@
+   DiscardView1(ID3D11View *pResourceView, const D3D11_RECT *pRects, UINT NumRects) override {
+     std::lock_guard<mutex_t> lock(mutex);
+     // a view of the whole of a texture of one subresource, without rectangles, discards the texture
+-    if (!pResourceView || (pRects && NumRects))
++    if (!pResourceView)
+       return;
+     ID3D11Resource *resource = nullptr;
+     pResourceView->GetResource(&resource);

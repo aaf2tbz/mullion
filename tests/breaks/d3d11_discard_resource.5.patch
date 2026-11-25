@@ -1,0 +1,13 @@
+# a resolve joining its pass never stores the samples, discarded or not
+# family native
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
+@@ -1828,7 +1828,7 @@
+       auto result = isResolveSignatureMatched(render, resolve);
+       if (result.src) {
+         result.src->store_action =
+-            resolve->discards_src ? WMTStoreActionMultisampleResolve : WMTStoreActionStoreAndMultisampleResolve;
++            WMTStoreActionMultisampleResolve;
+         result.src->resolve_attachment = result.dst;
+         render->fence_update.merge(resolve->fence_update);
+         render->fence_wait.merge(resolve->fence_wait);

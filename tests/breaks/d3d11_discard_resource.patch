@@ -1,0 +1,13 @@
+# a discard stops the last pass storing every target it draws, not the discarded one alone
+# family native
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
+@@ -924,7 +924,7 @@
+   if (!encoder_current && encoder_last && encoder_last->type == EncoderType::Render) {
+     auto pass = static_cast<RenderEncoderData *>(encoder_last);
+     for (auto &color : pass->colors)
+-      if (color.attachment && color.attachment->allocation == allocation) {
++      if (color.attachment) {
+         if (color.store_action == WMTStoreActionStore)
+           color.store_action = WMTStoreActionDontCare;
+         else if (color.store_action == WMTStoreActionStoreAndMultisampleResolve)

@@ -1,0 +1,13 @@
+# a discard makes the next pass load nothing of the texture though a clear came between
+# family native
+--- a/src/mullion/mullion_context.hpp
++++ b/src/mullion/mullion_context.hpp
+@@ -826,7 +826,7 @@
+   // of it while no encoder came between (discarded)
+   void discardTexture(Texture *texture);
+   bool discarded(const TextureAllocation *allocation) const {
+-    return !discarded_.empty() && discard_last_ == encoder_last &&
++    return !discarded_.empty() &&
+            std::find(discarded_.begin(), discarded_.end(), allocation) != discarded_.end();
+   }
+ 

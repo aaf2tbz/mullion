@@ -918,6 +918,42 @@ ArgumentEncodingContext::endPass() {
   }
 }
 
+void
+ArgumentEncodingContext::discardTexture(Texture *texture) {
+  const TextureAllocation *allocation = texture->current();
+  // a resolve just before, of the pass before it, joins that pass when the chunk is flushed
+  // (checkEncoderRelation): it resolves without storing the samples then
+  if (!encoder_current && encoder_last && encoder_last->type == EncoderType::Resolve) {
+    auto resolve = static_cast<ResolveEncoderData *>(encoder_last);
+    if (resolve->src && resolve->src->allocation == allocation)
+      resolve->discards_src = true;
+  }
+  if (!encoder_current && encoder_last && encoder_last->type == EncoderType::Render) {
+    auto pass = static_cast<RenderEncoderData *>(encoder_last);
+    for (auto &color : pass->colors)
+      if (color.attachment && color.attachment->allocation == allocation) {
+        if (color.store_action == WMTStoreActionStore)
+          color.store_action = WMTStoreActionDontCare;
+        else if (color.store_action == WMTStoreActionStoreAndMultisampleResolve)
+          color.store_action = WMTStoreActionMultisampleResolve;
+      }
+    if (pass->depth.attachment && pass->depth.attachment->allocation == allocation &&
+        pass->depth.store_action == WMTStoreActionStore)
+      pass->depth.store_action = WMTStoreActionDontCare;
+    if (pass->stencil.attachment && pass->stencil.attachment->allocation == allocation &&
+        pass->stencil.store_action == WMTStoreActionStore)
+      pass->stencil.store_action = WMTStoreActionDontCare;
+  }
+  if (encoder_current) {
+    discarded_.clear();
+    return;
+  }
+  if (discard_last_ != encoder_last)
+    discarded_.clear();
+  discarded_.push_back(allocation);
+  discard_last_ = encoder_last;
+}
+
 std::pair<WMT::Buffer, size_t>
 ArgumentEncodingContext::allocateTempBuffer(size_t size, size_t alignment) {
   return queue_.AllocateTempBuffer(seq_id_, size, alignment);
@@ -1685,6 +1721,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     groups.Enter(cmdbuf, {});
   encoder_head.next = nullptr;
   encoder_last = &encoder_head;
+  // a discard is of the chunk's passes: the next chunk's start is the same list head
+  discarded_.clear();
+  discard_last_ = nullptr;
   encoder_count_ = 0;
 
   cmdbuf.encodeSignalEvent(queue_.event, event_seq_id);
@@ -1788,7 +1827,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       auto resolve = reinterpret_cast<ResolveEncoderData *>(latter);
       auto result = isResolveSignatureMatched(render, resolve);
       if (result.src) {
-        result.src->store_action = WMTStoreActionStoreAndMultisampleResolve;
+        result.src->store_action =
+            resolve->discards_src ? WMTStoreActionMultisampleResolve : WMTStoreActionStoreAndMultisampleResolve;
         result.src->resolve_attachment = result.dst;
         render->fence_update.merge(resolve->fence_update);
         render->fence_wait.merge(resolve->fence_wait);

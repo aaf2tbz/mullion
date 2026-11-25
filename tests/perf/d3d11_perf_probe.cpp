@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -89,6 +90,31 @@ struct Probe {
   ComPtr<ID3D11ShaderResourceView> small_srvs[256];
   UINT ring_at = 0;
 } p;
+
+static ComPtr<ID3D11DepthStencilView> msaa_dsv;
+
+// msaa_resolve's frame: the 4x target drawn and resolved, then discarded with its depth where `discard`
+static void
+msaa_frame(ID3D11DeviceContext *c, UINT f, bool discard) {
+  float clear[4] = {0, 0, 0, 0};
+  c->OMSetRenderTargets(1, p.rtvs[0].GetAddressOf(), msaa_dsv.Get());
+  c->ClearRenderTargetView(p.rtvs[0].Get(), clear);
+  c->ClearDepthStencilView(msaa_dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+  for (UINT i = 0; i < 50; i++) {
+    c->VSSetConstantBuffers(0, 1, p.cbs[i % 64].GetAddressOf());
+    c->Draw(4, 0);
+  }
+  c->ResolveSubresource(p.targets[1].Get(), 0, p.targets[0].Get(), 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
+  if (discard) {
+    ComPtr<ID3D11DeviceContext1> c1;
+    if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
+      c1->DiscardResource(p.targets[0].Get());
+      c1->DiscardResource(p.targets[2].Get());
+    }
+  }
+  c->OMSetRenderTargets(1, p.rtv.GetAddressOf(), p.dsv.Get());
+  (void)f;
+}
 
 static ComPtr<ID3DBlob>
 compile(const char *entry, const char *profile, const char *variant = "0") {
@@ -420,6 +446,36 @@ scenes() {
          }
          c()->OMSetRenderTargets(1, p.rtv.GetAddressOf(), p.dsv.Get());
        }},
+      {"msaa_resolve", "a 4x RGBA16F 1080p target and 4x depth: cleared, 50 draws, resolved, each frame (Source 2's MSAA)",
+       [] {
+         D3D11_TEXTURE2D_DESC desc{1920, 1080, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {4, 0}, D3D11_USAGE_DEFAULT,
+                                   D3D11_BIND_RENDER_TARGET};
+         CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[0]));
+         CHECK(p.device->CreateRenderTargetView(p.targets[0].Get(), nullptr, &p.rtvs[0]));
+         desc.SampleDesc.Count = 1;
+         CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[1]));
+         desc.SampleDesc.Count = 4;
+         desc.Format = DXGI_FORMAT_D32_FLOAT;
+         desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+         CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[2]));
+         CHECK(p.device->CreateDepthStencilView(p.targets[2].Get(), nullptr, &msaa_dsv));
+       },
+       [c](UINT f) { msaa_frame(c(), f, false); }},
+      {"msaa_resolve_discard", "msaa_resolve with the 4x target and depth discarded after the resolve (DiscardResource)",
+       [] {
+         D3D11_TEXTURE2D_DESC desc{1920, 1080, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {4, 0}, D3D11_USAGE_DEFAULT,
+                                   D3D11_BIND_RENDER_TARGET};
+         CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[0]));
+         CHECK(p.device->CreateRenderTargetView(p.targets[0].Get(), nullptr, &p.rtvs[0]));
+         desc.SampleDesc.Count = 1;
+         CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[1]));
+         desc.SampleDesc.Count = 4;
+         desc.Format = DXGI_FORMAT_D32_FLOAT;
+         desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+         CHECK(p.device->CreateTexture2D(&desc, nullptr, &p.targets[2]));
+         CHECK(p.device->CreateDepthStencilView(p.targets[2].Get(), nullptr, &msaa_dsv));
+       },
+       [c](UINT f) { msaa_frame(c(), f, true); }},
       {"create_depth_initial", "a 1920x1080 D24_UNORM_S8_UINT texture made with initial data and released, each frame", [] {},
        [](UINT f) {
          static std::vector<uint32_t> texels(1920 * 1080);

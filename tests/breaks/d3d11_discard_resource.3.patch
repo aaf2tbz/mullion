@@ -1,0 +1,13 @@
+# a discard outlives its chunk: a texture of the next chunk at the same address loads nothing
+# family native
+--- a/src/mullion/mullion_context.cpp
++++ b/src/mullion/mullion_context.cpp
+@@ -1715,8 +1715,6 @@
+   encoder_head.next = nullptr;
+   encoder_last = &encoder_head;
+   // a discard is of the chunk's passes: the next chunk's start is the same list head
+-  discarded_.clear();
+-  discard_last_ = nullptr;
+   encoder_count_ = 0;
+ 
+   cmdbuf.encodeSignalEvent(queue_.event, event_seq_id);
