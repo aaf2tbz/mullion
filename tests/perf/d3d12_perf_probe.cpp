@@ -4154,6 +4154,36 @@ static std::vector<Scene> texture_scenes()
           [make_msaa, memory] { make_msaa(); memory(); }, [msaa_frame, memory](UINT f) { memory(); msaa_frame(f); } },
         { "tex_msaa_discard", "tex_msaa_corpus with each 4x target discarded after its resolve (DiscardResource)",
           [make_msaa, memory] { make_msaa(); memory(); }, [msaa_frame, memory](UINT f) { memory(); msaa_frame(f, true); } },
+        { "tex_sample_smooth", "20 full-screen quads sampling 8 RGBA8 1024x1024 textures of smooth gradients (real images, not noise)",
+          [heaps] {
+            heaps();
+            for (UINT t = 0; t < 8; t++)
+            {
+                auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 1024, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                run_init_commands([&](ID3D12GraphicsCommandList *l) {
+                    void *cpu;
+                    D3D12_GPU_VIRTUAL_ADDRESS va = upload_alloc(1024 * 1024 * 4, &cpu);
+                    uint32_t *w = (uint32_t *)cpu;
+                    for (UINT y = 0; y < 1024; y++)
+                        for (UINT x = 0; x < 1024; x++)
+                            w[y * 1024 + x] = 0xff000000u | ((x / 4 + t * 16) & 255) | ((y / 4) & 255) << 8 | (((x + y) / 8) & 255) << 16;
+                    D3D12_TEXTURE_COPY_LOCATION src = { p.upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                    src.PlacedFootprint.Offset = va - p.upload_ring->GetGPUVirtualAddress();
+                    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, 1024, 1024, 1, 4096 };
+                    D3D12_TEXTURE_COPY_LOCATION dst = { r, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                    l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    barrier(l, r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                });
+                p.device->CreateShaderResourceView(r, nullptr, srv_cpu(SRV_CORPUS + 64 + t));
+                corpus.push_back(r);
+            }
+            PsoDesc d; d.ps = "ps_tex"; tex8 = create_pso(d);
+        }, [](UINT f) {
+            set_quad_state(p.list, tex8);
+            p.list->SetGraphicsRootDescriptorTable(2, srv_gpu(SRV_CORPUS + 64));
+            for (UINT i = 0; i < 20; i++) fullscreen(p.list, f * 0.01f);
+        } },
         { "tex_stream_mips", "a 1024x1024 BC7 texture with all 11 mips placed in a heap, filled, viewed and released each frame (streaming)",
           [heaps] {
             heaps();
