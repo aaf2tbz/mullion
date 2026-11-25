@@ -134,6 +134,11 @@ public:
   }
 
   uint64_t
+  suballocationOffset(uint32_t sub) const noexcept {
+    return sub * suballocation_size_;
+  }
+
+  uint64_t
   currentSuballocationOffset() const noexcept {
     return current_suballocation_ * suballocation_size_;
   }

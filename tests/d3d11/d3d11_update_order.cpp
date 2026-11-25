@@ -3,7 +3,8 @@
 // vertex shader reads or a vertex buffer, and whether a draw of the pass used it before the update or not (an upload
 // into a resource no draw of the pass has used yet goes before the pass, MULLION_D3D11_HOIST_UPDATES), and so is a
 // copy from a staging texture the CPU wrote or one on the GPU from a resource no draw of the pass writes,
-// CopySubresourceRegion. each draw
+// CopySubresourceRegion, and so is a copy over the whole of a vertex buffer a draw of the pass read before it (it goes
+// before the pass into another allocation of the buffer, MULLION_D3D11_RENAME_COPIES). each draw
 // writes what it read into its own columns of a 16x1 target: the draws before an update read the value before it.
 #include "d3d11_test.hpp"
 
@@ -72,8 +73,8 @@ main() {
     bool used_first;
     // updates, each followed by a draw
     uint32_t updates;
-    // a texture's updates are CopySubresourceRegion from a staging texture the CPU wrote, or (gpu) from a default
-    // texture, not UpdateSubresource
+    // a resource's updates are CopySubresourceRegion from a staging resource the CPU wrote, or (gpu) from a default
+    // one, not UpdateSubresource
     bool staging = false, gpu = false;
   };
   const Case cases[] = {
@@ -89,6 +90,9 @@ main() {
       {"pixel shader, not read before copies from a staging texture", 0, false, 2, true},
       {"pixel shader, read before a copy from another texture", 0, true, 1, false, true},
       {"pixel shader, not read before copies from another texture", 0, false, 2, false, true},
+      {"vertex buffer, read before copies from another buffer", 2, true, 3, false, true},
+      {"vertex buffer, read before copies from a staging buffer", 2, true, 3, true},
+      {"vertex buffer, not read before copies from another buffer", 2, false, 2, false, true},
   };
   unsigned failures = 0;
   for (int deferred = 0; deferred < 2; deferred++)
@@ -147,7 +151,19 @@ main() {
       }
       for (uint32_t u = 0; u < c.updates; u++) {
         uint32_t value = 10 + u;
-        if (c.from == 2) {
+        if (c.from == 2 && (c.gpu || c.staging)) {
+          // the whole of the vertex buffer, from a buffer of its size
+          uint32_t values[4] = {value, value, value, value};
+          D3D11_BUFFER_DESC desc{sizeof(values), c.staging ? D3D11_USAGE_STAGING : D3D11_USAGE_DEFAULT,
+                                 c.staging ? 0u : UINT(D3D11_BIND_VERTEX_BUFFER), c.staging ? UINT(D3D11_CPU_ACCESS_WRITE) : 0u};
+          D3D11_SUBRESOURCE_DATA data{values};
+          ComPtr<ID3D11Buffer> source;
+          CHECK(device->CreateBuffer(&desc, &data, &source));
+          if (u % 2)
+            context->CopyResource(vb.Get(), source.Get());
+          else
+            context->CopySubresourceRegion(vb.Get(), 0, 0, 0, 0, source.Get(), 0, nullptr);
+        } else if (c.from == 2) {
           uint32_t values[4] = {value, value, value, value};
           context->UpdateSubresource(vb.Get(), 0, nullptr, values, 0, 0);
         } else if (c.gpu) {

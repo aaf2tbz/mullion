@@ -4012,6 +4012,52 @@ public:
     return HoistedUpdate(destination);
   }
 
+  // MULLION_D3D11_RENAME_COPIES (on unless 0, read once): a copy on the GPU over the whole of a buffer the open render
+  // pass has used, from one no draw of it writes, goes in the prelude too, into a new allocation of the buffer the
+  // draws after it bind, as an UpdateSubresource of the whole buffer renames it (an engine copying each draw's
+  // constants from a buffer of them, d3d11_perf_probe draws_copies). the draws before it keep the allocation they
+  // read; a buffer a shader may write (kD3D11OutputBindFlags) has no other allocation to take
+  struct RenamedCopy {
+    Prelude *prelude;
+    Rc<BufferAllocation> allocation;
+    uint32_t suballocation;
+  };
+
+  static bool
+  RenamesCopies() {
+    static const bool renames = env::getEnvVar("MULLION_D3D11_RENAME_COPIES") != "0";
+    return renames;
+  }
+
+  std::optional<RenamedCopy>
+  RenamedCopyDestination(ID3D11Resource *destination, D3D11ResourceCommon *source, uint32_t offset, uint32_t length) {
+    if (!pass_prelude_ || !RenamesCopies() || !source || offset || pass_written_.contains(source) ||
+        source == GetResourceCommon(destination))
+      return {};
+    UINT buffer_length = 0, bind_flags = 0;
+    auto dynamic = GetDynamicBuffer(destination, &buffer_length, &bind_flags);
+    if (!dynamic || length != buffer_length)
+      return {};
+    // renamed in order with the commands (MapResource marks it written in the pass)
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(MapResource(destination, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+      return {};
+    auto [allocation, suballocation] = GetDynamicBufferAllocation(dynamic);
+    return RenamedCopy{pass_prelude_.get(), allocation, suballocation};
+  }
+
+  // where a prelude's copy writes the renamed allocation, tracked as its suballocation's write: the draws after the
+  // rename wait for it (ArgumentEncodingContext::trackBuffer), and the ones before it, encoded after the prelude, still
+  // find the suballocation they read current
+  static std::pair<WMT::Buffer, uint64_t>
+  RenamedCopyWrite(ArgumentEncodingContext &enc, BufferAllocation *allocation, uint32_t suballocation) {
+    auto current = allocation->currentSuballocation();
+    allocation->useSuballocation(suballocation);
+    enc.trackBuffer<PipelineStage::Compute>(allocation, ResourceAccess::Write);
+    allocation->useSuballocation(current);
+    return {allocation->buffer(), allocation->suballocationOffset(suballocation)};
+  }
+
   template <typename Fn>
   static void
   AddPrelude(Prelude *prelude, Fn &&fn) {
@@ -4783,6 +4829,27 @@ public:
     } else if (auto dst = GetResourceCommon(pDstResource)) {
       if (auto staging_src = GetStagingResource(pSrcResource, SrcSubresource)) {
         auto hoisted = HoistedCopy(dst, GetResourceCommon(pSrcResource));
+        auto renamed = hoisted ? std::nullopt
+                               : RenamedCopyDestination(pDstResource, GetResourceCommon(pSrcResource), DstX,
+                                                        SrcBox.right - SrcBox.left);
+        if (renamed) {
+          UseCopySource(staging_src);
+          AddPrelude(renamed->prelude, [src_ = std::move(staging_src), SrcBox, allocation = renamed->allocation,
+                                        suballocation = renamed->suballocation](ArgumentEncodingContext &enc) {
+            auto [src, src_offset] =
+                enc.access(src_->buffer(), SrcBox.left, SrcBox.right - SrcBox.left, ResourceAccess::Read);
+            auto [dst, dst_offset] = RenamedCopyWrite(enc, allocation.ptr(), suballocation);
+            auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+            cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+            cmd.copy_length = SrcBox.right - SrcBox.left;
+            cmd.src = src->buffer();
+            cmd.src_offset = SrcBox.left + src_offset;
+            cmd.dst = dst;
+            cmd.dst_offset = dst_offset;
+          });
+          UseWrappedSubresource(pSrcResource, SrcSubresource, false);
+          return;
+        }
         if (!hoisted)
           SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseCopySource(staging_src);
@@ -4802,8 +4869,26 @@ public:
         else
           EmitOP(std::move(copy_op));
       } else if (auto src = GetResourceCommon(pSrcResource)) {
-        // on-device copy: before the open render pass where it can (HoistedCopy)
+        // on-device copy: before the open render pass where it can (HoistedCopy, RenamedCopyDestination)
         auto hoisted = HoistedCopy(dst, src);
+        auto renamed =
+            hoisted ? std::nullopt : RenamedCopyDestination(pDstResource, src, DstX, SrcBox.right - SrcBox.left);
+        if (renamed) {
+          AddPrelude(renamed->prelude, [src_ = src->buffer(), SrcBox, allocation = renamed->allocation,
+                                        suballocation = renamed->suballocation](ArgumentEncodingContext &enc) {
+            auto [src, src_offset] = enc.access(src_, SrcBox.left, SrcBox.right - SrcBox.left, ResourceAccess::Read);
+            auto [dst, dst_offset] = RenamedCopyWrite(enc, allocation.ptr(), suballocation);
+            auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+            cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+            cmd.copy_length = SrcBox.right - SrcBox.left;
+            cmd.src = src->buffer();
+            cmd.src_offset = SrcBox.left + src_offset;
+            cmd.dst = dst;
+            cmd.dst_offset = dst_offset;
+          });
+          UseWrappedSubresource(pSrcResource, SrcSubresource, false);
+          return;
+        }
         if (!hoisted)
           SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
         auto copy_op = [dst_ = dst->buffer(), src_ = src->buffer(), DstX,

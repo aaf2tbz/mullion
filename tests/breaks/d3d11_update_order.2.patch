@@ -1,0 +1,14 @@
+# a copy over a whole buffer the open render pass read writes the suballocation its draws read, not the one it renamed the buffer to: they see what it wrote
+# family native
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4055,7 +4055,7 @@
+     allocation->useSuballocation(suballocation);
+     enc.trackBuffer<PipelineStage::Compute>(allocation, ResourceAccess::Write);
+     allocation->useSuballocation(current);
+-    return {allocation->buffer(), allocation->suballocationOffset(suballocation)};
++    return {allocation->buffer(), allocation->currentSuballocationOffset()};
+   }
+ 
+   template <typename Fn>
+
