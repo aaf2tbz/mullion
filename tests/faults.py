@@ -75,7 +75,10 @@ def main(argv=None):
         names = sorted(declared & {test, test + "_dxil", test + "_dxbc"})
         before = answers / f"{test}-{families}{'-validated' if validate else ''}.txt"
         # by content, not times: a file the last fault changed comes back newer than its objects, so it is rebuilt
-        subprocess.run(["rsync", "-rlpc", "--delete", "--exclude", ".git", f"{SOURCE}/", f"{source}/"], check=True)
+        # the tree's build directories are left out: a fault's copy needs only the source, and the copy itself is one
+        # of them when it is made in the tree (copying it into itself, and Wine's files a test may still be writing)
+        subprocess.run(["rsync", "-rlpc", "--delete", "--exclude", ".git", "--exclude", "/build*/", f"{SOURCE}/",
+                        f"{source}/"], check=True)
         if subprocess.run(["git", "apply", patch.resolve()], cwd=source, capture_output=True).returncode:
             said = "does not apply"
         elif setup(library, faulted, source) or subprocess.run(["ninja", "-C", faulted], capture_output=True).returncode:

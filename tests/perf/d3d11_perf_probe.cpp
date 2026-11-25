@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -79,6 +80,10 @@ struct Probe {
   ComPtr<ID3D11RenderTargetView> rtvs[4];
   ComPtr<ID3D11Query> occlusion[500];
   ComPtr<ID3D11DeviceContext> deferred[8];
+  // the present scenes' window and swap chain
+  HWND window = nullptr;
+  ComPtr<IDXGISwapChain1> swapchain;
+  ComPtr<ID3D11RenderTargetView> back_rtv;
   ComPtr<ID3D11Texture2D> small[256];
   ComPtr<ID3D11ShaderResourceView> small_srvs[256];
   UINT ring_at = 0;
@@ -437,6 +442,38 @@ scenes() {
              c()->PSSetShaderResources(0, 1, p.srvs[i % 16].GetAddressOf());
              c()->Draw(4, 0);
            }
+       }},
+      {"present", "a 1920x1080 window's flip-model swap chain: the back buffer cleared and Present(0), nothing else",
+       [] {
+         WNDCLASSA wc{};
+         wc.lpfnWndProc = DefWindowProcA;
+         wc.hInstance = GetModuleHandleA(nullptr);
+         wc.lpszClassName = "d3d11_perf_probe";
+         RegisterClassA(&wc);
+         p.window = CreateWindowA("d3d11_perf_probe", "d3d11_perf_probe", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 1920,
+                                  1080, nullptr, nullptr, wc.hInstance, nullptr);
+         ComPtr<IDXGIDevice> dxgi_device;
+         ComPtr<IDXGIAdapter> adapter;
+         ComPtr<IDXGIFactory2> factory;
+         CHECK(p.device.As(&dxgi_device));
+         CHECK(dxgi_device->GetAdapter(&adapter));
+         CHECK(adapter->GetParent(IID_PPV_ARGS(&factory)));
+         DXGI_SWAP_CHAIN_DESC1 desc{1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0},
+                                    DXGI_USAGE_RENDER_TARGET_OUTPUT, 2};
+         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+         CHECK(factory->CreateSwapChainForHwnd(p.device.Get(), p.window, &desc, nullptr, nullptr, &p.swapchain));
+         ComPtr<ID3D11Texture2D> back;
+         CHECK(p.swapchain->GetBuffer(0, IID_PPV_ARGS(&back)));
+         CHECK(p.device->CreateRenderTargetView(back.Get(), nullptr, &p.back_rtv));
+       },
+       [c](UINT f) {
+         MSG msg;
+         while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+           DispatchMessageA(&msg);
+         float color[4] = {(f % 100) / 100.0f, 0.2f, 0.3f, 1};
+         c()->OMSetRenderTargets(1, p.back_rtv.GetAddressOf(), nullptr);
+         c()->ClearRenderTargetView(p.back_rtv.Get(), color);
+         p.swapchain->Present(0, 0);
        }},
       {"draws_copies", "500 draws, each after a CopySubresourceRegion of 256 bytes into the constant buffer it reads",
        [] {}, [c](UINT) {
