@@ -734,13 +734,118 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(renamable), pDevice)));
   } else {
-    HRESULT hr = initialize(texture->allocate(flags));
+    // a private render target, made zeroed, whose memory a released one of its description may give
+    // (D3D11TexturePool)
+    static const bool pooling = env::getEnvVar("MULLION_D3D11_TEXTURE_POOL") != "0";
+    auto &pool = pDevice->texture_pool;
+    const bool recyclable = pooling && pool && !pInitialData && (finalDesc.BindFlags & D3D11_BIND_RENDER_TARGET) &&
+                            !(finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL) && finalDesc.Usage == D3D11_USAGE_DEFAULT &&
+                            !finalDesc.CPUAccessFlags && !texture->chroma && !defers && !pDevice->shares_with_d3d12 &&
+                            pDevice->GetMTLDevice().heapTextureSizeAndAlign(info).size >= D3D11TexturePool::kLeast;
+    if (pool)
+      pool->age();
+    Rc<TextureAllocation> reused = recyclable ? pool->take(texture->info()) : nullptr;
+    Rc<TextureAllocation> allocation;
+    if (reused) {
+      std::vector<TextureViewRef> retired;
+      texture->rename(std::move(reused), retired);
+      allocation = texture->current();
+    } else {
+      uint64_t before = recyclable ? pDevice->GetMTLDevice().currentAllocatedSize() : 0;
+      allocation = texture->allocate(flags);
+      // what the device counts for it: an allocation the count does not show, or that other threads changed the
+      // count around, is not pooled
+      uint64_t size = recyclable && allocation->texture() ? pDevice->GetMTLDevice().currentAllocatedSize() - before : 0;
+      if (size >= D3D11TexturePool::kLeast && size < (1ull << 40)) {
+        allocation->recycler = pool;
+        allocation->recycle_info = texture->info();
+        allocation->recycle_size = size;
+      }
+    }
+    HRESULT hr = initialize(std::move(allocation));
     if (FAILED(hr))
       return hr;
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), pDevice)));
   }
   return S_OK;
+}
+
+static bool
+SameTexture(const WMTTextureInfo &a, const WMTTextureInfo &b) {
+  return a.pixel_format == b.pixel_format && a.width == b.width && a.height == b.height && a.depth == b.depth &&
+         a.array_length == b.array_length && a.type == b.type && a.mipmap_level_count == b.mipmap_level_count &&
+         a.sample_count == b.sample_count && a.usage == b.usage && a.options == b.options &&
+         a.placement_sparse_page_size == b.placement_sparse_page_size;
+}
+
+void
+D3D11TexturePool::evict(std::vector<Rc<TextureAllocation>> &freed, size_t index) {
+  auto &entry = entries_[index];
+  bytes_ -= entry.allocation->recycle_size;
+  adapter_->PooledMemory(-int64_t(entry.allocation->recycle_size));
+  // freed, not pooled again, when the last reference goes
+  entry.allocation->recycler = nullptr;
+  freed.push_back(std::move(entry.allocation));
+  entries_.erase(entries_.begin() + index);
+}
+
+bool
+D3D11TexturePool::recycle(TextureAllocation *allocation) {
+  static const uint64_t limit = std::min<uint64_t>(512ull << 20, memory::Limit(device_) / 16);
+  if (allocation->recycle_size > limit || memory::Budget(device_) < memory::Limit(device_))
+    return false;
+  std::vector<Rc<TextureAllocation>> freed;
+  {
+    std::lock_guard<mullion::mutex> lock(mutex_);
+    if (closed_)
+      return false;
+    // the last reference went: this one holds it again
+    entries_.push_back({Rc<TextureAllocation>(allocation), std::max<uint64_t>(GetTickCount64(), 1)});
+    bytes_ += allocation->recycle_size;
+    adapter_->PooledMemory(allocation->recycle_size);
+    while (bytes_ > limit)
+      evict(freed, 0);
+    oldest_.store(entries_.empty() ? 0 : entries_.front().at, std::memory_order_relaxed);
+  }
+  return true;
+}
+
+Rc<TextureAllocation>
+D3D11TexturePool::take(const WMTTextureInfo &info) {
+  if (!oldest_.load(std::memory_order_relaxed))
+    return nullptr;
+  std::lock_guard<mullion::mutex> lock(mutex_);
+  for (size_t i = entries_.size(); i-- > 0;)
+    if (SameTexture(entries_[i].allocation->recycle_info, info)) {
+      Rc<TextureAllocation> allocation = std::move(entries_[i].allocation);
+      bytes_ -= allocation->recycle_size;
+      adapter_->PooledMemory(-int64_t(allocation->recycle_size));
+      entries_.erase(entries_.begin() + i);
+      oldest_.store(entries_.empty() ? 0 : entries_.front().at, std::memory_order_relaxed);
+      return allocation;
+    }
+  return nullptr;
+}
+
+void
+D3D11TexturePool::age(uint64_t age) {
+  // `freed` goes after the lock, as its allocations' frees would take it
+  std::vector<Rc<TextureAllocation>> freed;
+  std::lock_guard<mullion::mutex> lock(mutex_);
+  uint64_t now = GetTickCount64();
+  while (!entries_.empty() && (!age || now - entries_.front().at > age))
+    evict(freed, 0);
+  oldest_.store(entries_.empty() ? 0 : entries_.front().at, std::memory_order_relaxed);
+}
+
+void
+D3D11TexturePool::close() {
+  {
+    std::lock_guard<mullion::mutex> lock(mutex_);
+    closed_ = true;
+  }
+  age(0);
 }
 
 HRESULT

@@ -389,6 +389,7 @@ public:
       depthstencil_states_(this),
       device_(device),
       d3dmt_(static_cast<ID3D11Device *>(this), mutex) {
+    texture_pool = std::make_shared<D3D11TexturePool>(container->GetMTLDevice(), pAdapter);
     commandlist_pool_ = InitializeCommandListPool(this);
     pipeline_cache_ = InitializePipelineCache(this);
     rasterizer_states_.CreateStateObject(&kDefaultRasterizerDesc, &default_rasterizer_state_);

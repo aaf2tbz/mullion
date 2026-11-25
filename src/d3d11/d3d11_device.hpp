@@ -39,6 +39,46 @@ class MTLCompiledComputePipeline;
 class MTLCompiledGeometryPipeline;
 class MTLCompiledTessellationMeshPipeline;
 
+// render targets released lately, with their memory resident: a texture of the same Metal description made next takes
+// one instead of new memory, which the kernel wires and zeroes at the first submission naming it (5.1 ms a frame for
+// four 4096x4096 RGBA8 targets on an M6, d3d11_perf_probe big_targets). such a texture is zeroed when made all the
+// same (ResourceInitializer::initWithZero), as a new one is. it holds at most a sixteenth of the working set, and no
+// more than 512 MiB, for 2 seconds, left out of QueryVideoMemoryInfo's usage; MULLION_D3D11_TEXTURE_POOL=0 is without
+// it
+class D3D11TexturePool final : public TextureRecycler, public std::enable_shared_from_this<D3D11TexturePool> {
+public:
+  D3D11TexturePool(WMT::Device device, IMTLDXGIAdapter *adapter) : device_(device), adapter_(adapter) {}
+  bool recycle(TextureAllocation *allocation) override;
+  // the latest given back of this description, or none
+  Rc<TextureAllocation> take(const WMTTextureInfo &info);
+  // gives back what was pooled before `age` milliseconds ago, everything with 0
+  void age(uint64_t age);
+  void
+  age() {
+    uint64_t oldest = oldest_.load(std::memory_order_relaxed);
+    if (oldest && GetTickCount64() - oldest > kAge)
+      age(kAge);
+  }
+  // the device goes: nothing more is pooled
+  void close();
+  static constexpr uint64_t kAge = 2000;
+  static constexpr uint64_t kLeast = 256 << 10;
+
+private:
+  struct Entry {
+    Rc<TextureAllocation> allocation;
+    uint64_t at;
+  };
+  WMT::Device device_;
+  IMTLDXGIAdapter *adapter_;
+  mullion::mutex mutex_;
+  std::vector<Entry> entries_;
+  uint64_t bytes_ = 0;
+  bool closed_ = false;
+  std::atomic<uint64_t> oldest_ = 0;
+  void evict(std::vector<Rc<TextureAllocation>> &freed, size_t index);
+};
+
 class MTLD3D11Device : public ID3D11Device5 {
 public:
 
@@ -83,6 +123,16 @@ public:
   bool PrepareFormatView(Texture *texture, WMTPixelFormat format);
   bool FormatViewMovesPending() const { return format_view_pending_.load(std::memory_order_acquire); }
   std::vector<std::pair<Rc<Texture>, Rc<TextureAllocation>>> TakeFormatViewMoves();
+
+  // released render targets (D3D11TexturePool), closed with the device
+  std::shared_ptr<D3D11TexturePool> texture_pool;
+  struct TexturePoolClose {
+    MTLD3D11Device *device;
+    ~TexturePoolClose() {
+      if (device->texture_pool)
+        device->texture_pool->close();
+    }
+  } texture_pool_close{this};
 
 private:
   mullion::mutex format_view_mutex_;

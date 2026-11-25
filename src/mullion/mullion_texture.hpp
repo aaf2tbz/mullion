@@ -87,6 +87,16 @@ struct TextureViewKey {
 class Texture;
 class TextureAllocation;
 
+// takes an allocation whose last reference went, which no work in flight names any more (its commands retain what
+// they use: ArgumentEncodingContext::retainAllocation), to give it to a texture of the same description later:
+// Direct3D 11's pool of released render targets (D3D11TexturePool)
+class TextureRecycler {
+public:
+  virtual ~TextureRecycler() = default;
+  // true where the recycler keeps it, holding a reference again
+  virtual bool recycle(TextureAllocation *allocation) = 0;
+};
+
 class TextureView {
 public:
   virtual ~TextureView() {};
@@ -190,6 +200,13 @@ private:
 
   void publishViews();
   bool kept_ = false; // in the residency heartbeat's set
+
+public:
+  // where the allocation goes when its last reference does, instead of being freed, with the description a texture
+  // taking it again has and the memory it counts for
+  std::shared_ptr<TextureRecycler> recycler;
+  WMTTextureInfo recycle_info{};
+  uint64_t recycle_size = 0;
 };
 
 class Texture {

@@ -1,0 +1,15 @@
+# a pooled allocation keeps the views the released texture made, under that texture's view numbers
+# family native
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -747,8 +747,8 @@
+     Rc<TextureAllocation> reused = recyclable ? pool->take(texture->info()) : nullptr;
+     Rc<TextureAllocation> allocation;
+     if (reused) {
+-      std::vector<TextureViewRef> retired;
+-      texture->rename(std::move(reused), retired);
++      reused->descriptor = texture.ptr();
++      texture->rename(std::move(reused));
+       allocation = texture->current();
+     } else {
+       uint64_t before = recyclable ? pDevice->GetMTLDevice().currentAllocatedSize() : 0;

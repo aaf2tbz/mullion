@@ -107,6 +107,8 @@ TextureAllocation::TextureAllocation(
 
 void
 TextureAllocation::free(){
+  if (recycler && recycler->recycle(this))
+    return;
   if (kept_)
     heartbeat::Release(buffer_ ? WMT::Allocation(buffer_) : WMT::Allocation(obj_));
 #ifdef __i386__

@@ -861,6 +861,9 @@ public:
   HRESULT
   PresentFrame(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) {
     auto began = diag::profile ? diag::Now() : 0;
+    // the render targets released 2 seconds ago go back (D3D11TexturePool)
+    if (device_->texture_pool)
+      device_->texture_pool->age();
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
     if (((PresentFlags & DXGI_PRESENT_ALLOW_TEARING) &&
