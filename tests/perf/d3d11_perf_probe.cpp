@@ -496,6 +496,20 @@ scenes() {
        [] { make_targets(false); }, [c](UINT) { targets_frame(c()); }},
       {"typeless_targets", "the same of R8G8B8A8_TYPELESS targets, drawn through UNORM views and sampled through SNORM ones",
        [] { make_targets(true); }, [c](UINT) { targets_frame(c()); }},
+      {"big_targets", "4 4096x4096 RGBA8 render targets made, cleared and released each frame (targets remade on a "
+                      "resolution change or a level's load)",
+       [] {}, [c](UINT) {
+         D3D11_TEXTURE2D_DESC desc{4096, 4096, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                   D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE};
+         float clear[4] = {0.5f, 0.5f, 0.5f, 1};
+         for (int i = 0; i < 4; i++) {
+           ComPtr<ID3D11Texture2D> texture;
+           ComPtr<ID3D11RenderTargetView> view;
+           CHECK(p.device->CreateTexture2D(&desc, nullptr, &texture));
+           CHECK(p.device->CreateRenderTargetView(texture.Get(), nullptr, &view));
+           c()->ClearRenderTargetView(view.Get(), clear);
+         }
+       }},
       {"msaa_resolve", "a 4x RGBA16F 1080p target and 4x depth: cleared, 50 draws, resolved, each frame (Source 2's MSAA)",
        [] {
          D3D11_TEXTURE2D_DESC desc{1920, 1080, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {4, 0}, D3D11_USAGE_DEFAULT,
