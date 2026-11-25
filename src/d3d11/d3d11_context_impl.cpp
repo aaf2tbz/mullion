@@ -2798,8 +2798,8 @@ public:
             enc.queue().counter_pool.updateCounter(filled, offset);
           enc.bindStreamOutputBuffer(slot, forward_rc(buffer), forward_rc(filled));
         });
-      } else {
-        state_.StreamOutput.Targets.unbind(slot);
+      } else if (state_.StreamOutput.Targets.unbind(slot)) {
+        // a slot with no target has none to unbind, as a shader resource slot has none
         EmitST([=](ArgumentEncodingContext &enc) mutable {
           enc.bindStreamOutputBuffer(slot, {}, {});
         });
