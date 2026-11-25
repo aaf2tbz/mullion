@@ -3881,6 +3881,108 @@ cbuffer C : register(b0) { uint4 rc; };
         b.UAV.pResource = vis_texture;
         l->ResourceBarrier(1, &b);
     };
+    // a ground plane to the horizon: 8 anisotropic samples a pixel of 4 mipped 1024x1024 textures, by a sampler from a
+    // descriptor table (as engines bind theirs) or a static one, at 16x
+    static ID3D12RootSignature *aniso_rs[2];
+    static ID3D12PipelineState *aniso_pso[2];
+    static ID3D12DescriptorHeap *aniso_samplers;
+    static const char *aniso_hlsl = R"(
+Texture2D tex[4] : register(t0);
+SamplerState smp : register(s0);
+cbuffer C : register(b0) { float4 rc; };
+struct V { float4 pos : SV_Position; };
+V vs_full(uint id : SV_VertexID) { V v; v.pos = float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1); return v; }
+float4 ps_ground(V i) : SV_Target {
+  float2 s = i.pos.xy / float2(1920, 1080);
+  float d = 1.0 / (s.y * 1.5 + 0.02);
+  float2 uv = float2((s.x - 0.5) * d, d * 2 + rc.w);
+  float4 c = 0;
+  [unroll] for (int k = 0; k < 8; k++) c += tex[k & 3].Sample(smp, uv * (1 + k * 0.13));
+  return c * 0.125;
+}
+)";
+    static auto make_aniso = [](bool table) {
+        for (UINT t = 0; t < 4; t++)
+        {
+            auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 1024, 1, 11, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_DESC rd = r->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[11];
+            UINT64 total = 0;
+            p.device->GetCopyableFootprints(&rd, 0, 11, 0, fp, nullptr, nullptr, &total);
+            run_init_commands([&](ID3D12GraphicsCommandList *l) {
+                void *cpu;
+                D3D12_GPU_VIRTUAL_ADDRESS va = upload_alloc(total, &cpu);
+                for (UINT m = 0; m < 11; m++)
+                {
+                    uint8_t *base = (uint8_t *)cpu + fp[m].Offset;
+                    for (UINT y = 0; y < fp[m].Footprint.Height; y++)
+                        for (UINT x = 0; x < fp[m].Footprint.Width; x++)
+                        {
+                            UINT X = x << m, Y = y << m;
+                            uint32_t v = 0xff000000u | ((X / 4 + t * 40) & 255) | ((Y / 8) & 255) << 8 | (((X ^ Y) / 16) & 255) << 16;
+                            memcpy(base + y * fp[m].Footprint.RowPitch + x * 4, &v, 4);
+                        }
+                    D3D12_TEXTURE_COPY_LOCATION src = { p.upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                    src.PlacedFootprint = fp[m];
+                    src.PlacedFootprint.Offset += va - p.upload_ring->GetGPUVirtualAddress();
+                    D3D12_TEXTURE_COPY_LOCATION dst = { r, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                    dst.SubresourceIndex = m;
+                    l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                }
+                barrier(l, r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            });
+            p.device->CreateShaderResourceView(r, nullptr, srv_cpu(SRV_CORPUS + 96 + t));
+            corpus.push_back(r);
+        }
+        D3D12_SAMPLER_DESC sd = {};
+        sd.Filter = D3D12_FILTER_ANISOTROPIC;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sd.MaxAnisotropy = 16;
+        sd.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_DESCRIPTOR_RANGE srv = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0 };
+        D3D12_DESCRIPTOR_RANGE smp = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0 };
+        D3D12_ROOT_PARAMETER rp[3] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants = { 0, 0, 4 };
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable = { 1, &srv };
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[2].DescriptorTable = { 1, &smp };
+        D3D12_STATIC_SAMPLER_DESC ss = {};
+        ss.Filter = sd.Filter;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        ss.MaxAnisotropy = 16;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_ROOT_SIGNATURE_DESC rsd = { table ? 3u : 2u, rp, table ? 0u : 1u, table ? nullptr : &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        aniso_rs[table] = serialize_root_signature(rsd);
+        PsoDesc d; d.hlsl = aniso_hlsl; d.vs = "vs_full"; d.ps = "ps_ground"; d.rs = aniso_rs[table];
+        aniso_pso[table] = create_pso(d);
+        if (table && !aniso_samplers)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+            CHECK(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&aniso_samplers)));
+            p.device->CreateSampler(&sd, aniso_samplers->GetCPUDescriptorHandleForHeapStart());
+        }
+    };
+    static auto aniso_frame = [](UINT f, bool table) {
+        ID3D12GraphicsCommandList *l = p.list;
+        ID3D12DescriptorHeap *heaps[] = { p.srv_heap, aniso_samplers };
+        l->SetDescriptorHeaps(table ? 2 : 1, heaps);
+        l->SetGraphicsRootSignature(aniso_rs[table]);
+        l->SetPipelineState(aniso_pso[table]);
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        l->SetGraphicsRootDescriptorTable(1, srv_gpu(SRV_CORPUS + 96));
+        if (table)
+            l->SetGraphicsRootDescriptorTable(2, aniso_samplers->GetGPUDescriptorHandleForHeapStart());
+        for (UINT i = 0; i < 4; i++)
+        {
+            float rc[4] = { 0, 0, 0, f * 0.001f + i * 0.25f };
+            l->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+            l->DrawInstanced(3, 1, 0, 0);
+        }
+        l->SetDescriptorHeaps(1, heaps);
+    };
     auto make_targets = [heaps, trtv](bool typeless, int placed = 0) {
         heaps();
         ID3D12Heap *heap = nullptr;
@@ -4154,6 +4256,11 @@ cbuffer C : register(b0) { uint4 rc; };
           [heaps] { heaps(); make_vis(true); }, [](UINT f) { vis_frame(f, true); } },
         { "tex_nanite_vis32", "the same into an R32_UINT texture (baseline for tex_nanite_vis64)",
           [heaps] { heaps(); make_vis(false); }, [](UINT f) { vis_frame(f, false); } },
+        { "tex_aniso_table", "4 full-screen passes of a ground plane to the horizon, 8 16x anisotropic samples a pixel of mipped "
+                             "1024x1024 textures, the sampler from a descriptor table (as engines bind theirs)",
+          [heaps] { heaps(); make_aniso(true); }, [](UINT f) { aniso_frame(f, true); } },
+        { "tex_aniso_static", "the same with the sampler a static one (baseline for tex_aniso_table)",
+          [heaps] { heaps(); make_aniso(false); }, [](UINT f) { aniso_frame(f, false); } },
         { "tex_view_churn", "2000 SRVs and UAVs a frame of 16 mipped textures (whole, per mip, per format), written to a CPU heap "
                             "and copied to the shader-visible one (a render graph's per-pass views)",
           [heaps] {
