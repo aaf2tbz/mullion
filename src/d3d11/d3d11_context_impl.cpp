@@ -3903,8 +3903,34 @@ public:
     bool written;
   };
   std::vector<FragmentAccess> pass_fragment_access_;
+  // whether a pixel shader of the pass wrote any of them: until one has, only what a pre-raster stage writes orders
+  bool pass_fragment_written_ = false;
+  // their places in the list, once it is long: a pass of a G-buffer samples hundreds of textures, and every draw
+  // looks up each resource its stages use
+  std::unordered_map<D3D11ResourceCommon *, uint32_t> pass_fragment_index_;
+  static constexpr size_t kFragmentAccessLinear = 32;
 
-  template <typename Fn>
+  FragmentAccess *
+  FindFragmentAccess(D3D11ResourceCommon *resource) {
+    if (pass_fragment_access_.size() <= kFragmentAccessLinear) {
+      for (auto &access : pass_fragment_access_)
+        if (access.resource == resource)
+          return &access;
+      return nullptr;
+    }
+    auto found = pass_fragment_index_.find(resource);
+    return found == pass_fragment_index_.end() ? nullptr : &pass_fragment_access_[found->second];
+  }
+
+  void
+  ClearFragmentAccess() {
+    pass_fragment_access_.clear();
+    pass_fragment_index_.clear();
+    pass_fragment_written_ = false;
+  }
+
+  // the resources a stage's shader uses, each with whether it writes it; with Reads false, only those it writes
+  template <bool Reads = true, typename Fn>
   void
   EachStageResource(PipelineStage stage, Fn &&fn) {
     auto &bindings = state_.ShaderStages[stage];
@@ -3913,14 +3939,18 @@ public:
       return;
     const auto &reflection = shader->reflection();
     constexpr auto bits = std::numeric_limits<decltype(reflection.SRVSlotMaskLo)>::digits;
-    for (const auto &[slot, entry] : bindings.SRVs) {
-      auto mask = slot < bits ? reflection.SRVSlotMaskLo : reflection.SRVSlotMaskHi;
-      if ((mask >> (slot % bits)) & 1)
-        fn(entry.SRV->resource_.ptr(), false);
+    if constexpr (Reads) {
+      for (const auto &[slot, entry] : bindings.SRVs) {
+        auto mask = slot < bits ? reflection.SRVSlotMaskLo : reflection.SRVSlotMaskHi;
+        if ((mask >> (slot % bits)) & 1)
+          fn(entry.SRV->resource_.ptr(), false);
+      }
+      for (const auto &[slot, entry] : bindings.ConstantBuffers)
+        if ((reflection.ConstantBufferSlotMask >> slot) & 1)
+          fn(entry.Buffer.ptr(), false);
     }
-    for (const auto &[slot, entry] : bindings.ConstantBuffers)
-      if ((reflection.ConstantBufferSlotMask >> slot) & 1)
-        fn(entry.Buffer.ptr(), false);
+    if (!reflection.UAVSlotMask)
+      return;
     for (const auto &[slot, entry] : state_.OutputMerger.UAVs)
       if ((reflection.UAVSlotMask >> slot) & 1)
         fn(entry.View->resource_.ptr(), true);
@@ -3933,10 +3963,19 @@ public:
       return false;
     bool after = false;
     auto check = [&](D3D11ResourceCommon *resource, bool written) {
-      for (auto &access : pass_fragment_access_)
-        if (resource && access.resource == resource && (written || access.written))
-          after = true;
+      if (!resource || after)
+        return;
+      if (auto access = FindFragmentAccess(resource); access && (written || access->written))
+        after = true;
     };
+    // a read orders nothing until a pixel shader of the pass has written
+    if (!pass_fragment_written_) {
+      for (auto stage : {PipelineStage::Vertex, PipelineStage::Hull, PipelineStage::Domain, PipelineStage::Geometry})
+        EachStageResource<false>(stage, check);
+      for (const auto &[slot, entry] : state_.StreamOutput.Targets)
+        check(entry.Buffer.ptr(), true);
+      return after;
+    }
     for (auto stage : {PipelineStage::Vertex, PipelineStage::Hull, PipelineStage::Domain, PipelineStage::Geometry})
       EachStageResource(stage, check);
     if (auto layout = state_.InputAssembler.InputLayout.ptr()) {
@@ -3959,12 +3998,17 @@ public:
     EachStageResource(PipelineStage::Pixel, [&](D3D11ResourceCommon *resource, bool written) {
       if (!resource)
         return;
-      for (auto &access : pass_fragment_access_)
-        if (access.resource == resource) {
-          access.written |= written;
-          return;
-        }
+      pass_fragment_written_ |= written;
+      if (auto access = FindFragmentAccess(resource)) {
+        access->written |= written;
+        return;
+      }
       pass_fragment_access_.push_back({resource, written});
+      if (pass_fragment_access_.size() == kFragmentAccessLinear + 1)
+        for (uint32_t i = 0; i < pass_fragment_access_.size(); i++)
+          pass_fragment_index_[pass_fragment_access_[i].resource] = i;
+      else if (pass_fragment_access_.size() > kFragmentAccessLinear + 1)
+        pass_fragment_index_[resource] = uint32_t(pass_fragment_access_.size() - 1);
     });
   }
 
@@ -5314,7 +5358,7 @@ public:
       allocated_encoder_argbuf_size_ = nullptr;
       visibility_result_segments_ = 0;
       pass_scissors_ = pass_viewports_ = 0;
-      pass_fragment_access_.clear();
+      ClearFragmentAccess();
       break;
     }
     case CommandBufferState::ComputeEncoderActive:
