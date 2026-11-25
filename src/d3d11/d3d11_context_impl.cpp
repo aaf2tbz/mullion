@@ -4964,11 +4964,15 @@ public:
           });
           return;
         }
-        // copy from staging to default
-        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        // copy from staging to default: before the open render pass when no draw of it has used the destination
+        // (pass_prelude_), as an upload goes: no draw can have used a staging texture
+        auto hoisted = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? nullptr
+                                                                            : HoistedUpdate(GetResourceCommon(cmd.pDst));
+        if (!hoisted)
+          SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
         UseCopySource(staging_src);
-        EmitOP([=, dst_ = std::move(dst), src_ =std::move(staging_src),
+        auto copy_op = [=, dst_ = std::move(dst), src_ =std::move(staging_src),
               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
           auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
@@ -4999,7 +5003,11 @@ public:
           cmd_cptex.slice = cmd.Dst.ArraySlice;
           cmd_cptex.level = cmd.Dst.MipLevel;
           cmd_cptex.origin = cmd.DstOrigin;
-        });
+        };
+        if (hoisted)
+          AddPrelude(hoisted, std::move(copy_op));
+        else
+          EmitOP(std::move(copy_op));
       } else if (auto src = GetTexture(cmd.pSrc, cmd.Plane)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
@@ -5314,10 +5322,14 @@ public:
 
     PrepareTextureUse({GetTexture(cmd.pDst, cmd.Plane)});
     if (auto dst = GetTexture(cmd.pDst, cmd.Plane)) {
-
-      SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+      // a staging texture's rows, which no draw of the pass can have used, into a texture none has either: before
+      // the pass (pass_prelude_), as an upload from the application's memory goes
+      auto hoisted = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? nullptr
+                                                                          : HoistedUpdate(GetResourceCommon(cmd.pDst));
+      if (!hoisted)
+        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       UseWrappedSubresource(cmd.pDst, cmd.DstSubresource, true);
-      EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+      auto copy_op = [=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
         auto [src_buffer, src_offset] = enc.access(src, 0, src->length(), ResourceAccess::Read);
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
         auto upload = src_buffer->buffer();
@@ -5343,7 +5355,11 @@ public:
         cmd_cptex.slice = cmd.Dst.ArraySlice;
         cmd_cptex.level = cmd.Dst.MipLevel;
         cmd_cptex.origin = cmd.DstOrigin;
-      });
+      };
+      if (hoisted)
+        AddPrelude(hoisted, std::move(copy_op));
+      else
+        EmitOP(std::move(copy_op));
     }
   }
 

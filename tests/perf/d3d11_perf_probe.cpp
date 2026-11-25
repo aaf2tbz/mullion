@@ -85,7 +85,7 @@ struct Probe {
   HWND window = nullptr;
   ComPtr<IDXGISwapChain1> swapchain;
   ComPtr<ID3D11RenderTargetView> back_rtv;
-  ComPtr<ID3D11Texture2D> small[256];
+  ComPtr<ID3D11Texture2D> small[256], staging_small[64];
   ComPtr<ID3D11ShaderResourceView> small_srvs[256];
   UINT ring_at = 0;
 } p;
@@ -475,6 +475,24 @@ scenes() {
          c()->OMSetRenderTargets(1, p.back_rtv.GetAddressOf(), nullptr);
          c()->ClearRenderTargetView(p.back_rtv.Get(), color);
          p.swapchain->Present(0, 0);
+       }},
+      {"streaming_copies", "64 textured draws, each after a CopySubresourceRegion from a staging texture into its own "
+                           "64x64 texture (texture streaming between draws)",
+       [] {
+         for (int i = 0; i < 256; i++) {
+           p.small[i] = make_texture(64, 64, D3D11_BIND_SHADER_RESOURCE);
+           CHECK(p.device->CreateShaderResourceView(p.small[i].Get(), nullptr, &p.small_srvs[i]));
+         }
+         for (auto &staging : p.staging_small)
+           staging = make_texture(64, 64, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_WRITE);
+       },
+       [c](UINT) {
+         c()->PSSetShader(p.ps_tex.Get(), nullptr, 0);
+         for (UINT i = 0; i < 64; i++) {
+           c()->CopySubresourceRegion(p.small[i].Get(), 0, 0, 0, 0, p.staging_small[i].Get(), 0, nullptr);
+           c()->PSSetShaderResources(0, 1, p.small_srvs[i].GetAddressOf());
+           c()->Draw(4, 0);
+         }
        }},
       {"draws_copies", "500 draws, each after a CopySubresourceRegion of 256 bytes into the constant buffer it reads",
        [] {}, [c](UINT) {
