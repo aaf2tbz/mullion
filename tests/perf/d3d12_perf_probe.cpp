@@ -3826,6 +3826,61 @@ static std::vector<Scene> texture_scenes()
     // 8 RGBA8 targets written through one format and read through another: typeless resources, as engines make for
     // sRGB and linear views of one image
     // placed: 0 committed, 1 in a heap of every kind of resource (UE's pools on tier 2), 2 in a render-target heap
+    static ID3D12RootSignature *vis_rs;
+    static ID3D12PipelineState *vis_pso;
+    static ID3D12Resource *vis_texture;
+    static const char *vis_hlsl = R"(
+RWTexture2D<uint64_t> vis64 : register(u0);
+RWTexture2D<uint> vis32 : register(u0);
+cbuffer C : register(b0) { uint4 rc; };
+[numthreads(64, 1, 1)] void cs_vis64(uint t : SV_DispatchThreadID) {
+  uint h = (t + rc.x) * 2654435761u;
+  uint2 base = uint2((t * 7) % 1916, (t / 274 * 5) % 1076);
+  for (uint i = 0; i < 16; i++) {
+    uint2 px = base + uint2(i & 3, i >> 2);
+    uint depth = (h ^ (i * 40503u)) >> 2;
+    InterlockedMax(vis64[px], ((uint64_t)depth << 32) | (t * 16 + i));
+  }
+}
+[numthreads(64, 1, 1)] void cs_vis32(uint t : SV_DispatchThreadID) {
+  uint h = (t + rc.x) * 2654435761u;
+  uint2 base = uint2((t * 7) % 1916, (t / 274 * 5) % 1076);
+  for (uint i = 0; i < 16; i++) {
+    uint2 px = base + uint2(i & 3, i >> 2);
+    InterlockedMax(vis32[px], (h ^ (i * 40503u)) >> 2);
+  }
+}
+)";
+    static auto make_vis = [](bool wide) {
+        D3D12_DESCRIPTOR_RANGE uav = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants = { 0, 0, 4 };
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable = { 1, &uav };
+        D3D12_ROOT_SIGNATURE_DESC rsd = { 2, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        vis_rs = serialize_root_signature(rsd);
+        vis_pso = compute_pso_from(vis_rs, shader_code(vis_hlsl, wide ? "cs_vis64" : "cs_vis32", "cs_6_6"));
+        vis_texture = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1, wide ? DXGI_FORMAT_R32G32_UINT : DXGI_FORMAT_R32_UINT,
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = wide ? DXGI_FORMAT_R32G32_UINT : DXGI_FORMAT_R32_UINT;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        p.device->CreateUnorderedAccessView(vis_texture, nullptr, &ud, srv_cpu(SRV_TARGETS));
+    };
+    static auto vis_frame = [](UINT f, bool) {
+        ID3D12GraphicsCommandList *l = p.list;
+        l->SetComputeRootSignature(vis_rs);
+        l->SetPipelineState(vis_pso);
+        uint32_t rc[4] = { f, 0, 0, 0 };
+        l->SetComputeRoot32BitConstants(0, 4, rc, 0);
+        l->SetComputeRootDescriptorTable(1, srv_gpu(SRV_TARGETS));
+        l->Dispatch((1 << 16) / 64, 1, 1);
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = vis_texture;
+        l->ResourceBarrier(1, &b);
+    };
     auto make_targets = [heaps, trtv](bool typeless, int placed = 0) {
         heaps();
         ID3D12Heap *heap = nullptr;
@@ -4093,6 +4148,12 @@ static std::vector<Scene> texture_scenes()
                 barrier(l, targets[t], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             }
         } },
+        // Nanite's visibility buffer: a 64-bit texture each software-rasterized pixel takes the max of (depth << 32 | id)
+        // in, with InterlockedMax from compute (UE5's VisBuffer64), and the same at 32 bits as the baseline
+        { "tex_nanite_vis64", "1M 64-bit InterlockedMax a frame into a 1080p R64_UINT texture, 4x4 pixel clusters (Nanite's visibility buffer)",
+          [heaps] { heaps(); make_vis(true); }, [](UINT f) { vis_frame(f, true); } },
+        { "tex_nanite_vis32", "the same into an R32_UINT texture (baseline for tex_nanite_vis64)",
+          [heaps] { heaps(); make_vis(false); }, [](UINT f) { vis_frame(f, false); } },
         { "tex_view_churn", "2000 SRVs and UAVs a frame of 16 mipped textures (whole, per mip, per format), written to a CPU heap "
                             "and copied to the shader-visible one (a render graph's per-pass views)",
           [heaps] {
