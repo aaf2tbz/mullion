@@ -405,6 +405,7 @@ public:
 
   ~MTLD3D12DeviceImpl() {
     heartbeat::Forget(heartbeat_);
+    AgeTexturePool(0);
     if (archive_opener_)
       archive_opener_->Cancel();
     if (archive_writer_.joinable()) {
@@ -445,6 +446,8 @@ public:
       return E_FAIL;
     }
     heartbeat_ = heartbeat::Watch([this] {
+      // an idle GPU: the pooled textures no target is made from go back
+      AgeTexturePool();
       std::unique_lock<mullion::mutex> lock(residency_lock_);
       ApplyResidencyChanges();
       if (std::exchange(residency_dirty_, false))
@@ -1784,10 +1787,12 @@ public:
     if (FAILED(hr))
       return hr;
     // the allocation stays within the working set where going past it panics the kernel (mullion_memory.hpp)
-    if (!memory::Admit(GetMTLDevice(), [&] {
-          D3D12_RESOURCE_ALLOCATION_INFO info;
-          return GetResourceAllocationInfo(&info, 0, 1, pDesc)->SizeInBytes;
-        }))
+    auto size = [&] {
+      D3D12_RESOURCE_ALLOCATION_INFO info;
+      return GetResourceAllocationInfo(&info, 0, 1, pDesc)->SizeInBytes;
+    };
+    // the pooled textures (TakePooledTexture) go first
+    if (!memory::Admit(GetMTLDevice(), size) && (AgeTexturePool(0), !memory::Admit(GetMTLDevice(), size)))
       return FAIL(E_OUTOFMEMORY);
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
@@ -2786,6 +2791,11 @@ public:
     Logger::info(str::format("D3D12 pipeline totals: ", late_pipelines_, " after first Present; ",
         std::setprecision(std::numeric_limits<double>::max_digits10), pipeline_ms_, " ms total; ",
         longest_pipeline_ms_, " ms longest"));
+  }
+
+  void
+  PooledMemory(int64_t delta) override {
+    adapter_->PooledMemory(delta);
   }
 
   HRESULT

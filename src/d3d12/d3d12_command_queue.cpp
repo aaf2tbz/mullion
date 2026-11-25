@@ -1518,6 +1518,7 @@ public:
 
   void STDMETHODCALLTYPE
   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
+    device_->AgeTexturePool();
     for (UINT i = 0; i < Count; i++)
       if (static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i])->encoder_count ==
           std::numeric_limits<size_t>::max()) {

@@ -998,6 +998,46 @@ public:
   // the address alone, and what ends with it (the buffer's acceleration structures)
   virtual void UnregisterVA(BufferAllocation *allocation) = 0;
 
+  // committed render targets and depth buffers released lately, with their memory still resident: a texture of the
+  // same description made next takes one instead of new memory, which the kernel wires and zeroes when the residency
+  // set is next committed (4.9 ms a frame for four 4096x4096 RGBA8 targets on an M6). an application initializes such
+  // a texture before reading it, with a clear, a discard or a copy ("Render Target and Depth Stencil ... must be
+  // initialized", ID3D12GraphicsCommandList::DiscardResource), so what one held before is never seen; nor is it of any
+  // texture made with D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, whose memory starts undefined (UE5 makes its committed
+  // resources so, streamed textures among them). the pool holds
+  // at most a sixteenth of the working set, and no more than 512 MiB, for 2 seconds; MULLION_D3D12_TEXTURE_POOL=0 is
+  // without it
+  // and the size it is counted at
+  Rc<TextureAllocation> TakePooledTexture(const WMTTextureInfo &info, uint64_t &size);
+  // the adapter's count of pooled memory, which QueryVideoMemoryInfo leaves out of the usage
+  virtual void PooledMemory(int64_t delta) = 0;
+  // false where the pool does not take it, which the caller then frees
+  bool PoolTexture(const WMTTextureInfo &info, Rc<TextureAllocation> &&allocation, uint64_t size);
+  // gives back what was pooled before `age` milliseconds ago, everything with 0
+  void AgeTexturePool(uint64_t age);
+  // a cheap check, made with each submission
+  void
+  AgeTexturePool() {
+    uint64_t oldest = texture_pool_oldest_.load(std::memory_order_relaxed);
+    if (oldest && GetTickCount64() - oldest > kTexturePoolAge)
+      AgeTexturePool(kTexturePoolAge);
+  }
+  static constexpr uint64_t kTexturePoolAge = 2000;
+
+private:
+  struct PooledTexture {
+    WMTTextureInfo info;
+    Rc<TextureAllocation> allocation;
+    uint64_t size;
+    uint64_t at;
+  };
+  mullion::mutex texture_pool_lock_;
+  std::deque<PooledTexture> texture_pool_;
+  uint64_t texture_pool_bytes_ = 0;
+  std::atomic<uint64_t> texture_pool_oldest_ = 0;
+
+public:
+
   // the buffer an address lies in, or none. pEnd, when given, is where the addresses that find the same buffer end:
   // its end, or the next buffer's start
   virtual BufferAllocation *

@@ -9,6 +9,9 @@
 DEFINE_COM_INTERFACE("acdf3ef1-b33a-4cb6-97bd-1c1974827e6d", IMTLDXGIAdapter)
     : public IDXGIAdapter4 {
   virtual WMT::Device STDMETHODCALLTYPE GetMTLDevice() = 0;
+  // memory a device keeps for its own reuse (D3D12's pool of released textures, MTLD3D12Device::PoolTexture), by
+  // `delta` bytes: allocated still, but free as the application sees it, so not in QueryVideoMemoryInfo's usage
+  virtual void STDMETHODCALLTYPE PooledMemory(int64_t delta) {}
 };
 
 DEFINE_COM_INTERFACE("6bfa1657-9cb1-471a-a4fb-7cacf8a81207", IMTLDXGIDevice)

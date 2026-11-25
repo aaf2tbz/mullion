@@ -21,6 +21,7 @@
 #include <bit>
 #include <cmath>
 #include "mullion_format.hpp"
+#include "mullion_memory.hpp"
 #include "mullion_shared_texture.hpp"
 #include "util_env.hpp"
 #include "com/com_pointer.hpp"
@@ -349,6 +350,9 @@ SharedDesc12(const D3D11_TEXTURE2D_DESC1 &desc) {
   return out;
 }
 
+// the least a texture's memory is for the device's pool to keep it (MTLD3D12Device::TakePooledTexture)
+constexpr uint64_t kPooledTextureSize = 256 << 10;
+
 class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
@@ -361,6 +365,18 @@ class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   Com<MTLD3D12Heap, false> heap_;
   // a committed texture on a shared heap, or one opened from a share: the share's object
   std::unique_ptr<D3D12TextureShare> share_;
+
+public:
+  // a committed texture of the application's own (not a swap chain's or an adopted one): its allocation may come from,
+  // and go back to, the device's pool (MTLD3D12Device::TakePooledTexture)
+  bool poolable_ = false;
+
+private:
+  // what a pooled allocation is: its description and size, and the allocation itself, which goes back to the pool
+  // only while the texture still has it
+  WMTTextureInfo pool_info_{};
+  uint64_t pool_size_ = 0;
+  TextureAllocation *pool_allocation_ = nullptr;
 
   // Makes the texture a share: its Metal allocation's port registered under a unique name, and the share's object
   // holding that name and the texture's description, which every handle of the share is a handle to.
@@ -519,11 +535,41 @@ public:
       Rc<Texture> storage = new Texture(texture_info, device_->GetMTLDevice());
       WMT::Texture adopted;
       adopted.handle = pTexture ? pTexture->texture : NULL_OBJECT_HANDLE;
-      storage->rename(pTexture ? storage->wrap(WMT::Reference<WMT::Texture>(adopted), texture_info, pTexture->flags)
-                      : pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
+      static const bool pooling = env::getEnvVar("MULLION_D3D12_TEXTURE_POOL") != "0";
+      // a small texture's memory is the kernel's to wire quickly, and Metal suballocates it where the device's count
+      // shows nothing: only textures of 256 KiB and more are pooled
+      bool pooled = pooling && poolable_ && !pHeap && !Reserved && !pTexture && !shared && planes == 1 &&
+                          flags.test(TextureAllocationFlag::CpuInvisible) && !(HeapFlags & D3D12_HEAP_FLAG_SHARED) &&
+                          ((desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
+                           (HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) &&
+                          !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+      pooled = pooled && device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info).size >= kPooledTextureSize;
+      uint64_t reused_size = 0;
+      Rc<TextureAllocation> reused = pooled ? device_->TakePooledTexture(texture_info, reused_size) : nullptr;
+      // a pooled allocation is in the residency set still
+      const bool resident = bool(reused);
+      // what the device counts for a new allocation, which QueryVideoMemoryInfo leaves out while it is pooled
+      // (heapTextureSizeAndAlign is less than that for small textures)
+      const uint64_t allocated = pooled && !reused ? device_->GetMTLDevice().currentAllocatedSize() : 0;
+      if (reused) {
+        std::vector<TextureViewRef> retired;
+        storage->rename(std::move(reused), retired);
+      } else
+        storage->rename(pTexture ? storage->wrap(WMT::Reference<WMT::Texture>(adopted), texture_info, pTexture->flags)
+                        : pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
       if (!storage->current()->texture())
         return FAIL(E_OUTOFMEMORY);
-      if (!pHeap)
+      if (pooled) {
+        // a reused allocation keeps the size it was counted at
+        pool_info_ = texture_info;
+        pool_size_ = resident ? reused_size : device_->GetMTLDevice().currentAllocatedSize() - allocated;
+        // an allocation the count does not show in, or that other threads' changed the count around, is not pooled
+        if (pool_size_ < kPooledTextureSize || pool_size_ > (1ull << 40))
+          pool_size_ = 0;
+        pool_allocation_ = storage->current();
+      } else
+        pool_size_ = 0;
+      if (!pHeap && !resident)
         device_->RegisterResidency(storage->current()->texture());
       storage->centered = desc_.SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN;
       storage->paired = texture_info.sample_count < desc_.SampleDesc.Count;
@@ -635,7 +681,11 @@ public:
   }
 
   ~MTLD3D12Texture() {
-    EndAfterWorkInFlight(device_, [device = device_, texture = std::move(texture)] {
+    const bool pool = pool_size_ && texture && !texture->chroma && texture->current() == pool_allocation_;
+    EndAfterWorkInFlight(device_, [device = device_, texture = std::move(texture), pool, info = pool_info_,
+                                   size = pool_size_] {
+      if (pool && device->PoolTexture(info, Rc<TextureAllocation>(texture->current()), size))
+        return;
       for (auto storage = texture.ptr(); storage; storage = storage->chroma.ptr())
         if (storage->current() && !storage->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
           device->UnregisterResidency(storage->current()->texture());
@@ -1539,6 +1589,7 @@ CreateCommittedTexture(
   auto texture = Com<MTLD3D12Texture>(
       pBufferRefs ? new MTLD3D12BackBuffer(pDevice, *pBufferRefs) : new MTLD3D12Texture(pDevice)
   );
+  texture->poolable_ = !pBufferRefs && !pTexture;
   HRESULT hr = texture->Initialize(pHeapProps, HeapFlags, pDesc, InitialState, nullptr, 0, false, pTexture);
   if (FAILED(hr))
     return hr;
@@ -1566,6 +1617,76 @@ OpenSharedTexture(MTLD3D12Device *pDevice, HANDLE handle, REFIID riid, void **pp
   if (FAILED(hr))
     return hr;
   return texture->QueryInterface(riid, ppResource);
+}
+
+static bool
+SameTexture(const WMTTextureInfo &a, const WMTTextureInfo &b) {
+  return a.pixel_format == b.pixel_format && a.width == b.width && a.height == b.height && a.depth == b.depth &&
+         a.array_length == b.array_length && a.type == b.type && a.mipmap_level_count == b.mipmap_level_count &&
+         a.sample_count == b.sample_count && a.usage == b.usage && a.options == b.options &&
+         a.placement_sparse_page_size == b.placement_sparse_page_size;
+}
+
+Rc<TextureAllocation>
+MTLD3D12Device::TakePooledTexture(const WMTTextureInfo &info, uint64_t &size) {
+  if (!texture_pool_oldest_.load(std::memory_order_relaxed))
+    return nullptr;
+  std::lock_guard<mullion::mutex> lock(texture_pool_lock_);
+  // the latest given back, as the one an application releasing and making a set of targets again wants
+  for (auto entry = texture_pool_.rbegin(); entry != texture_pool_.rend(); entry++)
+    if (SameTexture(entry->info, info)) {
+      Rc<TextureAllocation> allocation = std::move(entry->allocation);
+      size = entry->size;
+      texture_pool_bytes_ -= entry->size;
+      PooledMemory(-int64_t(entry->size));
+      texture_pool_.erase(std::next(entry).base());
+      texture_pool_oldest_.store(texture_pool_.empty() ? 0 : texture_pool_.front().at, std::memory_order_relaxed);
+      return allocation;
+    }
+  return nullptr;
+}
+
+bool
+MTLD3D12Device::PoolTexture(const WMTTextureInfo &info, Rc<TextureAllocation> &&allocation, uint64_t size) {
+  static const uint64_t limit = std::min<uint64_t>(512ull << 20, memory::Limit(GetMTLDevice()) / 16);
+  if (size > limit || memory::Budget(GetMTLDevice()) < memory::Limit(GetMTLDevice()))
+    return false;
+  std::vector<Rc<TextureAllocation>> freed;
+  {
+    std::lock_guard<mullion::mutex> lock(texture_pool_lock_);
+    uint64_t now = std::max<uint64_t>(GetTickCount64(), 1);
+    texture_pool_.push_back({info, std::move(allocation), size, now});
+    texture_pool_bytes_ += size;
+    PooledMemory(size);
+    while (texture_pool_bytes_ > limit) {
+      texture_pool_bytes_ -= texture_pool_.front().size;
+      PooledMemory(-int64_t(texture_pool_.front().size));
+      freed.push_back(std::move(texture_pool_.front().allocation));
+      texture_pool_.pop_front();
+    }
+    texture_pool_oldest_.store(texture_pool_.front().at, std::memory_order_relaxed);
+  }
+  for (auto &allocation : freed)
+    UnregisterResidency(allocation->texture());
+  return true;
+}
+
+void
+MTLD3D12Device::AgeTexturePool(uint64_t age) {
+  std::vector<Rc<TextureAllocation>> freed;
+  {
+    std::lock_guard<mullion::mutex> lock(texture_pool_lock_);
+    uint64_t now = GetTickCount64();
+    while (!texture_pool_.empty() && (!age || now - texture_pool_.front().at > age)) {
+      texture_pool_bytes_ -= texture_pool_.front().size;
+      PooledMemory(-int64_t(texture_pool_.front().size));
+      freed.push_back(std::move(texture_pool_.front().allocation));
+      texture_pool_.pop_front();
+    }
+    texture_pool_oldest_.store(texture_pool_.empty() ? 0 : texture_pool_.front().at, std::memory_order_relaxed);
+  }
+  for (auto &allocation : freed)
+    UnregisterResidency(allocation->texture());
 }
 
 HRESULT

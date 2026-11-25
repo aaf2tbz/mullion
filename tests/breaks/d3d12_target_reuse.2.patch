@@ -1,0 +1,14 @@
+# every committed private texture goes back to the pool, ones that start zeroed too
+# family native
+--- a/src/d3d12/d3d12_texture.cpp
++++ b/src/d3d12/d3d12_texture.cpp
+@@ -540,8 +540,7 @@
+       // shows nothing: only textures of 256 KiB and more are pooled
+       bool pooled = pooling && poolable_ && !pHeap && !Reserved && !pTexture && !shared && planes == 1 &&
+                           flags.test(TextureAllocationFlag::CpuInvisible) && !(HeapFlags & D3D12_HEAP_FLAG_SHARED) &&
+-                          ((desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
+-                           (HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) &&
++                          (desc_.Flags || !(HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) &&
+                           !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+       pooled = pooled && device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info).size >= kPooledTextureSize;
+       uint64_t reused_size = 0;

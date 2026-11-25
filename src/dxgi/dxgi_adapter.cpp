@@ -308,7 +308,8 @@ public:
     // under memory pressure
     // and never more than dxgi.maxDeviceMemory, where it is set
     pVideoMemoryInfo->Budget = local ? std::min(memory::Budget(device_), memory_) : 0;
-    pVideoMemoryInfo->CurrentUsage = local ? device_.currentAllocatedSize() : 0;
+    pVideoMemoryInfo->CurrentUsage =
+        local ? device_.currentAllocatedSize() - std::min(device_.currentAllocatedSize(), pooled_memory.load()) : 0;
     pVideoMemoryInfo->AvailableForReservation = pVideoMemoryInfo->Budget / 2;
     // MULLION_TRACE_MEMORY=heavy: every query; a game polls it each frame
     if (trace::Heavy(trace::Memory) && local)
@@ -357,6 +358,16 @@ private:
   // configuration, which is the process's
   DXGI_ADAPTER_DESC3 desc_ = {};
   uint64_t memory_ = 0;
+  // every device's pooled memory, of all the process's adapters (IMTLDXGIAdapter::PooledMemory)
+  static inline std::atomic<uint64_t> pooled_memory = 0;
+
+public:
+  void STDMETHODCALLTYPE
+  PooledMemory(int64_t delta) override {
+    pooled_memory += uint64_t(delta);
+  }
+
+private:
   uint64_t mem_reserved_[2] = {0, 0};
   std::atomic<DWORD> event_cookie_{0};
 };

@@ -1,0 +1,15 @@
+# a pooled allocation keeps the views the released texture made, under that texture's view numbers
+# family native
+--- a/src/d3d12/d3d12_texture.cpp
++++ b/src/d3d12/d3d12_texture.cpp
+@@ -552,8 +552,8 @@
+       // (heapTextureSizeAndAlign is less than that for small textures)
+       const uint64_t allocated = pooled && !reused ? device_->GetMTLDevice().currentAllocatedSize() : 0;
+       if (reused) {
+-        std::vector<TextureViewRef> retired;
+-        storage->rename(std::move(reused), retired);
++        reused->descriptor = storage.ptr();
++        storage->rename(std::move(reused));
+       } else
+         storage->rename(pTexture ? storage->wrap(WMT::Reference<WMT::Texture>(adopted), texture_info, pTexture->flags)
+                         : pHeap ? storage->allocate(flags, pHeap->heap, offset) : storage->allocate(flags));
