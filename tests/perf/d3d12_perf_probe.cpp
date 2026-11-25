@@ -3770,6 +3770,18 @@ float4 ps_volume(V i) : SV_Target
 }
 )";
 
+// a post-processing chain on RGBA8 UAV textures: each pass reads the one before through an SRV and writes its own
+static const char *uav_chain_hlsl = R"(
+cbuffer RC : register(b0) { float4 rc; };
+RWTexture2D<unorm float4> dst : register(u0);
+Texture2D<float4> src : register(t0);
+[numthreads(8, 8, 1)] void cs_chain(uint3 t : SV_DispatchThreadID)
+{
+    dst[t.xy] = src.Load(int3(t.xy, 0)) * 0.5 + src.Load(int3(t.xy + uint2(1, 0), 0)) * 0.25 +
+                src.Load(int3(t.xy + uint2(0, 1), 0)) * 0.25 + rc * 0.01;
+}
+)";
+
 static std::vector<Scene> texture_scenes()
 {
     static ID3D12DescriptorHeap *tex_rtv_heap, *tex_dsv_heap;
@@ -3813,14 +3825,38 @@ static std::vector<Scene> texture_scenes()
     };
     // 8 RGBA8 targets written through one format and read through another: typeless resources, as engines make for
     // sRGB and linear views of one image
-    auto make_targets = [heaps, trtv](bool typeless) {
+    // placed: 0 committed, 1 in a heap of every kind of resource (UE's pools on tier 2), 2 in a render-target heap
+    auto make_targets = [heaps, trtv](bool typeless, int placed = 0) {
         heaps();
+        ID3D12Heap *heap = nullptr;
+        if (placed)
+        {
+            D3D12_HEAP_DESC hd = { 8ull * 16 << 20, { D3D12_HEAP_TYPE_DEFAULT }, 0,
+                                   placed == 1 ? D3D12_HEAP_FLAG_NONE : D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES };
+            CHECK(p.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)));
+        }
         for (UINT t = 0; t < 8; t++)
         {
             D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_R8G8B8A8_UNORM };
-            auto r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1,
-                                     typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, &cv);
+            ID3D12Resource *r = nullptr;
+            if (heap)
+            {
+                D3D12_RESOURCE_DESC rd = {};
+                rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                rd.Width = W;
+                rd.Height = H;
+                rd.DepthOrArraySize = 1;
+                rd.MipLevels = 1;
+                rd.Format = typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
+                rd.SampleDesc.Count = 1;
+                rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                CHECK(p.device->CreatePlacedResource(heap, t * (16ull << 20), &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+                                                     IID_PPV_ARGS(&r)));
+            }
+            else
+                r = create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1,
+                                    typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, &cv);
             D3D12_RENDER_TARGET_VIEW_DESC rd = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D };
             p.device->CreateRenderTargetView(r, &rd, trtv(t));
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -3975,6 +4011,81 @@ static std::vector<Scene> texture_scenes()
           [make_targets] { make_targets(true); }, [targets_frame, memory](UINT f) { memory(); targets_frame(f); } },
         { "tex_typed_targets", "the same with RGBA8_UNORM targets and views (baseline for tex_typeless_targets)",
           [make_targets] { make_targets(false); }, [targets_frame, memory](UINT f) { memory(); targets_frame(f); } },
+        { "tex_placed_targets", "tex_typed_targets' targets placed in a heap of buffers and textures (an engine's resource pools)",
+          [make_targets] { make_targets(false, 1); }, [targets_frame, memory](UINT f) { memory(); targets_frame(f); } },
+        { "tex_placed_rt_targets", "the same placed in a heap of render targets and depth buffers alone",
+          [make_targets] { make_targets(false, 2); }, [targets_frame, memory](UINT f) { memory(); targets_frame(f); } },
+        { "tex_depth_stencil", "a 1080p D24_UNORM_S8_UINT buffer: 800 overlapping depth-tested and -written quads with a stencil write, each frame",
+          [heaps, tdsv] {
+            heaps();
+            D3D12_CLEAR_VALUE cv = { DXGI_FORMAT_D24_UNORM_S8_UINT };
+            cv.DepthStencil.Depth = 1.0f;
+            depths.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, 1, &cv));
+            D3D12_DEPTH_STENCIL_VIEW_DESC dd = { DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_DSV_DIMENSION_TEXTURE2D };
+            p.device->CreateDepthStencilView(depths.back(), &dd, tdsv(12));
+            PsoDesc d; d.depth = true; d.dsv = DXGI_FORMAT_D24_UNORM_S8_UINT; d.stencil_write = true; depth_pso = create_pso(d);
+        }, [tdsv](UINT f) {
+            ID3D12GraphicsCommandList *l = p.list;
+            auto bb = rtv(p.frame_index);
+            auto d = tdsv(12);
+            l->OMSetRenderTargets(1, &bb, FALSE, &d);
+            l->ClearDepthStencilView(d, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+            viewport(l);
+            set_quad_state(l, depth_pso);
+            for (UINT i = 0; i < 800; i++)
+            {
+                float rc[4] = { (float)(i % 20) / 10.0f - 0.95f, (float)(i / 20 % 20) / 10.0f - 0.95f, 0.6f, f * 0.001f };
+                l->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+                l->DrawInstanced(3, 1, 0, 0);
+            }
+        } },
+        { "tex_uav_chain", "8 RGBA8 1080p UAV textures, each written by a compute pass reading the one before (a post-processing chain)",
+          [heaps] {
+            heaps();
+            static ID3D12RootSignature *chain_rs;
+            static ID3D12PipelineState *chain_pso;
+            D3D12_DESCRIPTOR_RANGE uav = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+            D3D12_DESCRIPTOR_RANGE srv = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+            D3D12_ROOT_PARAMETER rp[3] = {};
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rp[0].Constants = { 0, 0, 4 };
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[1].DescriptorTable = { 1, &uav };
+            rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[2].DescriptorTable = { 1, &srv };
+            D3D12_ROOT_SIGNATURE_DESC rsd = { 3, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+            chain_rs = serialize_root_signature(rsd);
+            ID3DBlob *cs = compile(uav_chain_hlsl, "cs_chain", "cs_5_0");
+            D3D12_COMPUTE_PIPELINE_STATE_DESC c = {};
+            c.pRootSignature = chain_rs;
+            c.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+            CHECK(p.device->CreateComputePipelineState(&c, IID_PPV_ARGS(&chain_pso)));
+            for (UINT t = 0; t < 8; t++)
+            {
+                targets.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, W, H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+                p.device->CreateUnorderedAccessView(targets.back(), nullptr, nullptr, srv_cpu(SRV_TARGETS + 2 * t));
+                p.device->CreateShaderResourceView(targets.back(), nullptr, srv_cpu(SRV_TARGETS + 2 * t + 1));
+            }
+            depth_pso = chain_pso;
+            tex8_typed = (ID3D12PipelineState *)chain_rs;
+        }, [memory](UINT f) {
+            memory();
+            ID3D12GraphicsCommandList *l = p.list;
+            l->SetComputeRootSignature((ID3D12RootSignature *)tex8_typed);
+            l->SetPipelineState(depth_pso);
+            for (UINT t = 0; t < 8; t++)
+            {
+                barrier(l, targets[t], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                float rc[4] = { f * 0.01f, 0, 0, 0 };
+                l->SetComputeRoot32BitConstants(0, 4, rc, 0);
+                l->SetComputeRootDescriptorTable(1, srv_gpu(SRV_TARGETS + 2 * t));
+                l->SetComputeRootDescriptorTable(2, srv_gpu(SRV_TARGETS + 2 * ((t + 7) % 8) + 1));
+                l->Dispatch(W / 8, H / 8 + 1, 1);
+                barrier(l, targets[t], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+        } },
         { "tex_depth_typeless", "4 2048x2048 R32_TYPELESS shadow maps drawn as D32_FLOAT and sampled as R32_FLOAT each frame",
           make_depths, [depths_frame, memory](UINT f) { memory(); depths_frame(f); } },
         { "tex_volumes", "8 128^3 volumes (RGBA16F and RGBA8) marched 16 steps a pixel over the screen, 4 times",
