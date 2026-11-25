@@ -17,6 +17,7 @@
  */
 
 #include <deque>
+#include "util_cpu_fence.hpp"
 #include <functional>
 #include <algorithm>
 #include "com/com_guid.hpp"
@@ -887,12 +888,12 @@ private:
 
     uint64_t internal_seq = 1;
     for (;;) {
-      inflight_cmdbuf_seq_.wait(internal_seq, std::memory_order_acquire);
+      wait_while(inflight_cmdbuf_seq_, internal_seq, std::memory_order_acquire);
       if (inflight_cmdbuf_stop_.load() == internal_seq)
         break;
       auto &inflight = inflight_cmdbuf_pool_[internal_seq % kCommandQueueSize];
 
-      inflight.gate->closed.wait(true);
+      wait_while(inflight.gate->closed, true);
       // a cancelled gate's: it never runs, and nothing of the queue's follows it
       if (inflight.cmdbuf.status() < WMTCommandBufferStatusCommitted) {
         for (auto &allocator : inflight.allocators)
@@ -1103,7 +1104,7 @@ private:
     // command buffer of the queue's encoded already (Metal 3), which the slot then has
     void
     Start(WMT::Reference<MetalCommandBuffer> encoded = {}) {
-      queue->inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
+      wait_while(queue->inflight_cmdbuf_count_, kCommandQueueSize, std::memory_order_acquire);
       queue->inflight_cmdbuf_count_.fetch_add(1, std::memory_order_relaxed);
       auto seq = queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
       inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
@@ -1188,7 +1189,7 @@ private:
     bool
     Settle() {
       auto ended = End();
-      queue->gate_->closed.wait(true);
+      wait_while(queue->gate_->closed, true);
       if (ended.status() < WMTCommandBufferStatusCommitted)
         return false;
       ended.waitUntilCompleted();
@@ -1602,7 +1603,7 @@ public:
     auto mappings = device_->SparseBufferMappings();
     // another queue's mappings change the table, and a Wait may be for them: it is read past the Wait's fence
     if (!mappings.empty() && gate_->closed) {
-      gate_->closed.wait(true);
+      wait_while(gate_->closed, true);
       mappings = device_->SparseBufferMappings();
     }
     // the GPU only reads a table, and nothing writes it once made: the queue's last one goes on while the mappings
@@ -1807,7 +1808,7 @@ public:
           break;
         case EncoderType::AccelerationStructure: {
           // which structures are built is the device's, and another queue's builds change it
-          gate_->closed.wait(true);
+          wait_while(gate_->closed, true);
           auto data = static_cast<AccelerationStructureEncoderData *>(current);
           for (auto filled = data->filled; filled; filled = filled->next) {
             auto &structure = *filled->structure;
@@ -2689,7 +2690,7 @@ public:
     if (gate->closed)
       static_cast<MTLD3D12Fence *>(pFence)->completion->Expect(Value, [gate] { gate->Open(); });
     auto work = [this, gate] {
-      gate_->closed.wait(true);
+      wait_while(gate_->closed, true);
       {
         // after a submission another thread is in the middle of
         std::scoped_lock lock(mutex_commit_, held_mutex_);

@@ -1,4 +1,5 @@
 #include "Metal.hpp"
+#include "util_cpu_fence.hpp"
 #include "d3d11_private.h"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_device.hpp"
@@ -50,7 +51,7 @@ public:
       device_->CreateGraphicsPipeline(&desc, &pipeline);
       return pipeline->GetPipeline(pPipeline);
     }
-    ready_.wait(false, std::memory_order_acquire);
+    wait_while(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_};
   }
 
@@ -157,7 +158,7 @@ public:
   }
 
   void GetPipeline(MTL_COMPILED_COMPUTE_PIPELINE *pPipeline) final {
-    ready_.wait(false, std::memory_order_acquire);
+    wait_while(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_};
   }
 

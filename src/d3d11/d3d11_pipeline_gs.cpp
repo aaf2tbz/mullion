@@ -17,6 +17,7 @@
  */
 
 #include "Metal.hpp"
+#include "util_cpu_fence.hpp"
 #include "airconv_public.h"
 #include "DXBCParser/d3d12tokenizedprogramformat.hpp"
 #include "d3d11_device.hpp"
@@ -97,7 +98,7 @@ public:
       device_->CreateGeometryPipeline(&desc, &pipeline);
       return pipeline->GetPipeline(pPipeline);
     }
-    ready_.wait(false, std::memory_order_acquire);
+    wait_while(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_mesh_[0], state_mesh_[1], GeometryInstances, MeshInstances, MeshInvocations};
   }
 

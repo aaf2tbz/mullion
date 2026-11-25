@@ -17,6 +17,7 @@
  */
 
 #include "Metal.hpp"
+#include "util_cpu_fence.hpp"
 #include "airconv_public.h"
 #include "tessellation_limits.hpp"
 #include "mullion_tessellation_templates.hpp"
@@ -110,7 +111,7 @@ public:
       device_->CreateTessellationMeshPipeline(&desc, &pipeline);
       return pipeline->GetPipeline(pPipeline);
     }
-    ready_.wait(false, std::memory_order_acquire);
+    wait_while(ready_, false, std::memory_order_acquire);
     *pPipeline = {state_rasterization_, hull_reflection.NumOutputElement,
                   hull_reflection.ThreadsPerPatch, parts};
   }

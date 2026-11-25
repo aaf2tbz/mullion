@@ -18,6 +18,7 @@
  */
 
 #include "mullion_command_queue.hpp"
+#include "util_cpu_fence.hpp"
 #include "mullion_heartbeat.hpp"
 #include "Metal.hpp"
 #include "mullion_statistics.hpp"
@@ -219,7 +220,7 @@ CommandQueue::CommitCurrentChunk() {
   ready_for_encode.notify_one();
 
   auto t0 = clock::now();
-  chunk_ongoing.wait(kCommandChunkCount - 1, std::memory_order_acquire);
+  wait_while(chunk_ongoing, kCommandChunkCount - 1, std::memory_order_acquire);
   chunk_ongoing.fetch_add(1, std::memory_order_relaxed);
   auto t1 = clock::now();
   statistics.commit_interval += (t1 - t0);
@@ -271,7 +272,7 @@ CommandQueue::EncodingThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
-    ready_for_encode.wait(internal_seq, std::memory_order_acquire);
+    wait_while(ready_for_encode, internal_seq, std::memory_order_acquire);
     if (stopped.load() || (draining_.load(std::memory_order_acquire) && internal_seq > drain_last_seq_))
       break;
     // perform...
@@ -292,7 +293,7 @@ CommandQueue::WaitForFinishThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
-    ready_for_commit.wait(internal_seq, std::memory_order_acquire);
+    wait_while(ready_for_commit, internal_seq, std::memory_order_acquire);
     if (stopped.load())
       break;
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
