@@ -3959,18 +3959,37 @@ public:
     return hoists;
   }
 
+  // the resources recorded last, by a few bits of their address, in front of the sets: a draw binds the same ones
+  // again and again, and maps the same constant buffer every time (d3d11_perf_probe draws_map)
+  static constexpr size_t kPassRecent = 16;
+  std::array<D3D11ResourceCommon *, kPassRecent> pass_used_recent_{}, pass_written_recent_{};
+
+  static size_t
+  RecentSlot(D3D11ResourceCommon *resource) {
+    return (reinterpret_cast<uintptr_t>(resource) >> 6) % kPassRecent;
+  }
+
   void
   UsedInPass(D3D11ResourceCommon *resource) {
-    if (pass_prelude_ && resource)
-      pass_used_.insert(resource);
+    if (!pass_prelude_ || !resource)
+      return;
+    auto &recent = pass_used_recent_[RecentSlot(resource)];
+    if (recent == resource)
+      return;
+    recent = resource;
+    pass_used_.insert(resource);
   }
 
   void
   WrittenInPass(D3D11ResourceCommon *resource) {
-    if (pass_prelude_ && resource) {
-      pass_used_.insert(resource);
-      pass_written_.insert(resource);
-    }
+    if (!pass_prelude_ || !resource)
+      return;
+    auto &recent = pass_written_recent_[RecentSlot(resource)];
+    if (recent == resource)
+      return;
+    recent = resource;
+    UsedInPass(resource);
+    pass_written_.insert(resource);
   }
 
   // the prelude of the open render pass, where an upload into `resource` can go instead of ending the pass
@@ -5487,6 +5506,8 @@ public:
       pass_prelude_ = nullptr;
       pass_used_.clear();
       pass_written_.clear();
+      pass_used_recent_ = {};
+      pass_written_recent_ = {};
       pass_index_buffer_ = nullptr;
       break;
     }
