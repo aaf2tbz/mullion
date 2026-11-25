@@ -3975,7 +3975,7 @@ static std::vector<Scene> texture_scenes()
         p.device->CreateDepthStencilView(msaa.back(), &dd, tdsv(8));
         PsoDesc d; d.rt = HDR_FORMAT; d.samples = 4; d.depth = true; d.num_rt = 1; msaa_pso = create_pso(d);
     };
-    auto msaa_frame = [trtv, tdsv](UINT f) {
+    auto msaa_frame = [trtv, tdsv](UINT f, bool discard = false) {
         ID3D12GraphicsCommandList *l = p.list;
         for (UINT t = 0; t < 4; t++)
         {
@@ -3991,6 +3991,13 @@ static std::vector<Scene> texture_scenes()
             for (UINT i = 0; i < 50; i++) small_quad(l, i, f * 0.01f);
             barrier(l, msaa[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
             l->ResolveSubresource(resolved[t], 0, msaa[t], 0, HDR_FORMAT);
+            // the samples are not needed once resolved: back to a target, discarded, as a validated engine does
+            if (discard)
+            {
+                barrier(l, msaa[t], D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                l->DiscardResource(msaa[t], nullptr);
+                barrier(l, msaa[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            }
         }
         auto bb = rtv(p.frame_index);
         l->OMSetRenderTargets(1, &bb, FALSE, nullptr);
@@ -4086,6 +4093,44 @@ static std::vector<Scene> texture_scenes()
                 barrier(l, targets[t], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             }
         } },
+        { "tex_view_churn", "2000 SRVs and UAVs a frame of 16 mipped textures (whole, per mip, per format), written to a CPU heap "
+                            "and copied to the shader-visible one (a render graph's per-pass views)",
+          [heaps] {
+            heaps();
+            for (UINT t = 0; t < 16; t++)
+                corpus.push_back(create_resource(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 1024, 1, 11,
+                                                 t % 2 ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON));
+        }, [](UINT f) {
+            double t = qpc_ms();
+            for (UINT i = 0; i < 2000; i++)
+            {
+                ID3D12Resource *r = corpus[i % 16];
+                bool rgba8 = (i % 16) % 2;
+                UINT mip = (i / 16) % 11;
+                if (i % 4 == 3)
+                {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+                    ud.Format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                    ud.Texture2D.MipSlice = mip;
+                    p.device->CreateUnorderedAccessView(r, nullptr, &ud, staging_cpu(i % 512));
+                }
+                else
+                {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+                    sd.Format = rgba8 ? (i % 8 < 4 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) : DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    sd.Texture2D.MostDetailedMip = i % 3 ? mip : 0;
+                    sd.Texture2D.MipLevels = i % 3 ? 1 : ~0u;
+                    p.device->CreateShaderResourceView(r, &sd, staging_cpu(i % 512));
+                }
+                p.device->CopyDescriptorsSimple(1, srv_cpu(SRV_STREAM + 8 + i % 512), staging_cpu(i % 512),
+                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+            extras.add("us_per_view", (qpc_ms() - t) * 1000.0 / 2000);
+        } },
         { "tex_depth_typeless", "4 2048x2048 R32_TYPELESS shadow maps drawn as D32_FLOAT and sampled as R32_FLOAT each frame",
           make_depths, [depths_frame, memory](UINT f) { memory(); depths_frame(f); } },
         { "tex_volumes", "8 128^3 volumes (RGBA16F and RGBA8) marched 16 steps a pixel over the screen, 4 times",
@@ -4107,6 +4152,8 @@ static std::vector<Scene> texture_scenes()
         } },
         { "tex_msaa_corpus", "4 4x MSAA RGBA16F 1080p targets with a 4x depth: 50 draws each and a resolve, each frame",
           [make_msaa, memory] { make_msaa(); memory(); }, [msaa_frame, memory](UINT f) { memory(); msaa_frame(f); } },
+        { "tex_msaa_discard", "tex_msaa_corpus with each 4x target discarded after its resolve (DiscardResource)",
+          [make_msaa, memory] { make_msaa(); memory(); }, [msaa_frame, memory](UINT f) { memory(); msaa_frame(f, true); } },
         { "tex_stream_mips", "a 1024x1024 BC7 texture with all 11 mips placed in a heap, filled, viewed and released each frame (streaming)",
           [heaps] {
             heaps();
