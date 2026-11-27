@@ -91,14 +91,26 @@ versioned(NSString *path, uint64_t version) {
       stringByAppendingPathExtension:path.pathExtension];
 }
 
+// the version a cache file's name gives right after its stem ("v130" of "shaders_400.v130.db" after "shaders_400."),
+// 0 for one from before versions (the stem's name itself)
+static uint64_t
+name_version(NSString *name, NSString *stem) {
+  const char *rest = [name UTF8String] + [stem lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+  return rest[0] == 'v' ? strtoull(rest + 1, NULL, 10) : 0;
+}
+
 // no version reads what another stored, so a store that kept each grew by a whole version's conversions at every new
-// one: the files beside `stem` whose names start as its does and not as `kept`'s go. a process that still has one
-// open keeps it until it ends
+// one: the files beside `stem` whose names start as its does and not as `kept`'s go, those of older versions. a newer
+// version's stay: two runtimes of different Mullions can share a game's cache (MetalSharp's FEX and x86_64 builds),
+// and the older one would otherwise remove the newer one's at every switch between them. a process that still has
+// one open keeps it until it ends
 static void
 remove_other_versions(NSString *stem, NSString *kept) {
   NSString *directory = [stem stringByDeletingLastPathComponent];
+  NSString *stem_name = [stem lastPathComponent], *kept_name = [kept lastPathComponent];
+  uint64_t version = name_version(kept_name, stem_name);
   for (NSString *name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:directory error:nil])
-    if ([name hasPrefix:[stem lastPathComponent]] && ![name hasPrefix:[kept lastPathComponent]])
+    if ([name hasPrefix:stem_name] && ![name hasPrefix:kept_name] && name_version(name, stem_name) < version)
       unlink([[directory stringByAppendingPathComponent:name] fileSystemRepresentation]);
 }
 
