@@ -6357,6 +6357,8 @@ public:
     args.reset = pDesc->InReset;
     args.depth_reversed = pDesc->DepthReversed;
     args.ui_composited = ui && pDesc->UIComposited;
+    memcpy(args.world_to_view, pDesc->WorldToView, sizeof(args.world_to_view));
+    memcpy(args.view_to_clip, pDesc->ViewToClip, sizeof(args.view_to_clip));
     return S_OK;
   }
 
